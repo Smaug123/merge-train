@@ -78,9 +78,11 @@ Once started, the cascade proceeds automatically through all descendants. New PR
 
 Requests a halt of the cascade for the stack containing this PR. Due to inherent race conditions, the stop takes effect at the next opportunity — any in-flight git operation or API call may complete before the halt is observed. The bot will:
 
-1. Update the state comment on the root PR to `"state": "stopped"`
-2. Update the human-readable portion of the state comment describing the current state
-3. Take no further action on this stack until `@merge-train start` is issued again
+1. Cancel any in-flight git operations
+2. Hard-reset the local git repo to the default branch (cleans up any partial merge state)
+3. Update the state comment on the root PR to `"state": "stopped"`
+4. Update the human-readable portion of the state comment describing the current state
+5. Take no further action on this stack until `@merge-train start` is issued again
 
 The stop command is scoped to a single stack — other independent stacks in the same repo are unaffected.
 
@@ -129,7 +131,6 @@ When the bot takes ownership of a stack (via `@merge-train start`), it creates a
 {
   "version": 1,
   "state": "running",
-  "root_pr": 123,
   "current_pr": 124,
   "cascade_phase": "idle",
   "predecessor_head_sha": null,
@@ -149,7 +150,6 @@ When the bot takes ownership of a stack (via `@merge-train start`), it creates a
 |-------|------|-------------|
 | `version` | `number` | Schema version (currently `1`) |
 | `state` | `string` | One of: `running`, `stopped`, `waiting_ci`, `aborted` |
-| `root_pr` | `number` | PR number where the train was started |
 | `current_pr` | `number` | PR currently being processed in the cascade |
 | `cascade_phase` | `string` | One of: `idle`, `preparing`, `squash_pending`, `reconciling` |
 | `predecessor_head_sha` | `string?` | Head SHA of predecessor before it was squash-merged (for recovery) |
@@ -179,9 +179,14 @@ The bot updates the state comment atomically at each phase transition. The human
 
 **Comment ownership:**
 
-The bot identifies its own state comments by the `<!-- merge-train-state` marker. There is exactly one state comment per active train, always on the original root PR (even after that PR merges). When a train completes or is stopped, the comment is updated (not deleted) to reflect the final state.
+The bot identifies its own state comments by the `<!-- merge-train-state` marker. There is exactly one state comment per active train, always on the **current root PR** (the open PR that targets the default branch). When the current root merges, the bot creates a new state comment on the next PR in the cascade, which becomes the new root. The old comment on the merged PR is updated to reflect completion but is no longer authoritative.
 
-**Limitation**: If the bot is offline for an extended period and the root PR is no longer returned in "recently merged PRs", train state cannot be recovered. The train must be manually restarted.
+This "state follows the cascade" approach means:
+- State recovery only requires scanning open PRs (not merged PRs)
+- Each PR only cares about its direct predecessor, not any "original root"
+- The `active_trains` lookup `get(&root)` works directly with no traversal needed
+
+When a train completes or is stopped, the comment is updated (not deleted) to reflect the final state.
 
 ---
 
@@ -200,7 +205,7 @@ This design is intentional:
 - **Simpler deployment**: No database or persistent storage required
 - **Self-healing**: If a webhook is missed, the next webhook for that repo triggers re-bootstrap
 - **GitHub as source of truth**: All durable state lives in PR comments, not in the bot
-- **Recovery window**: State comments live on the original root PR. If the bot is offline long enough that this PR falls outside the "recently merged" window (controlled by GitHub's pagination), train state will be lost and must be manually restarted. In practice, this window is large (hundreds of PRs) and only affects extended outages.
+- **Recovery**: State comments live on the current root PR (open, targeting default branch). Recovery only requires scanning open PRs, not merged PRs. Train state is always recoverable as long as the root PR is still open.
 
 The tradeoff is that after a restart, a repo won't be processed until a relevant webhook arrives. In practice this is fine — CI completions, PR updates, or human comments will quickly trigger re-engagement. For repos with active trains, the `check_suite` webhooks from ongoing CI provide natural re-triggering.
 
@@ -279,7 +284,7 @@ On first webhook for a repo (or on re-sync):
 
 API calls are parallelized (concurrency limit ~10) to minimize bootstrap time.
 
-**State comment parsing**: During comment scanning (step 5), the bot looks for comments containing `<!-- merge-train-state`. The JSON between the marker and `-->` is parsed to recover the train state (`running`, `stopped`, etc.), `current_pr`, `cascade_phase`, and recovery SHAs. This enables seamless continuation of in-progress cascades after a restart.
+**State comment parsing**: During comment scanning (step 5), the bot looks for comments containing `<!-- merge-train-state`. The bot **must verify that the comment author's user ID matches the bot's own user ID** before parsing — this prevents malicious users from injecting fake state comments. The JSON between the marker and `-->` is parsed to recover the train state (`running`, `stopped`, etc.), `current_pr`, `cascade_phase`, and recovery SHAs. This enables seamless continuation of in-progress cascades after a restart.
 
 ### Incremental updates
 
@@ -329,10 +334,11 @@ From the cached state, stacks are computed by traversing predecessor relationshi
 3. Validate: no cycles, predecessors exist
 4. Check `active_trains` to determine if each stack is started/stopped
 
-**Fan-out handling**: When a PR has multiple open descendants (fan-out), the stack ends at that PR. Each descendant is not yet part of a computable stack — it will become the root of its own independent stack once its predecessor merges. After the fan-out point merges:
+**Fan-out handling**: When a PR has multiple open descendants (fan-out), the stack ends at that PR. Each descendant will become the root of its own independent stack once its predecessor merges. After the fan-out point merges:
 - Each descendant is retargeted to the default branch
-- Each descendant is discovered as a new root via normal stack computation
-- They proceed independently; whichever passes CI first merges next
+- Each descendant receives its own state comment (inheriting "started" status from the parent train)
+- They proceed as independent trains; whichever passes CI first merges next
+- The `cascade_step` returns `FanOut { descendants }` to trigger this state comment creation
 
 ---
 
@@ -445,7 +451,7 @@ We additionally assume the GitHub API has told us the `$PREDECESSOR_SQUASH_COMMI
 
 ```bash
 # Clone (or fetch into existing clone)
-git clone --depth=50 <repo-url> workdir
+git clone <repo-url> workdir
 cd workdir
 
 # Configure signing
@@ -530,10 +536,11 @@ For PR #N with descendants {#D1, #D2, ...} (may be one or multiple):
    → GitHub API: PATCH /repos/{o}/{r}/pulls/{n}  { "base": "main" }
 
 6. WAIT/BRANCH: Depends on descendant count
-   → Single descendant: Wait for CI, then continue cascade with that descendant
-   → Multiple descendants (fan-out): Each is now an independent root targeting main.
+   → Single descendant: Create state comment on descendant (it's the new root), wait for CI
+   → Multiple descendants (fan-out): Create state comment on EACH descendant.
+     Each becomes an independent train with its own root.
      They proceed independently; whichever passes CI first merges next.
-     The others pick up that merge via normal catch-up flow when their turn comes.
+     The others catch up via normal flow when their turn comes.
 
 7. REPEAT: For single descendant, it becomes the new #N, loop from step 1
 ```
@@ -828,9 +835,7 @@ struct StateComment {
     version: u32,
     /// Current train state
     state: TrainState,
-    /// PR number where the train was started (root)
-    root_pr: PrNumber,
-    /// PR currently being processed in the cascade
+    /// PR currently being processed in the cascade (may be root or descendant)
     current_pr: PrNumber,
     /// Current phase within the cascade step
     cascade_phase: CascadePhase,
@@ -843,6 +848,8 @@ struct StateComment {
     /// Error details if aborted
     error: Option<TrainError>,
 }
+// Note: The state comment's location (which PR it's on) implicitly defines the train's root.
+// When the root merges, we create a new state comment on the next PR in the cascade.
 
 #[derive(Serialize, Deserialize)]
 enum TrainState {
@@ -922,8 +929,10 @@ enum CascadeStepOutcome {
     Merged { pr_number: PrNumber },
     /// Waiting for CI on next PR
     WaitingOnCi { pr_number: PrNumber },
-    /// Stack fully merged
+    /// Stack fully merged (no descendants)
     Complete,
+    /// Fan-out: multiple descendants, each becomes an independent root
+    FanOut { descendants: Vec<PrNumber> },
     /// Something went wrong
     Aborted { pr_number: PrNumber, reason: AbortReason },
 }
@@ -1028,7 +1037,7 @@ impl Dispatcher {
     }
 
     /// Dispatch an event to the appropriate repo's queue
-    fn dispatch(&mut self, repo_id: &RepoId, event: QueuedEvent) {
+    fn dispatch(&mut self, repo_id: &RepoId, mut event: QueuedEvent) {
         let is_stop = event.priority == EventPriority::Stop;
 
         // If this is a stop command, cancel in-flight operations first
@@ -1044,8 +1053,18 @@ impl Dispatcher {
             }
         }
 
-        let handle = self.get_or_create_handle(repo_id);
-        let _ = handle.sender.send(event);
+        // Try to send; if worker died (idle timeout), recreate it
+        loop {
+            let handle = self.get_or_create_handle(repo_id);
+            match handle.sender.send(event) {
+                Ok(()) => return,
+                Err(mpsc::error::SendError(returned_event)) => {
+                    // Worker shut down — remove stale handle and retry with fresh worker
+                    self.repos.remove(repo_id);
+                    event = returned_event;
+                }
+            }
+        }
     }
 }
 
@@ -1187,7 +1206,8 @@ async fn recover_in_progress_trains(
     cancel: &CancellationToken,
     ctx: &AppContext,
 ) -> Result<()> {
-    for (root_pr, state_ref) in &repo_state.active_trains {
+    // active_trains is keyed by the PR number where the state comment lives (the current root)
+    for (train_root, state_ref) in &repo_state.active_trains {
         let state = &state_ref.state;
 
         // Only recover trains that were actively running (not stopped/aborted)
@@ -1218,7 +1238,7 @@ async fn recover_in_progress_trains(
                     }
                     _ => {
                         // PR closed without merge or missing - abort
-                        abort_train(*root_pr, "PR closed or missing during recovery", repo_state, ctx).await?;
+                        abort_train(*train_root, "PR closed or missing during recovery", repo_state, ctx).await?;
                     }
                 }
             }
@@ -1363,9 +1383,13 @@ async fn process_github_event(
                         evaluate_cascade(&stacks, repo_state, cancellation_token, ctx).await?;
                     }
                     Command::Stop => {
-                        // State already updated; just ack
-                        // Note: in-flight operations were already cancelled by the dispatcher
-                        ack_stop(&c, ctx).await?;
+                        // In-flight operations were already cancelled by the dispatcher.
+                        // Hard-reset the local repo to clean up any partial merge state.
+                        let git = ctx.git_for_repo(&repo_id);
+                        git.reset_to_default_branch(&repo_state.default_branch).await?;
+
+                        // Update state comment and ack
+                        ack_stop(&c, repo_state, ctx).await?;
                     }
                 }
             }
@@ -1552,9 +1576,10 @@ async fn bootstrap_repo(
     let mut active_trains = HashMap::new();
 
     for (pr, comments) in cached_prs {
-        // Look for state comments from the bot
-        if let Some(state_comment) = find_state_comment(&comments) {
-            active_trains.insert(state_comment.state.root_pr, state_comment);
+        // Look for state comments from the bot (author must be our own user ID)
+        // The state comment lives on the current root PR, so we key by that PR's number
+        if let Some(state_comment) = find_state_comment(&comments, ctx.bot_user_id) {
+            active_trains.insert(pr.number, state_comment);
         }
 
         if let Some(pred) = pr.predecessor {
@@ -1574,9 +1599,14 @@ async fn bootstrap_repo(
     })
 }
 
-/// Parse a state comment from a list of comments
-fn find_state_comment(comments: &[Comment]) -> Option<StateCommentRef> {
+/// Parse a state comment from a list of comments.
+/// Only considers comments authored by the bot itself (verified by user ID).
+fn find_state_comment(comments: &[Comment], bot_user_id: u64) -> Option<StateCommentRef> {
     for comment in comments {
+        // Only trust state comments authored by ourselves
+        if comment.user.id != bot_user_id {
+            continue;
+        }
         if let Some(start) = comment.body.find("<!-- merge-train-state\n") {
             if let Some(end) = comment.body[start..].find("\n-->") {
                 let json_start = start + "<!-- merge-train-state\n".len();
@@ -1696,6 +1726,46 @@ impl GitOperations {
         self.run_git(&["rev-parse", "HEAD"], cancel).await
     }
 
+    /// Hard-reset the local repo to the default branch.
+    /// Used during stop/cancellation to clean up any partial merge state.
+    /// Does NOT use cancellation token — this cleanup must complete.
+    async fn reset_to_default_branch(&self, default_branch: &str) -> Result<()> {
+        let origin_default = format!("origin/{}", default_branch);
+
+        // Fetch latest default branch
+        self.run_git_uncancellable(&["fetch", "origin", default_branch]).await?;
+
+        // Abort any in-progress merge
+        self.run_git_uncancellable(&["merge", "--abort"]).await.ok(); // May fail if no merge in progress
+
+        // Hard reset to origin/default
+        self.run_git_uncancellable(&["reset", "--hard", &origin_default]).await?;
+
+        // Clean up any untracked files
+        self.run_git_uncancellable(&["clean", "-fd"]).await?;
+
+        Ok(())
+    }
+
+    /// Run a git command without cancellation support (for cleanup operations).
+    async fn run_git_uncancellable(&self, args: &[&str]) -> Result<String> {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&self.workdir)
+            .env("GIT_COMMITTER_NAME", "merge-train[bot]")
+            .env("GIT_COMMITTER_EMAIL", "merge-train@example.com")
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            return Err(GitError::CommandFailed {
+                args: args.join(" "),
+                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            }.into());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
     /// Run a git command with cancellation support.
     /// If the token is cancelled, the child process is killed and Err(Cancelled) is returned.
     async fn run_git(&self, args: &[&str], cancel: &CancellationToken) -> Result<String> {
@@ -1764,7 +1834,9 @@ async fn cascade_step(
     match descendants.len() {
         0 => Ok(CascadeStepOutcome::Complete),
         1 => Ok(CascadeStepOutcome::WaitingOnCi { pr_number: descendants[0].number }),
-        _ => Ok(CascadeStepOutcome::Complete), // Fan-out: descendants are now independent roots
+        _ => Ok(CascadeStepOutcome::FanOut {
+            descendants: descendants.iter().map(|d| d.number).collect(),
+        }),
     }
 }
 ```
@@ -1810,6 +1882,12 @@ clone_base_dir = "/var/lib/merge-train/repos"
 bind_address = "0.0.0.0:8080"
 webhook_secret = "${WEBHOOK_SECRET}"  # env var substitution
 
+[bot]
+# The bot's GitHub user ID, used to verify authorship of state comments.
+# Can be obtained via: GET /app → returns app info including the bot user.
+# This prevents malicious users from injecting fake state comments.
+user_id = 123456789
+
 [behavior]
 # Future: auto_start = true
 ```
@@ -1836,6 +1914,7 @@ A monitoring/ops dashboard is planned to provide visibility into active trains, 
 ## Security Considerations
 
 - **Command authorization**: Only users with write access to the repo may issue commands. Validate via GitHub API before acting.
+- **State comment verification**: State comments (`<!-- merge-train-state`) are only parsed if the comment author's user ID matches the bot's configured user ID. This prevents malicious users from injecting fake state that could cause the bot to perform unintended operations.
 - **Webhook validation**: Verify `X-Hub-Signature-256` header against webhook secret.
 - **Signing key protection**: GPG private key should be stored securely (e.g., mounted secret, not in repo).
 - **Clone isolation**: Each repo gets its own workdir; clean up after operations.
