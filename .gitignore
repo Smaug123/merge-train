@@ -1,0 +1,9 @@
+.direnv/
+target/
+result
+.venv/
+
+
+# Added by cargo
+
+/target
