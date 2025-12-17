@@ -18,6 +18,7 @@ A GitHub bot that orchestrates sequential squash-merging of stacked PRs into `ma
 - Replacing CI (the bot waits for checks, doesn't run them)
 - Managing the GPT-5 review bot (separate system)
 - Cross-fork PRs (the bot only operates when the PR's head and base are in the same repository; fork-based PRs are ignored because the bot cannot push to arbitrary forks)
+- GitHub merge queue compatibility (the bot assumes users are not using GitHub's built-in merge queue feature; running both systems simultaneously on the same repository would cause conflicts)
 
 ---
 
@@ -75,7 +76,7 @@ Once started, the cascade proceeds automatically through all descendants. New PR
 @merge-train stop
 ```
 
-Immediately halts the cascade for the stack containing this PR. The bot will:
+Requests a halt of the cascade for the stack containing this PR. Due to inherent race conditions, the stop takes effect at the next opportunity — any in-flight git operation or API call may complete before the halt is observed. The bot will:
 
 1. Update the state comment on the root PR to `"state": "stopped"`
 2. Update the human-readable portion of the state comment describing the current state
@@ -178,7 +179,9 @@ The bot updates the state comment atomically at each phase transition. The human
 
 **Comment ownership:**
 
-The bot identifies its own state comments by the `<!-- merge-train-state` marker. There is exactly one state comment per active train. When a train completes or is stopped, the comment is updated (not deleted) to reflect the final state.
+The bot identifies its own state comments by the `<!-- merge-train-state` marker. There is exactly one state comment per active train, always on the original root PR (even after that PR merges). When a train completes or is stopped, the comment is updated (not deleted) to reflect the final state.
+
+**Limitation**: If the bot is offline for an extended period and the root PR is no longer returned in "recently merged PRs", train state cannot be recovered. The train must be manually restarted.
 
 ---
 
@@ -197,6 +200,7 @@ This design is intentional:
 - **Simpler deployment**: No database or persistent storage required
 - **Self-healing**: If a webhook is missed, the next webhook for that repo triggers re-bootstrap
 - **GitHub as source of truth**: All durable state lives in PR comments, not in the bot
+- **Recovery window**: State comments live on the original root PR. If the bot is offline long enough that this PR falls outside the "recently merged" window (controlled by GitHub's pagination), train state will be lost and must be manually restarted. In practice, this window is large (hundreds of PRs) and only affects extended outages.
 
 The tradeoff is that after a restart, a repo won't be processed until a relevant webhook arrives. In practice this is fine — CI completions, PR updates, or human comments will quickly trigger re-engagement. For repos with active trains, the `check_suite` webhooks from ongoing CI provide natural re-triggering.
 
@@ -275,7 +279,7 @@ On first webhook for a repo (or on re-sync):
 
 API calls are parallelized (concurrency limit ~10) to minimize bootstrap time.
 
-**State comment parsing**: During comment scanning (step 5), the bot looks for comments containing `<!-- merge-train-state`. The JSON between the marker and `-->` is parsed to recover `train_started`, `train_stopped`, `current_pr`, `cascade_phase`, and recovery SHAs. This enables seamless continuation of in-progress cascades after a restart.
+**State comment parsing**: During comment scanning (step 5), the bot looks for comments containing `<!-- merge-train-state`. The JSON between the marker and `-->` is parsed to recover the train state (`running`, `stopped`, etc.), `current_pr`, `cascade_phase`, and recovery SHAs. This enables seamless continuation of in-progress cascades after a restart.
 
 ### Incremental updates
 
@@ -284,8 +288,8 @@ Each webhook event updates the cached state:
 | Event | State Update |
 |-------|--------------|
 | `issue_comment` + `predecessor #N` | `pr.predecessor = Some(N)`, update descendants index |
-| `issue_comment` + `start` | Create/update state comment, `pr.train_started = true` |
-| `issue_comment` + `stop` | Update state comment with `stopped`, mark all PRs in stack as stopped |
+| `issue_comment` + `start` | Create/update state comment on root PR, add to `active_trains` |
+| `issue_comment` + `stop` | Update state comment on root PR with `stopped` |
 | `pull_request.opened` | Add new PR to cache |
 | `pull_request.closed` (merged) | `pr.state = Merged { sha }` |
 | `pull_request.closed` (not merged) | `pr.state = Closed` |
@@ -320,10 +324,10 @@ Periodic re-sync is implemented by injecting a `PeriodicSync` event into the sam
 
 From the cached state, stacks are computed by traversing predecessor relationships:
 
-1. Find all open PRs with `train_started = true` on any ancestor
-2. Build linear chains by following `predecessor` pointers
+1. Find all root PRs (target default branch, no open predecessor)
+2. Build linear chains from each root by following `descendants` index
 3. Validate: no cycles, predecessors exist
-4. Identify the "frontier" of each started stack
+4. Check `active_trains` to determine if each stack is started/stopped
 
 **Fan-out handling**: When a PR has multiple open descendants (fan-out), the stack ends at that PR. Each descendant is not yet part of a computable stack — it will become the root of its own independent stack once its predecessor merges. After the fan-out point merges:
 - Each descendant is retargeted to the default branch
@@ -342,6 +346,7 @@ From the cached state, stacks are computed by traversing predecessor relationshi
 | `pull_request` merged | If merged PR has descendants, cascade to next |
 | `pull_request` closed (not merged) | Notify descendants they're orphaned |
 | `check_suite` / `status` completed | If cascade waiting on this PR, continue |
+| `pull_request_review` submitted (approved) | If cascade waiting on this PR, continue |
 
 **Fan-out discovery**: After a fan-out point merges, each descendant is discovered as a new root on subsequent events. Since each descendant now targets the default branch and its predecessor is merged, `is_root()` returns true and `compute_stacks()` includes it. No special event handling is needed — the normal cascade flow applies to each independent branch.
 
@@ -614,7 +619,7 @@ The bot aborts the cascade (and comments with diagnostics) if:
 
 On abort, the bot:
 
-1. Stops immediately
+1. Stops at the next opportunity (in-flight operations may complete first)
 2. Posts a comment on the PR that failed, explaining what happened and suggesting recovery
 3. Posts a comment on downstream PRs that the train is halted
 4. Takes no further action until human intervenes or condition resolves
@@ -672,7 +677,7 @@ query($owner: String!, $repo: String!, $number: Int!) {
 
 GitHub App installation token with permissions:
 
-- `pull_requests`: write (merge, retarget, read, query `mergeStateStatus` via GraphQL)
+- `pull_requests`: write (merge, retarget, read, query `mergeStateStatus` via GraphQL, receive `pull_request_review` webhooks)
 - `contents`: write (push via git)
 - `checks`: read (receive `check_suite` webhooks to trigger re-evaluation)
 - `issues`: write (comments, reactions)
@@ -784,10 +789,6 @@ struct CachedPr {
     merge_state: MergeStateStatus,
     /// Declared predecessor (from @merge-train predecessor comment)
     predecessor: Option<PrNumber>,
-    /// True if this PR is part of an active train (derived from state comment)
-    train_started: bool,
-    /// True if the train containing this PR was stopped (derived from state comment)
-    train_stopped: bool,
 }
 
 enum PrState {
@@ -1158,11 +1159,17 @@ async fn process_event_for_repo(
     ctx: &AppContext,
 ) -> Result<()> {
     // Ensure repo is bootstrapped
-    if repo_state.is_none() {
+    let just_bootstrapped = repo_state.is_none();
+    if just_bootstrapped {
         *repo_state = Some(bootstrap_repo(repo_id, cancel, ctx).await?);
     }
 
     let state = repo_state.as_mut().unwrap();
+
+    // Recovery: if we just bootstrapped, check for in-progress trains that need resuming
+    if just_bootstrapped {
+        recover_in_progress_trains(state, cancel, ctx).await?;
+    }
 
     match event.payload {
         QueuedEventPayload::GitHub(gh_event) => {
@@ -1172,6 +1179,58 @@ async fn process_event_for_repo(
             resync_repo(repo_id, state, cancel, ctx).await
         }
     }
+}
+
+/// After bootstrap, check for trains that were mid-cascade and resume them.
+async fn recover_in_progress_trains(
+    repo_state: &mut RepoState,
+    cancel: &CancellationToken,
+    ctx: &AppContext,
+) -> Result<()> {
+    for (root_pr, state_ref) in &repo_state.active_trains {
+        let state = &state_ref.state;
+
+        // Only recover trains that were actively running (not stopped/aborted)
+        if !matches!(state.state, TrainState::Running | TrainState::WaitingCi) {
+            continue;
+        }
+
+        match state.cascade_phase {
+            CascadePhase::Idle => {
+                // Re-evaluate readiness of current_pr
+                // This will be handled by the triggering event, no special action needed
+            }
+            CascadePhase::Preparing => {
+                // Re-run preparation (idempotent - if already pushed, merges are no-ops)
+                resume_preparation(state.current_pr, repo_state, cancel, ctx).await?;
+            }
+            CascadePhase::SquashPending => {
+                // Check if the PR was already squash-merged
+                let pr = repo_state.prs.get(&state.current_pr);
+                match pr.map(|p| &p.state) {
+                    Some(PrState::Merged { .. }) => {
+                        // Already merged, move to reconciliation
+                        resume_reconciliation(state.current_pr, state.last_squash_sha.as_ref(), repo_state, cancel, ctx).await?;
+                    }
+                    Some(PrState::Open) => {
+                        // Not yet merged, proceed with squash
+                        resume_squash(state.current_pr, repo_state, cancel, ctx).await?;
+                    }
+                    _ => {
+                        // PR closed without merge or missing - abort
+                        abort_train(*root_pr, "PR closed or missing during recovery", repo_state, ctx).await?;
+                    }
+                }
+            }
+            CascadePhase::Reconciling => {
+                // Use last_squash_sha to complete reconciliation
+                let squash_sha = state.last_squash_sha.as_ref()
+                    .ok_or(Error::MissingRecoverySha)?;
+                resume_reconciliation(state.current_pr, Some(squash_sha), repo_state, cancel, ctx).await?;
+            }
+        }
+    }
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1321,6 +1380,9 @@ async fn process_github_event(
         GitHubEvent::CheckSuite(cs) if cs.conclusion == Some("success") => {
             evaluate_cascade(&stacks, repo_state, cancellation_token, ctx).await?;
         }
+        GitHubEvent::PullRequestReview(r) if r.action == "submitted" && r.review.state == "approved" => {
+            evaluate_cascade(&stacks, repo_state, cancellation_token, ctx).await?;
+        }
         _ => {}
     }
 
@@ -1420,11 +1482,19 @@ impl RepoState {
             current = n;
         }
 
-        let root_pr = self.prs.get(&root)?;
+        // Train state is a property of the stack (stored on root), not individual PRs
+        let (started, stopped) = match self.active_trains.get(&root) {
+            Some(state_ref) => (
+                matches!(state_ref.state.state, TrainState::Running | TrainState::WaitingCi),
+                matches!(state_ref.state.state, TrainState::Stopped),
+            ),
+            None => (false, false),
+        };
+
         Some(MergeStack {
             prs,
-            started: root_pr.train_started,
-            stopped: root_pr.train_stopped,
+            started,
+            stopped,
         })
     }
 }
@@ -1491,14 +1561,6 @@ async fn bootstrap_repo(
             descendants.entry(pred).or_insert_with(HashSet::new).insert(pr.number);
         }
         prs.insert(pr.number, pr);
-    }
-
-    // Mark PRs as started/stopped based on recovered train state
-    for (root_pr, state_ref) in &active_trains {
-        if let Some(pr) = prs.get_mut(root_pr) {
-            pr.train_started = matches!(state_ref.state.state, TrainState::Running | TrainState::WaitingCi);
-            pr.train_stopped = matches!(state_ref.state.state, TrainState::Stopped);
-        }
     }
 
     Ok(RepoState {
@@ -1764,6 +1826,10 @@ The design supports easy migration to automatic triggering:
    - Behave as if `@merge-train start` was issued
 
 The event-driven architecture means no other changes are needed — the cascade logic is identical whether triggered manually or automatically.
+
+## Future: Monitoring Dashboard
+
+A monitoring/ops dashboard is planned to provide visibility into active trains, cascade progress, and historical metrics.
 
 ---
 
