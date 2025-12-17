@@ -133,7 +133,7 @@ When the bot takes ownership of a stack (via `@merge-train start`), it creates a
   "state": "running",
   "current_pr": 124,
   "cascade_phase": "idle",
-  "predecessor_head_sha": null,
+  "predecessor_pr": null,
   "last_squash_sha": null,
   "stopped_at": null,
   "error": null
@@ -152,7 +152,7 @@ When the bot takes ownership of a stack (via `@merge-train start`), it creates a
 | `state` | `string` | One of: `running`, `stopped`, `waiting_ci`, `aborted` |
 | `current_pr` | `number` | PR currently being processed in the cascade |
 | `cascade_phase` | `string` | One of: `idle`, `preparing`, `squash_pending`, `reconciling` |
-| `predecessor_head_sha` | `string?` | Head SHA of predecessor before it was squash-merged (for recovery) |
+| `predecessor_pr` | `number?` | PR number of predecessor (for fetching via `refs/pull/<n>/head` during recovery) |
 | `last_squash_sha` | `string?` | SHA of last squash commit (for reconciliation recovery) |
 | `stopped_at` | `string?` | ISO 8601 timestamp if stopped |
 | `error` | `object?` | Error details if aborted: `{ "type": "...", "message": "..." }` |
@@ -188,28 +188,120 @@ This "state follows the cascade" approach means:
 
 When a train completes or is stopped, the comment is updated (not deleted) to reflect the final state.
 
+### State snapshot (persisted in git ref)
+
+The bot maintains a JSON file at `refs/meta/merge-train-snapshot:state.json` to persist structural state across restarts.
+
+**Ref structure:**
+
+```
+refs/meta/merge-train-snapshot
+└── state.json
+```
+
+**JSON format (`state.json`):**
+
+```json
+{
+  "schema_version": 1,
+  "updated_at": "2024-01-15T10:30:00Z",
+  "default_branch": "main",
+  "prs": {
+    "123": {
+      "head_sha": "abc123def456",
+      "base_ref": "main",
+      "predecessor": null,
+      "state": "open",
+      "state_comment_id": 987654321
+    },
+    "124": {
+      "head_sha": "def456ghi789",
+      "base_ref": "feature-123",
+      "predecessor": 123,
+      "state": "open",
+      "state_comment_id": null
+    },
+    "125": {
+      "head_sha": "ghi789jkl012",
+      "base_ref": "feature-124",
+      "predecessor": 124,
+      "state": "open",
+      "state_comment_id": null
+    }
+  },
+  "active_trains": {
+    "123": {
+      "state_comment_id": 987654321,
+      "current_pr": 124,
+      "started_at": "2024-01-15T09:00:00Z"
+    }
+  }
+}
+```
+
+**Field definitions:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `schema_version` | `number` | Schema version for forward-compatible migrations (currently `1`) |
+| `updated_at` | `string` | ISO 8601 timestamp of last snapshot update |
+| `default_branch` | `string` | Cached default branch name |
+| `prs` | `object` | Map of PR number (string) → cached PR info |
+| `prs[n].head_sha` | `string` | Last known head SHA |
+| `prs[n].base_ref` | `string` | Base branch name |
+| `prs[n].predecessor` | `number?` | Declared predecessor PR number |
+| `prs[n].state` | `string` | One of: `open`, `merged`, `closed` |
+| `prs[n].state_comment_id` | `number?` | Comment ID if this PR has a state comment |
+| `active_trains` | `object` | Map of root PR number → train metadata |
+| `active_trains[n].state_comment_id` | `number` | Comment ID of the state comment |
+| `active_trains[n].current_pr` | `number` | PR being processed |
+| `active_trains[n].started_at` | `string` | When the train was started |
+
+**Staleness detection**: The `updated_at` field indicates when state was last persisted. On bootstrap, if this is older than a threshold (default: 1 hour), the bot performs a full re-sync to catch any missed webhooks.
+
+**Ref creation**: On first contact with a repo (if the ref doesn't exist), the bot:
+1. Performs a full bootstrap (same as fallback path)
+2. Creates the ref with the bootstrapped state via Contents API
+
+**Inspecting the snapshot**: Operators can fetch and view the snapshot for debugging:
+
+```bash
+git fetch origin refs/meta/merge-train-snapshot:refs/meta/merge-train-snapshot
+git show refs/meta/merge-train-snapshot:state.json | jq .
+```
+
 ---
 
 ## State Management
 
-### Design decision: ephemeral repo tracking
+### Design decision: ref-based state persistence
 
-The bot does **not** persist the set of repositories it monitors. On restart, it has no memory of which repos it was previously tracking. Instead:
+The bot persists per-repo state in a **hidden git ref** (`refs/meta/merge-train-snapshot`) containing a JSON file. This enables fast bootstrap by reading cached state rather than crawling all PRs and comments on every restart.
 
-1. The bot waits for webhook events to arrive
-2. On first webhook for a repo, it bootstraps that repo's state from GitHub
-3. State comments on PRs provide the authoritative train state
+**Why a git ref instead of GitHub Issues or a database:**
 
-This design is intentional:
+- **Atomic updates**: The GitHub Contents API (`PUT /repos/{o}/{r}/contents/{path}`) requires the SHA of the file being replaced. This provides optimistic locking for free — concurrent updates are rejected with `409 Conflict`.
+- **No external dependencies**: State lives in the repository itself, not a separate database.
+- **Human-inspectable**: Operators can fetch the ref and inspect the JSON for debugging.
+- **Self-healing**: If the ref is missing or corrupted, the bot falls back to full bootstrap and recreates it.
 
-- **Simpler deployment**: No database or persistent storage required
-- **Self-healing**: If a webhook is missed, the next webhook for that repo triggers re-bootstrap
-- **GitHub as source of truth**: All durable state lives in PR comments, not in the bot
-- **Recovery**: State comments live on the current root PR (open, targeting default branch). Recovery only requires scanning open PRs, not merged PRs. Train state is always recoverable as long as the root PR is still open.
+**Ref location**: `refs/meta/merge-train-snapshot` (hidden from normal branch listings). The ref points to a tree containing a single file `state.json`.
 
-The tradeoff is that after a restart, a repo won't be processed until a relevant webhook arrives. In practice this is fine — CI completions, PR updates, or human comments will quickly trigger re-engagement. For repos with active trains, the `check_suite` webhooks from ongoing CI provide natural re-triggering.
+**Relationship to state comments**: The snapshot stores *structural* state (PR relationships, comment IDs, cursors). The per-train state comments on PRs store *operational* state (cascade phase, current PR). Both are authoritative for their respective concerns:
+- Snapshot: "What PRs exist and how are they related?"
+- State comments: "What is the cascade doing right now?"
 
-The bot maintains in-memory state per repository to avoid expensive API calls on every event. State is bootstrapped once per repo (on first webhook or restart) and updated incrementally from subsequent webhooks.
+**Concurrency handling**: If multiple bot instances (or a bot restart mid-operation) race to update the snapshot:
+
+1. Worker A reads `state.json` (SHA: `xyz`)
+2. Worker B reads `state.json` (SHA: `xyz`)
+3. Worker A updates successfully → new SHA: `123`
+4. Worker B attempts update with `sha: xyz` → `409 Conflict`
+5. Worker B re-fetches, sees A's changes, merges its own changes, retries
+
+This ensures no state is lost even under concurrent access.
+
+The bot maintains in-memory state per repository for fast event processing. On first webhook (or restart), it reads the snapshot (fast path) or falls back to full API crawl (if snapshot missing/stale), then updates incrementally from webhooks.
 
 ### Repository lifecycle
 
@@ -245,11 +337,20 @@ Each repo follows this state machine:
 
 ```rust
 pub struct RepoState {
+    /// The repository's default branch (e.g., "main", "master")
+    default_branch: String,
+
     /// All known PRs (open + recently merged)
     prs: HashMap<PrNumber, CachedPr>,
 
     /// Reverse index: predecessor → descendants
     descendants: HashMap<PrNumber, HashSet<PrNumber>>,
+
+    /// Active trains, keyed by root PR number
+    active_trains: HashMap<PrNumber, StateCommentRef>,
+
+    /// Reference to the persisted snapshot (for optimistic locking)
+    snapshot_ref: Option<SnapshotRef>,
 
     /// When bootstrap completed
     bootstrapped_at: Instant,
@@ -257,34 +358,71 @@ pub struct RepoState {
     /// For periodic re-sync
     last_sync: Instant,
 
+    /// When state was last persisted to the snapshot
+    last_persisted: Option<Instant>,
+
+    /// Whether in-memory state has changed since last persistence
+    dirty: bool,
+
     /// Cache miss counter for drift detection
     miss_count: u32,
+}
+
+/// Reference to the persisted snapshot (for optimistic locking)
+struct SnapshotRef {
+    /// SHA of the state.json file (required for Contents API updates)
+    file_sha: String,
 }
 ```
 
 ### Bootstrap algorithm
 
-On first webhook for a repo (or on re-sync):
+On first webhook for a repo (or on re-sync), the bot follows a two-phase approach: first attempt fast bootstrap from the snapshot, then fall back to full API crawl if necessary.
+
+**Phase 1: Snapshot-based bootstrap (fast path)**
 
 1. Transition to `Bootstrapping` state (queue incoming events)
-2. Fetch repository metadata: `GET /repos/{o}/{r}` → extract `default_branch`
-3. Fetch all open PRs: `GET /repos/{o}/{r}/pulls?state=open`
-4. Fetch recently merged PRs: `GET /repos/{o}/{r}/pulls?state=closed&sort=updated`
-5. For each PR, fetch comments to find:
+2. Attempt to fetch the snapshot: `GET /repos/{o}/{r}/contents/state.json?ref=refs/meta/merge-train-snapshot`
+3. If snapshot found and not stale (`updated_at` within threshold):
+   a. Parse the JSON, extract `default_branch`, `prs`, `active_trains`
+   b. Record the file's `sha` for later optimistic locking
+   c. For PRs with active trains, fetch state comments to recover operational state (`cascade_phase`, etc.)
+   d. For each open PR, fetch current `mergeStateStatus` via GraphQL (merge readiness may have changed)
+   e. Build `RepoState` from snapshot + refreshed merge states
+   f. Skip to step 11 (recovery check)
+4. If snapshot not found (404), stale, or corrupted: proceed to Phase 2
+
+**Phase 2: Full API crawl (fallback path)**
+
+5. Fetch repository metadata: `GET /repos/{o}/{r}` → extract `default_branch`
+6. Fetch all open PRs: `GET /repos/{o}/{r}/pulls?state=open`
+7. Fetch recently merged PRs: `GET /repos/{o}/{r}/pulls?state=closed&sort=updated`
+8. For each PR, fetch comments to find:
    - `@merge-train predecessor` declarations (from humans)
    - `<!-- merge-train-state` state comments (from bot) — parse JSON to recover train state
-6. For each open PR, fetch `mergeStateStatus` via GraphQL
-7. Build `RepoState` with default branch, PR map, descendants index, and recovered train state
-8. **Recovery check**: For any train in a non-idle `cascade_phase`, evaluate whether to resume:
-   - If `preparing`: Re-run preparation (merge operations are idempotent if already pushed)
-   - If `squash_pending`: Check if PR is already merged; if not, proceed with squash
-   - If `reconciling`: Use `last_squash_sha` from state comment to complete reconciliation
-9. Transition to `Ready` state
-10. Drain queued events, process each in order
+9. For each open PR, fetch `mergeStateStatus` via GraphQL
+10. Build `RepoState` with default branch, PR map, descendants index, and recovered train state
+11. **Persist snapshot**: Create or update the snapshot via Contents API (see State Persistence section)
+
+**Recovery and completion (both paths)**
+
+12. **Recovery check**: For any train in a non-idle `cascade_phase`, evaluate whether to resume:
+    - If `preparing`: Re-run preparation (merge operations are idempotent if already pushed)
+    - If `squash_pending`: Check if PR is already merged; if not, proceed with squash
+    - If `reconciling`: Use `last_squash_sha` from state comment to complete reconciliation
+13. Transition to `Ready` state
+14. Drain queued events, process each in order
 
 API calls are parallelized (concurrency limit ~10) to minimize bootstrap time.
 
-**State comment parsing**: During comment scanning (step 5), the bot looks for comments containing `<!-- merge-train-state`. The bot **must verify that the comment author's user ID matches the bot's own user ID** before parsing — this prevents malicious users from injecting fake state comments. The JSON between the marker and `-->` is parsed to recover the train state (`running`, `stopped`, etc.), `current_pr`, `cascade_phase`, and recovery SHAs. This enables seamless continuation of in-progress cascades after a restart.
+**Fast path efficiency**: With snapshot-based bootstrap, a typical restart requires:
+- 1 API call to fetch the snapshot
+- N API calls for merge state refresh (one GraphQL query per open PR, can be batched)
+- M API calls for state comment refresh (only for active trains, typically 0-2)
+
+Compare to full bootstrap which requires O(PRs) + O(comments) API calls.
+
+**State comment parsing**: During comment scanning (step 8), the bot looks for comments containing `<!-- merge-train-state`. The bot **must verify that the comment author's user ID matches the bot's own user ID** before parsing — this prevents malicious users from injecting fake state comments. The JSON between the marker and `-->` is parsed to recover the train state (`running`, `stopped`, etc.), `current_pr`, `cascade_phase`, and recovery SHAs. This enables seamless continuation of in-progress cascades after a restart.
 
 ### Incremental updates
 
@@ -304,7 +442,7 @@ Each webhook event updates the cached state:
 
 **State comment updates during cascade**: The bot updates its state comment at each phase transition:
 - Before preparation: `cascade_phase = "preparing"`
-- After preparation: `cascade_phase = "squash_pending"`, `predecessor_head_sha = <sha>`
+- After preparation: `cascade_phase = "squash_pending"`, `predecessor_pr = <pr_number>`
 - After squash: `cascade_phase = "reconciling"`, `last_squash_sha = <sha>`
 - After reconciliation: `cascade_phase = "idle"`, advance `current_pr`
 
@@ -322,8 +460,75 @@ When an event references a PR not in cache:
 The bot re-bootstraps a repo when:
 - **On error**: State inconsistency, cycle detected, too many cache misses, API errors
 - **Periodic**: Every hour (configurable), via synthetic event in the queue
+- **Stale snapshot**: Snapshot `updated_at` is older than staleness threshold
 
 Periodic re-sync is implemented by injecting a `PeriodicSync` event into the same queue as webhooks, preserving serial processing guarantees.
+
+### Snapshot persistence
+
+The bot periodically persists in-memory state to the snapshot ref to enable fast recovery after restarts.
+
+**Persistence triggers:**
+
+| Trigger | Timing | Rationale |
+|---------|--------|-----------|
+| Periodic timer | Every 5 minutes | Catch-all for accumulated changes |
+| Train start | Immediate | Critical state transition |
+| Train stop | Immediate | Critical state transition |
+| PR squash-merge | Immediate | Dependency graph changed |
+| Cascade completion | Immediate | Train finished |
+| Full bootstrap completion | Immediate | Fresh state worth preserving |
+
+**Batching**: The periodic timer batches multiple small updates (e.g., head SHA changes from `pull_request.synchronize`) to avoid excessive API calls. A "dirty" flag tracks whether persistence is needed.
+
+**Update via Contents API:**
+
+```
+PUT /repos/{o}/{r}/contents/state.json
+{
+  "message": "Update merge-train state",
+  "content": "<base64-encoded JSON>",
+  "sha": "<current file SHA>",
+  "branch": "refs/meta/merge-train-snapshot"
+}
+```
+
+The `sha` field provides optimistic locking — GitHub rejects the update with `409 Conflict` if the file has changed since we read it.
+
+**Conflict resolution (409 handling):**
+
+```
+1. Receive 409 Conflict
+2. Re-fetch snapshot: GET /repos/{o}/{r}/contents/state.json?ref=refs/meta/merge-train-snapshot
+3. Parse the new state (written by another instance or previous attempt)
+4. Merge our pending changes into the fetched state:
+   - For PR updates: use newer head_sha, preserve predecessor relationships
+   - For train state: merge active_trains maps
+   - For closed PRs: remove from both versions
+5. Retry PUT with the merged state and new SHA
+6. If still conflicting after 3 retries, log error and continue (in-memory state is authoritative)
+```
+
+**Ref creation (first time):**
+
+When the snapshot ref doesn't exist (404 on GET), the bot creates it:
+
+```
+PUT /repos/{o}/{r}/contents/state.json
+{
+  "message": "Initialize merge-train state",
+  "content": "<base64-encoded JSON>",
+  "branch": "refs/meta/merge-train-snapshot"
+}
+```
+
+Note: Omitting `sha` creates a new file. If the ref doesn't exist, GitHub creates both the ref and the file.
+
+**Failure handling**: If snapshot update fails after retries (rate limit, network error), the bot:
+1. Logs the failure with details
+2. Sets a retry flag
+3. Continues processing events (in-memory state is still authoritative)
+4. Retries on the next periodic timer or critical event
 
 ### Stack topology
 
@@ -430,6 +635,55 @@ receive event
         └─ If frontier CI failed: abort, notify
 ```
 
+### Polling fallback for active trains
+
+Webhooks are the primary trigger for cascade evaluation, but they're not sufficient alone:
+
+- **Missed webhooks**: Network issues, server downtime, or GitHub outages can cause webhook delivery failures
+- **Out-of-order delivery**: Webhooks may arrive in unexpected order, causing missed state transitions
+- **Incomplete event mapping**: Some events (notably `status`) don't directly map to PRs, making it hard to know which train to re-evaluate
+
+To ensure progress even when webhooks fail, the bot polls active trains periodically as a fallback.
+
+**Polling frequency**: Once per hour per active train (configurable). This is infrequent because:
+- Webhook failures are rare
+- Polling is expensive (requires API calls to refresh merge state)
+- The failure mode is "cascade stalls" not "cascade breaks" — low urgency
+
+**Implementation**: The periodic sync timer (which already exists for re-sync) also injects `PollActiveTrains` events:
+
+```rust
+enum QueuedEventPayload {
+    /// Webhook from GitHub
+    GitHub(GitHubEvent),
+    /// Internal: trigger periodic re-sync
+    PeriodicSync,
+    /// Internal: poll active trains for missed webhook recovery
+    PollActiveTrains,
+}
+```
+
+**Poll action**: When processing `PollActiveTrains`:
+
+1. For each active train in `active_trains`:
+   a. Fetch current `mergeStateStatus` for the frontier PR via GraphQL
+   b. Compare with cached `merge_state`
+   c. If changed (e.g., now `CLEAN` when previously `BLOCKED`), trigger cascade evaluation
+2. If any train's frontier PR is now ready but wasn't before, the missed webhook is effectively recovered
+
+**Distributed polling**: To avoid thundering herd when multiple bot instances restart:
+- Add jitter to the poll interval (e.g., 60 ± 10 minutes)
+- Stagger initial poll based on hash of repo ID
+
+**Logging**: Poll-triggered cascade evaluations are logged distinctly from webhook-triggered ones, making it easy to detect webhook delivery problems:
+
+```
+INFO repo=owner/repo train_root=123 trigger=poll "evaluating cascade (poll fallback)"
+INFO repo=owner/repo train_root=123 trigger=webhook "evaluating cascade"
+```
+
+If poll-triggered evaluations are frequent, it indicates a webhook delivery problem worth investigating.
+
 ---
 
 ## Merge Operations
@@ -446,7 +700,7 @@ The ours-strategy merge (as described at https://www.patrickstevens.co.uk/posts/
 
 We assume that the preceding PR in the merge train has just been squash-merged into `main`, and present the procedure to prepare the new root PR for its own squash-merge to `main`.
 
-Firstly, we assume that we've used the GitHub API to obtain the preceding PR's head.sha (which will still exist in GitHub even if the branch has been deleted), and that it's stored as `$PREDECESSOR_HEAD_SHA`.
+Firstly, we assume we know the preceding PR's number (`$PREDECESSOR_PR_NUMBER`). GitHub maintains `refs/pull/<n>/head` refs that point to a PR's head commit even after the branch is deleted — this is the reliable way to fetch PR commits (fetching by raw SHA is not guaranteed to work).
 We additionally assume the GitHub API has told us the `$PREDECESSOR_SQUASH_COMMIT`, that is on `main` (possibly in the history of `main`, if someone has made an intervening commit).
 
 ```bash
@@ -458,10 +712,11 @@ cd workdir
 git config user.signingkey <key-id>
 git config commit.gpgsign true
 
-git fetch origin <descendant-branch> "$PREDECESSOR_HEAD_SHA"
+# Fetch the predecessor's head via GitHub's PR ref (reliable even after branch deletion)
+git fetch origin <descendant-branch> "refs/pull/$PREDECESSOR_PR_NUMBER/head:refs/remotes/origin/pr/$PREDECESSOR_PR_NUMBER"
 
 git checkout <descendant-branch>
-git merge "$PREDECESSOR_HEAD_SHA" --no-edit -m "Merge predecessor into <descendant-branch> (merge train)"
+git merge "origin/pr/$PREDECESSOR_PR_NUMBER" --no-edit -m "Merge predecessor into <descendant-branch> (merge train)"
 git merge "$PREDECESSOR_SQUASH_COMMIT"^ --no-edit -m "Merge main into <descendant-branch> (merge train)"
 
 # Now <descendant-branch> is up to date both with main-immediately-before-merge-of-base-PR and with base-PR-immediately-before-merge.
@@ -484,14 +739,23 @@ All merge commits created by the bot are GPG-signed. The signing key is configur
 
 The squash-merge into `main` is performed via GitHub API — GitHub signs these commits itself, showing as "Verified" in the UI.
 
-### Note on using commit hashes
+### Note on using PR refs
 
-When a PR is merged, the PR object retains `head.sha` — the final commit on the branch before squash-merge. This commit continues to exist in the repo even if the branch is deleted. By using this SHA instead of branch names, the bot is resilient to:
+When a PR is merged, the PR object retains `head.sha` — the final commit on the branch before squash-merge. However, **fetching by raw SHA is unreliable** — it depends on server-side settings (`uploadpack.allowReachableSHA1InWant`) that aren't guaranteed.
+
+Instead, the bot uses GitHub's **PR refs** (`refs/pull/<n>/head`), which:
+- Are maintained by GitHub even after the PR branch is deleted
+- Point to the PR's head commit reliably
+- Can always be fetched via standard git protocols
+
+This makes the bot resilient to:
 
 - Branch deletion (GitHub's "delete branch on merge" setting)
 - Manual merges outside the bot's workflow
 - Crash recovery (we can resume even if the predecessor branch is gone)
 - Late additions to the stack (a PR added after its predecessor was already merged)
+
+The PR number (not the SHA) is the stable identifier used to construct these refs.
 
 ### Operation sequence
 
@@ -658,10 +922,18 @@ This means "fix the CI and push" is sufficient to resume — no manual re-trigge
 | Update comment | `/repos/{o}/{r}/issues/comments/{id}` | PATCH |
 | Add reaction | `/repos/{o}/{r}/issues/comments/{id}/reactions` | POST |
 | Get merge state | GraphQL `mergeStateStatus` | POST `/graphql` |
+| Get snapshot | `/repos/{o}/{r}/contents/state.json?ref=refs/meta/merge-train-snapshot` | GET |
+| Create/update snapshot | `/repos/{o}/{r}/contents/state.json` | PUT |
 
 The "Get repo metadata" endpoint returns `default_branch` which is used throughout the cascade logic.
 
 The "Update comment" endpoint is used to update state comments atomically during cascade phase transitions.
+
+**Contents API for snapshot persistence**: The bot uses the Contents API to persist state to `refs/meta/merge-train-snapshot:state.json`:
+- **GET** retrieves the snapshot and its `sha` (needed for optimistic locking)
+- **PUT** creates or updates the file; requires `sha` of current file for updates (omit for create)
+- Returns `409 Conflict` if the provided `sha` doesn't match current file (concurrent modification)
+- The `branch` parameter specifies the ref: `refs/meta/merge-train-snapshot`
 
 **GraphQL for merge state**: The bot uses GitHub's GraphQL API to query `mergeStateStatus`, which encapsulates all branch protection checks (required status checks, required reviewers, etc.) into a single authoritative value:
 
@@ -839,8 +1111,8 @@ struct StateComment {
     current_pr: PrNumber,
     /// Current phase within the cascade step
     cascade_phase: CascadePhase,
-    /// Head SHA of predecessor before squash (for recovery)
-    predecessor_head_sha: Option<Sha>,
+    /// PR number of predecessor (for fetching via refs/pull/<n>/head during recovery)
+    predecessor_pr: Option<PrNumber>,
     /// SHA of last squash commit (for reconciliation recovery)
     last_squash_sha: Option<Sha>,
     /// When the train was stopped (if applicable)
@@ -882,6 +1154,63 @@ struct StateCommentRef {
     comment_id: u64,
     /// Parsed state from the comment
     state: StateComment,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Persisted snapshot (stored in refs/meta/merge-train-snapshot)
+// ─────────────────────────────────────────────────────────────
+
+/// JSON structure stored in the snapshot ref.
+/// This persists structural state (PR relationships) for fast bootstrap.
+#[derive(Serialize, Deserialize)]
+struct PersistedSnapshot {
+    /// Schema version for forward-compatible migrations
+    schema_version: u32,
+    /// When this snapshot was last updated
+    updated_at: String, // ISO 8601
+    /// Cached default branch name
+    default_branch: String,
+    /// Cached PR info, keyed by PR number (as string for JSON)
+    prs: HashMap<String, PersistedPr>,
+    /// Active trains, keyed by root PR number
+    active_trains: HashMap<String, PersistedTrain>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedPr {
+    /// Last known head SHA
+    head_sha: String,
+    /// Base branch name
+    base_ref: String,
+    /// Declared predecessor (from @merge-train predecessor)
+    predecessor: Option<u64>,
+    /// PR state: "open", "merged", "closed"
+    state: String,
+    /// Comment ID of state comment on this PR (if any)
+    state_comment_id: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedTrain {
+    /// Comment ID of the state comment
+    state_comment_id: u64,
+    /// PR currently being processed
+    current_pr: u64,
+    /// When the train was started
+    started_at: String, // ISO 8601
+}
+
+impl PersistedSnapshot {
+    /// Check if snapshot is stale (older than threshold)
+    fn is_stale(&self, threshold: Duration) -> bool {
+        let updated = DateTime::parse_from_rfc3339(&self.updated_at)
+            .map(|dt| dt.with_timezone(&Utc))
+            .ok();
+        match updated {
+            Some(dt) => Utc::now() - dt > chrono::Duration::from_std(threshold).unwrap_or_default(),
+            None => true, // Can't parse = treat as stale
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -971,6 +1300,8 @@ enum QueuedEventPayload {
     GitHub(GitHubEvent),
     /// Internal: trigger periodic re-sync (repo is implicit — one queue per repo)
     PeriodicSync,
+    /// Internal: poll active trains for missed webhook recovery (hourly)
+    PollActiveTrains,
 }
 ```
 
@@ -1197,7 +1528,66 @@ async fn process_event_for_repo(
         QueuedEventPayload::PeriodicSync => {
             resync_repo(repo_id, state, cancel, ctx).await
         }
+        QueuedEventPayload::PollActiveTrains => {
+            poll_active_trains(repo_id, state, cancel, ctx).await
+        }
     }
+}
+
+/// Poll active trains to recover from missed webhooks.
+/// Refreshes merge state for each train's frontier PR and triggers cascade if ready.
+async fn poll_active_trains(
+    repo_id: &RepoId,
+    state: &mut RepoState,
+    cancel: &CancellationToken,
+    ctx: &AppContext,
+) -> Result<()> {
+    let github = ctx.github_for_repo(repo_id);
+
+    for (root_pr, train_ref) in &state.active_trains {
+        // Skip stopped/aborted trains
+        if !matches!(train_ref.state.state, TrainState::Running | TrainState::WaitingCi) {
+            continue;
+        }
+
+        // Find the frontier PR (the one we're waiting on)
+        let frontier_pr = train_ref.state.current_pr;
+        let Some(cached_pr) = state.prs.get_mut(&frontier_pr) else {
+            continue;
+        };
+
+        // Refresh merge state from GitHub
+        let fresh_merge_state = github.get_merge_state(frontier_pr.0).await?;
+        let old_merge_state = cached_pr.merge_state.clone();
+        cached_pr.merge_state = fresh_merge_state.clone();
+
+        // If state changed, log it for observability
+        if old_merge_state != fresh_merge_state {
+            tracing::info!(
+                ?repo_id,
+                train_root = root_pr.0,
+                frontier_pr = frontier_pr.0,
+                ?old_merge_state,
+                ?fresh_merge_state,
+                trigger = "poll",
+                "merge state changed (detected via poll fallback)"
+            );
+        }
+
+        // If now ready, evaluate cascade
+        if matches!(fresh_merge_state, MergeStateStatus::Clean | MergeStateStatus::Unstable) {
+            tracing::info!(
+                ?repo_id,
+                train_root = root_pr.0,
+                trigger = "poll",
+                "evaluating cascade (poll fallback)"
+            );
+            // Cascade evaluation would happen here
+            // (In practice, this calls evaluate_cascade with the updated state)
+        }
+    }
+
+    Ok(())
 }
 
 /// After bootstrap, check for trains that were mid-cascade and resume them.
@@ -1296,24 +1686,41 @@ async fn webhook_endpoint(
 }
 
 // ─────────────────────────────────────────────────────────────
-// Periodic sync timer
+// Periodic timers
 // ─────────────────────────────────────────────────────────────
 
-/// Periodic sync timer — injects PeriodicSync events into per-repo queues
-async fn periodic_sync_timer(
+/// Periodic timers for re-sync and active train polling
+async fn periodic_timers(
     dispatcher: Arc<Mutex<Dispatcher>>,
-    interval: Duration,
+    resync_interval: Duration,  // e.g., 1 hour
+    poll_interval: Duration,    // e.g., 1 hour (with jitter applied per-repo)
 ) {
-    let mut ticker = tokio::time::interval(interval);
+    let mut resync_ticker = tokio::time::interval(resync_interval);
+    let mut poll_ticker = tokio::time::interval(poll_interval);
+
     loop {
-        ticker.tick().await;
-        let mut d = dispatcher.lock().await;
-        let repo_ids: Vec<RepoId> = d.repos.keys().cloned().collect();
-        for repo_id in repo_ids {
-            d.dispatch(&repo_id, QueuedEvent {
-                priority: EventPriority::Normal,
-                payload: QueuedEventPayload::PeriodicSync,
-            });
+        tokio::select! {
+            _ = resync_ticker.tick() => {
+                let mut d = dispatcher.lock().await;
+                let repo_ids: Vec<RepoId> = d.repos.keys().cloned().collect();
+                for repo_id in repo_ids {
+                    d.dispatch(&repo_id, QueuedEvent {
+                        priority: EventPriority::Normal,
+                        payload: QueuedEventPayload::PeriodicSync,
+                    });
+                }
+            }
+            _ = poll_ticker.tick() => {
+                // Poll active trains to recover from missed webhooks
+                let mut d = dispatcher.lock().await;
+                let repo_ids: Vec<RepoId> = d.repos.keys().cloned().collect();
+                for repo_id in repo_ids {
+                    d.dispatch(&repo_id, QueuedEvent {
+                        priority: EventPriority::Normal,
+                        payload: QueuedEventPayload::PollActiveTrains,
+                    });
+                }
+            }
         }
     }
 }
@@ -1327,9 +1734,10 @@ async fn main() {
     let ctx = AppContext::from_config().await;
     let dispatcher = Arc::new(Mutex::new(Dispatcher::new(ctx)));
 
-    // Spawn periodic sync timer (e.g., every hour)
-    let sync_interval = Duration::from_secs(3600);
-    tokio::spawn(periodic_sync_timer(dispatcher.clone(), sync_interval));
+    // Spawn periodic timers for re-sync (hourly) and active train polling (hourly)
+    let resync_interval = Duration::from_secs(3600);
+    let poll_interval = Duration::from_secs(3600);
+    tokio::spawn(periodic_timers(dispatcher.clone(), resync_interval, poll_interval));
 
     // Run the HTTP server
     let app = Router::new()
@@ -1524,7 +1932,7 @@ impl RepoState {
 }
 ```
 
-### Bootstrap (fetches full state from GitHub)
+### Bootstrap (two-phase: snapshot then fallback)
 
 ```rust
 async fn bootstrap_repo(
@@ -1535,11 +1943,74 @@ async fn bootstrap_repo(
     let github = ctx.github_for_repo(repo_id);
 
     // Check for cancellation before starting
-    cancellation_token.cancelled().now_or_never();
     if cancellation_token.is_cancelled() {
         return Err(Error::Cancelled);
     }
 
+    // Phase 1: Try to load from snapshot (fast path)
+    match load_from_snapshot(repo_id, &github, ctx).await {
+        Ok(Some((state, snapshot_ref))) => {
+            // Snapshot found and not stale — refresh merge states and return
+            let state = refresh_merge_states(state, &github, cancellation_token).await?;
+            return Ok(state);
+        }
+        Ok(None) => {
+            // Snapshot not found or stale — fall through to full bootstrap
+            tracing::info!(?repo_id, "snapshot not found or stale, performing full bootstrap");
+        }
+        Err(e) => {
+            // Snapshot corrupted — log and fall through
+            tracing::warn!(?repo_id, ?e, "snapshot load failed, performing full bootstrap");
+        }
+    }
+
+    // Phase 2: Full API crawl (fallback path)
+    let state = full_bootstrap(repo_id, &github, cancellation_token, ctx).await?;
+
+    // Persist the freshly bootstrapped state
+    persist_snapshot(repo_id, &state, &github).await?;
+
+    Ok(state)
+}
+
+/// Load state from the snapshot ref (fast path)
+async fn load_from_snapshot(
+    repo_id: &RepoId,
+    github: &GitHubClient,
+    ctx: &AppContext,
+) -> Result<Option<(RepoState, SnapshotRef)>> {
+    // GET /repos/{o}/{r}/contents/state.json?ref=refs/meta/merge-train-snapshot
+    let response = match github.get_contents(
+        "state.json",
+        Some("refs/meta/merge-train-snapshot"),
+    ).await {
+        Ok(r) => r,
+        Err(ApiError::NotFound) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+
+    // Decode base64 content
+    let content = base64::decode(&response.content)?;
+    let snapshot: PersistedSnapshot = serde_json::from_slice(&content)?;
+
+    // Check staleness
+    if snapshot.is_stale(ctx.config.staleness_threshold) {
+        return Ok(None);
+    }
+
+    // Build RepoState from snapshot
+    let state = build_state_from_snapshot(snapshot, response.sha.clone());
+
+    Ok(Some((state, SnapshotRef { file_sha: response.sha })))
+}
+
+/// Full API crawl (fallback path)
+async fn full_bootstrap(
+    repo_id: &RepoId,
+    github: &GitHubClient,
+    cancel: &CancellationToken,
+    ctx: &AppContext,
+) -> Result<RepoState> {
     // Fetch repository metadata to get default branch
     let repo_info = github.get_repo().await?;
     let default_branch = repo_info.default_branch;
@@ -1550,8 +2021,7 @@ async fn bootstrap_repo(
     // Fetch recently merged PRs (for predecessor lookups)
     let merged_prs = github.list_recently_merged_prs().await?;
 
-    // Check for cancellation before the expensive parallel fetch
-    if cancellation_token.is_cancelled() {
+    if cancel.is_cancelled() {
         return Err(Error::Cancelled);
     }
 
@@ -1562,11 +2032,11 @@ async fn bootstrap_repo(
         .map(|pr| async {
             let (comments, merge_state) = tokio::join!(
                 github.list_comments(pr.number),
-                github.get_merge_state(pr.number),  // GraphQL query
+                github.get_merge_state(pr.number),
             );
             build_cached_pr(pr, comments?, merge_state?)
         })
-        .buffer_unordered(10) // Concurrency limit
+        .buffer_unordered(10)
         .try_collect::<Vec<_>>()
         .await?;
 
@@ -1576,8 +2046,6 @@ async fn bootstrap_repo(
     let mut active_trains = HashMap::new();
 
     for (pr, comments) in cached_prs {
-        // Look for state comments from the bot (author must be our own user ID)
-        // The state comment lives on the current root PR, so we key by that PR's number
         if let Some(state_comment) = find_state_comment(&comments, ctx.bot_user_id) {
             active_trains.insert(pr.number, state_comment);
         }
@@ -1593,8 +2061,11 @@ async fn bootstrap_repo(
         prs,
         descendants,
         active_trains,
+        snapshot_ref: None,
         bootstrapped_at: Instant::now(),
         last_sync: Instant::now(),
+        last_persisted: None,
+        dirty: true, // Will be persisted after bootstrap
         miss_count: 0,
     })
 }
@@ -1624,6 +2095,115 @@ fn find_state_comment(comments: &[Comment], bot_user_id: u64) -> Option<StateCom
 }
 ```
 
+### Snapshot persistence
+
+```rust
+/// Persist state to the snapshot ref with optimistic locking
+async fn persist_snapshot(
+    repo_id: &RepoId,
+    state: &RepoState,
+    github: &GitHubClient,
+) -> Result<()> {
+    let snapshot = build_snapshot_from_state(state);
+    let content = serde_json::to_string_pretty(&snapshot)?;
+    let encoded = base64::encode(&content);
+
+    // Retry loop for optimistic locking conflicts
+    let mut attempts = 0;
+    let mut current_sha = state.snapshot_ref.as_ref().map(|r| r.file_sha.clone());
+
+    loop {
+        attempts += 1;
+        if attempts > 3 {
+            tracing::error!(?repo_id, "snapshot persist failed after 3 attempts");
+            return Err(Error::SnapshotPersistFailed);
+        }
+
+        let result = github.put_contents(
+            "state.json",
+            &encoded,
+            "Update merge-train state",
+            current_sha.as_deref(),
+            "refs/meta/merge-train-snapshot",
+        ).await;
+
+        match result {
+            Ok(response) => {
+                // Success — update our cached SHA for next time
+                // (In practice, state.snapshot_ref would be updated)
+                tracing::debug!(?repo_id, sha = %response.content.sha, "snapshot persisted");
+                return Ok(());
+            }
+            Err(ApiError::Conflict) => {
+                // 409 Conflict — re-fetch and merge
+                tracing::info!(?repo_id, "snapshot conflict, refetching and retrying");
+
+                let fetched = github.get_contents(
+                    "state.json",
+                    Some("refs/meta/merge-train-snapshot"),
+                ).await?;
+
+                // Merge our changes with the fetched state
+                let fetched_content = base64::decode(&fetched.content)?;
+                let fetched_snapshot: PersistedSnapshot = serde_json::from_slice(&fetched_content)?;
+
+                // Merge strategy: prefer our newer data, but preserve anything we don't know about
+                let merged = merge_snapshots(&snapshot, &fetched_snapshot);
+                let merged_content = serde_json::to_string_pretty(&merged)?;
+                let merged_encoded = base64::encode(&merged_content);
+
+                // Update for next iteration
+                current_sha = Some(fetched.sha);
+                // Re-encode with merged content for the retry
+                // (In a real impl, we'd update `encoded` to `merged_encoded`)
+            }
+            Err(e) => {
+                tracing::error!(?repo_id, ?e, "snapshot persist failed");
+                return Err(e.into());
+            }
+        }
+    }
+}
+
+fn build_snapshot_from_state(state: &RepoState) -> PersistedSnapshot {
+    let prs = state.prs.iter()
+        .map(|(num, pr)| {
+            let persisted = PersistedPr {
+                head_sha: pr.head_sha.0.clone(),
+                base_ref: pr.base_ref.clone(),
+                predecessor: pr.predecessor.map(|p| p.0),
+                state: match pr.state {
+                    PrState::Open => "open".to_string(),
+                    PrState::Merged { .. } => "merged".to_string(),
+                    PrState::Closed => "closed".to_string(),
+                },
+                state_comment_id: state.active_trains.get(num).map(|t| t.comment_id),
+            };
+            (num.0.to_string(), persisted)
+        })
+        .collect();
+
+    let active_trains = state.active_trains.iter()
+        .map(|(root, train_ref)| {
+            let persisted = PersistedTrain {
+                state_comment_id: train_ref.comment_id,
+                current_pr: train_ref.state.current_pr.0,
+                started_at: Utc::now().to_rfc3339(), // Simplified — real impl tracks actual start time
+            };
+            (root.0.to_string(), persisted)
+        })
+        .collect();
+
+    PersistedSnapshot {
+        schema_version: 1,
+        updated_at: Utc::now().to_rfc3339(),
+        default_branch: state.default_branch.clone(),
+        prs,
+        active_trains,
+    }
+}
+```
+
 ### Git operations
 
 ```rust
@@ -1644,24 +2224,29 @@ impl GitOperations {
     async fn prepare_descendant(
         &self,
         descendant_branch: &str,
-        predecessor_head_sha: &str,
+        predecessor_pr_number: u64,
         default_branch: &str,
         cancel: &CancellationToken,
     ) -> Result<String> {
         // Fetch everything we need
         self.run_git(&["fetch", "origin", descendant_branch, default_branch], cancel).await?;
-        // Fetch the specific predecessor commit (may not be on any branch)
-        self.run_git(&["fetch", "origin", predecessor_head_sha], cancel).await?;
+
+        // Fetch the predecessor's head via GitHub's PR ref (reliable even after branch deletion).
+        // Fetching by raw SHA is unreliable — it depends on uploadpack.allowReachableSHA1InWant.
+        let pr_ref = format!("refs/pull/{}/head", predecessor_pr_number);
+        let local_ref = format!("refs/remotes/origin/pr/{}", predecessor_pr_number);
+        self.run_git(&["fetch", "origin", &format!("{}:{}", pr_ref, local_ref)], cancel).await?;
 
         // Checkout descendant
         self.run_git(&["checkout", descendant_branch], cancel).await?;
 
         // Merge predecessor commit (regular merge)
+        let merge_ref = format!("origin/pr/{}", predecessor_pr_number);
         self.run_git(&[
             "merge",
-            predecessor_head_sha,
+            &merge_ref,
             "--no-edit",
-            "-m", &format!("Merge predecessor into {} (merge-train prep)", descendant_branch),
+            "-m", &format!("Merge predecessor PR #{} into {} (merge-train prep)", predecessor_pr_number, descendant_branch),
         ], cancel).await?;
 
         // Merge default branch (regular merge) — critical for correctness!
@@ -1815,8 +2400,9 @@ async fn cascade_step(
     cancel: &CancellationToken,
 ) -> Result<CascadeStepOutcome> {
     // Phase 1: Prepare ALL descendants BEFORE squashing
+    // Use PR number to fetch via refs/pull/<n>/head (reliable even after branch deletion)
     for desc in descendants {
-        git.prepare_descendant(&desc.head_ref, &pr.head_sha, default_branch, cancel).await?;
+        git.prepare_descendant(&desc.head_ref, pr.number, default_branch, cancel).await?;
     }
 
     // Phase 2: Squash-merge this PR into the default branch
