@@ -19,6 +19,7 @@ A GitHub bot that orchestrates sequential squash-merging of stacked PRs into `ma
 - Managing the GPT-5 review bot (separate system)
 - Cross-fork PRs (the bot only operates when the PR's head and base are in the same repository; fork-based PRs are ignored because the bot cannot push to arbitrary forks)
 - GitHub merge queue compatibility (the bot assumes users are not using GitHub's built-in merge queue feature; running both systems simultaneously on the same repository would cause conflicts)
+- Repos requiring approval on latest commit (the bot pushes new commits to PR branches during cascade operations; if branch protection requires re-approval after each push, the cascade cannot proceed automatically)
 
 ---
 
