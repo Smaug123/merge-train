@@ -54,11 +54,18 @@ The bot will:
 4. Squash-merge the root PR
 5. Begin the cascade (updating the state comment at each phase transition)
 
-**Definition of "CI green / approved"**: A PR is considered ready to merge when:
-- **Approved**: Has at least one approving review and no changes-requested reviews
-- **CI green**: All check suites that exist have completed with status `success`, AND all required status checks (as configured in branch protection) are present and passing
+**Definition of "ready to merge"**: The bot uses GitHub's `mergeStateStatus` field (via GraphQL) to determine readiness. A PR is ready when `mergeStateStatus` is `CLEAN` or `UNSTABLE`:
 
-The bot will not merge a PR if any required check is missing, even if all existing checks pass.
+| Status | Meaning | Bot action |
+|--------|---------|------------|
+| `CLEAN` | All requirements satisfied | ✅ Proceed with merge |
+| `UNSTABLE` | Non-required checks failing | ✅ Proceed with merge |
+| `BLOCKED` | Required checks not passing or missing approvals | ⏳ Wait |
+| `BEHIND` | Head branch behind base (strict mode) | ⏳ Wait (bot will update) |
+| `DIRTY` | Merge conflicts | ❌ Abort cascade |
+| `UNKNOWN` | State not yet computed | ⏳ Wait and re-check |
+
+This delegates all branch protection logic to GitHub, ensuring the bot respects required status checks, required reviewers, and any other protection rules without duplicating that logic.
 
 Once started, the cascade proceeds automatically through all descendants. New PRs that declare themselves as descendants mid-cascade will be picked up when the cascade reaches their predecessor.
 
@@ -257,7 +264,7 @@ On first webhook for a repo (or on re-sync):
 5. For each PR, fetch comments to find:
    - `@merge-train predecessor` declarations (from humans)
    - `<!-- merge-train-state` state comments (from bot) — parse JSON to recover train state
-6. For each open PR, fetch check suites and reviews
+6. For each open PR, fetch `mergeStateStatus` via GraphQL
 7. Build `RepoState` with default branch, PR map, descendants index, and recovered train state
 8. **Recovery check**: For any train in a non-idle `cascade_phase`, evaluate whether to resume:
    - If `preparing`: Re-run preparation (merge operations are idempotent if already pushed)
@@ -282,9 +289,9 @@ Each webhook event updates the cached state:
 | `pull_request.opened` | Add new PR to cache |
 | `pull_request.closed` (merged) | `pr.state = Merged { sha }` |
 | `pull_request.closed` (not merged) | `pr.state = Closed` |
-| `pull_request.synchronize` | Update `head_sha`, reset `check_status` to Pending |
-| `check_suite.completed` | Update `check_status` for matching PR(s) |
-| `pull_request_review` | Re-evaluate `is_approved` |
+| `pull_request.synchronize` | Update `head_sha`, set `merge_state` to Unknown |
+| `check_suite.completed` | Re-fetch `merge_state` via GraphQL |
+| `pull_request_review` | Re-fetch `merge_state` via GraphQL |
 
 **State comment updates during cascade**: The bot updates its state comment at each phase transition:
 - Before preparation: `cascade_phase = "preparing"`
@@ -638,11 +645,24 @@ This means "fix the CI and push" is sufficient to resume — no manual re-trigge
 | Post comment | `/repos/{o}/{r}/issues/{n}/comments` | POST |
 | Update comment | `/repos/{o}/{r}/issues/comments/{id}` | PATCH |
 | Add reaction | `/repos/{o}/{r}/issues/comments/{id}/reactions` | POST |
-| Get check suites | `/repos/{o}/{r}/commits/{ref}/check-suites` | GET |
+| Get merge state | GraphQL `mergeStateStatus` | POST `/graphql` |
 
 The "Get repo metadata" endpoint returns `default_branch` which is used throughout the cascade logic.
 
 The "Update comment" endpoint is used to update state comments atomically during cascade phase transitions.
+
+**GraphQL for merge state**: The bot uses GitHub's GraphQL API to query `mergeStateStatus`, which encapsulates all branch protection checks (required status checks, required reviewers, etc.) into a single authoritative value:
+
+```graphql
+query($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      mergeable
+      mergeStateStatus
+    }
+  }
+}
+```
 
 ---
 
@@ -652,9 +672,9 @@ The "Update comment" endpoint is used to update state comments atomically during
 
 GitHub App installation token with permissions:
 
-- `pull_requests`: write (merge, retarget, read)
+- `pull_requests`: write (merge, retarget, read, query `mergeStateStatus` via GraphQL)
 - `contents`: write (push via git)
-- `checks`: read (wait for CI)
+- `checks`: read (receive `check_suite` webhooks to trigger re-evaluation)
 - `issues`: write (comments, reactions)
 
 ### Git operations
@@ -760,8 +780,8 @@ struct CachedPr {
     head_sha: Sha,
     base_ref: String,
     state: PrState,
-    check_status: CheckStatus,
-    is_approved: bool,
+    /// Merge readiness from GitHub's GraphQL `mergeStateStatus`
+    merge_state: MergeStateStatus,
     /// Declared predecessor (from @merge-train predecessor comment)
     predecessor: Option<PrNumber>,
     /// True if this PR is part of an active train (derived from state comment)
@@ -776,11 +796,23 @@ enum PrState {
     Closed,
 }
 
-enum CheckStatus {
-    Pending,
-    Success,
-    Failure,
-    Unknown, // Before any check_suite event
+/// GitHub's merge state status (from GraphQL `mergeStateStatus` field).
+/// This encapsulates all branch protection checks into a single value.
+enum MergeStateStatus {
+    /// All requirements satisfied — ready to merge
+    Clean,
+    /// Non-required checks failing — still mergeable
+    Unstable,
+    /// Required checks not passing or missing approvals
+    Blocked,
+    /// Head branch behind base (when "require up-to-date" is enabled)
+    Behind,
+    /// Merge conflicts with base branch
+    Dirty,
+    /// GitHub Enterprise: has pre-receive hooks
+    HasHooks,
+    /// State not yet computed by GitHub
+    Unknown,
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -873,9 +905,13 @@ enum StackAction {
 }
 
 enum BlockReason {
-    CiFailing,
-    NotApproved,
+    /// GitHub reports BLOCKED (required checks/approvals not satisfied)
+    Blocked,
+    /// GitHub reports BEHIND (head branch behind base, strict mode)
+    Behind,
+    /// GitHub reports DIRTY (merge conflicts)
     MergeConflict,
+    /// User issued @merge-train stop
     Stopped,
 }
 
@@ -1425,17 +1461,16 @@ async fn bootstrap_repo(
         return Err(Error::Cancelled);
     }
 
-    // Parallel fetch: comments, check suites, reviews for each PR
+    // Parallel fetch: comments and merge state for each PR
     let all_prs: Vec<_> = open_prs.iter().chain(merged_prs.iter()).collect();
 
     let cached_prs = futures::stream::iter(all_prs)
         .map(|pr| async {
-            let (comments, checks, reviews) = tokio::join!(
+            let (comments, merge_state) = tokio::join!(
                 github.list_comments(pr.number),
-                github.get_check_status(&pr.head_sha),
-                github.get_reviews(pr.number),
+                github.get_merge_state(pr.number),  // GraphQL query
             );
-            build_cached_pr(pr, comments?, checks?, reviews?)
+            build_cached_pr(pr, comments?, merge_state?)
         })
         .buffer_unordered(10) // Concurrency limit
         .try_collect::<Vec<_>>()
