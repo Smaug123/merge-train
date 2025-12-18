@@ -596,19 +596,20 @@ Each per-repo worker loop:
 
 **Priority ordering**: Stop commands (`@merge-train stop`) are processed before all other events within that repo's queue. This ensures that a human request to halt the cascade takes effect promptly.
 
-**Cancellation**: Each repo has an associated `CancellationToken`. When a stop command arrives, the dispatcher:
-1. Cancels the current token (aborting any in-flight git operations)
-2. Creates a fresh token for subsequent operations
+**Cancellation**: Cancellation is **stack-scoped**. Each stack has its own `CancellationToken`, managed by the worker. When a stop command arrives, the dispatcher:
+1. Sends a `CancelStackRequest` (containing the PR number) to the worker via a separate channel
+2. The worker resolves the PR to its stack root and cancels that stack's token
 3. Enqueues the stop event (which will be processed immediately due to priority)
 
-This allows long-running operations like `git clone` or `git fetch` to be interrupted promptly when a human requests a stop.
+This allows long-running operations like `git merge` or `git push` to be interrupted promptly when a human requests a stop — **without affecting other stacks in the same repo**.
 
 This design means:
-- No concurrent access to git working directories *within a repo*
+- Each stack has its own git worktree (see "Per-stack worktrees" section)
+- Stop on one stack doesn't interrupt operations on other stacks
 - Different repos proceed independently
 - No race between "check CI status" and "CI status changes"
 - Straightforward reasoning about state transitions per repo
-- Stop commands can interrupt in-flight operations
+- Stop commands can interrupt in-flight operations for the target stack only
 - Resilient to bot restarts — on startup, repos bootstrap on first webhook
 
 ### Event processing flow
@@ -1324,10 +1325,14 @@ use tokio_util::sync::CancellationToken;
 struct RepoHandle {
     /// Channel to send events to this repo's worker
     sender: mpsc::UnboundedSender<QueuedEvent>,
-    /// Watch channel to send fresh cancellation tokens to the worker
-    token_sender: watch::Sender<CancellationToken>,
-    /// Current token (also sent to worker via watch channel)
-    cancellation_token: CancellationToken,
+    /// Channel for immediate stack cancellation requests (processed via select!)
+    cancel_tx: mpsc::UnboundedSender<CancelStackRequest>,
+}
+
+/// Request to cancel operations for a specific stack
+struct CancelStackRequest {
+    /// Any PR in the stack — the worker will look up the root
+    pr_number: PrNumber,
 }
 
 /// Central dispatcher that routes events to per-repo workers
@@ -1350,38 +1355,29 @@ impl Dispatcher {
     fn get_or_create_handle(&mut self, repo_id: &RepoId) -> &mut RepoHandle {
         self.repos.entry(repo_id.clone()).or_insert_with(|| {
             let (event_tx, event_rx) = mpsc::unbounded_channel();
-            let token = CancellationToken::new();
-            let (token_tx, token_rx) = watch::channel(token.clone());
+            let (cancel_tx, cancel_rx) = mpsc::unbounded_channel();
 
             // Spawn a dedicated worker for this repo
             let worker_ctx = self.ctx.clone();
             let worker_repo_id = repo_id.clone();
             tokio::spawn(async move {
-                repo_worker(worker_repo_id, event_rx, token_rx, worker_ctx).await;
+                repo_worker(worker_repo_id, event_rx, cancel_rx, worker_ctx).await;
             });
 
             RepoHandle {
                 sender: event_tx,
-                token_sender: token_tx,
-                cancellation_token: token,
+                cancel_tx,
             }
         })
     }
 
     /// Dispatch an event to the appropriate repo's queue
     fn dispatch(&mut self, repo_id: &RepoId, mut event: QueuedEvent) {
-        let is_stop = event.priority == EventPriority::Stop;
-
-        // If this is a stop command, cancel in-flight operations first
-        if is_stop {
-            if let Some(handle) = self.repos.get_mut(repo_id) {
-                // Cancel current token (interrupts any in-flight git operations)
-                handle.cancellation_token.cancel();
-                // Create fresh token for subsequent operations
-                let new_token = CancellationToken::new();
-                handle.cancellation_token = new_token.clone();
-                // Send fresh token to worker (it will use this for new operations)
-                let _ = handle.token_sender.send(new_token);
+        // If this is a stop command, send immediate cancel request for the target stack.
+        // The worker will resolve the PR number to its stack root and cancel that stack's token.
+        if let Some(pr_number) = extract_stop_pr(&event) {
+            if let Some(handle) = self.repos.get(repo_id) {
+                let _ = handle.cancel_tx.send(CancelStackRequest { pr_number });
             }
         }
 
@@ -1397,6 +1393,20 @@ impl Dispatcher {
                 }
             }
         }
+    }
+}
+
+/// Extract PR number from a stop command event
+fn extract_stop_pr(event: &QueuedEvent) -> Option<PrNumber> {
+    match &event.payload {
+        QueuedEventPayload::GitHub(GitHubEvent::IssueComment(c)) => {
+            if parse_command(&c.body) == Some(Command::Stop) {
+                Some(c.issue_number)  // PR number from issue comment
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 
@@ -1437,20 +1447,57 @@ impl RepoPriorityQueue {
 // Per-repo worker
 // ─────────────────────────────────────────────────────────────
 
+/// Per-stack cancellation token management
+struct StackCancellation {
+    tokens: HashMap<PrNumber, CancellationToken>,
+}
+
+impl StackCancellation {
+    fn new() -> Self {
+        Self { tokens: HashMap::new() }
+    }
+
+    /// Get or create a cancellation token for a stack (keyed by root PR)
+    fn token_for_stack(&mut self, root: PrNumber) -> CancellationToken {
+        self.tokens.entry(root)
+            .or_insert_with(CancellationToken::new)
+            .clone()
+    }
+
+    /// Cancel a stack and create a fresh token for future operations
+    fn cancel(&mut self, root: PrNumber) {
+        if let Some(token) = self.tokens.get(&root) {
+            token.cancel();
+        }
+        self.tokens.insert(root, CancellationToken::new());
+    }
+}
+
 /// Worker loop for a single repository
 async fn repo_worker(
     repo_id: RepoId,
     mut event_rx: mpsc::UnboundedReceiver<QueuedEvent>,
-    mut token_rx: watch::Receiver<CancellationToken>,
+    mut cancel_rx: mpsc::UnboundedReceiver<CancelStackRequest>,
     ctx: AppContext,
 ) {
     let mut queue = RepoPriorityQueue::new();
     let mut repo_state: Option<RepoState> = None;
+    let mut stack_cancel = StackCancellation::new();
 
     // Idle timeout — worker shuts down if no events for this duration
     let idle_timeout = Duration::from_secs(3600);
 
     loop {
+        // Handle any pending cancel requests immediately
+        while let Ok(req) = cancel_rx.try_recv() {
+            if let Some(ref state) = repo_state {
+                if let Some(root) = state.find_stack_root(req.pr_number) {
+                    stack_cancel.cancel(root);
+                    tracing::info!(?repo_id, ?root, "cancelled stack");
+                }
+            }
+        }
+
         // Drain all pending events into priority queue
         while let Ok(event) = event_rx.try_recv() {
             queue.push(event);
@@ -1458,14 +1505,11 @@ async fn repo_worker(
 
         // Process highest-priority event
         if let Some(event) = queue.pop() {
-            // Get the current cancellation token (may have been refreshed by dispatcher)
-            let cancel = token_rx.borrow().clone();
-
             let result = process_event_for_repo(
                 &repo_id,
                 event,
                 &mut repo_state,
-                &cancel,
+                &mut stack_cancel,
                 &ctx,
             ).await;
 
@@ -1483,19 +1527,35 @@ async fn repo_worker(
         }
 
         // No events in queue — wait for more (with timeout)
-        match tokio::time::timeout(idle_timeout, event_rx.recv()).await {
-            Ok(Some(event)) => {
-                queue.push(event);
+        // Use select! to also handle cancel requests while waiting
+        tokio::select! {
+            biased;
+
+            Some(req) = cancel_rx.recv() => {
+                if let Some(ref state) = repo_state {
+                    if let Some(root) = state.find_stack_root(req.pr_number) {
+                        stack_cancel.cancel(root);
+                        tracing::info!(?repo_id, ?root, "cancelled stack");
+                    }
+                }
             }
-            Ok(None) => {
-                // Channel closed, shut down worker
-                tracing::info!(?repo_id, "repo worker shutting down: channel closed");
-                break;
-            }
-            Err(_) => {
-                // Idle timeout — shut down worker (will be recreated on next event)
-                tracing::info!(?repo_id, "repo worker shutting down: idle timeout");
-                break;
+
+            result = tokio::time::timeout(idle_timeout, event_rx.recv()) => {
+                match result {
+                    Ok(Some(event)) => {
+                        queue.push(event);
+                    }
+                    Ok(None) => {
+                        // Channel closed, shut down worker
+                        tracing::info!(?repo_id, "repo worker shutting down: channel closed");
+                        break;
+                    }
+                    Err(_) => {
+                        // Idle timeout — shut down worker (will be recreated on next event)
+                        tracing::info!(?repo_id, "repo worker shutting down: idle timeout");
+                        break;
+                    }
+                }
             }
         }
     }
@@ -1506,31 +1566,31 @@ async fn process_event_for_repo(
     repo_id: &RepoId,
     event: QueuedEvent,
     repo_state: &mut Option<RepoState>,
-    cancel: &CancellationToken,
+    stack_cancel: &mut StackCancellation,
     ctx: &AppContext,
 ) -> Result<()> {
-    // Ensure repo is bootstrapped
+    // Ensure repo is bootstrapped (not stack-specific, no cancellation)
     let just_bootstrapped = repo_state.is_none();
     if just_bootstrapped {
-        *repo_state = Some(bootstrap_repo(repo_id, cancel, ctx).await?);
+        *repo_state = Some(bootstrap_repo(repo_id, ctx).await?);
     }
 
     let state = repo_state.as_mut().unwrap();
 
     // Recovery: if we just bootstrapped, check for in-progress trains that need resuming
     if just_bootstrapped {
-        recover_in_progress_trains(state, cancel, ctx).await?;
+        recover_in_progress_trains(state, stack_cancel, ctx).await?;
     }
 
     match event.payload {
         QueuedEventPayload::GitHub(gh_event) => {
-            process_github_event(gh_event, state, cancel, ctx).await
+            process_github_event(gh_event, state, stack_cancel, ctx).await
         }
         QueuedEventPayload::PeriodicSync => {
-            resync_repo(repo_id, state, cancel, ctx).await
+            resync_repo(repo_id, state, ctx).await
         }
         QueuedEventPayload::PollActiveTrains => {
-            poll_active_trains(repo_id, state, cancel, ctx).await
+            poll_active_trains(repo_id, state, stack_cancel, ctx).await
         }
     }
 }
@@ -1540,7 +1600,7 @@ async fn process_event_for_repo(
 async fn poll_active_trains(
     repo_id: &RepoId,
     state: &mut RepoState,
-    cancel: &CancellationToken,
+    stack_cancel: &mut StackCancellation,
     ctx: &AppContext,
 ) -> Result<()> {
     let github = ctx.github_for_repo(repo_id);
@@ -1594,7 +1654,7 @@ async fn poll_active_trains(
 /// After bootstrap, check for trains that were mid-cascade and resume them.
 async fn recover_in_progress_trains(
     repo_state: &mut RepoState,
-    cancel: &CancellationToken,
+    stack_cancel: &mut StackCancellation,
     ctx: &AppContext,
 ) -> Result<()> {
     // active_trains is keyed by the PR number where the state comment lives (the current root)
@@ -1606,6 +1666,9 @@ async fn recover_in_progress_trains(
             continue;
         }
 
+        // Get cancellation token for this specific stack
+        let cancel = stack_cancel.token_for_stack(*train_root);
+
         match state.cascade_phase {
             CascadePhase::Idle => {
                 // Re-evaluate readiness of current_pr
@@ -1613,7 +1676,7 @@ async fn recover_in_progress_trains(
             }
             CascadePhase::Preparing => {
                 // Re-run preparation (idempotent - if already pushed, merges are no-ops)
-                resume_preparation(state.current_pr, repo_state, cancel, ctx).await?;
+                resume_preparation(state.current_pr, repo_state, &cancel, ctx).await?;
             }
             CascadePhase::SquashPending => {
                 // Check if the PR was already squash-merged
@@ -1621,11 +1684,11 @@ async fn recover_in_progress_trains(
                 match pr.map(|p| &p.state) {
                     Some(PrState::Merged { .. }) => {
                         // Already merged, move to reconciliation
-                        resume_reconciliation(state.current_pr, state.last_squash_sha.as_ref(), repo_state, cancel, ctx).await?;
+                        resume_reconciliation(state.current_pr, state.last_squash_sha.as_ref(), repo_state, &cancel, ctx).await?;
                     }
                     Some(PrState::Open) => {
                         // Not yet merged, proceed with squash
-                        resume_squash(state.current_pr, repo_state, cancel, ctx).await?;
+                        resume_squash(state.current_pr, repo_state, &cancel, ctx).await?;
                     }
                     _ => {
                         // PR closed without merge or missing - abort
@@ -1637,7 +1700,7 @@ async fn recover_in_progress_trains(
                 // Use last_squash_sha to complete reconciliation
                 let squash_sha = state.last_squash_sha.as_ref()
                     .ok_or(Error::MissingRecoverySha)?;
-                resume_reconciliation(state.current_pr, Some(squash_sha), repo_state, cancel, ctx).await?;
+                resume_reconciliation(state.current_pr, Some(squash_sha), repo_state, &cancel, ctx).await?;
             }
         }
     }
@@ -1756,7 +1819,7 @@ async fn main() {
 async fn process_github_event(
     event: GitHubEvent,
     repo_state: &mut RepoState,
-    cancellation_token: &CancellationToken,
+    stack_cancel: &mut StackCancellation,
     ctx: &AppContext,
 ) -> Result<()> {
     // Apply incremental state update
@@ -1789,13 +1852,19 @@ async fn process_github_event(
                         ack_predecessor(&c, ctx).await?;
                     }
                     Command::Start => {
-                        evaluate_cascade(&stacks, repo_state, cancellation_token, ctx).await?;
+                        evaluate_cascade(&stacks, repo_state, stack_cancel, ctx).await?;
                     }
                     Command::Stop => {
+                        // Find which stack this PR belongs to
+                        let root = repo_state.find_stack_root(c.issue_number);
+
                         // In-flight operations were already cancelled by the dispatcher.
-                        // Hard-reset the local repo to clean up any partial merge state.
-                        let git = ctx.git_for_repo(&repo_id);
-                        git.reset_to_default_branch(&repo_state.default_branch).await?;
+                        // Remove this stack's worktree to clean up any partial merge state.
+                        // This only affects this stack — other stacks' worktrees are untouched.
+                        if let Some(root) = root {
+                            let git = ctx.git_for_repo(&repo_id);
+                            git.remove_worktree(root).await?;
+                        }
 
                         // Update state comment and ack
                         ack_stop(&c, repo_state, ctx).await?;
@@ -1805,16 +1874,16 @@ async fn process_github_event(
         }
         GitHubEvent::PullRequest(pr) if pr.action == "closed" => {
             if pr.merged {
-                evaluate_cascade(&stacks, repo_state, cancellation_token, ctx).await?;
+                evaluate_cascade(&stacks, repo_state, stack_cancel, ctx).await?;
             } else {
                 notify_orphaned_descendants(pr.number, &stacks, ctx).await?;
             }
         }
         GitHubEvent::CheckSuite(cs) if cs.conclusion == Some("success") => {
-            evaluate_cascade(&stacks, repo_state, cancellation_token, ctx).await?;
+            evaluate_cascade(&stacks, repo_state, stack_cancel, ctx).await?;
         }
         GitHubEvent::PullRequestReview(r) if r.action == "submitted" && r.review.state == "approved" => {
-            evaluate_cascade(&stacks, repo_state, cancellation_token, ctx).await?;
+            evaluate_cascade(&stacks, repo_state, stack_cancel, ctx).await?;
         }
         _ => {}
     }
@@ -1936,23 +2005,19 @@ impl RepoState {
 ### Bootstrap (two-phase: snapshot then fallback)
 
 ```rust
+/// Bootstrap is not stack-specific — it happens before we know what stacks exist.
+/// Therefore it does not support cancellation (cancellation is stack-scoped).
 async fn bootstrap_repo(
     repo_id: &RepoId,
-    cancellation_token: &CancellationToken,
     ctx: &AppContext,
 ) -> Result<RepoState> {
     let github = ctx.github_for_repo(repo_id);
-
-    // Check for cancellation before starting
-    if cancellation_token.is_cancelled() {
-        return Err(Error::Cancelled);
-    }
 
     // Phase 1: Try to load from snapshot (fast path)
     match load_from_snapshot(repo_id, &github, ctx).await {
         Ok(Some((state, snapshot_ref))) => {
             // Snapshot found and not stale — refresh merge states and return
-            let state = refresh_merge_states(state, &github, cancellation_token).await?;
+            let state = refresh_merge_states(state, &github).await?;
             return Ok(state);
         }
         Ok(None) => {
@@ -1966,7 +2031,7 @@ async fn bootstrap_repo(
     }
 
     // Phase 2: Full API crawl (fallback path)
-    let state = full_bootstrap(repo_id, &github, cancellation_token, ctx).await?;
+    let state = full_bootstrap(repo_id, &github, ctx).await?;
 
     // Persist the freshly bootstrapped state
     persist_snapshot(repo_id, &state, &github).await?;
@@ -2212,7 +2277,8 @@ use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
 struct GitOperations {
-    workdir: PathBuf,
+    /// Base directory containing clone/ and worktrees/ subdirectories
+    base_dir: PathBuf,
     repo_url: String,
     signing_key: String,
 }
@@ -2388,6 +2454,74 @@ impl GitOperations {
     }
 }
 ```
+
+### Per-stack worktrees
+
+Each stack gets its own isolated git worktree, enabling true stack isolation for the stop command and laying groundwork for potential future parallel cascade operations.
+
+**Directory structure:**
+
+```
+/var/lib/merge-train/repos/
+  owner-repo/
+    clone/             # Shared bare clone (object store)
+    worktrees/
+      stack-123/       # Worktree for stack rooted at PR #123
+      stack-456/       # Worktree for stack rooted at PR #456
+```
+
+**Benefits:**
+- Stop on stack A removes stack A's worktree without affecting stack B
+- No partial merge state leaks between stacks
+- Each stack can have its own checked-out branch
+
+**Implementation:**
+
+```rust
+impl GitOperations {
+    /// Get or create a worktree for a stack. Called before cascade operations.
+    async fn worktree_for_stack(&self, root_pr: PrNumber) -> Result<PathBuf> {
+        let worktree_path = self.base_dir
+            .join("worktrees")
+            .join(format!("stack-{}", root_pr.0));
+
+        if !worktree_path.exists() {
+            // Create worktree from the shared clone
+            self.run_git_uncancellable(&[
+                "worktree", "add",
+                worktree_path.to_str().unwrap(),
+                "HEAD",
+            ]).await?;
+        }
+
+        Ok(worktree_path)
+    }
+
+    /// Remove a stack's worktree. Called on stop or after stack completes.
+    async fn remove_worktree(&self, root_pr: PrNumber) -> Result<()> {
+        let worktree_path = self.base_dir
+            .join("worktrees")
+            .join(format!("stack-{}", root_pr.0));
+
+        if worktree_path.exists() {
+            self.run_git_uncancellable(&[
+                "worktree", "remove", "--force",
+                worktree_path.to_str().unwrap(),
+            ]).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Prune stale worktree references (housekeeping).
+    async fn prune_worktrees(&self) -> Result<()> {
+        self.run_git_uncancellable(&["worktree", "prune"]).await?;
+        Ok(())
+    }
+}
+```
+
+The `prepare_descendant` and `reconcile_descendant` methods operate within the stack's worktree, obtained via `worktree_for_stack(root_pr)`. The `run_git` and `run_git_uncancellable` methods take a `workdir` parameter to specify which worktree to use.
 
 **Usage in cascade logic:**
 
