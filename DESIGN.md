@@ -213,26 +213,37 @@ refs/meta/merge-train-snapshot
   "updated_at": "2024-01-15T10:30:00Z",
   "default_branch": "main",
   "prs": {
+    "122": {
+      "head_sha": "000111222333",
+      "base_ref": "main",
+      "predecessor": null,
+      "state": "merged",
+      "state_comment_id": null,
+      "closed_at": "2024-01-14T15:00:00Z"
+    },
     "123": {
       "head_sha": "abc123def456",
       "base_ref": "main",
       "predecessor": null,
       "state": "open",
-      "state_comment_id": 987654321
+      "state_comment_id": 987654321,
+      "closed_at": null
     },
     "124": {
       "head_sha": "def456ghi789",
       "base_ref": "feature-123",
       "predecessor": 123,
       "state": "open",
-      "state_comment_id": null
+      "state_comment_id": null,
+      "closed_at": null
     },
     "125": {
       "head_sha": "ghi789jkl012",
       "base_ref": "feature-124",
       "predecessor": 124,
       "state": "open",
-      "state_comment_id": null
+      "state_comment_id": null,
+      "closed_at": null
     }
   },
   "active_trains": {
@@ -258,6 +269,7 @@ refs/meta/merge-train-snapshot
 | `prs[n].predecessor` | `number?` | Declared predecessor PR number |
 | `prs[n].state` | `string` | One of: `open`, `merged`, `closed` |
 | `prs[n].state_comment_id` | `number?` | Comment ID if this PR has a state comment |
+| `prs[n].closed_at` | `string?` | ISO 8601 timestamp when PR was merged/closed (for pruning) |
 | `active_trains` | `object` | Map of root PR number → train metadata |
 | `active_trains[n].state_comment_id` | `number` | Comment ID of the state comment |
 | `active_trains[n].current_pr` | `number` | PR being processed |
@@ -547,6 +559,124 @@ After the ref exists, subsequent updates use the Contents API with optimistic lo
 2. Sets a retry flag
 3. Continues processing events (in-memory state is still authoritative)
 4. Retries on the next periodic timer or critical event
+
+### Snapshot pruning
+
+The `prs` map in the snapshot can grow unboundedly as PRs accumulate over time. Without pruning, a busy repository could accumulate thousands of entries, eventually hitting practical size limits for the Contents API or slowing down bootstrap reads.
+
+**Retention policy:**
+
+The snapshot is a cache for fast bootstrap—stale or missing entries trigger re-fetch from the API. This means pruning doesn't need to be perfect; it just needs to keep the file bounded while retaining useful data.
+
+| PR state | Retention |
+|----------|-----------|
+| Open | Always keep (needed for stack tracking) |
+| Merged/closed, in active train | Always keep (train still references it) |
+| Merged/closed, referenced as predecessor by a kept PR | Keep (transitive closure) |
+| Merged/closed, not referenced | Prune after retention period |
+
+**Default retention period**: 30 days for unreferenced merged/closed PRs. Configurable via `MERGE_TRAIN_PR_RETENTION_DAYS`.
+
+**Size limit fallback**: If the `prs` map exceeds `max_prs_in_snapshot` (default: 1000), aggressively prune the oldest unreferenced merged/closed PRs (by PR number, lower = older) until under limit. This prevents unbounded growth even in pathological cases.
+
+**Pruning algorithm** (runs before each snapshot save):
+
+```rust
+fn prune_snapshot(snapshot: &mut PersistedSnapshot, config: &Config) {
+    let now = Utc::now();
+    let retention = Duration::days(config.pr_retention_days as i64);
+
+    // Collect PRs to keep
+    let mut keep: HashSet<u64> = HashSet::new();
+
+    // 1. Keep all open PRs
+    for (pr_num, pr) in &snapshot.prs {
+        if pr.state == "open" {
+            keep.insert(pr_num.parse().unwrap());
+        }
+    }
+
+    // 2. Keep all PRs in active trains
+    for train in snapshot.active_trains.values() {
+        keep.insert(train.current_pr);
+    }
+
+    // 3. Transitive closure: keep predecessors of kept PRs
+    loop {
+        let mut added = false;
+        for (pr_num, pr) in &snapshot.prs {
+            let num: u64 = pr_num.parse().unwrap();
+            if keep.contains(&num) {
+                if let Some(pred) = pr.predecessor {
+                    if keep.insert(pred) {
+                        added = true;
+                    }
+                }
+            }
+        }
+        if !added { break; }
+    }
+
+    // 4. Prune unreferenced merged/closed PRs older than retention period
+    snapshot.prs.retain(|pr_num, pr| {
+        let num: u64 = pr_num.parse().unwrap();
+        if keep.contains(&num) {
+            return true;
+        }
+        // Check closed_at if available
+        if let Some(closed_at) = &pr.closed_at {
+            if let Ok(dt) = DateTime::parse_from_rfc3339(closed_at) {
+                return now - dt.with_timezone(&Utc) < retention;
+            }
+        }
+        // No closed_at timestamp - keep for now (legacy entries)
+        true
+    });
+
+    // 5. Size limit fallback
+    if snapshot.prs.len() > config.max_prs_in_snapshot {
+        // Sort merged/closed PRs by PR number (ascending = oldest first)
+        let mut prunable: Vec<u64> = snapshot.prs.iter()
+            .filter(|(pr_num, pr)| {
+                let num: u64 = pr_num.parse().unwrap();
+                !keep.contains(&num) && pr.state != "open"
+            })
+            .map(|(pr_num, _)| pr_num.parse().unwrap())
+            .collect();
+        prunable.sort();
+
+        // Remove oldest until under limit
+        let to_remove = snapshot.prs.len() - config.max_prs_in_snapshot;
+        for pr_num in prunable.into_iter().take(to_remove) {
+            snapshot.prs.remove(&pr_num.to_string());
+        }
+    }
+}
+```
+
+**Schema addition**: Add `closed_at` timestamp to `PersistedPr`:
+
+```rust
+#[derive(Serialize, Deserialize)]
+struct PersistedPr {
+    head_sha: String,
+    base_ref: String,
+    predecessor: Option<u64>,
+    state: String,
+    state_comment_id: Option<u64>,
+    /// When the PR was merged or closed (ISO 8601). Null for open PRs.
+    /// Used for retention-based pruning.
+    closed_at: Option<String>,
+}
+```
+
+The `closed_at` field is set when processing `pull_request.closed` events. Existing entries without this field are treated as "keep until size limit forces pruning."
+
+**Observability**: Log pruning activity:
+
+```
+INFO repo=owner/repo pruned_prs=42 remaining_prs=158 "snapshot pruned"
+```
 
 ### Stack topology
 
@@ -1254,6 +1384,9 @@ struct PersistedPr {
     state: String,
     /// Comment ID of state comment on this PR (if any)
     state_comment_id: Option<u64>,
+    /// When the PR was merged or closed (ISO 8601). Null for open PRs.
+    /// Used for retention-based pruning of the snapshot.
+    closed_at: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2639,8 +2772,91 @@ impl GitOperations {
         self.run_git_uncancellable(&["worktree", "prune"]).await?;
         Ok(())
     }
+
+    /// Clean up stale worktrees on startup.
+    ///
+    /// If the bot crashes mid-operation, worktrees may be left behind. This method
+    /// removes worktrees that are either:
+    /// - Not associated with an active train (orphaned)
+    /// - Older than the max age threshold (stale from a previous crashed instance)
+    ///
+    /// Call this during startup after loading active trains from the snapshot.
+    async fn cleanup_stale_worktrees(
+        &self,
+        active_train_roots: &HashSet<PrNumber>,
+        max_age: Duration,
+    ) -> Result<()> {
+        let worktrees_dir = self.base_dir.join("worktrees");
+        if !worktrees_dir.exists() {
+            return Ok(());
+        }
+
+        for entry in std::fs::read_dir(&worktrees_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+
+            // Parse "stack-NNN" directory name to extract PR number
+            let Some(pr_number) = parse_stack_dir_name(&path) else {
+                // Not a stack directory, skip
+                continue;
+            };
+
+            // Keep if this is an active train
+            if active_train_roots.contains(&pr_number) {
+                continue;
+            }
+
+            // Check directory age via mtime
+            let metadata = std::fs::metadata(&path)?;
+            let modified = metadata.modified()?;
+            let age = std::time::SystemTime::now()
+                .duration_since(modified)
+                .unwrap_or(Duration::MAX);
+
+            if age > max_age {
+                tracing::info!(
+                    path = %path.display(),
+                    age_hours = age.as_secs() / 3600,
+                    pr = pr_number.0,
+                    "removing stale worktree"
+                );
+                self.remove_worktree(pr_number).await?;
+            }
+        }
+
+        // Also run git worktree prune to clean up any dangling references
+        self.prune_worktrees().await?;
+
+        Ok(())
+    }
+}
+
+/// Parse a worktree directory name like "stack-123" to extract the PR number.
+fn parse_stack_dir_name(path: &Path) -> Option<PrNumber> {
+    let name = path.file_name()?.to_str()?;
+    let num_str = name.strip_prefix("stack-")?;
+    let num: u64 = num_str.parse().ok()?;
+    Some(PrNumber(num))
 }
 ```
+
+**Worktree cleanup configuration:**
+
+| Config | Default | Env var | Description |
+|--------|---------|---------|-------------|
+| `worktree_max_age` | 24 hours | `MERGE_TRAIN_WORKTREE_MAX_AGE_HOURS` | Worktrees older than this are removed on startup |
+
+**When cleanup runs:**
+
+1. **On bot startup**: After loading active trains from the snapshot, before processing any events
+2. **Optionally on periodic timer**: Can be added to the hourly maintenance if desired, but startup cleanup handles the primary crash-recovery case
+
+**Why 24 hours?** This threshold is deliberately generous:
+- A healthy cascade completes in minutes to hours
+- 24 hours provides ample margin for long CI pipelines or rate-limited operations
+- If a worktree is 24+ hours old and not in an active train, it's almost certainly orphaned
+
+**Observability**: Cleanup activity is logged at INFO level, making it easy to detect if orphaned worktrees are accumulating frequently (which might indicate a bug in the normal cleanup path).
 
 The `prepare_descendant` and `reconcile_descendant` methods operate within the stack's worktree, obtained via `worktree_for_stack(root_pr)`. The `run_git` and `run_git_uncancellable` methods take a `workdir` parameter to specify which worktree to use.
 
@@ -2732,6 +2948,16 @@ user_id = 123456789
 
 [behavior]
 # Future: auto_start = true
+
+[housekeeping]
+# Snapshot pruning: how long to retain merged/closed PRs before pruning
+pr_retention_days = 30  # or env: MERGE_TRAIN_PR_RETENTION_DAYS
+
+# Maximum PRs to store in snapshot (hard limit to prevent unbounded growth)
+max_prs_in_snapshot = 1000  # or env: MERGE_TRAIN_MAX_PRS_IN_SNAPSHOT
+
+# Worktree cleanup: remove worktrees older than this on startup
+worktree_max_age_hours = 24  # or env: MERGE_TRAIN_WORKTREE_MAX_AGE_HOURS
 ```
 
 ---
