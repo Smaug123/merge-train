@@ -517,18 +517,30 @@ The `sha` field provides optimistic locking — GitHub rejects the update with `
 
 **Ref creation (first time):**
 
-When the snapshot ref doesn't exist (404 on GET), the bot creates it:
+When the snapshot ref doesn't exist (404 on GET), the bot must create it using the Git Data API. The Contents API cannot create refs outside `refs/heads/`, so we create the ref explicitly:
 
 ```
-PUT /repos/{o}/{r}/contents/state.json
-{
-  "message": "Initialize merge-train state",
-  "content": "<base64-encoded JSON>",
-  "branch": "refs/meta/merge-train-snapshot"
-}
+1. Create a blob with the JSON content:
+   POST /repos/{o}/{r}/git/blobs
+   { "content": "<JSON content>", "encoding": "utf-8" }
+   → returns { "sha": "<blob_sha>" }
+
+2. Create a tree containing state.json pointing to the blob:
+   POST /repos/{o}/{r}/git/trees
+   { "tree": [{ "path": "state.json", "mode": "100644", "type": "blob", "sha": "<blob_sha>" }] }
+   → returns { "sha": "<tree_sha>" }
+
+3. Create a commit with that tree:
+   POST /repos/{o}/{r}/git/commits
+   { "message": "Initialize merge-train state", "tree": "<tree_sha>", "parents": [] }
+   → returns { "sha": "<commit_sha>" }
+
+4. Create the ref pointing to the commit:
+   POST /repos/{o}/{r}/git/refs
+   { "ref": "refs/meta/merge-train-snapshot", "sha": "<commit_sha>" }
 ```
 
-Note: Omitting `sha` creates a new file. If the ref doesn't exist, GitHub creates both the ref and the file.
+After the ref exists, subsequent updates use the Contents API with optimistic locking as described above.
 
 **Failure handling**: If snapshot update fails after retries (rate limit, network error), the bot:
 1. Logs the failure with details
@@ -710,6 +722,26 @@ Webhooks are ACKed (return 202) before processing, and the per-repo queue is in-
 - The failure mode is obvious to users: the bot doesn't respond. They can re-issue the command.
 
 **Mitigation:** Users who notice the bot didn't respond to their command should simply re-issue it. The polling fallback ensures active trains eventually make progress even without new webhooks, but it cannot recover commands that were never processed.
+
+### Known limitation: state comment migration window
+
+When a PR merges and the cascade advances, the bot creates a new state comment on the next PR (the new root) and updates the old comment on the merged PR to reflect completion. There is a brief window between these operations where a crash would leave the train in an ambiguous state: the old root is merged (so its state comment is no longer authoritative), but the new root doesn't yet have a state comment.
+
+**Why this is acceptable:**
+
+- The window is very small (milliseconds between API calls)
+- The irreversible operation (squash-merge) has already succeeded
+- All merge operations (preparation, reconciliation) are idempotent — re-running them is safe
+- The `refs/pull/<n>/head` refs survive branch deletion, so recovery data exists
+- The hourly `PollActiveTrains` would detect a retargeted PR awaiting CI with no active train
+
+**What happens if crashed in this window:**
+
+The train state is lost. On restart, the bot won't find a state comment on any open PR for this train. The descendant PRs will have been retargeted to the default branch and prepared/reconciled, but won't automatically continue.
+
+**Recovery:** A user can re-issue `@merge-train start` on the new root PR. Since preparation and reconciliation are idempotent, this is safe even if those steps partially completed.
+
+**Note on comment updates:** GitHub's comment API does not support compare-and-swap, so duplicate webhook delivery or multi-instance scenarios could theoretically race on state comment updates. This is mitigated by per-repo serial event processing within a single instance. Multi-instance deployments should use leader election or sticky routing to ensure a single instance handles each repository.
 
 ---
 
@@ -950,16 +982,23 @@ This means "fix the CI and push" is sufficient to resume — no manual re-trigge
 | Add reaction | `/repos/{o}/{r}/issues/comments/{id}/reactions` | POST |
 | Get merge state | GraphQL `mergeStateStatus` | POST `/graphql` |
 | Get snapshot | `/repos/{o}/{r}/contents/state.json?ref=refs/meta/merge-train-snapshot` | GET |
-| Create/update snapshot | `/repos/{o}/{r}/contents/state.json` | PUT |
+| Update snapshot | `/repos/{o}/{r}/contents/state.json` | PUT |
+| Create blob | `/repos/{o}/{r}/git/blobs` | POST |
+| Create tree | `/repos/{o}/{r}/git/trees` | POST |
+| Create commit | `/repos/{o}/{r}/git/commits` | POST |
+| Create ref | `/repos/{o}/{r}/git/refs` | POST |
 
 The "Get repo metadata" endpoint returns `default_branch` which is used throughout the cascade logic.
 
 The "Update comment" endpoint is used to update state comments atomically during cascade phase transitions.
 
-**Contents API for snapshot persistence**: The bot uses the Contents API to persist state to `refs/meta/merge-train-snapshot:state.json`:
+**Snapshot persistence**: The bot persists state to `refs/meta/merge-train-snapshot:state.json` using two different APIs depending on whether the ref exists:
+
+*Initial creation (Git Data API)*: The Contents API cannot create refs outside `refs/heads/`, so first-time setup uses the Git Data API to create a blob → tree → commit → ref chain. See "Ref creation (first time)" above.
+
+*Subsequent updates (Contents API)*:
 - **GET** retrieves the snapshot and its `sha` (needed for optimistic locking)
-- **PUT** creates or updates the file; requires `sha` of current file for updates (omit for create)
-- Returns `409 Conflict` if the provided `sha` doesn't match current file (concurrent modification)
+- **PUT** updates the file; requires `sha` of current file (returns `409 Conflict` on mismatch)
 - The `branch` parameter specifies the ref: `refs/meta/merge-train-snapshot`
 
 **GraphQL for merge state**: The bot uses GitHub's GraphQL API to query `mergeStateStatus`, which encapsulates all branch protection checks (required status checks, required reviewers, etc.) into a single authoritative value:
@@ -2189,7 +2228,9 @@ fn find_state_comment(comments: &[Comment], bot_user_id: u64) -> Option<StateCom
 ### Snapshot persistence
 
 ```rust
-/// Persist state to the snapshot ref with optimistic locking
+/// Persist state to the snapshot ref with optimistic locking.
+/// On first run (no existing ref), uses Git Data API to create the ref.
+/// On subsequent runs, uses Contents API with optimistic locking.
 async fn persist_snapshot(
     repo_id: &RepoId,
     state: &RepoState,
@@ -2197,11 +2238,27 @@ async fn persist_snapshot(
 ) -> Result<()> {
     let snapshot = build_snapshot_from_state(state);
     let content = serde_json::to_string_pretty(&snapshot)?;
-    let encoded = base64::encode(&content);
 
-    // Retry loop for optimistic locking conflicts
-    let mut attempts = 0;
+    // If no snapshot ref exists, we need to create it via Git Data API
     let mut current_sha = state.snapshot_ref.as_ref().map(|r| r.file_sha.clone());
+    if current_sha.is_none() {
+        // Check if ref exists (maybe another instance created it)
+        match github.get_contents("state.json", Some("refs/meta/merge-train-snapshot")).await {
+            Ok(existing) => {
+                // Ref was created by another instance; use Contents API path
+                current_sha = Some(existing.sha);
+            }
+            Err(ApiError::NotFound) => {
+                // Ref doesn't exist; create it via Git Data API
+                return create_snapshot_ref(repo_id, &content, github).await;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    // Ref exists; update via Contents API with optimistic locking
+    let encoded = base64::encode(&content);
+    let mut attempts = 0;
 
     loop {
         attempts += 1;
@@ -2220,8 +2277,6 @@ async fn persist_snapshot(
 
         match result {
             Ok(response) => {
-                // Success — update our cached SHA for next time
-                // (In practice, state.snapshot_ref would be updated)
                 tracing::debug!(?repo_id, sha = %response.content.sha, "snapshot persisted");
                 return Ok(());
             }
@@ -2234,7 +2289,6 @@ async fn persist_snapshot(
                     Some("refs/meta/merge-train-snapshot"),
                 ).await?;
 
-                // Merge our changes with the fetched state
                 let fetched_content = base64::decode(&fetched.content)?;
                 let fetched_snapshot: PersistedSnapshot = serde_json::from_slice(&fetched_content)?;
 
@@ -2243,9 +2297,7 @@ async fn persist_snapshot(
                 let merged_content = serde_json::to_string_pretty(&merged)?;
                 let merged_encoded = base64::encode(&merged_content);
 
-                // Update for next iteration
                 current_sha = Some(fetched.sha);
-                // Re-encode with merged content for the retry
                 // (In a real impl, we'd update `encoded` to `merged_encoded`)
             }
             Err(e) => {
@@ -2253,6 +2305,50 @@ async fn persist_snapshot(
                 return Err(e.into());
             }
         }
+    }
+}
+
+/// Create the snapshot ref for the first time using Git Data API.
+/// The Contents API cannot create refs outside refs/heads/, so we must
+/// create blob → tree → commit → ref explicitly.
+async fn create_snapshot_ref(
+    repo_id: &RepoId,
+    content: &str,
+    github: &GitHubClient,
+) -> Result<()> {
+    // 1. Create blob
+    let blob = github.create_blob(content, "utf-8").await?;
+
+    // 2. Create tree with state.json
+    let tree = github.create_tree(&[
+        TreeEntry {
+            path: "state.json".to_string(),
+            mode: "100644".to_string(),
+            entry_type: "blob".to_string(),
+            sha: blob.sha.clone(),
+        }
+    ]).await?;
+
+    // 3. Create commit (no parents - this is an orphan commit)
+    let commit = github.create_commit(
+        "Initialize merge-train state",
+        &tree.sha,
+        &[], // no parents
+    ).await?;
+
+    // 4. Create the ref
+    match github.create_ref("refs/meta/merge-train-snapshot", &commit.sha).await {
+        Ok(_) => {
+            tracing::info!(?repo_id, "created snapshot ref");
+            Ok(())
+        }
+        Err(ApiError::UnprocessableEntity) => {
+            // 422 means ref already exists (race with another instance)
+            // This is fine; the other instance's state will be picked up on next read
+            tracing::info!(?repo_id, "snapshot ref created by another instance");
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
     }
 }
 
