@@ -2755,7 +2755,9 @@ A monitoring/ops dashboard is planned to provide visibility into active trains, 
 
 ## Security Considerations
 
-- **Command authorization**: Only users with write access to the repo may issue commands. Validate via GitHub API before acting.
+- **Command authorization**: Commands (`@merge-train predecessor`, `start`, `stop`) are only accepted when:
+  1. The comment is on a **pull request**, not an issue. The `issue_comment` webhook fires for both PRs and issues; the bot checks the payload's `issue.pull_request` field exists before processing.
+  2. The comment author is **the user who opened the PR**. The bot compares `comment.user.id` against the PR's `user.id` (available in the webhook payload or cached PR metadata). This prevents other users—even those with write access—from hijacking someone else's merge train.
 - **State comment verification**: State comments (`<!-- merge-train-state`) are only parsed if the comment author's user ID matches the bot's configured user ID. This prevents malicious users from injecting fake state that could cause the bot to perform unintended operations.
 - **Webhook validation**: Verify `X-Hub-Signature-256` header against webhook secret.
 - **Signing key protection**: GPG private key should be stored securely (e.g., mounted secret, not in repo).
