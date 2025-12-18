@@ -52,7 +52,7 @@ The bot will:
 
 1. Create a state comment on this PR (the root) to claim ownership of the train
 2. Walk the linked list to find all descendants (including any added after this command)
-3. Validate the root PR is approved and CI is green (see below)
+3. Validate the root PR is mergeable (approved, required checks passing — see below)
 4. Squash-merge the root PR
 5. Begin the cascade (updating the state comment at each phase transition)
 
@@ -68,6 +68,11 @@ The bot will:
 | `UNKNOWN` | State not yet computed | ⏳ Wait and re-check |
 
 This delegates all branch protection logic to GitHub, ensuring the bot respects required status checks, required reviewers, and any other protection rules without duplicating that logic.
+
+**Note on "check failure"**: Throughout this document, "check failure" or "required check failure" refers to `mergeStateStatus` transitioning to `BLOCKED`. The bot does not query branch protection rules to distinguish required from non-required checks — it relies entirely on GitHub's `mergeStateStatus` computation. This means:
+- If a non-required check fails → `UNSTABLE` → bot proceeds
+- If a required check fails → `BLOCKED` → bot waits/aborts
+- If approval is withdrawn → `BLOCKED` → bot waits/aborts (same signal as check failure)
 
 Once started, the cascade proceeds automatically through all descendants. New PRs that declare themselves as descendants mid-cascade will be picked up when the cascade reaches their predecessor.
 
@@ -89,9 +94,9 @@ The stop command is scoped to a single stack — other independent stacks in the
 
 ### Aborting
 
-The bot automatically aborts a cascade when it encounters an error (merge conflict, CI failure, etc.). This is distinct from a manual stop:
+The bot automatically aborts a cascade when it encounters an error (merge conflict, required check failure, etc.). This is distinct from a manual stop:
 
-- **Abort**: Caused by an error condition. The bot posts diagnostics and waits for the condition to resolve. Some conditions (like CI failure) auto-resume when fixed.
+- **Abort**: Caused by an error condition. The bot posts diagnostics and waits for the condition to resolve. Some conditions (like required check failure) auto-resume when fixed.
 - **Stop**: Explicit human request. The cascade will not resume until `@merge-train start` is issued again.
 
 ---
@@ -633,8 +638,8 @@ receive event
         │
         ├─ Find frontier of each started stack
         ├─ If frontier ready and predecessor merged: cascade
-        ├─ If frontier CI pending: wait
-        └─ If frontier CI failed: abort, notify
+        ├─ If frontier pending (BLOCKED/UNKNOWN): wait
+        └─ If frontier blocked (required checks/approvals): abort, notify
 ```
 
 ### Polling fallback for active trains
@@ -685,6 +690,26 @@ INFO repo=owner/repo train_root=123 trigger=webhook "evaluating cascade"
 ```
 
 If poll-triggered evaluations are frequent, it indicates a webhook delivery problem worth investigating.
+
+### Known limitation: crash during webhook processing
+
+Webhooks are ACKed (return 202) before processing, and the per-repo queue is in-memory. If the bot crashes between acknowledging a webhook and processing it, that event is silently dropped.
+
+**What is recovered after restart:**
+- **Predecessor declarations** (`@merge-train predecessor #N`): Scanned from PR comments during bootstrap
+- **Train state** (started, cascade progress, stopped): Recovered from state comments on root PRs
+- **PR metadata** (merge state, CI status): Fetched fresh from GitHub API
+
+**What is NOT recovered:**
+- **Pending `start` commands**: If a user comments `@merge-train start` and the bot crashes before processing it, that command is lost. The train will not start.
+- **Pending `stop` commands**: If a user comments `@merge-train stop` and the bot crashes before processing it, that command is lost. The cascade will continue after restart.
+
+**Why this trade-off:**
+- Command comments are one-time events, not persistent state. Scanning all comments on every bootstrap would be expensive and still racy (new commands could arrive during the scan).
+- The failure window is small (milliseconds between ACK and processing).
+- The failure mode is obvious to users: the bot doesn't respond. They can re-issue the command.
+
+**Mitigation:** Users who notice the bot didn't respond to their command should simply re-issue it. The polling fallback ensures active trains eventually make progress even without new webhooks, but it cannot recover commands that were never processed.
 
 ---
 
@@ -879,7 +904,7 @@ The bot aborts the cascade (and comments with diagnostics) if:
 | Preparation merge fails | Conflict between predecessor/main and descendant | Resolve locally, push to descendant branch, re-trigger |
 | `git push` rejected | Force-push or concurrent modification | Investigate branch state, re-trigger |
 | PR closed without merge | Human intervention | Re-open or restructure stack |
-| CI fails on a descendant | Code issue | Fix, push, bot will auto-continue |
+| Required check fails on descendant | Code issue | Fix, push, bot will auto-continue |
 | Cycle detected | Misconfigured predecessor | Fix comments |
 | Approval withdrawn | Review state changed | Re-approve |
 | Review dismissed | Reviewer dismissed their approval or requested changes | Re-approve; cascade will not auto-resume |
@@ -897,9 +922,9 @@ On abort, the bot:
 3. Posts a comment on downstream PRs that the train is halted
 4. Takes no further action until human intervenes or condition resolves
 
-### Auto-resume on CI fix
+### Auto-resume on check fix
 
-If the cascade aborted due to CI failure, the bot will automatically resume when:
+If the cascade aborted because `mergeStateStatus` became `BLOCKED` (required checks failing), the bot will automatically resume when:
 
 - A `check_suite` success event fires for that PR
 - The PR is still open
