@@ -74,7 +74,7 @@ This delegates all branch protection logic to GitHub, ensuring the bot respects 
 - If a required check fails → `BLOCKED` → bot waits/aborts
 - If approval is withdrawn → `BLOCKED` → bot waits/aborts (same signal as check failure)
 
-Once started, the cascade proceeds automatically through all descendants. New PRs that declare themselves as descendants mid-cascade will be picked up when the cascade reaches their predecessor.
+Once started, the cascade proceeds automatically through all descendants. New PRs that declare themselves as descendants mid-cascade will be picked up when the cascade reaches their predecessor — but with an important constraint: see "Descendant set freezing" below.
 
 ### Stopping
 
@@ -137,7 +137,7 @@ When the bot takes ownership of a stack (via `@merge-train start`), it persists 
 | `version` | `number` | Schema version (currently `1`) |
 | `state` | `string` | One of: `running`, `stopped`, `waiting_ci`, `aborted` |
 | `current_pr` | `number` | PR currently being processed (the train's current root PR) |
-| `cascade_phase` | `string` | One of: `idle`, `preparing`, `squash_pending`, `reconciling` |
+| `cascade_phase` | `object` | Phase with optional `completed` list (see below) |
 | `predecessor_pr` | `number?` | PR number of predecessor (for fetching via `refs/pull/<n>/head` during recovery) |
 | `last_squash_sha` | `string?` | SHA of last squash commit (for reconciliation recovery) |
 | `started_at` | `string` | ISO 8601 timestamp when started |
@@ -150,6 +150,10 @@ When the bot takes ownership of a stack (via `@merge-train start`), it persists 
 - `preparing`: Merging predecessor head and default branch into descendants (before squash)
 - `squash_pending`: Preparation complete; about to squash-merge current PR
 - `reconciling`: Squash complete; performing ours-strategy merges into descendants
+- `catching_up`: Ours-merge complete; performing regular merge of origin/main
+- `retargeting`: Catch-up complete; retargeting descendant PRs to default branch
+
+Phases with multiple descendants (`preparing`, `reconciling`, `catching_up`, `retargeting`) include a `completed` list tracking which descendants have finished that phase.
 
 **Recovery semantics:**
 
@@ -158,9 +162,11 @@ If the bot crashes mid-cascade, the `cascade_phase` indicates where to resume:
 | Phase | Recovery action |
 |-------|-----------------|
 | `idle` | Re-evaluate current PR's readiness |
-| `preparing` | Re-run preparation (idempotent if already pushed) |
+| `preparing` | Skip descendants in `completed`, re-run for remaining (idempotent if already pushed) |
 | `squash_pending` | Check if squash already happened; if not, perform it |
-| `reconciling` | Use `last_squash_sha` to complete reconciliation (see below for fallback) |
+| `reconciling` | Skip descendants in `completed`, use `last_squash_sha` to complete for remaining |
+| `catching_up` | Skip descendants in `completed`, re-run merge of origin/main for remaining |
+| `retargeting` | Skip descendants in `completed`, retarget remaining (idempotent via API check) |
 
 **Reconciling recovery with missing `last_squash_sha`:**
 
@@ -169,10 +175,11 @@ If recovery finds `cascade_phase = "reconciling"` but `last_squash_sha` is null 
 1. Check if `predecessor_pr` is recorded (should be set during preparation)
 2. Fetch the predecessor PR from GitHub API
 3. If `state == "merged"`, extract `merge_commit_sha` — this is the squash SHA
-4. Continue reconciliation with the recovered SHA
-5. If predecessor is not merged, the squash didn't actually happen — revert to `squash_pending`
+4. **If `merge_commit_sha` is null**: GitHub may not have propagated it yet. Retry with exponential backoff (100ms, 200ms, 400ms, up to 5 attempts). If still null after retries, log a warning and abort with a recoverable error.
+5. Continue reconciliation with the recovered SHA
+6. If predecessor is not merged, the squash didn't actually happen — revert to `squash_pending`
 
-This derives the squash SHA from GitHub rather than hard-failing, since the squash-merge is recorded in GitHub's PR state even if our local record was lost.
+This derives the squash SHA from GitHub rather than hard-failing, since the squash-merge is recorded in GitHub's PR state even if our local record was lost. The retry handles eventual consistency in GitHub's API.
 
 **GitHub-based recovery**: If the local state files are missing or corrupted, the bot can recover train state from GitHub during bootstrap by scanning for status comments on open root PRs. The status comment contains the full `TrainRecord` as machine-readable JSON, enabling precise recovery without inference. See "Status comments" below.
 
@@ -187,10 +194,12 @@ This derives the squash SHA from GitHub rather than hard-failing, since the squa
 
 This handles the scenario where: local state shows `squash_pending`, but GitHub shows `reconciling` with `last_squash_sha`. The squash succeeded and was recorded to GitHub, but the local write was lost. Without this, recovery would attempt to squash again (which would fail or duplicate).
 
-**Recovery precedence:**
-- If GitHub is ahead: Use GitHub's phase/SHA (operation succeeded, local lost the record)
-- If local is ahead: Use local (status comment update was delayed/lost)
+**Recovery precedence** (determined by comparing `recovery_seq`):
+- If GitHub's `recovery_seq` > local: Use GitHub's state (operation succeeded, local lost the record)
+- If local's `recovery_seq` > GitHub: Use local (status comment update was delayed/lost)
 - If both agree: Normal recovery
+
+This eliminates ambiguity in "which is ahead" — the monotonic sequence provides a total ordering.
 
 ### Status comments (required, non-authoritative for normal operation)
 
@@ -205,9 +214,11 @@ The bot MUST post and update a status comment on the current root PR at each pha
 <!-- merge-train-state
 {
   "version": 1,
+  "recovery_seq": 42,
   "state": "running",
+  "original_root_pr": 123,
   "current_pr": 124,
-  "cascade_phase": "reconciling",
+  "cascade_phase": { "Reconciling": { "completed": [125] } },
   "predecessor_pr": 123,
   "last_squash_sha": "abc123def456",
   "started_at": "2024-01-15T09:00:00Z"
@@ -215,10 +226,12 @@ The bot MUST post and update a status comment on the current root PR at each pha
 -->
 **Merge Train Status**
 
-Train running — reconciling PR #124 after squash
+Train running — reconciling PR #124 after squash (1/2 descendants complete)
 ```
 
-**JSON fields:** Same as the `TrainRecord` fields documented in "Local train state" above: `version`, `state`, `current_pr`, `cascade_phase`, `predecessor_pr`, `last_squash_sha`, `started_at`.
+**JSON fields:** Same as the `TrainRecord` fields documented in "Local train state" above: `version`, `recovery_seq`, `state`, `original_root_pr`, `current_pr`, `cascade_phase` (as full `CascadePhase` object including `completed` lists), `predecessor_pr`, `last_squash_sha`, `started_at`. The `recovery_seq` is a monotonic counter incremented on each state change, used to determine which record is "ahead" during recovery.
+
+**Critical for recovery:** The `cascade_phase` must be serialized as a full object (not just a string) to include the `completed` list. Without this, GitHub-based recovery cannot resume mid-phase for multi-descendant operations — it would have to redo work on already-completed descendants.
 
 **Authoritative source of truth:** During normal operation, the local event log is authoritative. Status comments serve as:
 - User-facing observability (what is the bot doing?)
@@ -238,11 +251,16 @@ The bot persists per-repo state using an append-only event log with periodic sna
 /var/lib/merge-train/state/
   owner/
     repo/
-      events.log      # append-only state event log (JSON Lines)
-      snapshot.json   # periodic snapshot for fast bootstrap
-      spool/          # webhook delivery spool (separate, transient)
+      generation        # current generation number (single integer)
+      snapshot.0.json   # snapshot for generation 0
+      events.0.log      # event log for generation 0 (JSON Lines)
+      snapshot.1.json   # snapshot for generation 1 (after compaction)
+      events.1.log      # event log for generation 1
+      spool/            # webhook delivery spool (separate, transient)
         <delivery-id>.json
 ```
+
+Only the current generation's files are active; older generations are deleted after compaction completes.
 
 **Webhook spool lifecycle:**
 
@@ -257,31 +275,65 @@ The spool is a durable queue, not just a transient buffer. Deliveries progress t
 A delivery is only deleted (GC'd) after its `.done` marker exists AND a grace period (e.g., 1 hour) has passed. This allows debugging of recently processed events.
 
 **Dedupe strategy:** Deliveries are deduped by multiple stable identifiers, not just `X-GitHub-Delivery`:
-- For `issue_comment` events: `(PR number, comment ID)` — comment ID is globally unique
+- For `issue_comment.created` events: `(PR number, comment ID, "created")` — a comment can only be created once
+- For `issue_comment.edited` events: `(PR number, comment ID, "edited", updated_at)` — each edit has a distinct timestamp; using just `(comment ID, "edited")` would incorrectly drop subsequent edits
 - For `pull_request` events: `(PR number, action, head SHA)` — same PR+action+SHA = same logical event
 - For `check_suite` events: `(check suite ID)`
 
 This handles GitHub's redelivery with new delivery IDs for the same logical event.
 
-The event log is persistent (state changes are retained for recovery/debugging).
-
-**Event log format (`events.log`):**
-
-Newline-delimited JSON (JSON Lines), one event per line. Each event includes a monotonic sequence number:
+**Dedupe key persistence:** The seen dedupe keys are stored in the snapshot to survive restarts:
 
 ```json
-{"seq":1,"ts":"2024-01-15T10:00:00Z","type":"train_started","root_pr":123}
-{"seq":2,"ts":"2024-01-15T10:01:00Z","type":"phase_transition","train_root":123,"phase":"preparing"}
-{"seq":3,"ts":"2024-01-15T10:02:00Z","type":"pr_merged","pr":123,"sha":"abc123"}
-{"seq":4,"ts":"2024-01-15T10:03:00Z","type":"train_completed","root_pr":123}
+{
+  "seen_dedupe_keys": {
+    "issue_comment:123:456789": "2024-01-15T10:00:00Z",
+    "pull_request:124:opened:abc123": "2024-01-15T10:01:00Z"
+  }
+}
 ```
 
-**Snapshot format (`snapshot.json`):**
+Keys are pruned after 24 hours (configurable via `MERGE_TRAIN_DEDUPE_TTL_HOURS`). Before processing any event, check the dedupe key against this set; if present, skip processing and immediately mark `.done`.
+
+**Idempotency beyond dedupe:** Even with dedupe, some actions may be retried due to crashes (the dedupe keys live in the snapshot, and snapshots are periodic). All external actions must be idempotent:
+- Before git push: check if remote ref already has expected tree content (see "Git push idempotency details")
+- Before squash-merge: check if PR is already merged
+- Before retarget: check if PR base already equals target
+- Before posting ack reaction (👍): check if bot already reacted to that comment (via `GET /repos/{o}/{r}/issues/comments/{id}/reactions`)
+- Before posting/updating status comment: check if comment already exists with matching content; use comment ID recorded in train state to find existing comment
+- Before posting error/notification comments: include a unique identifier (e.g., event sequence number) in the comment body so duplicates can be detected and skipped
+
+The event log is persistent (state changes are retained for recovery/debugging).
+
+**Event log format (`events.<N>.log`):**
+
+Newline-delimited JSON (JSON Lines), one event per line. Each event includes a monotonic sequence number. **Critical**: All fields needed to reconstruct train state must be durably logged — the event log is the source of truth for recovery.
+
+```json
+{"seq":1,"ts":"2024-01-15T10:00:00Z","type":"train_started","root_pr":123,"current_pr":123}
+{"seq":2,"ts":"2024-01-15T10:01:00Z","type":"phase_transition","train_root":123,"current_pr":123,"predecessor_pr":null,"last_squash_sha":null,"phase":{"Preparing":{"completed":[],"frozen_descendants":[124]}}}
+{"seq":3,"ts":"2024-01-15T10:01:30Z","type":"phase_transition","train_root":123,"current_pr":123,"predecessor_pr":123,"last_squash_sha":null,"phase":"SquashPending"}
+{"seq":4,"ts":"2024-01-15T10:02:00Z","type":"squash_committed","train_root":123,"pr":123,"sha":"abc123"}
+{"seq":5,"ts":"2024-01-15T10:02:30Z","type":"phase_transition","train_root":123,"current_pr":123,"predecessor_pr":123,"last_squash_sha":"abc123","phase":{"Reconciling":{"completed":[]}}}
+{"seq":6,"ts":"2024-01-15T10:03:00Z","type":"phase_transition","train_root":123,"current_pr":124,"predecessor_pr":123,"last_squash_sha":"abc123","phase":"Idle"}
+{"seq":7,"ts":"2024-01-15T10:10:00Z","type":"train_completed","root_pr":123}
+```
+
+**Required fields per event type:**
+- `train_started`: `root_pr`, `current_pr`
+- `phase_transition`: ALL of `train_root`, `current_pr`, `predecessor_pr`, `last_squash_sha`, `phase` (as full `CascadePhase` object including `completed` lists for multi-descendant phases)
+- `squash_committed`: `train_root`, `pr`, `sha`
+- `train_completed`/`train_stopped`/`train_aborted`: `root_pr`
+
+Without these fields durably logged, recovery cannot determine which PR the train was processing or what SHA to use for reconciliation.
+
+**Snapshot format (`snapshot.<N>.json`):**
 
 ```json
 {
   "schema_version": 1,
   "snapshot_at": "2024-01-15T10:30:00Z",
+  "log_generation": 1,
   "log_position": 1234,
   "next_seq": 5,
   "default_branch": "main",
@@ -304,9 +356,11 @@ Newline-delimited JSON (JSON Lines), one event per line. Each event includes a m
   "active_trains": {
     "123": {
       "version": 1,
+      "recovery_seq": 5,
       "state": "running",
+      "original_root_pr": 123,
       "current_pr": 123,
-      "cascade_phase": "idle",
+      "cascade_phase": "Idle",
       "predecessor_pr": null,
       "last_squash_sha": null,
       "started_at": "2024-01-15T09:00:00Z",
@@ -319,19 +373,33 @@ Newline-delimited JSON (JSON Lines), one event per line. Each event includes a m
 
 **Bootstrap from local storage:**
 
-1. Load `snapshot.json` if it exists
-2. Seek to `log_position` in `events.log` and replay from there
-3. Skip any trailing partial line (incomplete JSON due to crash mid-append)
-4. Rebuild in-memory state
+1. Read the `generation` file to find current generation `N`
+2. Load `snapshot.<N>.json` if it exists (fall back to `snapshot.<N-1>.json` if crash during compaction)
+3. Seek to byte offset `log_position` in `events.<N>.log` and replay from there
+4. Skip any trailing partial line (incomplete JSON due to crash mid-append)
+5. Rebuild in-memory state
 
 **Partial line handling:** On replay, if the final line doesn't parse as valid JSON, truncate the log file at the start of that line and continue. This handles crashes mid-append without failing boot.
 
 **Compaction:**
 
+Compaction cannot atomically update both the snapshot and truncate the log — a crash between these operations would either replay duplicates or lose events. Instead, use a generation-based scheme:
+
 - Periodically (e.g., every hour) or when log exceeds size threshold
-- Write current in-memory state to new `snapshot.json` with `log_position` = current file size
-- Truncate `events.log` to zero (events are now captured in snapshot)
-- Events for completed/stopped trains can be omitted from the snapshot
+- Increment the generation number (stored in a `generation` file, starting at 0)
+- Write snapshot to `snapshot.<gen>.json` (e.g., `snapshot.1.json`) with `log_generation = <gen>` and `log_position = 0`
+- fsync the snapshot file, then fsync the directory
+- Start a new log file `events.<gen>.log` (new events append here)
+- Update `generation` file to the new generation, fsync, fsync directory
+- **Only after** the new generation is durable, delete the old snapshot and log files
+
+On startup:
+1. Read the `generation` file to find the current generation `N`
+2. Load `snapshot.<N>.json` (or `snapshot.<N-1>.json` if N doesn't exist — crash during compaction)
+3. Replay from the corresponding `events.<N>.log` starting at `log_position`
+4. Clean up any stale files from older generations
+
+This ensures that at any crash point, either the old or new generation is complete and consistent. Events for completed/stopped trains can be omitted from the snapshot.
 
 **Staleness detection**: The `snapshot_at` field indicates when state was last persisted. If this is older than a threshold (default: 1 hour) and the event log is empty/missing, the bot performs a full re-sync from the GitHub API to catch drift and missed deliveries.
 
@@ -368,13 +436,57 @@ Non-critical events (fsync batched for performance):
 
 **Snapshot update strategy**:
 
-- Serialize state to a temp file in the same directory as `snapshot.json`
-- `fsync` the temp file
-- Rename over `snapshot.json` (atomic on POSIX filesystems)
-- Truncate `events.log`
-- `fsync` the directory to persist the rename (best-effort)
+Use the **generation-based compaction** approach (see "Compaction" in the Data Model section and "Snapshot update" in State Persistence). The naive "rename snapshot then truncate log" approach is **not crash-atomic** — a crash between these operations would either replay duplicates or lose events. Generation-based compaction provides correct crash recovery by maintaining complete generations that can be switched atomically.
+
+**Critical**: All directory fsyncs (for both spool and snapshot directories) are **mandatory**, not best-effort. Without directory fsync, a power loss can drop files even after the file contents were fsynced, because the directory entry wasn't persisted.
 
 **Concurrency**: This design assumes a single active bot process per `state_dir`. Multi-instance deployments require external coordination (leader election, sticky routing, or a shared database) and are out of scope for this document.
+
+**Startup lock**: To prevent accidental multi-instance split-brain (which could cause double-merges), the bot acquires an exclusive `flock` on `<state_dir>/lock` at startup:
+
+```rust
+use std::fs::File;
+use fs2::FileExt;
+
+fn acquire_state_lock(state_dir: &Path) -> Result<File> {
+    let lock_path = state_dir.join("lock");
+    let lock_file = File::create(&lock_path)?;
+    lock_file.try_lock_exclusive().map_err(|_| {
+        Error::AnotherInstanceRunning(lock_path)
+    })?;
+    Ok(lock_file) // Hold this for the lifetime of the process
+}
+```
+
+If the lock is already held, the bot fails immediately with a clear error message. The lock is released automatically when the process exits.
+
+**Critical limitation of flock**: The `flock` mechanism ONLY prevents split-brain when all instances share the same filesystem for `state_dir`. In distributed deployments (multiple hosts, container orchestration, etc.), two instances with separate local disks can BOTH acquire their local flock and run simultaneously, causing double-merges and corrupted cascade state.
+
+**Distributed deployment requirements**: If running multiple instances (for HA, rolling deploys, etc.), you MUST use one of:
+
+1. **Shared persistent storage**: Mount `state_dir` on shared storage (NFS, EFS, etc.) so flock works across instances. The storage must support POSIX advisory locks.
+
+2. **External leader election**: Use a distributed coordination service (etcd, ZooKeeper, Consul) to elect a single active instance. Only the leader processes webhooks; standbys just healthcheck.
+
+3. **GitHub-based mutual exclusion**: Before performing any irreversible operation (squash-merge, git push), atomically create a "lock comment" on the PR:
+   - Check if a lock comment from another instance exists
+   - If not, create your lock comment (includes instance ID and timestamp)
+   - Re-fetch and verify your comment was first
+   - Only proceed if you hold the lock
+   - Delete the lock comment when operation completes or on error
+
+   This provides distributed mutual exclusion using GitHub as the coordination point.
+
+4. **Sticky routing + health checks**: Route all webhooks for a given repo to a single instance (hash by repo ID). The load balancer must drain connections and wait for handoff during deploys.
+
+**Recommended for production**: Option 1 (shared storage) or option 2 (leader election) provide the strongest guarantees. Option 3 adds latency and GitHub API calls but works without infrastructure changes.
+
+**Split-brain detection**: Even with the above mitigations, defense in depth is valuable. Before each squash-merge:
+1. Fetch the PR's current state from GitHub
+2. Verify it matches our cached state (head SHA, merge status)
+3. If there's a mismatch (another instance may have acted), abort and re-bootstrap
+
+This catch-all check ensures that even if coordination fails, we detect the problem before causing damage.
 
 The bot maintains in-memory state per repository for fast event processing. On startup it loads existing snapshots and replays event logs from disk; for unknown repos it bootstraps on the first relevant webhook (or via an operator-initiated full sync), then persists state.
 
@@ -452,9 +564,10 @@ On startup (and on first webhook for an unknown repo), the bot follows a two-pha
 
 1. Transition to `Bootstrapping` state (queue incoming events)
 2. Attempt to load repo state from disk:
-   a. Load `<state_dir>/<owner>/<repo>/snapshot.json` if it exists
-   b. Replay events from `events.log` that have timestamps after `snapshot_at`
-   c. Rebuild in-memory state
+   a. Read the `generation` file to find current generation `N`
+   b. Load `<state_dir>/<owner>/<repo>/snapshot.<N>.json` if it exists (fall back to `snapshot.<N-1>.json` if crash during compaction)
+   c. Replay events from `events.<N>.log` starting at byte offset `log_position` (not by timestamp — timestamps can drift or be non-monotonic)
+   d. Rebuild in-memory state
 3. If snapshot found and not stale (`snapshot_at` within threshold):
    a. Rebuild derived indexes (e.g., `descendants`) from the persisted graph
    b. For each open PR, fetch current `mergeStateStatus` via GraphQL (merge readiness may have changed)
@@ -470,11 +583,12 @@ On startup (and on first webhook for an unknown repo), the bot follows a two-pha
 8. For each PR, fetch comments to find:
    - `@merge-train predecessor` declarations (from humans)
    - `<!-- merge-train-state {...} -->` status comments (from bot — for train recovery)
-9. **Train state recovery**: For each open PR targeting the default branch:
+9. **Train state recovery**: For each PR (open OR recently merged) that targets the default branch:
    a. If a bot-owned status comment with `<!-- merge-train-state {...} -->` is found:
    b. Verify comment author matches bot's user ID (security check)
    c. Parse the JSON to extract full `TrainRecord`
-   d. Add to `active_trains` map
+   d. Compare `recovery_seq` to determine which record is most recent (see below)
+   e. Add to `active_trains` map (most recent wins if duplicates exist)
 10. For each open PR, fetch `mergeStateStatus` via GraphQL
 11. Build `RepoState` with default branch, PR map, descendants index, and recovered active trains
 12. **Persist state**: Write snapshot to disk (see State Persistence section)
@@ -547,12 +661,13 @@ The bot persists state via an append-only event log with periodic snapshots (see
 
 | Trigger | Action | fsync? |
 |---------|--------|--------|
-| Phase transition | Append event to `events.log` | No |
+| Phase transition | Append event to `events.log` | Yes (critical) |
 | Train start | Append event to `events.log` | Yes (critical) |
 | Train stop/abort | Append event to `events.log` | Yes (critical) |
 | Train completion | Append event to `events.log` | Yes (critical) |
-| PR merged | Append event to `events.log` | No |
-| PR state change | Append event to `events.log` | No |
+| Squash committed | Append event to `events.log` | Yes (critical) |
+| PR merged | Append event to `events.log` | No (batched) |
+| PR state change | Append event to `events.log` | No (batched) |
 
 **Append strategy:**
 
@@ -560,7 +675,7 @@ The bot persists state via an append-only event log with periodic snapshots (see
 fn append_event(log: &mut File, event: &Event) -> io::Result<()> {
     writeln!(log, "{}", serde_json::to_string(event)?)?;
     if event.is_critical() {
-        log.sync_all()?; // fsync on train start/stop/complete
+        log.sync_all()?; // fsync on phase transitions, train lifecycle, squash commits
     }
     Ok(())
 }
@@ -574,13 +689,17 @@ fn append_event(log: &mut File, event: &Event) -> io::Result<()> {
 | Full bootstrap completion | Write snapshot | Fresh state worth preserving |
 | Train completion | OK to compact (train events no longer needed) | Remove stale entries |
 
-**Atomic snapshot update:**
+**Snapshot update (generation-based):**
 
-- Serialize JSON to a temp file in the same directory as `snapshot.json`
-- `fsync` the temp file
-- Rename over `snapshot.json` (atomic)
-- Truncate `events.log`
-- `fsync` the directory (best-effort) to persist the rename
+See "Compaction" in the Data Model section for the full algorithm. In brief:
+
+- Write new snapshot to `snapshot.<N+1>.json` with `log_generation = N+1`, `log_position = 0`
+- fsync the file, then fsync the directory
+- Start new log file `events.<N+1>.log`
+- Update `generation` file to `N+1`, fsync, fsync directory
+- Delete old `snapshot.<N>.json` and `events.<N>.log` only after new generation is durable
+
+This avoids the crash-atomicity problem of "rename snapshot, then truncate log" — at any crash point, at least one complete generation exists.
 
 **Failure handling**: If state persistence fails (disk full, permissions, I/O errors), the bot treats this as fatal for that repo: it logs loudly, stops advancing trains, and returns an error for new webhook deliveries for that repo until persistence is restored. This avoids silently running with state that cannot survive a restart.
 
@@ -763,13 +882,16 @@ From the cached state, stacks are computed by traversing predecessor relationshi
 
 | Event | Action |
 |-------|--------|
-| `issue_comment` with `@merge-train predecessor #N` | Validate, record, ack |
-| `issue_comment` with `@merge-train start` | Squash-merge root, begin cascade |
-| `issue_comment` with `@merge-train stop` | Mark stack stopped, report state |
+| `issue_comment.created` with `@merge-train predecessor #N` | Validate, record, ack |
+| `issue_comment.created` with `@merge-train start` | Squash-merge root, begin cascade |
+| `issue_comment.created` with `@merge-train stop` | Mark stack stopped, report state |
+| `issue_comment.edited` with `@merge-train predecessor #N` | Update predecessor (replaces previous declaration) |
 | `pull_request` merged | If merged PR has descendants, cascade to next |
 | `pull_request` closed (not merged) | Notify descendants they're orphaned |
 | `check_suite` / `status` completed | If cascade waiting on this PR, continue |
 | `pull_request_review` submitted (approved) | If cascade waiting on this PR, continue |
+
+**Comment edit handling**: When a predecessor declaration is edited (e.g., changing `#123` to `#456`), the bot updates the predecessor relationship. The dedupe key for edits is `(PR number, comment ID, "edited", updated_at)` — the `updated_at` timestamp distinguishes different edits of the same comment, preventing later edits from being incorrectly dropped. If a train is already started and the predecessor is changed, the bot aborts with an error (cannot safely change stack structure mid-cascade).
 
 **Fan-out discovery**: After a fan-out point merges, each descendant is discovered as a new root on subsequent events. Since each descendant now targets the default branch and its predecessor is merged, `is_root()` returns true and `compute_stacks()` includes it. No special event handling is needed — the normal cascade flow applies to each independent branch.
 
@@ -796,25 +918,41 @@ Deliveries are written to a per-repo spool directory keyed by `X-GitHub-Delivery
 The HTTP handler:
 1. Validates the webhook signature
 2. Extracts the repository ID and `X-GitHub-Delivery` ID
-3. Writes the delivery (headers + body) to the per-repo disk spool atomically (dedupe by delivery ID)
+3. Writes the delivery (headers + body) to the per-repo disk spool:
+   a. Write to a temp file in the spool directory
+   b. fsync the temp file
+   c. Rename to `<delivery-id>.json` (atomic on POSIX)
+   d. fsync the spool directory (ensures the directory entry is durable — without this, a power loss could drop the file even though it was written)
 4. Classifies the delivery by priority (stop commands have higher priority)
 5. Pushes the parsed event onto the **per-repo** priority queue (creating queue + worker if needed)
 6. Returns `202 Accepted`
 
+**Critical:** Step 3d (fsync directory) is required for durability. A successful write and file rename does NOT guarantee the directory entry survives a power loss — the directory must also be synced. Only after this completes can we safely return `202 Accepted`.
+
 Each per-repo worker loop:
 1. Ensures repo state is loaded/bootstrapped from disk (or re-syncs from GitHub if needed)
-2. Drains the per-repo disk spool (replaying any `.json` files without `.done` markers)
+2. Drains the per-repo disk spool:
+   a. First, reclaim any `.json.proc` files (rename back to `.json`) — these are deliveries that were being processed when a crash occurred
+   b. Then replay any `.json` files without corresponding `.done` markers
 3. Pulls the highest-priority event from its queue
-4. Renames delivery file to `.proc` (claiming it for processing)
+4. Renames delivery file to `.json.proc` (claiming it for processing)
 5. Applies incremental state update from the event
-6. If state effects require persistence (recovery-critical event):
-   a. Appends event to log + fsync
-   b. Creates `.done` marker for the delivery
-7. Evaluates cascade actions based on updated state
-8. On cascade phase transitions or irreversible operations, persists state before proceeding
-9. Loops (or shuts down after idle timeout)
+6. Appends event to log
+7. If event is recovery-critical:
+   a. fsync the log immediately
+   b. Create `.done` marker for the delivery
+   c. fsync the spool directory (required — without this, the `.done` marker may not survive power loss, causing replay of an already-processed event)
+8. If event uses batched fsync:
+   a. Add delivery ID to pending batch set
+   b. On next batch fsync (or before any irreversible operation), fsync the log
+   c. Create `.done` markers for all deliveries in the pending batch
+   d. fsync the spool directory once (after all `.done` files are created)
+   e. Clear the pending batch set
+9. Evaluates cascade actions based on updated state
+10. On cascade phase transitions or irreversible operations, flush pending batch first
+11. Loops (or shuts down after idle timeout)
 
-**Critical invariant:** A delivery's `.done` marker is only created after all state effects from that delivery are durably persisted. This ensures that on restart, unprocessed deliveries are replayed correctly.
+**Critical invariant:** A delivery's `.done` marker is only created after all state effects from that delivery are durably persisted (fsynced). This ensures that on restart, unprocessed deliveries are replayed correctly. For batched events, `.done` is deferred until the batch fsync completes.
 
 **Priority ordering**: Stop commands (`@merge-train stop`) are processed before all other events within that repo's queue. This ensures that a human request to halt the cascade takes effect promptly.
 
@@ -1050,6 +1188,10 @@ For PR #N with descendants {#D1, #D2, ...} (may be one or multiple):
    → Regular merge (not ours) to properly incorporate any commits that landed on main
      after the squash commit (from other PRs, hotfixes, etc.)
    → If main hasn't advanced past the squash commit, this is a no-op
+   → **If merge conflicts**: This is a genuine conflict between descendant's work and
+     new commits on main. Abort with specific error: "Conflict with commits on main
+     that landed after the squash. Manual resolution required." This is distinct from
+     cascade-specific failures — the descendant genuinely conflicts with new main content.
    → Push to origin
 
 5. RETARGET: For EACH descendant, update base branch to main
@@ -1068,6 +1210,37 @@ For PR #N with descendants {#D1, #D2, ...} (may be one or multiple):
 For the root PR (#123), there is no predecessor to merge, so the sequence starts at step 2.
 
 For the final PR in the stack (#125), there is no descendant, so steps 1, 3-5 are skipped.
+
+### Descendant set freezing
+
+**Invariant**: The descendant set for PR #N is frozen at the moment we begin preparing descendants for #N's squash. Any new PRs that declare #N as their predecessor after this point are **not** included in the current cascade step for #N.
+
+**Why this matters**: Preparation must happen for ALL descendants BEFORE squashing #N (step 1 completes entirely before step 2). If a new descendant appears after preparation started but before the squash, that descendant:
+- Would not have been prepared (no merge of #N's head or main)
+- Would break after the squash (its base becomes invalid)
+
+**Freeze point and logging**: When entering the `Preparing` phase for PR #N:
+1. Query the current descendant set from the `descendants` index
+2. Log the `phase_transition` event with the descendant list frozen in the `completed: []` field
+3. Only process descendants that were captured at this moment
+4. New descendants that arrive after the phase_transition event will be handled in the NEXT cascade step (when #N's successor becomes the current root)
+
+**Late additions recovery**: If a new PR declares #N as predecessor after #N has already merged:
+1. The new PR is discovered when the cascade reaches #N's former position (now an independent root or the next train root)
+2. Its predecessor (#N) is already merged, so the bot:
+   - Fetches #N's final head via `refs/pull/{N}/head`
+   - Fetches the squash commit SHA from #N's merge_commit_sha
+   - Performs the full prepare/reconcile sequence for the late arrival
+3. This works because GitHub maintains PR refs even after merge
+
+**Event log format for frozen descendants**:
+```json
+{"seq":5,"ts":"...","type":"phase_transition","train_root":123,"current_pr":123,
+ "predecessor_pr":null,"last_squash_sha":null,
+ "phase":{"Preparing":{"completed":[],"frozen_descendants":[124,125]}}}
+```
+
+The `frozen_descendants` field captures the exact set that will be processed. Recovery uses this list to avoid re-querying descendants (which might have changed).
 
 ### Durability and commit points
 
@@ -1091,10 +1264,26 @@ If the bot crashes:
 
 | Operation | Intent event | Completion event | Idempotency check |
 |-----------|--------------|------------------|-------------------|
-| git push (preparation) | `intent_push_prep` | `done_push_prep` | Check if remote ref matches expected SHA |
+| git push (preparation) | `intent_push_prep` (with `pre_push_sha`, `expected_tree`) | `done_push_prep` | Compare tree SHA + verify parent chain (see below) |
 | Squash-merge | `intent_squash` | `squash_committed` | Check if PR is already merged via API |
-| git push (reconciliation) | `intent_push_reconcile` | `done_push_reconcile` | Check if remote ref matches expected SHA |
+| git push (reconciliation) | `intent_push_reconcile` (with `pre_push_sha`, `expected_tree`) | `done_push_reconcile` | Compare tree SHA + verify parent chain (see below) |
 | Retarget PR | `intent_retarget` | `done_retarget` | Check if PR base already equals target |
+
+**Git push idempotency details:**
+
+Merge commits are **not reproducible** across retries: timestamps, GPG signatures, and other metadata vary between runs. Therefore, recovery cannot simply compare "expected SHA" against "remote SHA" — a SHA mismatch doesn't mean the push failed.
+
+The intent event records `pre_push_sha` (the remote ref before our push) and `expected_tree` (the tree SHA we expect). On recovery:
+
+1. Query GitHub API: `GET /repos/{o}/{r}/git/ref/heads/{branch}` to get current remote SHA
+2. Fetch the commit object and extract its tree SHA
+3. If the tree matches `expected_tree` **and** the commit's parent chain includes `pre_push_sha`: push already succeeded, write completion event
+4. If tree differs or parent chain doesn't include `pre_push_sha`: fetch the remote state, then:
+   a. If remote is a fast-forward from `pre_push_sha` but with different content: someone else pushed — abort with conflict
+   b. Otherwise: re-run the merge operations locally, then push
+5. If push fails with "non-fast-forward": someone else pushed — abort with conflict
+
+The tree SHA is deterministic (same file content = same tree), so it serves as a stable comparison point even when commit metadata varies. Recording `pre_push_sha` lets us verify the push actually happened (our commit is reachable from the remote and the remote has advanced past the pre-push state).
 
 **Phase transitions with commit points:**
 
@@ -1169,7 +1358,7 @@ The bot aborts the cascade (and comments with diagnostics) if:
 | Condition | Likely cause | Recovery hint |
 |-----------|--------------|---------------|
 | Preparation merge fails | Conflict between predecessor/main and descendant | Resolve locally, push to descendant branch, re-trigger |
-| `git push` rejected | Force-push or concurrent modification | Investigate branch state, re-trigger |
+| `git push` rejected (non-fast-forward) | Someone else pushed to the branch during cascade | See "Concurrent push handling" below |
 | PR closed without merge | Human intervention | Re-open or restructure stack |
 | Required check fails on descendant | Code issue | Fix, push, bot will auto-continue |
 | Cycle detected | Misconfigured predecessor | Fix comments |
@@ -1181,6 +1370,17 @@ The bot aborts the cascade (and comments with diagnostics) if:
 **Review dismissal behaviour**: If a review is dismissed (either by the reviewer or due to new commits in repos with "dismiss stale reviews" enabled), the cascade aborts immediately. Unlike CI failure, review dismissal does **not** auto-resume — a new approval must be obtained and `@merge-train start` must be re-issued to continue.
 
 **Branch protection behaviour**: If the target branch has protection rules that prevent the squash-merge (e.g., required status checks not yet present, insufficient approvals, unsigned commits), the GitHub API will reject the merge request. The bot treats this as a fatal error for the stack: it posts a diagnostic comment and stops handling the stack entirely. The user must satisfy the branch protection requirements and re-issue `@merge-train start`.
+
+**Concurrent push handling**: If the bot's push is rejected because someone else pushed to the descendant branch during the cascade:
+
+1. **Detection**: The push fails with "non-fast-forward" error
+2. **Before reconciliation**: If this happens during preparation, the bot:
+   - Fetches the new remote state
+   - Checks if the new commits conflict with the merge
+   - If no conflict: re-runs preparation to incorporate the new commits, then pushes
+   - If conflict: aborts with a message explaining that someone pushed conflicting changes
+3. **After reconciliation**: If this happens during reconciliation/catch-up, the bot aborts — the ours-strategy merge was computed against a different base
+4. **Recovery**: The user can either revert their push and re-trigger, or stop the train, push their changes, and start a new cascade
 
 On abort, the bot:
 
@@ -1219,7 +1419,7 @@ This means "fix the CI and push" is sufficient to resume — no manual re-trigge
 
 The "Get repo metadata" endpoint returns `default_branch` which is used throughout the cascade logic.
 
-The "Update comment" endpoint is used to update optional human-readable status comments (not parsed for recovery).
+The "Update comment" endpoint is used to update status comments (which contain machine-readable JSON for disaster recovery — see "Status comments" section).
 
 **GraphQL for merge state**: The bot uses GitHub's GraphQL API to query `mergeStateStatus`, which encapsulates all branch protection checks (required status checks, required reviewers, etc.) into a single authoritative value:
 
@@ -1391,8 +1591,14 @@ enum MergeStateStatus {
 	struct TrainRecord {
 	    /// Schema version for forward compatibility
 	    version: u32,
+	    /// Monotonic sequence number, incremented on each state change.
+	    /// Used to determine which record is "ahead" during recovery when
+	    /// comparing local state vs GitHub status comments.
+	    recovery_seq: u64,
 	    /// Current train state
 	    state: TrainState,
+	    /// PR that originally received @merge-train start (used for worktree path)
+	    original_root_pr: PrNumber,
 	    /// PR currently being processed (the train's current root)
 	    current_pr: PrNumber,
 	    /// Current phase within the cascade step
@@ -1407,7 +1613,7 @@ enum MergeStateStatus {
 	    stopped_at: Option<String>, // ISO 8601
 	    /// Error details if aborted
 	    error: Option<TrainError>,
-	    /// Optional comment ID of a human-readable status comment (not parsed for recovery)
+	    /// Comment ID of the status comment (contains machine-readable JSON for recovery)
 	    status_comment_id: Option<u64>,
 	}
 
@@ -1421,15 +1627,33 @@ enum TrainState {
 
 	#[derive(Serialize, Deserialize)]
 	enum CascadePhase {
-	    /// Not currently performing any operation
+	    /// Not currently performing any operation; waiting for CI or next event
 	    Idle,
-	    /// Merging predecessor head and default branch into descendants
-	    Preparing,
+	    /// Merging predecessor head and default branch into descendants.
+	    /// `frozen_descendants` is captured at phase entry and used for recovery —
+	    /// new descendants that arrive mid-phase are NOT included (see "Descendant set freezing").
+	    Preparing {
+	        completed: Vec<PrNumber>,
+	        frozen_descendants: Vec<PrNumber>,
+	    },
 	    /// Preparation complete, about to squash-merge
 	    SquashPending,
-	    /// Squash complete, performing ours-strategy merges
-	    Reconciling,
+	    /// Squash complete, performing ours-strategy merges into descendants
+	    Reconciling { completed: Vec<PrNumber> },
+	    /// Ours-merge complete, performing regular merge of origin/main (catch-up)
+	    CatchingUp { completed: Vec<PrNumber> },
+	    /// Catch-up complete, retargeting descendant PRs to default branch
+	    Retargeting { completed: Vec<PrNumber> },
 	}
+
+	// The `completed` vectors track which descendants have finished each phase.
+	// On recovery, we skip descendants already in `completed` and resume with the rest.
+	// This ensures crash between processing descendant N and N+1 doesn't repeat N.
+	//
+	// The `frozen_descendants` in `Preparing` captures the exact descendant set at phase
+	// entry. Recovery uses this list rather than re-querying the descendants index,
+	// which might have changed. This ensures the invariant that ALL descendants present
+	// when we start preparing are prepared BEFORE the squash.
 
 #[derive(Serialize, Deserialize)]
 struct TrainError {
@@ -1459,6 +1683,9 @@ struct TrainError {
 	    prs: HashMap<String, PersistedPr>,
 	    /// Active trains, keyed by root PR number
 	    active_trains: HashMap<String, TrainRecord>,
+	    /// Seen dedupe keys with timestamps for TTL-based pruning.
+	    /// Key format: "event_type:pr:id" or "event_type:pr:action:sha"
+	    seen_dedupe_keys: HashMap<String, String>, // key -> ISO 8601 timestamp
 	}
 
 	#[derive(Serialize, Deserialize)]
@@ -1506,26 +1733,74 @@ struct TrainError {
 	    TrainAborted { root_pr: u64, error: TrainError },
 
 	    // ─── Phase transitions (always critical) ───
+	    //
+	    // Phase transitions must include all fields needed for restart-safe recovery:
+	    // - current_pr: which PR the train is currently processing
+	    // - predecessor_pr: for fetching via refs/pull/<n>/head during recovery
+	    // - last_squash_sha: for reconciliation recovery
+	    // - phase: the CascadePhase including completed descendant lists
+	    //
+	    // Without these fields durably logged, recovery cannot determine which PR
+	    // the train was processing or what SHA to use for reconciliation.
 	    #[serde(rename = "phase_transition")]
-	    PhaseTransition { train_root: u64, phase: String },
+	    PhaseTransition {
+	        train_root: u64,
+	        current_pr: u64,
+	        predecessor_pr: Option<u64>,
+	        last_squash_sha: Option<String>,
+	        /// Full CascadePhase including completed lists for multi-descendant phases
+	        phase: CascadePhase,
+	    },
 	    #[serde(rename = "squash_committed")]
 	    SquashCommitted { train_root: u64, pr: u64, sha: String },
 
 	    // ─── Intent/done pairs for irreversible operations ───
+	    //
+	    // Push intents record `pre_push_sha` (remote ref before our push) and `expected_tree`
+	    // (tree SHA we expect after the merge). On recovery:
+	    // 1. Fetch current remote SHA
+	    // 2. If remote's tree matches expected_tree AND remote's parent chain includes pre_push_sha:
+	    //    push already succeeded → write completion event
+	    // 3. Otherwise: re-run merge operations and push
+	    //
+	    // We use tree SHA (not commit SHA) because merge commits aren't reproducible across
+	    // retries (timestamps, signatures vary), but the tree content is deterministic.
 	    #[serde(rename = "intent_push_prep")]
-	    IntentPushPrep { train_root: u64, branch: String, expected_sha: String },
+	    IntentPushPrep {
+	        train_root: u64,
+	        branch: String,
+	        /// Remote ref SHA before we push (for verifying push actually happened)
+	        pre_push_sha: String,
+	        /// Expected tree SHA after merge (deterministic, unlike commit SHA)
+	        expected_tree: String,
+	    },
 	    #[serde(rename = "done_push_prep")]
 	    DonePushPrep { train_root: u64, branch: String },
 	    #[serde(rename = "intent_squash")]
 	    IntentSquash { train_root: u64, pr: u64 },
 	    #[serde(rename = "intent_push_reconcile")]
-	    IntentPushReconcile { train_root: u64, branch: String, expected_sha: String },
+	    IntentPushReconcile {
+	        train_root: u64,
+	        branch: String,
+	        /// Remote ref SHA before we push
+	        pre_push_sha: String,
+	        /// Expected tree SHA after merge
+	        expected_tree: String,
+	    },
 	    #[serde(rename = "done_push_reconcile")]
 	    DonePushReconcile { train_root: u64, branch: String },
 	    #[serde(rename = "intent_retarget")]
 	    IntentRetarget { train_root: u64, pr: u64, new_base: String },
 	    #[serde(rename = "done_retarget")]
 	    DoneRetarget { train_root: u64, pr: u64 },
+
+	    // ─── Fan-out (atomic update of train records) ───
+	    #[serde(rename = "fan_out_completed")]
+	    FanOutCompleted {
+	        old_root: u64,               // Original train root being retired
+	        new_roots: Vec<u64>,         // New train roots (the descendants)
+	        original_root_pr: u64,       // For worktree management
+	    },
 
 	    // ─── Non-critical state updates (batched fsync) ───
 	    #[serde(rename = "pr_merged")]
@@ -1559,6 +1834,8 @@ struct TrainError {
 	                | StateEventPayload::DonePushPrep { .. }
 	                | StateEventPayload::DonePushReconcile { .. }
 	                | StateEventPayload::DoneRetarget { .. }
+	            // Fan-out (atomic train record updates)
+	                | StateEventPayload::FanOutCompleted { .. }
 	        )
 	    }
 	}
@@ -2318,6 +2595,13 @@ impl RepoState {
     /// IMPORTANT: We always require base_ref == default_branch. A PR whose predecessor
     /// merged but which hasn't been retargeted yet is NOT a root — it's in a transitional
     /// state and should not be squash-merged until retargeting completes.
+    ///
+    /// NOTE: During an active cascade, progress is driven by the TrainRecord, not is_root().
+    /// The TrainRecord tracks which PR is currently being processed. is_root() is only used
+    /// for *discovering* new roots (stacks that aren't yet being processed). A PR mid-cascade
+    /// may fail is_root() (e.g., base_ref not yet updated), but the cascade continues because
+    /// the TrainRecord knows what to do next. After retargeting completes, is_root() will
+    /// return true for the new root.
     fn is_root(&self, pr: &CachedPr) -> bool {
         // Must target the default branch to be a root
         if pr.base_ref != self.default_branch {
@@ -2487,6 +2771,47 @@ async fn load_from_disk(
     Ok(Some(snapshot))
 }
 
+/// Convert persisted snapshot to in-memory RepoState.
+/// IMPORTANT: Rebuilds derived indexes (like `descendants`) that aren't persisted.
+fn build_state_from_persisted(snapshot: PersistedRepoSnapshot) -> Result<RepoState> {
+    // Convert persisted PRs to CachedPr
+    let prs: HashMap<PrNumber, CachedPr> = snapshot.prs
+        .into_iter()
+        .map(|(num_str, pr)| {
+            let num = PrNumber(num_str.parse().unwrap());
+            (num, CachedPr::from_persisted(num, pr))
+        })
+        .collect();
+
+    // Rebuild the descendants reverse index (predecessor → set of descendants)
+    // This is a derived index, not stored in the snapshot
+    let mut descendants: HashMap<PrNumber, HashSet<PrNumber>> = HashMap::new();
+    for (pr_num, pr) in &prs {
+        if let Some(pred) = pr.predecessor {
+            descendants.entry(pred).or_default().insert(*pr_num);
+        }
+    }
+
+    // Convert active_trains keys from String to PrNumber
+    let active_trains: HashMap<PrNumber, TrainRecord> = snapshot.active_trains
+        .into_iter()
+        .map(|(k, v)| (PrNumber(k.parse().unwrap()), v))
+        .collect();
+
+    Ok(RepoState {
+        default_branch: snapshot.default_branch,
+        prs,
+        descendants,
+        active_trains,
+        state_path: PathBuf::new(), // Set by caller
+        bootstrapped_at: Instant::now(),
+        last_sync: Instant::now(),
+        last_persisted: Some(Instant::now()),
+        dirty: false,
+        miss_count: 0,
+    })
+}
+
 /// Full API crawl (fallback path)
 async fn full_bootstrap(
     repo_id: &RepoId,
@@ -2593,6 +2918,11 @@ impl GitOperations {
     /// Must be called BEFORE squash-merging the predecessor into the default branch.
     /// This ensures the descendant has all content from the default branch, so the later
     /// ours-strategy merge doesn't cause content to be lost.
+    ///
+    /// **Detached HEAD strategy**: We use detached HEAD to avoid git's restriction that
+    /// a branch can only be checked out in one worktree at a time. This is critical for
+    /// fan-out scenarios where multiple worktrees may work with related branches, and for
+    /// crash recovery where stale worktrees may still reference branches.
     async fn prepare_descendant(
         &self,
         descendant_branch: &str,
@@ -2609,8 +2939,11 @@ impl GitOperations {
         let local_ref = format!("refs/remotes/origin/pr/{}", predecessor_pr_number);
         self.run_git(&["fetch", "origin", &format!("{}:{}", pr_ref, local_ref)], cancel).await?;
 
-        // Checkout descendant
-        self.run_git(&["checkout", descendant_branch], cancel).await?;
+        // Checkout in DETACHED HEAD mode to avoid branch locking issues.
+        // Git forbids the same branch being checked out in multiple worktrees, so we
+        // work with the commit directly rather than the branch reference.
+        let origin_descendant = format!("origin/{}", descendant_branch);
+        self.run_git(&["checkout", "--detach", &origin_descendant], cancel).await?;
 
         // Merge predecessor commit (regular merge)
         let merge_ref = format!("origin/pr/{}", predecessor_pr_number);
@@ -2632,8 +2965,9 @@ impl GitOperations {
             "-m", &format!("Merge {} into {} (merge-train prep)", default_branch, descendant_branch),
         ], cancel).await?;
 
-        // Push
-        self.run_git(&["push", "origin", descendant_branch], cancel).await?;
+        // Push HEAD to the remote branch (not a local branch ref, since we're detached).
+        let push_ref = format!("HEAD:refs/heads/{}", descendant_branch);
+        self.run_git(&["push", "origin", &push_ref], cancel).await?;
 
         self.run_git(&["rev-parse", "HEAD"], cancel).await
     }
@@ -2644,6 +2978,9 @@ impl GitOperations {
     /// IMPORTANT: Uses the specific squash commit SHA, not origin/<default_branch>, to avoid
     /// accidentally marking the branch as up-to-date with commits that landed
     /// after the squash.
+    ///
+    /// **Detached HEAD strategy**: Same as prepare_descendant — we use detached HEAD to
+    /// avoid git's branch locking restriction across worktrees.
     async fn reconcile_descendant(
         &self,
         descendant_branch: &str,
@@ -2651,14 +2988,17 @@ impl GitOperations {
         default_branch: &str,
         cancel: &CancellationToken,
     ) -> Result<String> {
-        // Fetch the squash commit and descendant branch
-        self.run_git(&["fetch", "origin", descendant_branch], cancel).await?;
-        self.run_git(&["fetch", "origin", squash_commit_sha], cancel).await?;
+        // Fetch default branch (which contains the squash commit) and descendant branch.
+        // NOTE: We do NOT fetch by raw SHA — that's unreliable (depends on uploadpack settings).
+        // The squash commit is reachable from origin/<default_branch>.
+        self.run_git(&["fetch", "origin", default_branch, descendant_branch], cancel).await?;
 
-        // Checkout descendant
-        self.run_git(&["checkout", descendant_branch], cancel).await?;
+        // Checkout in DETACHED HEAD mode (see prepare_descendant for rationale).
+        let origin_descendant = format!("origin/{}", descendant_branch);
+        self.run_git(&["checkout", "--detach", &origin_descendant], cancel).await?;
 
-        // Merge the squash commit with ours strategy — keeps our tree, adds it as parent
+        // Merge the squash commit with ours strategy — keeps our tree, adds it as parent.
+        // The SHA is reachable after fetching the default branch.
         self.run_git(&[
             "merge",
             squash_commit_sha,
@@ -2669,7 +3009,6 @@ impl GitOperations {
 
         // Now do a regular merge of origin/<default_branch> to pick up any subsequent commits
         let origin_default = format!("origin/{}", default_branch);
-        self.run_git(&["fetch", "origin", default_branch], cancel).await?;
         self.run_git(&[
             "merge",
             &origin_default,
@@ -2677,8 +3016,9 @@ impl GitOperations {
             "-m", &format!("Merge {} into {} (merge-train catch-up)", default_branch, descendant_branch),
         ], cancel).await?;
 
-        // Push
-        self.run_git(&["push", "origin", descendant_branch], cancel).await?;
+        // Push HEAD to the remote branch (detached HEAD mode).
+        let push_ref = format!("HEAD:refs/heads/{}", descendant_branch);
+        self.run_git(&["push", "origin", &push_ref], cancel).await?;
 
         self.run_git(&["rev-parse", "HEAD"], cancel).await
     }
@@ -2707,6 +3047,8 @@ impl GitOperations {
     /// Run a git command without cancellation support (for cleanup operations).
     async fn run_git_uncancellable(&self, args: &[&str]) -> Result<String> {
         let output = Command::new("git")
+            .args(&["-c", &format!("user.signingkey={}", self.signing_key)])
+            .args(&["-c", "commit.gpgsign=true"])
             .args(args)
             .current_dir(&self.workdir)
             .env("GIT_COMMITTER_NAME", "merge-train[bot]")
@@ -2727,6 +3069,8 @@ impl GitOperations {
     /// If the token is cancelled, the child process is killed and Err(Cancelled) is returned.
     async fn run_git(&self, args: &[&str], cancel: &CancellationToken) -> Result<String> {
         let mut child = Command::new("git")
+            .args(&["-c", &format!("user.signingkey={}", self.signing_key)])
+            .args(&["-c", "commit.gpgsign=true"])
             .args(args)
             .current_dir(&self.workdir)
             .env("GIT_COMMITTER_NAME", "merge-train[bot]")
@@ -2780,20 +3124,49 @@ Each stack gets its own isolated git worktree, enabling true stack isolation for
 - No partial merge state leaks between stacks
 - Each stack can have its own checked-out branch
 
+**Worktree lifecycle:**
+
+Worktrees are keyed by the **original** root PR number (the PR that received `@merge-train start`), not the current root. This provides a stable identifier throughout the cascade:
+
+1. **Creation**: When `@merge-train start` is issued on PR #123, create `stack-123/`
+2. **During cascade**: As the cascade advances (#123 merges, #124 becomes new root), continue using `stack-123/`
+3. **Completion**: When the final PR in the stack merges, remove `stack-123/`
+4. **Stop**: When `@merge-train stop` is issued, remove the worktree immediately
+
+For **fan-out**, when PR #123 has multiple descendants (#124, #125):
+1. Original worktree `stack-123/` is used until #123 merges
+2. After #123 merges, #124 and #125 become independent roots
+3. **Remove `stack-123/` FIRST** (before creating new worktrees)
+4. Create new worktrees `stack-124/` and `stack-125/` for each
+
+**Critical ordering**: The old worktree must be removed before creating new worktrees. Although we use detached HEAD mode (avoiding branch locking), removing the old worktree first ensures:
+- No risk of stale worktree references causing git errors
+- Clean state for the new independent trains
+- Prevents accumulation of worktrees during rapid fan-out cascades
+
+This ensures worktrees are cleaned up promptly rather than waiting for the 24-hour timeout.
+
 **Implementation:**
 
 ```rust
 impl GitOperations {
     /// Get or create a worktree for a stack. Called before cascade operations.
+    ///
+    /// Worktrees are created in detached HEAD mode to avoid git's restriction that
+    /// a branch can only be checked out in one worktree at a time. Operations within
+    /// the worktree use `git checkout --detach origin/<branch>` and push with
+    /// `git push origin HEAD:refs/heads/<branch>`.
     async fn worktree_for_stack(&self, root_pr: PrNumber) -> Result<PathBuf> {
         let worktree_path = self.base_dir
             .join("worktrees")
             .join(format!("stack-{}", root_pr.0));
 
         if !worktree_path.exists() {
-            // Create worktree from the shared clone
+            // Create worktree from the shared clone in detached HEAD mode.
+            // Using --detach ensures no branch is "checked out" in this worktree,
+            // avoiding conflicts with other worktrees or the main clone.
             self.run_git_uncancellable(&[
-                "worktree", "add",
+                "worktree", "add", "--detach",
                 worktree_path.to_str().unwrap(),
                 "HEAD",
             ]).await?;
@@ -3008,6 +3381,115 @@ max_prs_in_snapshot = 1000  # or env: MERGE_TRAIN_MAX_PRS_IN_SNAPSHOT
 # Worktree cleanup: remove worktrees older than this on startup
 worktree_max_age_hours = 24  # or env: MERGE_TRAIN_WORKTREE_MAX_AGE_HOURS
 ```
+
+---
+
+## Testing
+
+### Crash-injection testing
+
+The durability and recovery guarantees documented above must be verified with crash-injection tests. Without these tests, subtle bugs in fsync ordering, event log format, or recovery logic could cause data corruption or duplicate operations in production.
+
+**Commit point boundaries**: Inject crashes (simulated process kill or SIGKILL) at each of these points:
+
+| Phase | Crash point | Expected recovery behavior |
+|-------|-------------|---------------------------|
+| Intent fsync | After writing intent event, before external operation | Recovery sees intent, retries operation (must be idempotent or detectable) |
+| External operation | During git push or API call | Operation may or may not have completed; recovery must detect and handle both |
+| Done fsync | After external op succeeded, before writing completion event | Recovery sees intent without completion, verifies operation succeeded, writes completion |
+| Spool .done marker | After completion event, before marking webhook as processed | Webhook may replay; all state changes must be idempotent |
+| Generation rollover | During compaction (between any two fsyncs) | Either old or new generation must be complete and usable |
+
+**Required test assertions**:
+
+1. **Each PR squashed at most once**: After any crash/recovery sequence, verify the PR was merged exactly once (not zero, not twice). Use GitHub API to check merge status.
+
+2. **No silent branch divergence**: After recovery, verify that each descendant branch's tree matches what it would have been with no crash. Compute expected tree independently and compare.
+
+3. **Monotonic progress**: After recovery, the `recovery_seq` must be >= what it was before the crash. State should not "rewind" to an earlier phase.
+
+4. **Frozen descendants honored**: If crash occurs mid-preparation, recovery must use the frozen_descendants from the logged phase_transition, not re-query the (possibly changed) descendants index.
+
+5. **No orphaned worktrees**: After recovery, all worktrees must be either associated with an active train or cleaned up within the configured max_age.
+
+**Crash-injection test harness**:
+
+```rust
+/// Trait for injecting crashes at specific points
+trait CrashPoint {
+    /// Called before each fsync. If returns Err(Crash), the process "dies".
+    fn before_fsync(&self, ctx: &FsyncContext) -> Result<(), Crash>;
+
+    /// Called before each external operation (git push, API call)
+    fn before_external_op(&self, ctx: &OpContext) -> Result<(), Crash>;
+}
+
+/// Test harness that runs the full cascade with crash injection
+async fn test_crash_recovery(
+    scenario: CrashScenario,
+    crash_points: &[CrashPointConfig],
+) -> TestResult {
+    for crash_point in crash_points {
+        // 1. Set up initial state (stack of PRs, train started)
+        let initial_state = setup_test_scenario(&scenario).await;
+
+        // 2. Run cascade with crash injection enabled
+        let crash_injector = CrashInjector::new(crash_point);
+        let result = run_cascade_with_crashes(&crash_injector).await;
+
+        // 3. Simulate process restart
+        let recovered_state = restart_and_recover().await;
+
+        // 4. Verify assertions
+        assert_squashed_at_most_once(&initial_state, &recovered_state);
+        assert_no_branch_divergence(&initial_state, &recovered_state);
+        assert_monotonic_progress(&initial_state, &recovered_state);
+
+        // 5. Let cascade complete
+        let final_state = continue_cascade_to_completion().await;
+        assert_cascade_correct(&scenario, &final_state);
+    }
+}
+```
+
+**Minimum test matrix**:
+
+- Linear stack (main ← #1 ← #2 ← #3): Crash at each phase boundary
+- Fan-out (main ← #1 ← {#2, #3}): Crash during each descendant's preparation
+- Concurrent descendant addition: Crash after frozen_descendants logged but before squash
+- Power loss simulation: Kill -9 without clean shutdown
+- Partial fsync: Simulate fsync succeeding for file but not directory
+
+**Property-based testing**: Use property-based testing to generate arbitrary stack topologies and crash points:
+
+```rust
+proptest! {
+    #[test]
+    fn crash_recovery_preserves_invariants(
+        stack: StackTopology,
+        crash_points: Vec<CrashPoint>,
+    ) {
+        for crash_point in crash_points {
+            let result = run_crash_test(&stack, crash_point);
+            prop_assert!(result.squash_count <= 1);
+            prop_assert!(result.no_branch_divergence);
+            prop_assert!(result.recovery_seq_monotonic);
+        }
+    }
+}
+```
+
+### Integration testing with GitHub
+
+For end-to-end testing against real GitHub (or a GitHub Enterprise test instance):
+
+1. **Test repository setup**: Create a dedicated test repository with branch protection rules matching production
+2. **Automated stack creation**: Script that creates PRs in various topologies
+3. **Cascade verification**: After cascade completes, verify:
+   - All PRs are merged
+   - Commit history on main is correct (linear, squash commits only)
+   - No orphaned branches
+4. **Failure injection**: Use GitHub's rate limiting or a mock server to test API error handling
 
 ---
 
