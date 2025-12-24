@@ -175,11 +175,50 @@ If recovery finds `cascade_phase = "reconciling"` but `last_squash_sha` is null 
 1. Check if `predecessor_pr` is recorded (should be set during preparation)
 2. Fetch the predecessor PR from GitHub API
 3. If `state == "merged"`, extract `merge_commit_sha` — this is the squash SHA
-4. **If `merge_commit_sha` is null**: GitHub may not have propagated it yet. Retry with exponential backoff (100ms, 200ms, 400ms, up to 5 attempts). If still null after retries, log a warning and abort with a recoverable error.
+4. **If `merge_commit_sha` is null**: GitHub's API has eventual consistency — the merge may have succeeded but `merge_commit_sha` may not be populated yet. Retry with exponential backoff:
+   - Initial delay: 1 second
+   - Max delay: 30 seconds (cap)
+   - Max attempts: 10
+   - Total max wait: ~60 seconds
+
+   ```rust
+   async fn fetch_merge_commit_sha_with_retry(
+       github: &GitHubClient,
+       pr_number: PrNumber,
+   ) -> Result<Option<String>> {
+       let mut delay = Duration::from_secs(1);
+       let max_delay = Duration::from_secs(30);
+       let max_attempts = 10;
+
+       for attempt in 1..=max_attempts {
+           let pr = github.get_pr(pr_number).await?;
+           if let Some(sha) = pr.merge_commit_sha {
+               return Ok(Some(sha));
+           }
+           if attempt == max_attempts {
+               break;
+           }
+           tracing::info!(
+               pr = pr_number.0,
+               attempt,
+               delay_ms = delay.as_millis(),
+               "merge_commit_sha not yet available, retrying"
+           );
+           tokio::time::sleep(delay).await;
+           delay = std::cmp::min(delay * 2, max_delay);
+       }
+       Ok(None)
+   }
+   ```
+
+   If still null after all retries, log a warning and abort with a recoverable error. The user can retry recovery later.
+
 5. Continue reconciliation with the recovered SHA
 6. If predecessor is not merged, the squash didn't actually happen — revert to `squash_pending`
 
-This derives the squash SHA from GitHub rather than hard-failing, since the squash-merge is recorded in GitHub's PR state even if our local record was lost. The retry handles eventual consistency in GitHub's API.
+This derives the squash SHA from GitHub rather than hard-failing, since the squash-merge is recorded in GitHub's PR state even if our local record was lost.
+
+**Why 60 seconds total?** GitHub's API typically propagates `merge_commit_sha` within a few seconds, but under heavy load or during incidents, propagation can take 10-30 seconds. A 60-second total wait covers the vast majority of cases without making recovery unacceptably slow. The exponential backoff (1s, 2s, 4s, 8s, 16s, 30s, 30s...) front-loads fast retries for the common case while backing off for edge cases.
 
 **GitHub-based recovery**: If the local state files are missing or corrupted, the bot can recover train state from GitHub during bootstrap by scanning for status comments on open root PRs. The status comment contains the full `TrainRecord` as machine-readable JSON, enabling precise recovery without inference. See "Status comments" below.
 
@@ -264,15 +303,29 @@ Only the current generation's files are active; older generations are deleted af
 
 **Webhook spool lifecycle:**
 
-The spool is a durable queue, not just a transient buffer. Deliveries progress through states:
+The spool is a durable queue, not just a transient buffer. Deliveries progress through states using **separate marker files** (not renames):
 
 ```
-<delivery-id>.json       → pending (just received)
-<delivery-id>.json.proc  → processing (worker claimed it)
-<delivery-id>.json.done  → processed (state effects durably persisted)
+<delivery-id>.json       → pending (just received, contains payload)
+<delivery-id>.json.proc  → processing (empty marker: worker claimed it)
+<delivery-id>.json.done  → processed (empty marker: state effects durably persisted)
 ```
 
-A delivery is only deleted (GC'd) after its `.done` marker exists AND a grace period (e.g., 1 hour) has passed. This allows debugging of recently processed events.
+**File semantics:**
+- `.json` file: Contains the actual webhook payload (headers + body). Created atomically via temp file + rename + fsync + directory fsync.
+- `.json.proc` marker: Empty file indicating a worker is processing this delivery. Created atomically. If present without `.done`, the processing was interrupted.
+- `.json.done` marker: Empty file indicating the delivery's state effects are durably persisted. Created atomically after fsync of the event log.
+
+**Why separate marker files instead of renaming the payload file:**
+1. **Crash atomicity**: Creating an empty file is simpler to make atomic than renaming a file while preserving its content.
+2. **Debugging**: The original `.json` payload remains readable even after processing, aiding diagnosis.
+3. **No content loss risk**: A crash during rename could corrupt the payload; marker files avoid this.
+
+**Cleanup/GC**: A delivery is deleted after BOTH:
+1. Its `.done` marker exists, AND
+2. A grace period (default: 1 hour) has passed
+
+This allows debugging of recently processed events.
 
 **Dedupe strategy:** Deliveries are deduped by multiple stable identifiers, not just `X-GitHub-Delivery`:
 - For `issue_comment.created` events: `(PR number, comment ID, "created")` — a comment can only be created once
@@ -533,7 +586,9 @@ pub struct RepoState {
     /// Reverse index: predecessor → descendants
     descendants: HashMap<PrNumber, HashSet<PrNumber>>,
 
-    /// Active trains, keyed by root PR number
+    /// Active trains, keyed by original_root_pr (the PR that received @merge-train start).
+    /// This key is STABLE throughout the cascade — it doesn't change as PRs merge.
+    /// Use TrainRecord.current_pr to find which PR is currently being processed.
     active_trains: HashMap<PrNumber, TrainRecord>,
 
     /// Filesystem path for this repo's state file
@@ -932,25 +987,41 @@ The HTTP handler:
 Each per-repo worker loop:
 1. Ensures repo state is loaded/bootstrapped from disk (or re-syncs from GitHub if needed)
 2. Drains the per-repo disk spool:
-   a. First, reclaim any `.json.proc` files (rename back to `.json`) — these are deliveries that were being processed when a crash occurred
-   b. Then replay any `.json` files without corresponding `.done` markers
+   a. First, clean up interrupted processing: delete any `.json.proc` markers without corresponding `.done` markers — these are deliveries that were being processed when a crash occurred, and need to be reprocessed
+   b. Then replay any `.json` files without corresponding `.done` markers (parse and enqueue)
 3. Pulls the highest-priority event from its queue
-4. Renames delivery file to `.json.proc` (claiming it for processing)
+4. Creates `.json.proc` marker for the delivery (claiming it for processing)
 5. Applies incremental state update from the event
 6. Appends event to log
 7. If event is recovery-critical:
    a. fsync the log immediately
-   b. Create `.done` marker for the delivery
+   b. Create `.done` marker for the delivery (empty file, created atomically)
    c. fsync the spool directory (required — without this, the `.done` marker may not survive power loss, causing replay of an already-processed event)
+   d. Delete the `.json.proc` marker (optional, for cleanliness)
 8. If event uses batched fsync:
    a. Add delivery ID to pending batch set
    b. On next batch fsync (or before any irreversible operation), fsync the log
    c. Create `.done` markers for all deliveries in the pending batch
    d. fsync the spool directory once (after all `.done` files are created)
-   e. Clear the pending batch set
+   e. Delete `.json.proc` markers for all deliveries in the batch (optional)
+   f. Clear the pending batch set
 9. Evaluates cascade actions based on updated state
 10. On cascade phase transitions or irreversible operations, flush pending batch first
 11. Loops (or shuts down after idle timeout)
+
+**Marker file atomicity:**
+```rust
+// Creating a marker file atomically
+fn create_marker(path: &Path) -> io::Result<()> {
+    // Create marker with a unique temp name first
+    let temp = path.with_extension("tmp");
+    File::create(&temp)?;
+    temp.sync_all()?;  // fsync the (empty) file
+    std::fs::rename(&temp, path)?;  // atomic rename
+    // Directory fsync happens separately after all markers in batch
+    Ok(())
+}
+```
 
 **Critical invariant:** A delivery's `.done` marker is only created after all state effects from that delivery are durably persisted (fsynced). This ensures that on restart, unprocessed deliveries are replayed correctly. For batched events, `.done` is deferred until the batch fsync completes.
 
@@ -1007,10 +1078,12 @@ Webhooks are the primary trigger for cascade evaluation, but they're not suffici
 
 To ensure progress even when webhooks fail, the bot polls active trains periodically as a fallback.
 
-**Polling frequency**: Once per hour per active train (configurable). This is infrequent because:
+**Polling frequency**: Once per 10 minutes per active train (configurable via `MERGE_TRAIN_POLL_INTERVAL_MINS`, default 10). This is relatively infrequent because:
 - Webhook failures are rare
 - Polling is expensive (requires API calls to refresh merge state)
-- The failure mode is "cascade stalls" not "cascade breaks" — low urgency
+- The failure mode is "cascade stalls" not "cascade breaks"
+
+The 10-minute default balances responsiveness (not waiting an hour for a missed webhook) against API cost. For high-traffic installations, increase this; for critical workflows, decrease it.
 
 **Implementation**: The periodic sync timer (which already exists for re-sync) also injects `PollActiveTrains` events:
 
@@ -1059,20 +1132,57 @@ On restart, the bot:
 
 **Worktree cleanup on restart:**
 
-If the process dies mid-git operation, worktrees may be left in a dirty state (in-progress merge, uncommitted changes). On restart, for each active train's worktree:
+If the process dies mid-git operation, worktrees may be left in a dirty state (in-progress merge, uncommitted changes). Since worktrees use **detached HEAD mode** (not checked-out branches), and branches may be deleted after PR merge, the cleanup approach must not rely on `origin/<branch>` being available.
 
-```bash
-# Abort any in-progress merge
-git merge --abort 2>/dev/null || true
+**Cleanup strategy:**
 
-# Reset to remote tracking branch (discards local changes)
-git reset --hard origin/<branch>
+```rust
+async fn cleanup_worktree_on_restart(
+    worktree_path: &Path,
+    train_state: &TrainRecord,
+    ctx: &AppContext,
+) -> Result<()> {
+    // First, try to abort any in-progress merge
+    run_git_in_worktree(worktree_path, &["merge", "--abort"]).await.ok();
 
-# Remove untracked files
-git clean -fd
+    // Try to clean up uncommitted changes
+    let cleanup_result = run_git_in_worktree(worktree_path, &["reset", "--hard"]).await
+        .and_then(|_| run_git_in_worktree(worktree_path, &["clean", "-fd"]).await);
+
+    match cleanup_result {
+        Ok(_) => {
+            // Worktree is clean, but we're in detached HEAD at an unknown commit.
+            // The recovery logic will fetch and checkout the appropriate ref.
+            Ok(())
+        }
+        Err(_) => {
+            // Worktree is too corrupted — delete and recreate
+            tracing::warn!(
+                ?worktree_path,
+                train_root = train_state.original_root_pr.0,
+                "worktree corrupted, deleting and recreating"
+            );
+            delete_worktree(worktree_path).await?;
+            // Worktree will be recreated on first cascade operation
+            Ok(())
+        }
+    }
+}
 ```
 
-If the worktree is too corrupted to clean, delete and recreate it.
+**Why not `git reset --hard origin/<branch>`:**
+1. **Detached HEAD**: Worktrees use detached HEAD mode to avoid branch locking issues across multiple worktrees.
+2. **Branch deletion**: After a PR merges, GitHub may delete the branch (if "delete branch on merge" is enabled).
+3. **Unknown state**: On restart, we don't know which branch the worktree was working on — the recovery logic determines this from the `TrainRecord`.
+
+**Recovery flow after cleanup:**
+1. Worktree cleanup just ensures no uncommitted changes or in-progress merges
+2. Recovery logic (see `recover_in_progress_trains`) determines what state we need
+3. Recovery fetches the appropriate refs (via `refs/pull/<n>/head` which is always available)
+4. Recovery checks out and resumes from the correct point
+
+**Fallback — delete and recreate:**
+If a worktree is too corrupted to clean (e.g., `.git` file corrupted, missing index), the safest approach is to delete and recreate it. Since worktrees don't contain any state that isn't recoverable from the remote and the `TrainRecord`, this is always safe.
 
 **Operational requirement**: `state_dir` must be on persistent storage. If `state_dir` is lost or corrupted, in-progress trains can be recovered from GitHub status comments (slower, but works).
 
@@ -1160,38 +1270,37 @@ The cascade proceeds by repeating the following for each PR, starting from the r
 ```
 For PR #N with descendants {#D1, #D2, ...} (may be one or multiple):
 
-1. PREPARATION: For EACH descendant, bring it up to date with both #N and main
-   a. Merge #N's head commit into descendant's branch (regular merge)
-      → Local git: git merge <N.head_sha>
-      → Ensures descendant has all of #N's final content
-   b. Merge main into descendant's branch (regular merge)
-      → Local git: git merge origin/main
-      → Ensures descendant has any independent changes that landed on main
-   → Both merges signed by bot
+1. PREPARATION: For EACH descendant, merge predecessor head ONLY (NOT main!)
+   → Local git: git merge <N.head_sha>
+   → Ensures descendant has all of #N's final content
+   → Signed by bot
    → Push to origin
    → Must happen BEFORE squash-merging #N
    → Loop over ALL descendants before proceeding to step 2
 
+   CRITICAL: Do NOT merge main here! See "Why merging $SQUASH_SHA^ is essential" below.
+   Merging main before we know the squash SHA causes lost commits.
+
 2. SQUASH: Squash-merge #N into main
    → GitHub API, signed by GitHub
-   → Record #N's head.sha for use in future recovery scenarios
+   → Returns squash_commit_sha (the commit on main)
 
-3. RECONCILIATION: For EACH descendant, relate its branch with the squash commit
-   → Local git: git merge <squash_commit_sha> --strategy ours
-   → Uses the specific squash commit hash returned by step 2, NOT origin/main
-   → Signed by bot
-   → Adds the squash commit as a parent without changing tree content
+3. RECONCILIATION: For EACH descendant, incorporate the squash into history
+   a. Merge $SQUASH_SHA^ (parent of squash = main state just before squash)
+      → Local git: git merge <squash_commit_sha>^
+      → Incorporates all main content up to (but not including) the squash
+   b. Ours-merge the squash commit itself
+      → Local git: git merge <squash_commit_sha> --strategy ours
+      → Marks squash as ancestor without changing tree (which already has the content)
+   → Both merges signed by bot
    → Push to origin
 
 4. CATCH-UP: For EACH descendant, merge any subsequent main commits
    → Local git: git merge origin/main
-   → Regular merge (not ours) to properly incorporate any commits that landed on main
-     after the squash commit (from other PRs, hotfixes, etc.)
+   → Regular merge (not ours) to incorporate commits that landed AFTER the squash
    → If main hasn't advanced past the squash commit, this is a no-op
-   → **If merge conflicts**: This is a genuine conflict between descendant's work and
-     new commits on main. Abort with specific error: "Conflict with commits on main
-     that landed after the squash. Manual resolution required." This is distinct from
-     cascade-specific failures — the descendant genuinely conflicts with new main content.
+   → **If merge conflicts**: Genuine conflict between descendant's work and new main content.
+     Abort with specific error: "Conflict with commits on main that landed after the squash."
    → Push to origin
 
 5. RETARGET: For EACH descendant, update base branch to main
@@ -1216,7 +1325,7 @@ For the final PR in the stack (#125), there is no descendant, so steps 1, 3-5 ar
 **Invariant**: The descendant set for PR #N is frozen at the moment we begin preparing descendants for #N's squash. Any new PRs that declare #N as their predecessor after this point are **not** included in the current cascade step for #N.
 
 **Why this matters**: Preparation must happen for ALL descendants BEFORE squashing #N (step 1 completes entirely before step 2). If a new descendant appears after preparation started but before the squash, that descendant:
-- Would not have been prepared (no merge of #N's head or main)
+- Would not have been prepared (no merge of #N's head)
 - Would break after the squash (its base becomes invalid)
 
 **Freeze point and logging**: When entering the `Preparing` phase for PR #N:
@@ -1226,12 +1335,87 @@ For the final PR in the stack (#125), there is no descendant, so steps 1, 3-5 ar
 4. New descendants that arrive after the phase_transition event will be handled in the NEXT cascade step (when #N's successor becomes the current root)
 
 **Late additions recovery**: If a new PR declares #N as predecessor after #N has already merged:
-1. The new PR is discovered when the cascade reaches #N's former position (now an independent root or the next train root)
-2. Its predecessor (#N) is already merged, so the bot:
-   - Fetches #N's final head via `refs/pull/{N}/head`
-   - Fetches the squash commit SHA from #N's merge_commit_sha
-   - Performs the full prepare/reconcile sequence for the late arrival
-3. This works because GitHub maintains PR refs even after merge
+
+The late descendant's `base_ref` still points to #N's branch (not the default branch), so `is_root()` returns false and `compute_stacks()` won't discover it. This requires explicit detection:
+
+**Detection trigger**: When processing a `predecessor_declared` event:
+1. Look up the predecessor PR from the cache
+2. If predecessor is `Merged`, this is a late addition — trigger immediate reconciliation
+
+**Late addition reconciliation flow**:
+
+**IMPORTANT**: Late additions require a DIFFERENT flow than normal cascading!
+- In normal cascading, we prepare BEFORE squash (merge predecessor head only)
+- For late additions, the predecessor is ALREADY merged, so we go directly to reconciliation
+- We cannot use `prepare_descendant` because that's for pre-squash preparation
+
+```rust
+async fn handle_late_addition(
+    late_pr: PrNumber,
+    late_pr_branch: &str,
+    merged_predecessor: PrNumber,
+    default_branch: &str,
+    git: &GitOperations,
+    github: &GitHubClient,
+) -> Result<()> {
+    // 1. Fetch predecessor's final head via GitHub's PR ref
+    let pr_ref = format!("refs/pull/{}/head", merged_predecessor.0);
+    git.fetch_ref(&pr_ref).await?;
+
+    // 2. Get the squash commit SHA from the merged PR
+    let pred_pr = github.get_pr(merged_predecessor).await?;
+    let squash_sha = pred_pr.merge_commit_sha
+        .ok_or(Error::MissingMergeCommitSha)?;
+
+    // 3. Fetch and checkout the late PR branch
+    git.fetch_and_checkout_detached(late_pr_branch).await?;
+
+    // 4. Merge predecessor's final head (what they had just before merge)
+    // This is analogous to normal preparation, but we already have the squash SHA
+    let pred_head_ref = format!("origin/pr/{}", merged_predecessor.0);
+    git.merge(&pred_head_ref, "Merge predecessor head (late addition)").await?;
+
+    // 5. Reconcile using the same logic as normal cascading:
+    //    - Merge $SQUASH_SHA^ (parent of squash)
+    //    - ours-merge $SQUASH_SHA
+    //    - Merge origin/main (catch-up)
+    //
+    // We can reuse reconcile_descendant because it does exactly this.
+    git.reconcile_descendant(late_pr_branch, &squash_sha, default_branch).await?;
+
+    // 6. Retarget the PR to the default branch
+    github.update_pr_base(late_pr, default_branch).await?;
+
+    // 7. Now the PR has base_ref == default_branch, so is_root() will return true
+    Ok(())
+}
+```
+
+**Why this is different from normal flow**:
+- Normal flow: prepare (merge predecessor head only) → squash → reconcile (merge $SHA^, ours-merge $SHA, catch-up)
+- Late addition: predecessor already squashed, so we do: merge predecessor head → reconcile (merge $SHA^, ours-merge $SHA, catch-up)
+
+The key insight is that `reconcile_descendant` already does the correct ours-merge dance, so we can reuse it. We just need to first merge the predecessor's head (which prepare_descendant would have done before the squash).
+
+**Polling fallback**: During `PollActiveTrains`, also scan for "orphaned" PRs:
+```rust
+// Find PRs whose predecessor is merged but base_ref != default_branch
+for pr in repo_state.prs.values() {
+    if pr.state != PrState::Open { continue; }
+    if pr.base_ref == repo_state.default_branch { continue; }
+
+    if let Some(pred) = pr.predecessor {
+        if let Some(pred_pr) = repo_state.prs.get(&pred) {
+            if matches!(pred_pr.state, PrState::Merged { .. }) {
+                // Late addition detected — trigger reconciliation
+                handle_late_addition(pr.number, pred, repo_state, ctx).await?;
+            }
+        }
+    }
+}
+```
+
+This ensures late additions are handled promptly (on predecessor_declared) and caught during polling if the event was missed. After reconciliation and retargeting, `is_root()` returns true and the PR joins normal cascade processing.
 
 **Event log format for frozen descendants**:
 ```json
@@ -1267,6 +1451,7 @@ If the bot crashes:
 | git push (preparation) | `intent_push_prep` (with `pre_push_sha`, `expected_tree`) | `done_push_prep` | Compare tree SHA + verify parent chain (see below) |
 | Squash-merge | `intent_squash` | `squash_committed` | Check if PR is already merged via API |
 | git push (reconciliation) | `intent_push_reconcile` (with `pre_push_sha`, `expected_tree`) | `done_push_reconcile` | Compare tree SHA + verify parent chain (see below) |
+| git push (catch-up) | `intent_push_catchup` (with `pre_push_sha`, `expected_tree`) | `done_push_catchup` | Compare tree SHA + verify parent chain (see below) |
 | Retarget PR | `intent_retarget` | `done_retarget` | Check if PR base already equals target |
 
 **Git push idempotency details:**
@@ -1289,31 +1474,99 @@ The tree SHA is deterministic (same file content = same tree), so it serves as a
 
 The `cascade_phase` transitions map to these commit points:
 
-- `idle` → `preparing`: Write `phase_transition{preparing}` + fsync before starting preparation
-- `preparing` → `squash_pending`: Write `phase_transition{squash_pending}` + fsync after all prep pushes complete
-- `squash_pending` → `reconciling`: Write `squash_committed{sha}` + fsync **immediately after** receiving squash SHA from API
-- `reconciling` → `idle`: Write `phase_transition{idle}` + fsync after all reconciliation pushes and retargets complete
+- `idle` → `preparing`: Write `phase_transition{Preparing{...}}` + fsync before starting preparation
+- `preparing` → `squash_pending`: Write `phase_transition{SquashPending{...}}` + fsync after all prep pushes complete
+- `squash_pending` → `reconciling`: Write `squash_committed{sha}` + `phase_transition{Reconciling{...}}` + fsync **immediately after** receiving squash SHA from API
+- `reconciling` → `catching_up`: Write `phase_transition{CatchingUp{...}}` + fsync after all ours-merge pushes complete
+- `catching_up` → `retargeting`: Write `phase_transition{Retargeting{...}}` + fsync after all catch-up pushes complete
+- `retargeting` → `idle`: Write `phase_transition{Idle}` + fsync after all retarget API calls complete
+
+**Per-phase intent/done events:**
+
+Each phase that performs irreversible operations uses intent/done pairs:
+
+| Phase | Intent event | Done event | Per-descendant? |
+|-------|--------------|------------|-----------------|
+| Preparing | `intent_push_prep` | `done_push_prep` | Yes |
+| Reconciling | `intent_push_reconcile` | `done_push_reconcile` | Yes |
+| CatchingUp | `intent_push_catchup` | `done_push_catchup` | Yes |
+| Retargeting | `intent_retarget` | `done_retarget` | Yes |
+
+Each descendant in the `frozen_descendants` set requires its own intent/done cycle. The `completed` vector in each phase tracks which descendants have finished, enabling crash recovery to skip already-completed work.
 
 **Critical invariant:** The `squash_committed` event with the squash SHA must be durably recorded before any reconciliation pushes occur. If the bot crashes after squash but before recording the SHA, it must re-fetch the SHA from GitHub (PR's `merge_commit_sha` field).
 
-**Why step 1b is essential**: If main has independent changes (commits that landed outside this stack), the descendant must incorporate them before the ours-strategy merge. Otherwise, squash-merging the descendant would compute a diff against main that effectively reverts those independent changes.
+**Critical invariant:** The `frozen_descendants` set must be carried through all phases (SquashPending, Reconciling, CatchingUp, Retargeting). Recovery must use this set, not re-query `repo_state.descendants`, which may have changed during spool replay.
+
+### Expected state tracking
+
+Rather than pre-validating state before each operation (which creates TOCTOU bugs), we track what we *expect* to be true after each operation. When reality diverges from expectations, we diagnose and handle the divergence at the point of failure.
+
+**Philosophy**: Attempt the operation, handle failure gracefully. Since we never force-push, we cannot silently clobber human changes — at worst, our push fails with "non-fast-forward", which is loud and recoverable.
+
+**What we track**:
+
+| After operation | Expected state | Stored in |
+|-----------------|----------------|-----------|
+| Preparation push | Branch X has tree Y, parent chain includes pre-push SHA | `intent_push_prep.expected_tree`, `intent_push_prep.pre_push_sha` |
+| Squash-merge | PR is merged, merge_commit_sha is set | `squash_committed.sha` |
+| Reconciliation push | Branch X has tree Z, parent chain includes squash SHA | `intent_push_reconcile.expected_tree` |
+| Catch-up push | Branch X has tree W, parent chain includes origin/main | `intent_push_catchup.expected_tree` |
+| Retarget | PR base_ref equals default_branch | Verified via API after `done_retarget` |
+
+**Diagnosing divergence**:
+
+When an operation fails or state doesn't match expectations:
+
+1. **Push fails non-fast-forward**: Someone pushed to the branch since we last fetched.
+   - Fetch the new remote state
+   - If the remote tree matches our expected tree: someone pushed the same content (rare but possible) — treat as success
+   - If the remote tree differs: genuine conflict — abort with clear error: "Branch was modified during cascade. Remote has tree X, we expected Y."
+
+2. **PR already merged when we try to squash**: Either we crashed after squashing (recovery case) or a human merged it manually.
+   - If `merge_commit_sha` matches our expected flow: treat as success, continue to reconciliation
+   - If `merge_commit_sha` differs or merge method wasn't squash: abort with error: "PR was merged outside the cascade."
+
+3. **Descendant PR closed/deleted when we try to prepare/reconcile**: Human intervention.
+   - Skip this descendant with a warning: "Descendant #N was closed during cascade, skipping."
+   - Continue with remaining descendants in `frozen_descendants`
+   - If ALL descendants are gone, the cascade completes (nothing left to process)
+
+4. **Branch deleted when we try to push**: PR was closed and branch auto-deleted.
+   - Same handling as "descendant closed" — skip with warning
+
+**Why not pre-validate**: Checking "is this PR still open?" before preparing it is useless — it could close between the check and the operation. By handling failure at the operation site, we get:
+- Simpler code (no duplicated state checks)
+- Correct handling of races (the operation itself is the authoritative check)
+- Clear diagnostics (we know exactly what failed and why)
+
+**Frozen descendants and failure handling**: When a descendant in `frozen_descendants` fails (closed, branch deleted, etc.), we:
+1. Log the failure clearly
+2. Remove it from the working set for subsequent phases (but keep it in `frozen_descendants` for the record)
+3. Continue with remaining descendants
+
+This means `completed` tracks "successfully processed" and we implicitly have "failed/skipped" = `frozen_descendants - completed - remaining`. On recovery, we attempt remaining descendants again (they might have been transiently unavailable).
+
+**Why merging $SQUASH_SHA^ is essential**: If main has independent changes (commits that landed outside this stack), the descendant must incorporate them. This happens in reconciliation by merging `$SQUASH_SHA^` (the parent of the squash commit, i.e., main immediately before the squash). The ours-merge then marks the squash commit as an ancestor without changing the tree (which already has all pre-squash content).
+
+**CRITICAL**: We do NOT merge main during preparation (before squash). See `reconcile_descendant` for why this ordering prevents lost commits.
 
 **Example timeline for main ← #123 ← #124 ← #125 (linear):**
 
 ```
-1.  Merge #123's head SHA into #124 (preparation 1a)
-2.  Merge main into #124 (preparation 1b)
-3.  Squash-merge #123 into main → returns squash_sha_123
-4.  Merge squash_sha_123 into #124 (ours strategy, reconciliation)
-5.  Merge origin/main into #124 (catch-up, regular merge)
+1.  Merge #123's head SHA into #124 (preparation — predecessor head only, NOT main)
+2.  Squash-merge #123 into main → returns squash_sha_123
+3.  Merge squash_sha_123^ into #124 (parent of squash = pre-squash main)
+4.  Merge squash_sha_123 into #124 (ours strategy — marks as merged)
+5.  Merge origin/main into #124 (catch-up for anything after squash)
 6.  Retarget #124 to main
 7.  Wait for #124 CI...
     [webhook fires when CI passes]
-8.  Merge #124's head SHA into #125 (preparation 1a)
-9.  Merge main into #125 (preparation 1b)
-10. Squash-merge #124 into main → returns squash_sha_124
-11. Merge squash_sha_124 into #125 (ours strategy, reconciliation)
-12. Merge origin/main into #125 (catch-up, regular merge)
+8.  Merge #124's head SHA into #125 (preparation — predecessor head only)
+9.  Squash-merge #124 into main → returns squash_sha_124
+10. Merge squash_sha_124^ into #125 (parent of squash)
+11. Merge squash_sha_124 into #125 (ours strategy)
+12. Merge origin/main into #125 (catch-up)
 13. Retarget #125 to main
 14. Wait for #125 CI...
     [webhook fires when CI passes]
@@ -1324,15 +1577,15 @@ The `cascade_phase` transitions map to these commit points:
 **Example timeline for main ← #123 ← {#124, #125} (fan-out):**
 
 ```
-1.  Merge #123's head SHA into #124 (preparation 1a for first descendant)
-2.  Merge main into #124 (preparation 1b for first descendant)
-3.  Merge #123's head SHA into #125 (preparation 1a for second descendant)
-4.  Merge main into #125 (preparation 1b for second descendant)
-5.  Squash-merge #123 into main → returns squash_sha_123
-6.  Merge squash_sha_123 into #124 (ours strategy, reconciliation)
-7.  Merge origin/main into #124 (catch-up)
-8.  Retarget #124 to main
-9.  Merge squash_sha_123 into #125 (ours strategy, reconciliation)
+1.  Merge #123's head SHA into #124 (preparation for first descendant)
+2.  Merge #123's head SHA into #125 (preparation for second descendant)
+3.  Squash-merge #123 into main → returns squash_sha_123
+4.  Merge squash_sha_123^ into #124 (parent of squash)
+5.  Merge squash_sha_123 into #124 (ours strategy)
+6.  Merge origin/main into #124 (catch-up)
+7.  Retarget #124 to main
+8.  Merge squash_sha_123^ into #125 (parent of squash)
+9.  Merge squash_sha_123 into #125 (ours strategy)
 10. Merge origin/main into #125 (catch-up)
 11. Retarget #125 to main
     [#124 and #125 are now independent roots — cascade returns Complete]
@@ -1407,7 +1660,7 @@ This means "fix the CI and push" is sufficient to resume — no manual re-trigge
 | Operation | Endpoint | Method |
 |-----------|----------|--------|
 | Get repo metadata | `/repos/{o}/{r}` | GET |
-| Squash-merge PR | `/repos/{o}/{r}/pulls/{n}/merge` | POST |
+| Squash-merge PR | `/repos/{o}/{r}/pulls/{n}/merge` | PUT |
 | Retarget PR base | `/repos/{o}/{r}/pulls/{n}` | PATCH |
 | Get PR details | `/repos/{o}/{r}/pulls/{n}` | GET |
 | List open PRs | `/repos/{o}/{r}/pulls` | GET |
@@ -1420,6 +1673,64 @@ This means "fix the CI and push" is sufficient to resume — no manual re-trigge
 The "Get repo metadata" endpoint returns `default_branch` which is used throughout the cascade logic.
 
 The "Update comment" endpoint is used to update status comments (which contain machine-readable JSON for disaster recovery — see "Status comments" section).
+
+**Squash-merge with SHA guard (CRITICAL)**:
+
+When calling the merge endpoint, **always** pass the expected head SHA:
+
+```json
+POST /repos/{o}/{r}/pulls/{n}/merge
+{
+  "merge_method": "squash",
+  "sha": "<expected_head_sha>"
+}
+```
+
+The `sha` parameter is a **race condition guard**. GitHub will reject the merge with HTTP 409 if the PR's head SHA doesn't match. This prevents:
+
+1. **Merging unreviewed commits**: If someone pushes to the PR branch after we evaluated readiness (CI passed, approvals obtained), without the SHA guard we'd merge those new commits without review.
+
+2. **TOCTOU bugs**: Between "check if ready" and "merge", the PR state can change. The SHA guard makes the operation atomic.
+
+```rust
+async fn squash_merge(
+    &self,
+    pr_number: PrNumber,
+    expected_head_sha: &str,
+) -> Result<String> {
+    let response = self.client
+        .put(format!("/repos/{}/{}/pulls/{}/merge", owner, repo, pr_number.0))
+        .json(&json!({
+            "merge_method": "squash",
+            "sha": expected_head_sha,  // CRITICAL: prevents merging unreviewed commits
+        }))
+        .send()
+        .await?;
+
+    match response.status() {
+        StatusCode::OK => {
+            let body: MergeResponse = response.json().await?;
+            Ok(body.sha)  // This is the squash commit SHA
+        }
+        StatusCode::CONFLICT => {
+            // PR head changed since we checked — abort and re-evaluate
+            Err(Error::HeadShaChanged)
+        }
+        StatusCode::METHOD_NOT_ALLOWED => {
+            // PR is not mergeable (conflicts, branch protection, etc.)
+            Err(Error::NotMergeable)
+        }
+        _ => Err(Error::ApiError(response.status())),
+    }
+}
+```
+
+**Handling 409 Conflict**: If the merge returns 409, the bot should:
+1. Log the SHA mismatch
+2. Abort the current cascade step
+3. Re-fetch the PR state and re-evaluate readiness
+4. If still ready with the new head SHA, retry (the new commits may have been benign)
+5. If no longer ready (CI failing, reviews dismissed), wait for the appropriate webhook
 
 **GraphQL for merge state**: The bot uses GitHub's GraphQL API to query `mergeStateStatus`, which encapsulates all branch protection checks (required status checks, required reviewers, etc.) into a single authoritative value:
 
@@ -1584,6 +1895,35 @@ enum MergeStateStatus {
 	// ─────────────────────────────────────────────────────────────
 	// Train state (persisted locally for restart recovery)
 	// ─────────────────────────────────────────────────────────────
+	//
+	// TRAIN IDENTITY MODEL:
+	//
+	// A train has TWO PR numbers that serve different purposes:
+	//
+	// 1. `original_root_pr`: The PR that received `@merge-train start`.
+	//    - STABLE throughout the cascade — never changes
+	//    - Used as the key in `active_trains` HashMap
+	//    - Used to name the worktree (`stack-<original_root_pr>/`)
+	//    - Used to look up the train when a stop command arrives
+	//
+	// 2. `current_pr`: The PR currently being processed.
+	//    - CHANGES as PRs merge and the cascade advances
+	//    - Initially equals `original_root_pr`
+	//    - After #123 merges, becomes #124 (its descendant)
+	//    - Used for merge operations, CI checks, status updates
+	//
+	// Example: Stack is main ← #123 ← #124 ← #125, user runs `@merge-train start` on #123
+	//   - original_root_pr = 123 (forever)
+	//   - current_pr = 123 → 124 → 125 as cascade advances
+	//   - active_trains key = 123 (forever)
+	//   - worktree path = stack-123/ (forever)
+	//
+	// FAN-OUT HANDLING:
+	// When #123 has multiple descendants (#124 and #125):
+	//   - Original train (original_root_pr=123) completes after #123 merges
+	//   - Two NEW trains are created: one with original_root_pr=124, one with original_root_pr=125
+	//   - Each gets its own worktree, its own entry in active_trains
+	//   - The old train (keyed by 123) is removed from active_trains
 
 	/// Train record stored in the local state file.
 	/// This is the authoritative source of truth for train state.
@@ -1634,26 +1974,59 @@ enum TrainState {
 	    /// new descendants that arrive mid-phase are NOT included (see "Descendant set freezing").
 	    Preparing {
 	        completed: Vec<PrNumber>,
+	        skipped: Vec<PrNumber>,
 	        frozen_descendants: Vec<PrNumber>,
 	    },
 	    /// Preparation complete, about to squash-merge
-	    SquashPending,
+	    SquashPending {
+	        /// Carried forward from Preparing for subsequent phases
+	        frozen_descendants: Vec<PrNumber>,
+	        /// Descendants that failed during preparation (won't be processed in later phases)
+	        skipped: Vec<PrNumber>,
+	    },
 	    /// Squash complete, performing ours-strategy merges into descendants
-	    Reconciling { completed: Vec<PrNumber> },
+	    Reconciling {
+	        completed: Vec<PrNumber>,
+	        skipped: Vec<PrNumber>,
+	        /// Carried forward from Preparing — recovery MUST use this, not repo_state.descendants
+	        frozen_descendants: Vec<PrNumber>,
+	    },
 	    /// Ours-merge complete, performing regular merge of origin/main (catch-up)
-	    CatchingUp { completed: Vec<PrNumber> },
+	    CatchingUp {
+	        completed: Vec<PrNumber>,
+	        skipped: Vec<PrNumber>,
+	        /// Carried forward from Preparing
+	        frozen_descendants: Vec<PrNumber>,
+	    },
 	    /// Catch-up complete, retargeting descendant PRs to default branch
-	    Retargeting { completed: Vec<PrNumber> },
+	    Retargeting {
+	        completed: Vec<PrNumber>,
+	        skipped: Vec<PrNumber>,
+	        /// Carried forward from Preparing
+	        frozen_descendants: Vec<PrNumber>,
+	    },
 	}
 
 	// The `completed` vectors track which descendants have finished each phase.
-	// On recovery, we skip descendants already in `completed` and resume with the rest.
-	// This ensures crash between processing descendant N and N+1 doesn't repeat N.
+	// The `skipped` vectors track descendants that failed (PR closed, branch deleted, etc.).
+	// On recovery, we process: frozen_descendants - completed - skipped.
+	// This ensures we don't endlessly retry failed descendants.
 	//
-	// The `frozen_descendants` in `Preparing` captures the exact descendant set at phase
-	// entry. Recovery uses this list rather than re-querying the descendants index,
-	// which might have changed. This ensures the invariant that ALL descendants present
-	// when we start preparing are prepared BEFORE the squash.
+	// CRITICAL: `frozen_descendants` is captured once in `Preparing` and carried through
+	// ALL subsequent phases. Recovery MUST use this list, NOT repo_state.descendants.
+	//
+	// Why this matters for correctness:
+	// 1. After restart, the bot replays the spool BEFORE performing recovery (see Restart safety)
+	// 2. During spool replay, new `predecessor_declared` events may add descendants
+	// 3. If recovery re-queried repo_state.descendants, it would see descendants that weren't
+	//    present when we entered the Preparing phase
+	// 4. Those new descendants never got step 1b (merge main before squash)
+	// 5. The ours-strategy merge in Reconciling would then fail to incorporate main commits
+	//    that landed between Preparing and Reconciling, potentially reverting them
+	//
+	// By carrying frozen_descendants through all phases, recovery always knows exactly which
+	// descendants were promised preparation and which still need reconciliation/catch-up/retarget.
+	// The `skipped` set ensures we don't retry descendants that permanently failed.
 
 #[derive(Serialize, Deserialize)]
 struct TrainError {
@@ -1665,14 +2038,17 @@ struct TrainError {
 	// Persisted repo state (stored on disk)
 	// ─────────────────────────────────────────────────────────────
 
-	/// JSON structure stored at `<state_dir>/<owner>/<repo>/snapshot.json`.
+	/// JSON structure stored at `<state_dir>/<owner>/<repo>/snapshot.<gen>.json`.
+	/// The `<gen>` suffix is the current generation number (see "Compaction" section).
 	#[derive(Serialize, Deserialize)]
 	struct PersistedRepoSnapshot {
 	    /// Schema version for forward-compatible migrations
 	    schema_version: u32,
 	    /// When this snapshot was last updated
 	    snapshot_at: String, // ISO 8601
-	    /// Byte offset in events.log at which this snapshot was taken.
+	    /// The generation number this snapshot belongs to (matches filename suffix)
+	    log_generation: u64,
+	    /// Byte offset in events.<log_generation>.log at which this snapshot was taken.
 	    /// On replay, seek to this offset and read forward.
 	    log_position: u64,
 	    /// Next sequence number to assign (monotonically increasing).
@@ -1789,6 +2165,17 @@ struct TrainError {
 	    },
 	    #[serde(rename = "done_push_reconcile")]
 	    DonePushReconcile { train_root: u64, branch: String },
+	    #[serde(rename = "intent_push_catchup")]
+	    IntentPushCatchup {
+	        train_root: u64,
+	        branch: String,
+	        /// Remote ref SHA before we push
+	        pre_push_sha: String,
+	        /// Expected tree SHA after catch-up merge
+	        expected_tree: String,
+	    },
+	    #[serde(rename = "done_push_catchup")]
+	    DonePushCatchup { train_root: u64, branch: String },
 	    #[serde(rename = "intent_retarget")]
 	    IntentRetarget { train_root: u64, pr: u64, new_base: String },
 	    #[serde(rename = "done_retarget")]
@@ -1829,10 +2216,12 @@ struct TrainError {
 	                | StateEventPayload::IntentPushPrep { .. }
 	                | StateEventPayload::IntentSquash { .. }
 	                | StateEventPayload::IntentPushReconcile { .. }
+	                | StateEventPayload::IntentPushCatchup { .. }
 	                | StateEventPayload::IntentRetarget { .. }
 	            // Done events (must be durable before considering operation complete)
 	                | StateEventPayload::DonePushPrep { .. }
 	                | StateEventPayload::DonePushReconcile { .. }
+	                | StateEventPayload::DonePushCatchup { .. }
 	                | StateEventPayload::DoneRetarget { .. }
 	            // Fan-out (atomic train record updates)
 	                | StateEventPayload::FanOutCompleted { .. }
@@ -2304,49 +2693,100 @@ async fn recover_in_progress_trains(
     stack_cancel: &mut StackCancellation,
     ctx: &AppContext,
 ) -> Result<()> {
-    // active_trains is keyed by the stack's current root PR number
-    for (train_root, state) in &repo_state.active_trains {
+    // active_trains is keyed by original_root_pr (stable throughout cascade)
+    for (original_root, train) in &repo_state.active_trains {
 
         // Only recover trains that were actively running (not stopped/aborted)
-        if !matches!(state.state, TrainState::Running | TrainState::WaitingCi) {
+        if !matches!(train.state, TrainState::Running | TrainState::WaitingCi) {
             continue;
         }
 
-        // Get cancellation token for this specific stack
-        let cancel = stack_cancel.token_for_stack(*train_root);
+        // Get cancellation token for this specific stack (keyed by original_root)
+        let cancel = stack_cancel.token_for_stack(*original_root);
 
-        match state.cascade_phase {
+        match &train.cascade_phase {
             CascadePhase::Idle => {
                 // Re-evaluate readiness of current_pr
                 // This will be handled by the triggering event, no special action needed
             }
-            CascadePhase::Preparing => {
-                // Re-run preparation (idempotent - if already pushed, merges are no-ops)
-                resume_preparation(state.current_pr, repo_state, &cancel, ctx).await?;
+            CascadePhase::Preparing { completed, frozen_descendants, .. } => {
+                // CRITICAL: Use frozen_descendants from the logged phase_transition, NOT
+                // repo_state.descendants. The descendants index may have changed during spool
+                // replay (step 3 of restart), but we must only prepare the descendants that
+                // were frozen when we entered this phase.
+                resume_preparation(
+                    train.current_pr,
+                    frozen_descendants,
+                    completed,
+                    repo_state,
+                    &cancel,
+                    ctx
+                ).await?;
             }
-            CascadePhase::SquashPending => {
+            CascadePhase::SquashPending { frozen_descendants, .. } => {
                 // Check if the PR was already squash-merged
-                let pr = repo_state.prs.get(&state.current_pr);
+                let pr = repo_state.prs.get(&train.current_pr);
                 match pr.map(|p| &p.state) {
                     Some(PrState::Merged { .. }) => {
-                        // Already merged, move to reconciliation
-                        resume_reconciliation(state.current_pr, state.last_squash_sha.as_ref(), repo_state, &cancel, ctx).await?;
+                        // Already merged, move to reconciliation with frozen_descendants
+                        resume_reconciliation(
+                            train.current_pr,
+                            train.last_squash_sha.as_ref(),
+                            frozen_descendants,
+                            repo_state,
+                            &cancel,
+                            ctx
+                        ).await?;
                     }
                     Some(PrState::Open) => {
-                        // Not yet merged, proceed with squash
-                        resume_squash(state.current_pr, repo_state, &cancel, ctx).await?;
+                        // Not yet merged, proceed with squash (frozen_descendants carried forward)
+                        resume_squash(train.current_pr, frozen_descendants, repo_state, &cancel, ctx).await?;
                     }
                     _ => {
                         // PR closed without merge or missing - abort
-                        abort_train(*train_root, "PR closed or missing during recovery", repo_state, ctx).await?;
+                        abort_train(*original_root, "PR closed or missing during recovery", repo_state, ctx).await?;
                     }
                 }
             }
-            CascadePhase::Reconciling => {
-                // Use last_squash_sha to complete reconciliation
-                let squash_sha = state.last_squash_sha.as_ref()
+            CascadePhase::Reconciling { completed, frozen_descendants, .. } => {
+                // Use last_squash_sha and frozen_descendants to complete reconciliation
+                // for remaining descendants (those in frozen_descendants but not in completed)
+                let squash_sha = train.last_squash_sha.as_ref()
                     .ok_or(Error::MissingRecoverySha)?;
-                resume_reconciliation(state.current_pr, Some(squash_sha), repo_state, &cancel, ctx).await?;
+                resume_reconciliation_with_completed(
+                    train.current_pr,
+                    squash_sha,
+                    frozen_descendants,
+                    completed,
+                    repo_state,
+                    &cancel,
+                    ctx
+                ).await?;
+            }
+            CascadePhase::CatchingUp { completed, frozen_descendants, .. } => {
+                // Resume catch-up (merge origin/main) for remaining descendants
+                let squash_sha = train.last_squash_sha.as_ref()
+                    .ok_or(Error::MissingRecoverySha)?;
+                resume_catch_up(
+                    train.current_pr,
+                    squash_sha,
+                    frozen_descendants,
+                    completed,
+                    repo_state,
+                    &cancel,
+                    ctx
+                ).await?;
+            }
+            CascadePhase::Retargeting { completed, frozen_descendants, .. } => {
+                // Resume retargeting for remaining descendants
+                resume_retargeting(
+                    train.current_pr,
+                    frozen_descendants,
+                    completed,
+                    repo_state,
+                    &cancel,
+                    ctx
+                ).await?;
             }
         }
     }
@@ -2461,9 +2901,9 @@ async fn main() {
     let ctx = AppContext::from_config().await;
     let dispatcher = Arc::new(Mutex::new(Dispatcher::new(ctx)));
 
-    // Spawn periodic timers for re-sync (hourly) and active train polling (hourly)
+    // Spawn periodic timers for re-sync (hourly) and active train polling (10 min default)
     let resync_interval = Duration::from_secs(3600);
-    let poll_interval = Duration::from_secs(3600);
+    let poll_interval = Duration::from_secs(600); // 10 minutes, configurable via MERGE_TRAIN_POLL_INTERVAL_MINS
     tokio::spawn(periodic_timers(dispatcher.clone(), resync_interval, poll_interval));
 
     // Run the HTTP server
@@ -2596,12 +3036,11 @@ impl RepoState {
     /// merged but which hasn't been retargeted yet is NOT a root — it's in a transitional
     /// state and should not be squash-merged until retargeting completes.
     ///
-    /// NOTE: During an active cascade, progress is driven by the TrainRecord, not is_root().
-    /// The TrainRecord tracks which PR is currently being processed. is_root() is only used
-    /// for *discovering* new roots (stacks that aren't yet being processed). A PR mid-cascade
-    /// may fail is_root() (e.g., base_ref not yet updated), but the cascade continues because
-    /// the TrainRecord knows what to do next. After retargeting completes, is_root() will
-    /// return true for the new root.
+    /// PRIVATE: This function is for stack *discovery* only — finding new stacks that
+    /// aren't yet being processed. Once a train is active, all progress is driven by the
+    /// TrainRecord (which tracks current_pr, cascade_phase, frozen_descendants, etc.).
+    /// Never call is_root() to decide what to do next in an active cascade; consult the
+    /// TrainRecord instead.
     fn is_root(&self, pr: &CachedPr) -> bool {
         // Must target the default branch to be a root
         if pr.base_ref != self.default_branch {
@@ -2669,6 +3108,46 @@ impl RepoState {
             stopped,
         })
     }
+
+    /// Given any PR number, find the original_root_pr of its active train (if any).
+    /// Returns None if this PR is not part of an active train.
+    ///
+    /// This is used to map stop commands (which reference any PR in the stack)
+    /// to the train's stable identifier (original_root_pr).
+    fn find_stack_root(&self, pr: PrNumber) -> Option<PrNumber> {
+        // Check if this PR is itself an original_root_pr
+        if self.active_trains.contains_key(&pr) {
+            return Some(pr);
+        }
+
+        // Check if this PR is the current_pr of any active train
+        for (original_root, train) in &self.active_trains {
+            if train.current_pr == pr {
+                return Some(*original_root);
+            }
+            // Also check if it's in the frozen_descendants of any phase
+            // (the PR might be mid-cascade but not yet the current_pr)
+            if self.is_pr_in_train(pr, train) {
+                return Some(*original_root);
+            }
+        }
+
+        None
+    }
+
+    /// Check if a PR is part of a train's frozen descendants
+    fn is_pr_in_train(&self, pr: PrNumber, train: &TrainRecord) -> bool {
+        match &train.cascade_phase {
+            CascadePhase::Preparing { frozen_descendants, .. } |
+            CascadePhase::SquashPending { frozen_descendants, .. } |
+            CascadePhase::Reconciling { frozen_descendants, .. } |
+            CascadePhase::CatchingUp { frozen_descendants, .. } |
+            CascadePhase::Retargeting { frozen_descendants, .. } => {
+                frozen_descendants.contains(&pr)
+            }
+            CascadePhase::Idle => false,
+        }
+    }
 }
 ```
 
@@ -2712,22 +3191,35 @@ async fn bootstrap_repo(
 }
 
 /// Load state from disk (fast path): snapshot + event log replay
+/// Uses generation-based file naming: snapshot.<gen>.json and events.<gen>.log
 async fn load_from_disk(
     state_dir: &Path,
     _ctx: &AppContext,
 ) -> Result<Option<PersistedRepoSnapshot>> {
-    let snapshot_path = state_dir.join("snapshot.json");
-    let events_path = state_dir.join("events.log");
+    // Read the current generation number
+    let gen_path = state_dir.join("generation");
+    let gen: u64 = match tokio::fs::read_to_string(&gen_path).await {
+        Ok(s) => s.trim().parse().unwrap_or(0),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
 
-    // Load snapshot
+    // Load snapshot for current generation (with fallback to previous if crash during compaction)
+    let snapshot_path = state_dir.join(format!("snapshot.{}.json", gen));
     let snapshot_bytes = match tokio::fs::read(&snapshot_path).await {
         Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && gen > 0 => {
+            // Crash during compaction — try previous generation
+            let prev_snapshot = state_dir.join(format!("snapshot.{}.json", gen - 1));
+            tokio::fs::read(&prev_snapshot).await?
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
     let mut snapshot: PersistedRepoSnapshot = serde_json::from_slice(&snapshot_bytes)?;
 
-    // Replay events from log starting at log_position
+    // Replay events from the corresponding log file starting at log_position
+    let events_path = state_dir.join(format!("events.{}.log", snapshot.log_generation));
     if let Ok(mut file) = tokio::fs::File::open(&events_path).await {
         use tokio::io::{AsyncBufReadExt, AsyncSeekExt, BufReader};
 
@@ -2914,38 +3406,35 @@ struct GitOperations {
 }
 
 impl GitOperations {
-    /// Phase 1: Preparation — bring descendant up to date with predecessor and default branch.
+    /// Phase 1: Preparation — merge predecessor's head into descendant.
     /// Must be called BEFORE squash-merging the predecessor into the default branch.
-    /// This ensures the descendant has all content from the default branch, so the later
-    /// ours-strategy merge doesn't cause content to be lost.
+    ///
+    /// **CRITICAL**: We do NOT merge the default branch here. That happens in
+    /// reconciliation AFTER the squash, using $SQUASH_SHA^ (parent of squash commit).
+    /// See reconcile_descendant for why this ordering is essential for correctness.
     ///
     /// **Detached HEAD strategy**: We use detached HEAD to avoid git's restriction that
-    /// a branch can only be checked out in one worktree at a time. This is critical for
-    /// fan-out scenarios where multiple worktrees may work with related branches, and for
-    /// crash recovery where stale worktrees may still reference branches.
+    /// a branch can only be checked out in one worktree at a time.
     async fn prepare_descendant(
         &self,
         descendant_branch: &str,
         predecessor_pr_number: u64,
-        default_branch: &str,
         cancel: &CancellationToken,
     ) -> Result<String> {
-        // Fetch everything we need
-        self.run_git(&["fetch", "origin", descendant_branch, default_branch], cancel).await?;
+        // Fetch descendant branch only — we don't need default branch yet
+        self.run_git(&["fetch", "origin", descendant_branch], cancel).await?;
 
         // Fetch the predecessor's head via GitHub's PR ref (reliable even after branch deletion).
-        // Fetching by raw SHA is unreliable — it depends on uploadpack.allowReachableSHA1InWant.
         let pr_ref = format!("refs/pull/{}/head", predecessor_pr_number);
         let local_ref = format!("refs/remotes/origin/pr/{}", predecessor_pr_number);
         self.run_git(&["fetch", "origin", &format!("{}:{}", pr_ref, local_ref)], cancel).await?;
 
         // Checkout in DETACHED HEAD mode to avoid branch locking issues.
-        // Git forbids the same branch being checked out in multiple worktrees, so we
-        // work with the commit directly rather than the branch reference.
         let origin_descendant = format!("origin/{}", descendant_branch);
         self.run_git(&["checkout", "--detach", &origin_descendant], cancel).await?;
 
-        // Merge predecessor commit (regular merge)
+        // Merge predecessor commit ONLY — do NOT merge main here!
+        // Merging main before we know the squash SHA causes lost commits.
         let merge_ref = format!("origin/pr/{}", predecessor_pr_number);
         self.run_git(&[
             "merge",
@@ -2954,33 +3443,42 @@ impl GitOperations {
             "-m", &format!("Merge predecessor PR #{} into {} (merge-train prep)", predecessor_pr_number, descendant_branch),
         ], cancel).await?;
 
-        // Merge default branch (regular merge) — critical for correctness!
-        // Without this, any independent changes on the default branch would be reverted
-        // when the descendant is later squash-merged.
-        let origin_default = format!("origin/{}", default_branch);
-        self.run_git(&[
-            "merge",
-            &origin_default,
-            "--no-edit",
-            "-m", &format!("Merge {} into {} (merge-train prep)", default_branch, descendant_branch),
-        ], cancel).await?;
-
-        // Push HEAD to the remote branch (not a local branch ref, since we're detached).
+        // Push HEAD to the remote branch
         let push_ref = format!("HEAD:refs/heads/{}", descendant_branch);
         self.run_git(&["push", "origin", &push_ref], cancel).await?;
 
         self.run_git(&["rev-parse", "HEAD"], cancel).await
     }
 
-    /// Phase 2: Reconciliation — merge the squash commit into descendant with ours strategy.
+    /// Phase 2: Reconciliation — incorporate the squash commit into descendant.
     /// Must be called AFTER squash-merging the predecessor into the default branch.
-    /// Adds the squash commit as a parent without changing tree content.
-    /// IMPORTANT: Uses the specific squash commit SHA, not origin/<default_branch>, to avoid
-    /// accidentally marking the branch as up-to-date with commits that landed
-    /// after the squash.
     ///
-    /// **Detached HEAD strategy**: Same as prepare_descendant — we use detached HEAD to
-    /// avoid git's branch locking restriction across worktrees.
+    /// This performs the ours-merge dance in the correct order:
+    /// 1. Merge $SQUASH_SHA^ (parent of squash) — incorporates main up to just before squash
+    /// 2. ours-merge $SQUASH_SHA — marks squash as ancestor without changing tree
+    /// 3. Merge origin/<default_branch> — picks up any commits after squash
+    ///
+    /// **Why merging $SQUASH_SHA^ (not origin/main before squash) is critical**:
+    ///
+    /// WRONG approach (merging main in preparation):
+    /// 1. Prep: merge origin/main (at commit A)
+    /// 2. Someone pushes commit B to main
+    /// 3. Squash predecessor → creates commit S (parent is B)
+    /// 4. Reconcile: ours-merge S
+    /// 5. Catch-up: merge origin/main (now at S)
+    ///
+    /// In step 5, git thinks S is already merged (via ours-merge), so the merge is
+    /// a no-op. But descendant's tree doesn't have B's content! B's changes are lost.
+    ///
+    /// CORRECT approach (this implementation):
+    /// 1. Prep: merge predecessor head only
+    /// 2. Squash predecessor → creates commit S (parent is B)
+    /// 3. Reconcile: merge S^ (which is B) — gets B's content
+    /// 4. Reconcile: ours-merge S — marks as merged, tree already has B's content
+    /// 5. Catch-up: merge origin/main — gets anything after S
+    ///
+    /// By merging S^ AFTER the squash, we guarantee we incorporate exactly the main
+    /// state up to (but not including) the squash, regardless of when commits landed.
     async fn reconcile_descendant(
         &self,
         descendant_branch: &str,
@@ -2989,16 +3487,25 @@ impl GitOperations {
         cancel: &CancellationToken,
     ) -> Result<String> {
         // Fetch default branch (which contains the squash commit) and descendant branch.
-        // NOTE: We do NOT fetch by raw SHA — that's unreliable (depends on uploadpack settings).
-        // The squash commit is reachable from origin/<default_branch>.
         self.run_git(&["fetch", "origin", default_branch, descendant_branch], cancel).await?;
 
-        // Checkout in DETACHED HEAD mode (see prepare_descendant for rationale).
+        // Checkout in DETACHED HEAD mode
         let origin_descendant = format!("origin/{}", descendant_branch);
         self.run_git(&["checkout", "--detach", &origin_descendant], cancel).await?;
 
-        // Merge the squash commit with ours strategy — keeps our tree, adds it as parent.
-        // The SHA is reachable after fetching the default branch.
+        // Step 1: Merge the PARENT of the squash commit ($SQUASH_SHA^)
+        // This incorporates all of main up to (but not including) the squash.
+        // This is the critical fix — we merge the exact pre-squash state.
+        let squash_parent = format!("{}^", squash_commit_sha);
+        self.run_git(&[
+            "merge",
+            &squash_parent,
+            "--no-edit",
+            "-m", &format!("Merge {} (pre-squash) into {} (merge-train)", default_branch, descendant_branch),
+        ], cancel).await?;
+
+        // Step 2: ours-merge the squash commit itself
+        // Adds squash as parent without changing tree (which now has all pre-squash content).
         self.run_git(&[
             "merge",
             squash_commit_sha,
@@ -3007,7 +3514,8 @@ impl GitOperations {
             "-m", &format!("Relate {} with squash commit (merge-train)", descendant_branch),
         ], cancel).await?;
 
-        // Now do a regular merge of origin/<default_branch> to pick up any subsequent commits
+        // Step 3: Catch-up merge of origin/<default_branch>
+        // Picks up any commits that landed on main AFTER the squash commit.
         let origin_default = format!("origin/{}", default_branch);
         self.run_git(&[
             "merge",
@@ -3016,7 +3524,7 @@ impl GitOperations {
             "-m", &format!("Merge {} into {} (merge-train catch-up)", default_branch, descendant_branch),
         ], cancel).await?;
 
-        // Push HEAD to the remote branch (detached HEAD mode).
+        // Push HEAD to the remote branch
         let push_ref = format!("HEAD:refs/heads/{}", descendant_branch);
         self.run_git(&["push", "origin", &push_ref], cancel).await?;
 
@@ -3296,17 +3804,18 @@ async fn cascade_step(
     cancel: &CancellationToken,
 ) -> Result<CascadeStepOutcome> {
     // Phase 1: Prepare ALL descendants BEFORE squashing
-    // Use PR number to fetch via refs/pull/<n>/head (reliable even after branch deletion)
+    // ONLY merges predecessor head — does NOT merge main (that happens in reconcile)
     for desc in descendants {
-        git.prepare_descendant(&desc.head_ref, pr.number, default_branch, cancel).await?;
+        git.prepare_descendant(&desc.head_ref, pr.number, cancel).await?;
     }
 
     // Phase 2: Squash-merge this PR into the default branch
-    // IMPORTANT: Capture the squash commit SHA for the reconciliation step
-    // Note: GitHub API calls are quick, so we don't pass cancel here
-    let squash_sha = github.squash_merge(pr.number).await?;
+    // CRITICAL: Pass expected_head_sha to prevent merging unreviewed commits!
+    // If someone pushes to the PR branch after we evaluated readiness, this will fail.
+    let squash_sha = github.squash_merge(pr.number, &pr.head_sha).await?;
 
-    // Phase 3: Reconcile and retarget ALL descendants AFTER squashing
+    // Phase 3: Reconcile ALL descendants AFTER squashing
+    // This merges $SQUASH_SHA^ (parent of squash), then ours-merges squash, then catches up
     for desc in descendants {
         git.reconcile_descendant(&desc.head_ref, &squash_sha, default_branch, cancel).await?;
         github.retarget_pr(desc.number, default_branch).await?;
@@ -3380,6 +3889,10 @@ max_prs_in_snapshot = 1000  # or env: MERGE_TRAIN_MAX_PRS_IN_SNAPSHOT
 
 # Worktree cleanup: remove worktrees older than this on startup
 worktree_max_age_hours = 24  # or env: MERGE_TRAIN_WORKTREE_MAX_AGE_HOURS
+
+# Poll interval for active trains (fallback for missed webhooks)
+# Lower = faster recovery from missed webhooks, but more API calls
+poll_interval_mins = 10  # or env: MERGE_TRAIN_POLL_INTERVAL_MINS
 ```
 
 ---
