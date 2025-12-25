@@ -66,11 +66,36 @@ The bot will:
 | `CLEAN` | All requirements satisfied | ✅ Proceed with merge |
 | `UNSTABLE` | Non-required checks failing | ✅ Proceed with merge |
 | `BLOCKED` | Required checks not passing or missing approvals | ⏳ Wait |
-| `BEHIND` | Head branch behind base (strict mode) | ⏳ Wait (bot will update) |
+| `BEHIND` | Head branch behind base (strict mode) | ⏳ Update (see below) |
 | `DIRTY` | Merge conflicts | ❌ Abort cascade |
 | `UNKNOWN` | State not yet computed | ⏳ Wait and re-check |
 
 This delegates all branch protection logic to GitHub, ensuring the bot respects required status checks, required reviewers, and any other protection rules without duplicating that logic.
+
+**Handling BEHIND status**: When `mergeStateStatus` is `BEHIND`, the PR's head branch is not up-to-date with its base branch (typically because "Require branches to be up to date before merging" is enabled in branch protection). The bot's response depends on context:
+
+1. **Root PR (base = default branch)**: The bot merges the default branch into the PR branch:
+   ```
+   git fetch origin main
+   git checkout <pr_branch>
+   git merge origin/main -m "Merge main to satisfy branch protection"
+   git push origin <pr_branch>
+   ```
+   This is safe because the root has no predecessor — there's no cascade state to protect. After pushing, the bot waits for CI to run on the updated branch before proceeding.
+
+2. **Descendant during PREPARATION phase** (before predecessor squash): Should not happen — the descendant's base is the predecessor's branch, and we just merged the predecessor's head. If this occurs:
+   - Log warning: "Descendant #N is BEHIND after preparation — unexpected state"
+   - Re-merge the predecessor's head (idempotent if already merged)
+   - If still BEHIND: Abort with error. Someone may have pushed to the predecessor branch after we prepared.
+
+3. **Descendant during RECONCILIATION phase** (after predecessor squash): Should not happen — after reconciliation, the descendant's base is retargeted to main and should include all main history. If this occurs:
+   - The catch-up step may have failed or been skipped
+   - Re-run catch-up: `git merge origin/main`
+   - If conflicts: Abort (genuine conflict with new main content)
+
+4. **Descendant during WAITING_CI phase**: The bot already pushed updates. If BEHIND, main advanced after our push. Re-run catch-up merge and wait for CI again.
+
+**CRITICAL**: The bot NEVER merges main into a descendant BEFORE the predecessor is squash-merged. Doing so would cause lost commits (see "Why merging $SQUASH_SHA^ is essential"). The handling above only applies when the descendant's base is already main (post-retarget) or for the root PR.
 
 **Eventual consistency caveat**: GitHub's `mergeStateStatus` is eventually consistent. After a push (including pushes from the bot itself during preparation or reconciliation), the field may reflect stale state for several seconds. To avoid acting on stale data:
 
@@ -93,15 +118,24 @@ Once started, the cascade proceeds automatically through all descendants. New PR
 @merge-train stop
 ```
 
-Requests a halt of the cascade for the stack containing this PR. Due to inherent race conditions, the stop takes effect at the next opportunity — any in-flight git operation or API call may complete before the halt is observed. The bot will:
+Requests a halt of the cascade for the stack containing this PR. Unlike `start` and `predecessor`, the `stop` command can be issued by the PR author OR any repository admin/maintainer — this allows intervention when the author is unavailable. See "Command authorization" in Security Considerations for details.
+
+Due to inherent race conditions, the stop takes effect at the next opportunity — any in-flight git operation or API call may complete before the halt is observed. The bot will:
 
 1. Cancel any in-flight git operations
-2. Hard-reset the local git repo to the default branch (cleans up any partial merge state)
+2. Clean up the stack's dedicated worktree (abort any in-progress merge, reset to clean state)
 3. Persist the stack as `"state": "stopped"` in the local state store
 4. Optionally post/update a status comment describing the current state
 5. Take no further action on this stack until `@merge-train start` is issued again
 
-The stop command is scoped to a single stack — other independent stacks in the same repo are unaffected.
+The stop command is scoped to a single stack — other independent stacks in the same repo are unaffected. Each stack has its own isolated worktree (see "Per-stack worktrees" section), so stopping one stack has no effect on others.
+
+**Worktree cleanup on stop**: The stop command calls `cleanup_worktree_state` on the stack's worktree. This:
+- Aborts any in-progress merge (`git merge --abort` if `.git/MERGE_HEAD` exists)
+- Resets uncommitted changes (`git checkout -- .`)
+- Does NOT reset to `origin/<branch>` — the worktree uses detached HEAD mode and the branch may be deleted after merge
+
+If the worktree is corrupted beyond repair, it is deleted entirely and will be recreated when the train restarts.
 
 ### Aborting
 
@@ -300,6 +334,30 @@ Train running — reconciling PR #124 after squash (1/2 descendants complete)
 **JSON fields:** Same as the `TrainRecord` fields documented in "Local train state" above: `version`, `recovery_seq`, `state`, `original_root_pr`, `current_pr`, `cascade_phase` (as full `CascadePhase` object including `completed` lists), `predecessor_pr`, `last_squash_sha`, `started_at`. The `recovery_seq` is a monotonic counter incremented on each state change, used to determine which record is "ahead" during recovery.
 
 **Critical for recovery:** The `cascade_phase` must be serialized as a full object (not just a string) to include the `completed` list. Without this, GitHub-based recovery cannot resume mid-phase for multi-descendant operations — it would have to redo work on already-completed descendants.
+
+**Comment size limits:** GitHub comments have a 65536-character limit. For large stacks, the full JSON might exceed this. The bot handles this with a tiered approach:
+
+1. **Normal case** (< 60KB): Embed full JSON including `frozen_descendants` and `completed` lists.
+
+2. **Large stack** (≥ 60KB): Reduce the embedded state:
+   - Omit `frozen_descendants` from the JSON (can be reconstructed from predecessor declarations)
+   - Keep only `completed` list (essential for resumption)
+   - Add `"state_truncated": true` flag
+   - Append human-readable note: "Full state exceeds comment size limit; some fields omitted."
+
+3. **Extremely large stack** (still ≥ 60KB after reduction): This indicates hundreds of PRs in a single stack — an unusual case. The bot:
+   - Stores only essential fields: `version`, `recovery_seq`, `state`, `current_pr`, `last_squash_sha`
+   - Sets `"recovery_mode": "inference_required"` — on recovery, the bot must use inference-based recovery even with the status comment present
+   - Posts warning: "Stack too large for full state persistence. Recovery will require inference."
+
+The 60KB threshold (not 65KB) provides headroom for the human-readable portion and Markdown formatting.
+
+**Recovery with truncated state:** When `state_truncated: true`:
+- `frozen_descendants` is reconstructed by querying PRs that declared the current PR (or its predecessors) as predecessor at the time the phase started. Since descendants can only be added, never removed, reconstruction is safe — new descendants added after truncation will be picked up naturally.
+- `completed` list is authoritative — work is not redone.
+
+When `recovery_mode: inference_required`:
+- The bot uses inference-based recovery (same as "Recovery without status comment") but with the advantage of knowing `current_pr` and `last_squash_sha`.
 
 **Authoritative source of truth:** During normal operation, the local event log is authoritative. Status comments serve as:
 - User-facing observability (what is the bot doing?)
@@ -1423,20 +1481,42 @@ async fn handle_late_addition(
     let pr_ref = format!("refs/pull/{}/head", merged_predecessor.0);
     git.fetch_ref(&pr_ref).await?;
 
-    // 2. Get the squash commit SHA from the merged PR
-    let pred_pr = github.get_pr(merged_predecessor).await?;
-    let squash_sha = pred_pr.merge_commit_sha
+    // 2. Get the squash commit SHA from the merged PR (with retry for eventual consistency)
+    //    CRITICAL: Also validate the merge method — see below.
+    let squash_sha = fetch_merge_commit_sha_with_retry(github, merged_predecessor)
+        .await?
         .ok_or(Error::MissingMergeCommitSha)?;
 
-    // 3. Fetch and checkout the late PR branch
+    // 3. CRITICAL: Validate this was a squash merge, not merge/rebase!
+    //    The ours-merge strategy only works correctly for squash merges.
+    //    If predecessor was merged with merge/rebase, the merge_commit_sha points to
+    //    a different commit structure and the ours-merge will drop or duplicate changes.
+    git.fetch_commit(&squash_sha).await?;
+    let commit = git.get_commit_info(&squash_sha).await?;
+    if commit.parents.len() != 1 {
+        // Squash commits have exactly one parent (the prior main HEAD).
+        // Merge commits have two parents. Rebase doesn't create merge_commit_sha pointing
+        // to a merge commit, but the parent count check catches merge commits.
+        return Err(Error::NonSquashMerge {
+            pr: merged_predecessor,
+            message: format!(
+                "Predecessor #{} was merged with merge/rebase, not squash. \
+                 Late-addition reconciliation requires squash merge. \
+                 Manual intervention required: rebase the late PR onto main.",
+                merged_predecessor.0
+            ),
+        });
+    }
+
+    // 4. Fetch and checkout the late PR branch
     git.fetch_and_checkout_detached(late_pr_branch).await?;
 
-    // 4. Merge predecessor's final head (what they had just before merge)
+    // 5. Merge predecessor's final head (what they had just before merge)
     // This is analogous to normal preparation, but we already have the squash SHA
     let pred_head_ref = format!("origin/pr/{}", merged_predecessor.0);
     git.merge(&pred_head_ref, "Merge predecessor head (late addition)").await?;
 
-    // 5. Reconcile using the same logic as normal cascading:
+    // 6. Reconcile using the same logic as normal cascading:
     //    - Merge $SQUASH_SHA^ (parent of squash)
     //    - ours-merge $SQUASH_SHA
     //    - Merge origin/main (catch-up)
@@ -1444,19 +1524,25 @@ async fn handle_late_addition(
     // We can reuse reconcile_descendant because it does exactly this.
     git.reconcile_descendant(late_pr_branch, &squash_sha, default_branch).await?;
 
-    // 6. Retarget the PR to the default branch
+    // 7. Retarget the PR to the default branch
     github.update_pr_base(late_pr, default_branch).await?;
 
-    // 7. Now the PR has base_ref == default_branch, so is_root() will return true
+    // 8. Now the PR has base_ref == default_branch, so is_root() will return true
     Ok(())
 }
 ```
 
 **Why this is different from normal flow**:
 - Normal flow: prepare (merge predecessor head only) → squash → reconcile (merge $SHA^, ours-merge $SHA, catch-up)
-- Late addition: predecessor already squashed, so we do: merge predecessor head → reconcile (merge $SHA^, ours-merge $SHA, catch-up)
+- Late addition: validate squash → merge predecessor head → reconcile (merge $SHA^, ours-merge $SHA, catch-up)
 
 The key insight is that `reconcile_descendant` already does the correct ours-merge dance, so we can reuse it. We just need to first merge the predecessor's head (which prepare_descendant would have done before the squash).
+
+**CRITICAL: Squash validation for late additions**: The ours-merge strategy assumes `merge_commit_sha` is a squash commit (single parent pointing to the prior main HEAD). If the predecessor was merged with merge/rebase:
+- **Merge commit**: Has two parents, so `$SHA^` doesn't mean "main before squash" — it might be the PR branch head. The ours-merge would incorporate wrong history.
+- **Rebase**: GitHub's `merge_commit_sha` may point to a merge commit or the tip of rebased commits, neither of which has the right structure.
+
+The parent-count check (`commit.parents.len() != 1`) catches merge commits. For rebase merges, the structure varies, but the check is conservative: if it's not a clean single-parent commit, abort and request manual intervention. This is safer than silently producing wrong results.
 
 **Polling fallback**: During `PollActiveTrains`, also scan for "orphaned" PRs:
 ```rust
@@ -4086,9 +4172,30 @@ A monitoring/ops dashboard is planned to provide visibility into active trains, 
 
 ## Security Considerations
 
-- **Command authorization**: Commands (`@merge-train predecessor`, `start`, `stop`) are only accepted when:
-  1. The comment is on a **pull request**, not an issue. The `issue_comment` webhook fires for both PRs and issues; the bot checks the payload's `issue.pull_request` field exists before processing.
-  2. The comment author is **the user who opened the PR**. The bot compares `comment.user.id` against the PR's `user.id` (available in the webhook payload or cached PR metadata). This prevents other users—even those with write access—from hijacking someone else's merge train.
+- **Command authorization**: Commands (`@merge-train predecessor`, `start`, `stop`) are accepted when the comment is on a **pull request** (not an issue) AND the author has appropriate permissions:
+
+  | Command | Who can issue |
+  |---------|---------------|
+  | `predecessor` | PR author only |
+  | `start` | PR author only |
+  | `stop` | PR author OR repository admin/maintainer |
+  | `stop --force` | Repository admin only |
+
+  **Authorization checks**:
+  1. The comment is on a PR (check `issue.pull_request` field in webhook payload).
+  2. For author-only commands: `comment.user.id == pr.user.id`.
+  3. For admin/maintainer commands: Query `GET /repos/{o}/{r}/collaborators/{username}/permission` and check `permission` is `admin` or `maintain`.
+
+  **Rationale for stop permissions**: If a train enters a bad state (e.g., stuck on a failing check, endless loop) and the PR author is unavailable (vacation, left company, different timezone), maintainers need the ability to halt the cascade. Without this, a stuck train blocks the entire stack indefinitely.
+
+  **Force stop**: `@merge-train stop --force` performs additional cleanup:
+  - Closes the status comment with "Train forcibly stopped by admin"
+  - Optionally closes the affected PRs (if `--close-prs` flag added)
+  - Clears all local state for the train (allows fresh start)
+
+  This is restricted to admins because it's destructive — normal `stop` leaves state intact for resumption.
+
+  **Audit trail**: All commands are logged with: timestamp, command, issuer user ID, issuer permission level, PR number, outcome. This provides accountability for admin overrides.
 - **Webhook validation**: Verify `X-Hub-Signature-256` header against webhook secret.
 - **Signing key protection**: GPG private key should be stored securely (e.g., mounted secret, not in repo).
 - **Clone isolation**: Each repo gets its own workdir; clean up after operations.
