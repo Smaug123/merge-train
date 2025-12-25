@@ -36,7 +36,10 @@ On a PR whose base branch is *not* `main`, comment:
 This declares that the current PR is stacked on top of PR #123. The bot will:
 
 1. Validate that #123 either targets `main` or itself has a predecessor declaration
-2. Acknowledge with a reaction (👍) or error comment
+2. Validate that the current PR's base branch matches #123's head branch (the branch the predecessor PR would merge FROM). This ensures the PR is actually stacked on the predecessor, not just claiming to be. Without this check, a PR based on `main` could declare a predecessor and the cascade would merge unrelated history.
+3. Acknowledge with a reaction (👍) or error comment
+
+**Base branch mismatch**: If the PR's base branch doesn't match the predecessor's head branch, the bot rejects the declaration with an error: "PR #N declares predecessor #123, but its base branch 'X' doesn't match #123's head branch 'Y'. The PR must be based on the predecessor's branch."
 
 A PR with a valid predecessor declaration is automatically part of any train rooted at its ancestor.
 
@@ -68,6 +71,14 @@ The bot will:
 | `UNKNOWN` | State not yet computed | ⏳ Wait and re-check |
 
 This delegates all branch protection logic to GitHub, ensuring the bot respects required status checks, required reviewers, and any other protection rules without duplicating that logic.
+
+**Eventual consistency caveat**: GitHub's `mergeStateStatus` is eventually consistent. After a push (including pushes from the bot itself during preparation or reconciliation), the field may reflect stale state for several seconds. To avoid acting on stale data:
+
+1. **Before checking readiness after a bot-initiated push**: The bot must verify that the PR's `headRefOid` matches the SHA it just pushed. Poll until they match (with timeout), then check `mergeStateStatus`.
+2. **Before squash-merging**: The bot must verify that `headRefOid` matches the expected head SHA recorded when the train was started or when preparation completed. If they differ, someone pushed to the branch — abort and notify.
+3. **On `UNKNOWN` status**: This explicitly means GitHub hasn't computed the status yet. Wait and re-poll.
+
+This prevents races where: (a) the bot pushes a reconciliation commit, (b) immediately checks mergeStateStatus, (c) gets `CLEAN` based on the OLD head, (d) merges before required checks have run on the NEW head.
 
 **Note on "check failure"**: Throughout this document, "check failure" or "required check failure" refers to `mergeStateStatus` transitioning to `BLOCKED`. The bot does not query branch protection rules to distinguish required from non-required checks — it relies entirely on GitHub's `mergeStateStatus` computation. This means:
 - If a non-required check fails → `UNSTABLE` → bot proceeds
@@ -135,10 +146,11 @@ When the bot takes ownership of a stack (via `@merge-train start`), it persists 
 | Field | Type | Description |
 |-------|------|-------------|
 | `version` | `number` | Schema version (currently `1`) |
-| `state` | `string` | One of: `running`, `stopped`, `waiting_ci`, `aborted` |
+| `state` | `string` | One of: `running`, `stopped`, `waiting_ci`, `aborted`, `needs_manual_review` |
 | `current_pr` | `number` | PR currently being processed (the train's current root PR) |
 | `cascade_phase` | `object` | Phase with optional `completed` list (see below) |
 | `predecessor_pr` | `number?` | PR number of predecessor (for fetching via `refs/pull/<n>/head` during recovery) |
+| `predecessor_head_sha` | `string?` | Head SHA of predecessor at preparation time (for verifying preparation during recovery) |
 | `last_squash_sha` | `string?` | SHA of last squash commit (for reconciliation recovery) |
 | `started_at` | `string` | ISO 8601 timestamp when started |
 | `stopped_at` | `string?` | ISO 8601 timestamp if stopped |
@@ -147,7 +159,7 @@ When the bot takes ownership of a stack (via `@merge-train start`), it persists 
 **Cascade phases:**
 
 - `idle`: Not currently performing any operation; waiting for CI or next event
-- `preparing`: Merging predecessor head and default branch into descendants (before squash)
+- `preparing`: Merging predecessor head into descendants (before squash) — NOT main, only predecessor head
 - `squash_pending`: Preparation complete; about to squash-merge current PR
 - `reconciling`: Squash complete; performing ours-strategy merges into descendants
 - `catching_up`: Ours-merge complete; performing regular merge of origin/main
@@ -164,9 +176,26 @@ If the bot crashes mid-cascade, the `cascade_phase` indicates where to resume:
 | `idle` | Re-evaluate current PR's readiness |
 | `preparing` | Skip descendants in `completed`, re-run for remaining (idempotent if already pushed) |
 | `squash_pending` | Check if squash already happened; if not, perform it |
-| `reconciling` | Skip descendants in `completed`, use `last_squash_sha` to complete for remaining |
+| `reconciling` | Verify preparation, then skip descendants in `completed`, use `last_squash_sha` to complete for remaining |
 | `catching_up` | Skip descendants in `completed`, re-run merge of origin/main for remaining |
 | `retargeting` | Skip descendants in `completed`, retarget remaining (idempotent via API check) |
+
+**Verifying preparation before reconciliation:**
+
+Reconciliation assumes all descendants were prepared (predecessor head merged into them) before the squash. This invariant can be violated if:
+- Someone manually merges the root PR via GitHub UI (bypassing the bot)
+- The bot crashes between preparation and squash, and on recovery finds the PR already merged
+- A race condition where preparation partially completed
+
+**On recovery to `reconciling` phase**, before proceeding, the bot MUST verify for each descendant not in `completed`:
+
+1. Fetch the descendant's head SHA and the predecessor's pre-squash head SHA (from `predecessor_head_sha` field, or by fetching `refs/pull/<predecessor_pr>/head` via `git ls-remote` as fallback)
+2. Check if the predecessor head is an ancestor of the descendant head: `git merge-base --is-ancestor <predecessor_head> <descendant_head>`
+3. If NOT an ancestor: This descendant was never prepared. The bot cannot safely reconcile — the descendant doesn't have the predecessor's content.
+   - **Recovery action**: Abort with error: "Descendant #N was not prepared before squash. Manual intervention required: merge main into the descendant branch or rebase."
+   - Do NOT attempt to "fix" this automatically — the descendant may have diverged in ways that make automatic merge incorrect.
+
+This verification is fast (local git operation after fetching refs) and prevents silent data loss where reconciliation would create ours-merges for content that was never actually integrated.
 
 **Reconciling recovery with missing `last_squash_sha`:**
 
@@ -279,6 +308,23 @@ Train running — reconciling PR #124 after squash (1/2 descendants complete)
 **Security:** The bot verifies that the comment author's user ID matches its own before parsing, preventing injection of fake state by malicious users.
 
 **Deletion handling:** If a user deletes the status comment, the bot recreates it on the next phase transition.
+
+**Recovery without status comment:** If local state is lost AND the status comment is missing (deleted or bot identity changed), GitHub-based recovery cannot determine precise cascade state. The bot falls back to **inference-based recovery**:
+
+1. **Scan for active trains**: Query open PRs with predecessor declarations. Build the stack topology from these declarations.
+
+2. **Check merge status**: For each stack, identify which PRs have already been merged (from GitHub PR state).
+
+3. **Infer cascade position**: The "current PR" is the first non-merged PR in the stack. If all PRs are merged, the train is complete.
+
+4. **Cannot infer cascade phase**: Without the status comment, the bot cannot know which phase (`preparing`, `reconciling`, etc.) was interrupted. The bot MUST:
+   - Mark the train as `needs_manual_review` (a new state)
+   - Post a NEW status comment explaining the situation: "Train state was lost. Manual review required. The bot has identified [list of descendants] but cannot safely resume mid-operation. Options: (a) Issue `@merge-train stop` then `@merge-train start` to restart from current position, (b) Manually complete the cascade."
+   - Do NOT attempt to auto-resume — the risk of data loss (e.g., skipping preparation) is too high.
+
+5. **Bot identity change**: If the bot's GitHub identity changes (different app installation, new bot user), it cannot locate its own status comments by author check. The bot should log this condition and treat it as "status comment missing."
+
+This fallback is lossy — some in-progress work may need to be repeated — but it prevents permanent inability to recover. The key insight is that stack TOPOLOGY can be reconstructed from predecessor declarations, but operational STATE (which phase, which descendants completed) cannot.
 
 ### Local state storage
 
@@ -941,12 +987,27 @@ From the cached state, stacks are computed by traversing predecessor relationshi
 | `issue_comment.created` with `@merge-train start` | Squash-merge root, begin cascade |
 | `issue_comment.created` with `@merge-train stop` | Mark stack stopped, report state |
 | `issue_comment.edited` with `@merge-train predecessor #N` | Update predecessor (replaces previous declaration) |
+| `issue_comment.deleted` | If deleted comment was a predecessor declaration, remove predecessor relationship |
 | `pull_request` merged | If merged PR has descendants, cascade to next |
 | `pull_request` closed (not merged) | Notify descendants they're orphaned |
 | `check_suite` / `status` completed | If cascade waiting on this PR, continue |
 | `pull_request_review` submitted (approved) | If cascade waiting on this PR, continue |
 
 **Comment edit handling**: When a predecessor declaration is edited (e.g., changing `#123` to `#456`), the bot updates the predecessor relationship. The dedupe key for edits is `(PR number, comment ID, "edited", updated_at)` — the `updated_at` timestamp distinguishes different edits of the same comment, preventing later edits from being incorrectly dropped. If a train is already started and the predecessor is changed, the bot aborts with an error (cannot safely change stack structure mid-cascade).
+
+**Comment deletion handling**: When a comment is deleted, the bot checks if it was the authoritative predecessor declaration for a PR. If so:
+1. Remove the predecessor relationship from the cached state
+2. If a train is running that involves this PR, abort with error: "Predecessor declaration deleted mid-cascade"
+3. The PR becomes orphaned (no longer part of any stack) unless another predecessor comment exists
+
+To identify predecessor comments for deletion handling, the bot tracks `(PR number, comment ID)` for each predecessor declaration in the event log. On `issue_comment.deleted`, look up whether that comment ID was a predecessor declaration.
+
+**Multiple predecessor comments**: A PR should have exactly one predecessor declaration. If multiple `@merge-train predecessor` comments are created:
+1. The FIRST valid declaration (by comment creation time) is authoritative
+2. Subsequent declarations are rejected with error: "PR already has predecessor declaration in comment #C pointing to #N. Edit that comment to change predecessors, or delete it first."
+3. This prevents conflicting/ambiguous stack topology
+
+If the authoritative predecessor comment is deleted and other predecessor comments exist, the bot does NOT automatically promote another comment — the PR becomes orphaned. The user must create a fresh declaration to re-establish the relationship. This avoids silently switching predecessors based on comment ordering races.
 
 **Fan-out discovery**: After a fan-out point merges, each descendant is discovered as a new root on subsequent events. Since each descendant now targets the default branch and its predecessor is merged, `is_root()` returns true and `compute_stacks()` includes it. No special event handling is needed — the normal cascade flow applies to each independent branch.
 
