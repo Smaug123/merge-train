@@ -118,13 +118,13 @@ This delegates all branch protection logic to GitHub, ensuring the bot respects 
 
 **CRITICAL**: The bot NEVER merges main into a descendant BEFORE the predecessor is squash-merged. Doing so would cause lost commits (see "Why merging $SQUASH_SHA^ is essential"). The handling above only applies when the descendant's base is already main (post-retarget) or for the root PR.
 
-**Eventual consistency caveat**: GitHub's `mergeStateStatus` is eventually consistent. After a push (including pushes from the bot itself during preparation or reconciliation), the field may reflect stale state for several seconds. To avoid acting on stale data:
+**Eventual consistency caveat**: GitHub's `mergeStateStatus` is eventually consistent. After a push (including pushes from the bot itself during preparation or reconciliation), the field may reflect stale state for several seconds — even after `headRefOid` is updated to reflect the new head. To avoid acting on stale data:
 
-1. **Before checking readiness after a bot-initiated push**: The bot must verify that the PR's `headRefOid` matches the SHA it just pushed. Poll until they match (with timeout), then check `mergeStateStatus`.
+1. **After a bot-initiated push**: The bot must **wait for a `check_suite` webhook** for the new head SHA before trusting `mergeStateStatus`. Simply polling until `headRefOid` matches is insufficient — `mergeStateStatus` can still reflect the old head's status even after `headRefOid` updates. The `check_suite.requested` or `check_suite.completed` event for the pushed SHA confirms GitHub has begun/finished evaluating the new head.
 2. **Before squash-merging**: The bot must verify that `headRefOid` matches the expected head SHA recorded when the train was started or when preparation completed. If they differ, someone pushed to the branch — abort and notify.
-3. **On `UNKNOWN` status**: This explicitly means GitHub hasn't computed the status yet. Wait and re-poll.
+3. **On `UNKNOWN` status**: This explicitly means GitHub hasn't computed the status yet. Wait for `check_suite` webhook.
 
-This prevents races where: (a) the bot pushes a reconciliation commit, (b) immediately checks mergeStateStatus, (c) gets `CLEAN` based on the OLD head, (d) merges before required checks have run on the NEW head.
+This prevents races where: (a) the bot pushes a reconciliation commit, (b) immediately checks mergeStateStatus, (c) gets `CLEAN` based on the OLD head's check results, (d) merges before required checks have run on the NEW head.
 
 **Note on "check failure"**: Throughout this document, "check failure" or "required check failure" refers to `mergeStateStatus` transitioning to `BLOCKED`. The bot does not query branch protection rules to distinguish required from non-required checks — it relies entirely on GitHub's `mergeStateStatus` computation. This means:
 - If a non-required check fails → `UNSTABLE` → bot proceeds
@@ -184,6 +184,29 @@ This "warn and proceed" approach balances operational flexibility with user awar
 3. The user can `@merge-train stop`, wait for cache expiry (or restart the bot), then re-evaluate
 
 **Refresh on stall**: When a cascade stalls due to `mergeStateStatus` becoming `BLOCKED` after a bot push (the exact symptom of dismissed approvals), the bot **invalidates the protection cache** and re-queries. If it now detects `dismiss_stale_reviews: true`, it posts an updated error message explaining the root cause rather than a generic "waiting for approval" message.
+
+### Merge method preflight check
+
+Before starting a train, the bot verifies that squash merge is enabled on the repository. The bot **requires** squash merge — other merge methods (merge commit, rebase) would not maintain the linear history that the cascade logic depends on.
+
+**Detection**: On `@merge-train start`, the bot queries repository settings:
+
+```
+GET /repos/{owner}/{repo}
+```
+
+The response includes `allow_squash_merge`. If `false`, the bot **refuses to start** and posts an error:
+
+```
+Cannot start merge train: this repository has squash merge disabled.
+
+The merge train bot requires squash merge to maintain linear history on the default branch.
+Please enable "Allow squash merging" in repository settings.
+```
+
+**Caching**: This check uses the same per-repo cache as branch protection queries (1 hour TTL). Repository merge method settings rarely change.
+
+**No warn-and-proceed**: Unlike the "dismiss stale approvals" check (which can warn and proceed if permissions are missing), the merge method check is **hard requirement**. The cascade fundamentally cannot work without squash merge — attempting to proceed would fail immediately on the first merge with `METHOD_NOT_ALLOWED`.
 
 ### Stopping
 
@@ -520,7 +543,7 @@ This allows debugging of recently processed events.
 **Dedupe strategy:** Deliveries are deduped by multiple stable identifiers, not just `X-GitHub-Delivery`:
 - For `issue_comment.created` events: `(PR number, comment ID, "created")` — a comment can only be created once
 - For `issue_comment.edited` events: `(PR number, comment ID, "edited", updated_at)` — each edit has a distinct timestamp; using just `(comment ID, "edited")` would incorrectly drop subsequent edits
-- For `pull_request` events: `(PR number, action, head SHA)` — same PR+action+SHA = same logical event
+- For `pull_request` events: `(PR number, action, head SHA)` for most actions; for `pull_request.edited`: `(PR number, "edited", updated_at)` — edits that don't change head SHA (base retargets, title changes) must not be deduplicated against each other
 - For `check_suite` events: `(check suite ID)`
 
 This handles GitHub's redelivery with new delivery IDs for the same logical event.
@@ -1132,13 +1155,20 @@ From the cached state, stacks are computed by traversing predecessor relationshi
 | `issue_comment.created` with `@merge-train start` | Squash-merge root, begin cascade |
 | `issue_comment.created` with `@merge-train stop` | Mark stack stopped, report state |
 | `issue_comment.edited` with `@merge-train predecessor #N` | Update predecessor (replaces previous declaration) |
+| `issue_comment.edited` where authoritative predecessor comment no longer contains command | Remove predecessor relationship (see below) |
 | `issue_comment.deleted` | If deleted comment was a predecessor declaration, remove predecessor relationship |
 | `pull_request` merged | If merged PR has descendants, cascade to next |
 | `pull_request` closed (not merged) | Notify descendants they're orphaned |
 | `check_suite` / `status` completed | If cascade waiting on this PR, continue |
 | `pull_request_review` submitted (approved) | If cascade waiting on this PR, continue |
 
-**Comment edit handling**: When a predecessor declaration is edited (e.g., changing `#123` to `#456`), the bot updates the predecessor relationship. The dedupe key for edits is `(PR number, comment ID, "edited", updated_at)` — the `updated_at` timestamp distinguishes different edits of the same comment, preventing later edits from being incorrectly dropped. If a train is already started and the predecessor is changed, the bot aborts with an error (cannot safely change stack structure mid-cascade).
+**Comment edit handling**: When a predecessor declaration is edited, the bot handles several cases:
+
+1. **Command changed** (e.g., `#123` to `#456`): Update the predecessor relationship to point to the new PR.
+2. **Command removed** (e.g., editing to remove `@merge-train predecessor` entirely): If this was the authoritative predecessor comment for the PR (tracked via comment ID), remove the predecessor relationship. The PR becomes orphaned unless another predecessor comment exists (which would be an error state — see "Multiple predecessor comments").
+3. **Command added to non-predecessor comment**: Rejected if the PR already has a predecessor declaration.
+
+The dedupe key for edits is `(PR number, comment ID, "edited", updated_at)` — the `updated_at` timestamp distinguishes different edits of the same comment, preventing later edits from being incorrectly dropped. If a train is already started and the predecessor is changed or removed, the bot aborts with an error (cannot safely change stack structure mid-cascade).
 
 **Comment deletion handling**: When a comment is deleted, the bot checks if it was the authoritative predecessor declaration for a PR. If so:
 1. Remove the predecessor relationship from the cached state
@@ -1486,6 +1516,20 @@ This makes the bot resilient to:
 - Late additions to the stack (a PR added after its predecessor was already merged)
 
 The PR number (not the SHA) is the stable identifier used to construct these refs.
+
+**PR ref availability**: On github.com, PR refs are retained indefinitely and never garbage-collected. However, on GitHub Enterprise Server (GHES) instances, administrators may configure aggressive ref garbage collection that removes PR refs after the PR is closed. If the bot fails to fetch a PR ref:
+
+1. The fetch operation fails with a clear git error ("couldn't find remote ref")
+2. The bot aborts the cascade with an actionable error message:
+   ```
+   Failed to fetch predecessor PR #123's head ref (refs/pull/123/head).
+
+   This ref may have been garbage-collected. On github.com this should not happen;
+   on GitHub Enterprise Server, check your instance's ref retention settings.
+
+   The cascade cannot proceed without the predecessor's commit history.
+   ```
+3. The train is marked as aborted; the user must manually resolve (potentially by re-opening/re-creating the predecessor PR to restore its refs)
 
 ### Operation sequence
 
