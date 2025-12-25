@@ -41,6 +41,17 @@ This declares that the current PR is stacked on top of PR #123. The bot will:
 
 **Base branch mismatch**: If the PR's base branch doesn't match the predecessor's head branch, the bot rejects the declaration with an error: "PR #N declares predecessor #123, but its base branch 'X' doesn't match #123's head branch 'Y'. The PR must be based on the predecessor's branch."
 
+**Continuous base branch validation**: Base branch matching is validated not just at declaration time, but also:
+
+1. **On `pull_request.edited` events**: When a PR's base branch changes (retargeting), the bot re-validates the predecessor relationship. If the new base no longer matches the predecessor's head branch:
+   - The predecessor relationship is marked **invalid** (but not removed — the declaration still exists)
+   - The PR is excluded from any active cascade until the mismatch is resolved
+   - The bot posts a warning: "PR #N was retargeted to 'X', which no longer matches predecessor #123's head branch 'Y'. This PR will not be included in the cascade until the base branch is corrected."
+
+2. **At cascade time**: Before entering the `preparing` phase for any descendant, the bot re-validates that the descendant's base branch matches the predecessor's head branch. This catches any retargeting that occurred between declaration and cascade. If validation fails, the cascade aborts for that PR with a clear error.
+
+This prevents stale predecessor links from causing merges into wrong branches.
+
 A PR with a valid predecessor declaration is automatically part of any train rooted at its ancestor.
 
 ### Triggering the merge train
@@ -71,6 +82,16 @@ The bot will:
 | `UNKNOWN` | State not yet computed | ⏳ Wait and re-check |
 
 This delegates all branch protection logic to GitHub, ensuring the bot respects required status checks, required reviewers, and any other protection rules without duplicating that logic.
+
+**Draft PRs**: Draft PRs (`isDraft: true` in GraphQL) are treated as follows:
+
+1. **On `@merge-train start`**: If the root PR is a draft, the bot **rejects the command** and posts an error: "Cannot start merge train: PR #N is a draft. Please mark it as ready for review first." This is checked explicitly via the `isDraft` field, not via `mergeStateStatus`.
+
+2. **Descendants**: Draft descendants are allowed in the stack — they will be processed when the cascade reaches them. If a descendant is still a draft when the cascade arrives:
+   - The bot waits (similar to `BLOCKED` status)
+   - When the PR is marked ready for review, the bot re-evaluates and continues
+
+3. **Why explicit check?**: GitHub's `mergeStateStatus` for a draft PR may be `CLEAN` (if CI passes), but the merge API will reject it with "Pull request is in draft state." Checking `isDraft` at start time provides a clearer error message than waiting for the API rejection.
 
 **Handling BEHIND status**: When `mergeStateStatus` is `BEHIND`, the PR's head branch is not up-to-date with its base branch (typically because "Require branches to be up to date before merging" is enabled in branch protection). The bot's response depends on context:
 
@@ -140,9 +161,29 @@ The merge train bot pushes merge commits to PR branches during cascade operation
 See: https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches#require-pull-request-reviews-before-merging
 ```
 
-**API permission**: The bot requires `administration:read` permission (or higher) to query branch protection rules. If the permission is missing, the bot logs a warning but proceeds — it cannot know if the setting is enabled.
+**Rulesets**: GitHub rulesets can also enforce "dismiss stale reviews" independently of branch protection. The bot also queries:
 
-**Caching**: Branch protection rules are cached per-repo for 1 hour (configurable via `MERGE_TRAIN_BRANCH_PROTECTION_CACHE_TTL_MINS`). Changes to branch protection during an active train are not detected until cache expiry or bot restart.
+```
+GET /repos/{owner}/{repo}/rulesets?includes_parents=true
+```
+
+And checks each ruleset for `dismiss_stale_reviews_on_push: true` in the `pull_request` rule. If found on any ruleset targeting the default branch, the bot refuses to start with the same error message.
+
+**API permission**: The bot requires `administration:read` permission (or higher) to query branch protection rules, and `repository_metadata:read` for rulesets. If permissions are missing:
+
+1. The bot logs a **warning** and posts a visible notice on the PR: "⚠️ Unable to verify branch protection settings (missing permissions). If 'dismiss stale approvals' is enabled, the cascade may stall. Consider granting `administration:read` permission."
+2. The bot **proceeds anyway** — this is a deliberate choice to avoid blocking workflows entirely when the admin hasn't granted full permissions.
+3. If the cascade later stalls due to dismissed approvals, the error message explicitly suggests checking this setting.
+
+This "warn and proceed" approach balances operational flexibility with user awareness. Admins who want strict enforcement can grant the permission; those who know their settings are compatible can proceed without it.
+
+**Caching**: Branch protection and ruleset queries are cached per-repo for 1 hour (configurable via `MERGE_TRAIN_BRANCH_PROTECTION_CACHE_TTL_MINS`). This cache is appropriate because:
+
+1. Branch protection changes during an active cascade are rare
+2. If the setting IS changed mid-cascade, the cascade will stall with a clear error (dismissed approvals → `BLOCKED` state)
+3. The user can `@merge-train stop`, wait for cache expiry (or restart the bot), then re-evaluate
+
+**Refresh on stall**: When a cascade stalls due to `mergeStateStatus` becoming `BLOCKED` after a bot push (the exact symptom of dismissed approvals), the bot **invalidates the protection cache** and re-queries. If it now detects `dismiss_stale_reviews: true`, it posts an updated error message explaining the root cause rather than a generic "waiting for approval" message.
 
 ### Stopping
 
@@ -387,6 +428,20 @@ Rather than attempting truncated recovery (which is fragile and can violate free
    - The train transitions to `aborted` state
 
 4. **Why 50 PRs?** A train with 50 PRs produces status comment JSON of approximately 20-30KB (depending on branch names and SHA lengths), well under the 60KB safe threshold. This leaves ample headroom for human-readable content and any future schema additions.
+
+5. **Unbounded field truncation**: The `error.message` field and other variable-length strings (git command output, API error responses) are truncated before serialization to ensure the total JSON stays within bounds:
+   - `error.message`: Maximum 4KB (truncated with "... [truncated]" suffix)
+   - `error.stderr`: Maximum 2KB
+   - Branch names: Maximum 256 characters each (GitHub's limit is 255)
+
+   Truncation happens **before** JSON serialization, ensuring the size estimate remains valid. The full error details are preserved in the local event log for debugging.
+
+6. **Final size check**: Before posting/updating the status comment, the bot verifies the serialized JSON is under 60KB. If it exceeds this (which should not happen with the above limits, but is a safety net):
+   - The `error.message` and `error.stderr` fields are aggressively truncated to 500 characters each
+   - If still too large, the bot posts a minimal status comment without the embedded JSON and logs an error
+   - Recovery falls back to local state only; GitHub-based recovery is degraded
+
+This defense-in-depth approach ensures a large git error (e.g., a merge conflict with extensive diff output) cannot break status comment updates or recovery.
 
 This approach is simpler and safer than truncation-based recovery, which would require reconstructing `frozen_descendants` from current declarations — a process that violates the freeze invariant by potentially including PRs added after preparation began or missing PRs that were removed via comment edits.
 
@@ -815,6 +870,7 @@ Each webhook event updates the cached state:
 | `pull_request.opened` | Add new PR to cache |
 | `pull_request.closed` (merged) | `pr.state = Merged { sha }` |
 | `pull_request.closed` (not merged) | `pr.state = Closed` |
+| `pull_request.edited` (base changed) | Update `base_branch`, re-validate predecessor relationship (see "Continuous base branch validation") |
 | `pull_request.synchronize` | Update `head_sha`, set `merge_state` to Unknown |
 | `check_suite.completed` | Re-fetch `merge_state` via GraphQL |
 | `pull_request_review` | Re-fetch `merge_state` via GraphQL |
@@ -1183,6 +1239,26 @@ fn create_marker(path: &Path) -> io::Result<()> {
 3. Enqueues the stop event (which will be processed immediately due to priority)
 
 This allows long-running operations like `git merge` or `git push` to be interrupted promptly when a human requests a stop — **without affecting other stacks in the same repo**.
+
+**Non-blocking polling**: When the bot needs to wait for GitHub state to propagate (e.g., `headRefOid` to match after a push, or `mergeStateStatus` to transition from `UNKNOWN`), it does **not** block the event queue:
+
+1. **Timer-based re-evaluation**: Instead of synchronous polling loops, the bot:
+   - Records what condition it's waiting for in the train state (e.g., `waiting_for: { headRefOid: "<expected_sha>" }`)
+   - Sets a timer (e.g., 5s) to re-check
+   - **Yields control** back to the event loop, allowing other events (including stop commands) to be processed
+   - When the timer fires, re-evaluates the condition and either proceeds or schedules another timer
+
+2. **Event-driven updates**: Many conditions resolve via webhook events rather than polling:
+   - `check_suite.completed` / `status` → re-evaluate `mergeStateStatus`
+   - `pull_request.synchronize` → `headRefOid` updated
+   - The bot processes these events and checks if the waiting condition is satisfied
+
+3. **Timeout handling**: After a maximum wait time (configurable, default 5 minutes), the bot:
+   - Logs a warning: "Timed out waiting for GitHub state propagation"
+   - Treats this as a transient failure (see retry logic above)
+   - Does NOT abort permanently — GitHub may be experiencing delays
+
+This ensures stop commands are processed promptly (within one timer interval) even while waiting for state propagation, and independent stacks in the same repo can proceed concurrently.
 
 This design means:
 - Each stack has its own git worktree (see "Per-stack worktrees" section)
@@ -1882,12 +1958,30 @@ The bot aborts the cascade (and comments with diagnostics) if:
 | Cycle detected | Misconfigured predecessor | Fix comments |
 | Approval withdrawn | Review state changed | Re-approve |
 | Review dismissed | Reviewer dismissed their approval or requested changes | Re-approve; cascade will not auto-resume |
-| Squash-merge API fails | Branch protection, conflicts | Check PR status |
-| Branch protection blocks merge | Required checks missing, insufficient approvals, etc. | Satisfy branch protection rules, re-trigger |
+| Squash-merge API fails (transient) | Propagation delay, rate limit, 5xx | Auto-retry with backoff; wait for status event if retries exhausted |
+| Squash-merge API fails (permanent) | Conflicts, missing approval, signing required | Check PR status, satisfy requirements, re-trigger |
 
 **Review dismissal behaviour**: If a review is dismissed (either by the reviewer or due to new commits in repos with "dismiss stale reviews" enabled), the cascade aborts immediately. Unlike CI failure, review dismissal does **not** auto-resume — a new approval must be obtained and `@merge-train start` must be re-issued to continue.
 
-**Branch protection behaviour**: If the target branch has protection rules that prevent the squash-merge (e.g., required status checks not yet present, insufficient approvals, unsigned commits), the GitHub API will reject the merge request. The bot treats this as a fatal error for the stack: it posts a diagnostic comment and stops handling the stack entirely. The user must satisfy the branch protection requirements and re-issue `@merge-train start`.
+**Branch protection behaviour**: If the target branch has protection rules that prevent the squash-merge, the GitHub API will reject the merge request. The bot distinguishes between **transient** and **permanent** failures:
+
+1. **Transient failures** (retry with backoff):
+   - "Required status check is expected" — status propagation delay after bot's push
+   - "Base branch was modified" — someone pushed to main during merge attempt
+   - HTTP 5xx errors, timeouts, rate limits
+   - The bot retries up to 3 times with exponential backoff (2s, 4s, 8s) before treating as permanent
+
+2. **Permanent failures** (abort immediately):
+   - "Pull request is not mergeable" with `mergeStateStatus: DIRTY` — genuine conflict
+   - "Approving review required" — missing approval (won't fix itself)
+   - "Changes must be signed" — commit signing required but not present
+   - 4xx errors other than rate limits
+
+This distinction is critical because the eventual consistency caveat (see above) means `mergeStateStatus` may briefly show `CLEAN` while GitHub's merge machinery still sees stale state. The retry window allows propagation to complete.
+
+On **transient** failure after exhausting retries, the bot transitions to `waiting_ci` state (not `aborted`) and waits for the next `check_suite` or `status` event to re-attempt. This prevents false aborts from brief propagation delays.
+
+On **permanent** failure, the bot posts a diagnostic comment and stops handling the stack entirely. The user must satisfy the branch protection requirements and re-issue `@merge-train start`.
 
 **Concurrent push handling**: If the bot's push is rejected because someone else pushed to the descendant branch during the cascade:
 
