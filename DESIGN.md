@@ -1264,8 +1264,15 @@ Each per-repo worker loop:
 ```rust
 // Creating a marker file atomically
 fn create_marker(path: &Path) -> io::Result<()> {
-    // Create marker with a unique temp name first
-    let temp = path.with_extension("tmp");
+    // Create marker with a unique temp name first.
+    // IMPORTANT: Append ".tmp" rather than replacing the extension, so that
+    // <id>.json.proc and <id>.json.done get distinct temp files:
+    //   <id>.json.proc -> <id>.json.proc.tmp
+    //   <id>.json.done -> <id>.json.done.tmp
+    let mut temp_name = path.as_os_str().to_owned();
+    temp_name.push(".tmp");
+    let temp = PathBuf::from(temp_name);
+
     let file = File::create(&temp)?;
     file.sync_all()?;  // fsync the (empty) file
     std::fs::rename(&temp, path)?;  // atomic rename
@@ -3394,7 +3401,11 @@ async fn process_github_event(
                 notify_orphaned_descendants(pr.number, &stacks, ctx).await?;
             }
         }
-        GitHubEvent::CheckSuite(cs) if cs.conclusion == Some("success") => {
+        GitHubEvent::CheckSuite(cs) if cs.conclusion.is_some() => {
+            // Re-evaluate on ANY check completion, not just success.
+            // The bot determines mergeability via `mergeStateStatus`, not individual check
+            // conclusions. Non-required checks failing yields UNSTABLE (which is mergeable),
+            // so we must re-evaluate even on "failure" or "neutral" conclusions.
             evaluate_cascade(&stacks, repo_state, stack_cancel, ctx).await?;
         }
         GitHubEvent::PullRequestReview(r) if r.action == "submitted" && r.review.state == "approved" => {
@@ -3561,7 +3572,8 @@ impl RepoState {
         None
     }
 
-    /// Check if a PR is part of a train's frozen descendants
+    /// Check if a PR is part of a train (either in frozen_descendants or reachable via
+    /// the predecessor chain from train.current_pr when Idle).
     fn is_pr_in_train(&self, pr: PrNumber, train: &TrainRecord) -> bool {
         match &train.cascade_phase {
             CascadePhase::Preparing { frozen_descendants, .. } |
@@ -3571,8 +3583,35 @@ impl RepoState {
             CascadePhase::Retargeting { frozen_descendants, .. } => {
                 frozen_descendants.contains(&pr)
             }
-            CascadePhase::Idle => false,
+            CascadePhase::Idle => {
+                // When Idle (e.g., waiting on CI), the frozen_descendants aren't populated yet.
+                // Walk the predecessor chain from `pr` to see if it leads to train.current_pr.
+                // This handles stop commands on future descendants that haven't been frozen.
+                self.is_descendant_of(pr, train.current_pr)
+            }
         }
+    }
+
+    /// Check if `pr` is a descendant of `ancestor` by walking the predecessor chain.
+    /// Returns true if walking up from `pr` eventually reaches `ancestor`.
+    fn is_descendant_of(&self, pr: PrNumber, ancestor: PrNumber) -> bool {
+        let mut current = pr;
+        let mut visited = HashSet::new();
+
+        while let Some(cached_pr) = self.prs.get(&current) {
+            if !visited.insert(current) {
+                return false; // Cycle detected
+            }
+            if let Some(pred) = cached_pr.predecessor {
+                if pred == ancestor {
+                    return true;
+                }
+                current = pred;
+            } else {
+                return false; // Reached a root (no predecessor)
+            }
+        }
+        false
     }
 }
 ```
