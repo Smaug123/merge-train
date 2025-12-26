@@ -246,15 +246,7 @@ Due to inherent race conditions, the stop takes effect at the next opportunity �
 
 The stop command is scoped to a single stack — other independent stacks in the same repo are unaffected. Each stack has its own isolated worktree (see "Per-stack worktrees" section), so stopping one stack has no effect on others.
 
-**Worktree cleanup on stop**: The stop command calls `cleanup_worktree_on_abort` (same function used by abort — see "Worktree cleanup on abort" in the Abort Conditions section) on the stack's worktree. This:
-- Aborts any in-progress merge (`git merge --abort` — clears MERGE_HEAD and unmerged index entries)
-- Hard-resets to HEAD (`git reset --hard HEAD` — not `git checkout -- .`, which doesn't clear unmerged index)
-- Cleans untracked files (`git clean -fd`)
-- Does NOT reset to `origin/<branch>` — the worktree uses detached HEAD mode and the branch may be deleted after merge
-
-**Why `git reset --hard` instead of `git checkout -- .`**: The `checkout` command cannot clear an unmerged index (it fails with "you need to resolve your current index first"). If a stop command is issued while the worktree has merge conflicts, only `reset --hard` reliably clears the index.
-
-If the worktree is corrupted beyond repair, it is deleted entirely and will be recreated when the train restarts.
+**Worktree removal on stop**: The stop command removes the stack's worktree entirely via `remove_worktree`. This is intentional: a stopped train is expected to be restarted from scratch if needed, and removing the worktree ensures clean state. When the train restarts, a fresh worktree is created.
 
 ### Aborting
 
@@ -4108,8 +4100,7 @@ impl GitOperations {
     }
 
     /// Remove a stack's worktree. Called after stack completes successfully,
-    /// or when cleanup_worktree_on_abort fails (worktree corrupted beyond repair).
-    /// Note: Normal stop does NOT remove the worktree — it cleans in place for resume.
+    /// on stop command, or when cleanup_worktree_on_abort fails (worktree corrupted beyond repair).
     async fn remove_worktree(&self, root_pr: PrNumber) -> Result<()> {
         let worktree_path = self.base_dir
             .join("worktrees")

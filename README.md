@@ -4,12 +4,12 @@ This bot implements a merge train, following [my standard workflow](https://www.
 
 # Gotchas
 
-* The merge train will proceed with draft PRs, but will fail at merge time to merge into main if the PR we're merging is still in draft state at that point. Probably don't use merge trains in conjunction with draft PRs.
+* If the root PR is a draft, the bot rejects `@merge-train start` with an error asking you to mark the PR as ready for review first. Draft PRs elsewhere in the stack are allowed: when the cascade reaches them, it waits (similar to waiting for CI) rather than failing immediately. However, draft PRs cannot be merged into main, so they must be marked ready before the cascade can complete.
 
 # Limitations by design
 
 * The bot works against GitHub only, and is only designed to be run against github.com (though it may work against GitHub Enterprise by coincidence).
-* The bot performs a check to ensure there's a branch protection rule on the default branch specifying that "squash merge" is the only allowed merge method: no rebase-merge, no merge commits. It's possible to fool this check by e.g. force-pushing a rebase commit manually to the default branch, or by quickly switching the branch protection rule off after one of our preflight checks has run; if you do that, you may silently get incorrect results, including data loss!
+* The bot performs a check to ensure the repository is configured for squash-only merges (via the repository settings `allow_squash_merge`, `allow_merge_commit`, `allow_rebase_merge` - not branch protection rules). It's possible to fool this check by e.g. force-pushing a rebase commit manually to the default branch, or by quickly re-enabling other merge methods after one of our preflight checks has run; if you do that, you may silently get incorrect results, including data loss!
 * Of course, don't attempt to run any other merge train software like GitHub's own merge queue.
 * The system is incompatible with "dismiss stale approvals" branch protection, because the system will push to each branch, invalidating approvals on that branch.
 * The bot doesn't work across forks, because it pushes to the incoming branches.
