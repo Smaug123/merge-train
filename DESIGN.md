@@ -2429,9 +2429,9 @@ enum TrainState {
 	// 2. During spool replay, new `predecessor_declared` events may add descendants
 	// 3. If recovery re-queried repo_state.descendants, it would see descendants that weren't
 	//    present when we entered the Preparing phase
-	// 4. Those new descendants never got step 1b (merge main before squash)
-	// 5. The ours-strategy merge in Reconciling would then fail to incorporate main commits
-	//    that landed between Preparing and Reconciling, potentially reverting them
+	// 4. Those new descendants never got preparation (predecessor head merge)
+	// 5. Their branches don't contain the predecessor's changes, so reconciliation would
+	//    produce incorrect results (missing the predecessor's work)
 	//
 	// By carrying frozen_descendants through all phases, recovery always knows exactly which
 	// descendants were promised preparation and which still need reconciliation/catch-up/retarget.
@@ -3506,8 +3506,13 @@ impl RepoState {
             current = n;
         }
 
-        // Train state is a property of the stack (stored on root), not individual PRs
-        let (started, stopped) = match self.active_trains.get(&root) {
+        // Train state lookup: use find_stack_root to handle the case where the train
+        // has advanced (root PR merged, cascade moved to a descendant). The train is
+        // keyed by original_root_pr (stable), but the discovered root here is the
+        // *current* stack root which may differ after advancement.
+        let (started, stopped) = match self.find_stack_root(root)
+            .and_then(|original_root| self.active_trains.get(&original_root))
+        {
             Some(train) => (
                 matches!(train.state, TrainState::Running | TrainState::WaitingCi),
                 matches!(train.state, TrainState::Stopped),
