@@ -254,7 +254,7 @@ The stop command is scoped to a single stack — other independent stacks in the
 
 The bot pauses a cascade when it encounters an error. The pause state depends on whether the condition can auto-resolve:
 
-- **Waiting (`waiting_ci`)**: Transient conditions that can resolve without user action — check failures, approval temporarily missing. The bot monitors for relevant events (`check_suite.completed`, `pull_request_review.submitted`) and auto-resumes when `mergeStateStatus` becomes `CLEAN`.
+- **Waiting (`waiting_ci`)**: Transient conditions that can resolve without user action — check failures, approval temporarily missing. The bot monitors for relevant events (`check_suite.completed`, `pull_request_review.submitted`) and auto-resumes when `mergeStateStatus` becomes `CLEAN` or `UNSTABLE`.
 - **Aborted (`aborted`)**: Permanent conditions that require explicit user intervention — merge conflicts, review dismissed, permanent API failures. The cascade will not resume until `@merge-train start` is re-issued.
 - **Stopped (`stopped`)**: Explicit human request via `@merge-train stop`. The cascade will not resume until `@merge-train start` is issued again.
 
@@ -2058,7 +2058,7 @@ This means "fix the CI and push" is sufficient to resume — no manual re-trigge
 
 **Distinguishing BLOCKED causes**: GitHub's `mergeStateStatus` returns `BLOCKED` for both check failures AND missing approvals — it doesn't distinguish between them. The bot handles this by:
 
-1. **Event-driven re-evaluation**: When `check_suite.completed` or `pull_request_review.submitted` fires, the bot re-queries `mergeStateStatus`. If now `CLEAN`, the cascade continues regardless of what caused the prior `BLOCKED`.
+1. **Event-driven re-evaluation**: When `check_suite.completed` or `pull_request_review.submitted` fires, the bot re-queries `mergeStateStatus`. If now `CLEAN` or `UNSTABLE`, the cascade continues regardless of what caused the prior `BLOCKED`.
 
 2. **Review dismissal is special**: When a review is dismissed (detected via `pull_request_review.dismissed` event), the cascade transitions to `aborted` state with a specific reason. This state does NOT auto-resume on subsequent approval — the user must re-issue `@merge-train start`. See "Review dismissal behaviour" above.
 
