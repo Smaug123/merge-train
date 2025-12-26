@@ -48,7 +48,7 @@ This declares that the current PR is stacked on top of PR #123. The bot will:
    - The PR is excluded from any active cascade until the mismatch is resolved
    - The bot posts a warning: "PR #N was retargeted to 'X', which no longer matches predecessor #123's head branch 'Y'. This PR will not be included in the cascade until the base branch is corrected."
 
-2. **At cascade time**: Before entering the `preparing` phase for any descendant, the bot re-validates that the descendant's base branch matches the predecessor's head branch. This catches any retargeting that occurred between declaration and cascade. If validation fails, the cascade aborts for that PR with a clear error.
+2. **At cascade time**: Before entering the `Preparing` phase for any descendant, the bot re-validates that the descendant's base branch matches the predecessor's head branch. This catches any retargeting that occurred between declaration and cascade. If validation fails, the cascade aborts for that PR with a clear error.
 
 This prevents stale predecessor links from causing merges into wrong branches.
 
@@ -248,12 +248,13 @@ The stop command is scoped to a single stack — other independent stacks in the
 
 **Worktree removal on stop**: The stop command removes the stack's worktree entirely via `remove_worktree`. This is intentional: a stopped train is expected to be restarted from scratch if needed, and removing the worktree ensures clean state. When the train restarts, a fresh worktree is created.
 
-### Aborting
+### Aborting and Waiting
 
-The bot automatically aborts a cascade when it encounters an error (merge conflict, required check failure, etc.). This is distinct from a manual stop:
+The bot pauses a cascade when it encounters an error. The pause state depends on whether the condition can auto-resolve:
 
-- **Abort**: Caused by an error condition. The bot posts diagnostics and waits for the condition to resolve. Some conditions (like required check failure) auto-resume when fixed.
-- **Stop**: Explicit human request. The cascade will not resume until `@merge-train start` is issued again.
+- **Waiting (`waiting_ci`)**: Transient conditions that can resolve without user action — check failures, approval temporarily missing. The bot monitors for relevant events (`check_suite.completed`, `pull_request_review.submitted`) and auto-resumes when `mergeStateStatus` becomes `CLEAN`.
+- **Aborted (`aborted`)**: Permanent conditions that require explicit user intervention — merge conflicts, review dismissed, permanent API failures. The cascade will not resume until `@merge-train start` is re-issued.
+- **Stopped (`stopped`)**: Explicit human request via `@merge-train stop`. The cascade will not resume until `@merge-train start` is issued again.
 
 ---
 
@@ -301,16 +302,16 @@ When the bot takes ownership of a stack (via `@merge-train start`), it persists 
 | `stopped_at` | `string?` | ISO 8601 timestamp if stopped |
 | `error` | `object?` | Error details if aborted: `{ "type": "...", "message": "..." }` |
 
-**Cascade phases:**
+**Cascade phases** (serialized as `{ "PhaseName": {...} }` for phases with data, or `"PhaseName"` for unit variants):
 
-- `idle`: Not currently performing any operation; waiting for CI or next event
-- `preparing`: Merging predecessor head into descendants (before squash) — NOT main, only predecessor head
-- `squash_pending`: Preparation complete; about to squash-merge current PR
-- `reconciling`: Squash complete; performing ours-strategy merges into descendants
-- `catching_up`: Ours-merge complete; performing regular merge of origin/main
-- `retargeting`: Catch-up complete; retargeting descendant PRs to default branch
+- `Idle`: Not currently performing any operation; waiting for CI or next event
+- `Preparing`: Merging predecessor head into descendants (before squash) — NOT main, only predecessor head
+- `SquashPending`: Preparation complete; about to squash-merge current PR
+- `Reconciling`: Squash complete; performing ours-strategy merges into descendants
+- `CatchingUp`: Ours-merge complete; performing regular merge of origin/main
+- `Retargeting`: Catch-up complete; retargeting descendant PRs to default branch
 
-Phases with multiple descendants (`preparing`, `reconciling`, `catching_up`, `retargeting`) include a `completed` list tracking which descendants have finished that phase.
+Phases with multiple descendants (`Preparing`, `Reconciling`, `CatchingUp`, `Retargeting`) include a `completed` list tracking which descendants have finished that phase.
 
 **Recovery semantics:**
 
@@ -318,12 +319,12 @@ If the bot crashes mid-cascade, the `cascade_phase` indicates where to resume:
 
 | Phase | Recovery action |
 |-------|-----------------|
-| `idle` | Re-evaluate current PR's readiness |
-| `preparing` | Skip descendants in `completed`, re-run for remaining (idempotent if already pushed) |
-| `squash_pending` | Check if squash already happened; if not, perform it |
-| `reconciling` | Verify preparation, then skip descendants in `completed`, use `last_squash_sha` to complete for remaining |
-| `catching_up` | Skip descendants in `completed`, re-run merge of origin/main for remaining |
-| `retargeting` | Skip descendants in `completed`, retarget remaining (idempotent via API check) |
+| `Idle` | Re-evaluate current PR's readiness |
+| `Preparing` | Skip descendants in `completed`, re-run for remaining (idempotent if already pushed) |
+| `SquashPending` | Check if squash already happened; if not, perform it |
+| `Reconciling` | Verify preparation, then skip descendants in `completed`, use `last_squash_sha` to complete for remaining |
+| `CatchingUp` | Skip descendants in `completed`, re-run merge of origin/main for remaining |
+| `Retargeting` | Skip descendants in `completed`, retarget remaining (idempotent via API check) |
 
 **Verifying preparation before reconciliation:**
 
@@ -332,7 +333,7 @@ Reconciliation assumes all descendants were prepared (predecessor head merged in
 - The bot crashes between preparation and squash, and on recovery finds the PR already merged
 - A race condition where preparation partially completed
 
-**On recovery to `reconciling` phase**, before proceeding, the bot MUST verify for each descendant not in `completed`:
+**On recovery to `Reconciling` phase**, before proceeding, the bot MUST verify for each descendant not in `completed`:
 
 1. Fetch the descendant's head SHA and the predecessor's pre-squash head SHA (from `predecessor_head_sha` field, or by fetching `refs/pull/<predecessor_pr>/head` via `git ls-remote` as fallback)
 2. Check if the predecessor head is an ancestor of the descendant head: `git merge-base --is-ancestor <predecessor_head> <descendant_head>`
@@ -388,7 +389,7 @@ If recovery finds `cascade_phase = "reconciling"` but `last_squash_sha` is null 
    If still null after all retries, log a warning and abort with a recoverable error. The user can retry recovery later.
 
 5. Continue reconciliation with the recovered SHA
-6. If predecessor is not merged, the squash didn't actually happen — revert to `squash_pending`
+6. If predecessor is not merged, the squash didn't actually happen — revert to `SquashPending`
 
 This derives the squash SHA from GitHub rather than hard-failing, since the squash-merge is recorded in GitHub's PR state even if our local record was lost.
 
@@ -405,7 +406,7 @@ This derives the squash SHA from GitHub rather than hard-failing, since the squa
    - Use the GitHub values to update local state
 4. Continue recovery from the merged state
 
-This handles the scenario where: local state shows `squash_pending`, but GitHub shows `reconciling` with `last_squash_sha`. The squash succeeded and was recorded to GitHub, but the local write was lost. Without this, recovery would attempt to squash again (which would fail or duplicate).
+This handles the scenario where: local state shows `SquashPending`, but GitHub shows `Reconciling` with `last_squash_sha`. The squash succeeded and was recorded to GitHub, but the local write was lost. Without this, recovery would attempt to squash again (which would fail or duplicate).
 
 **Recovery precedence** (determined by comparing `recovery_seq`):
 - If GitHub's `recovery_seq` > local: Use GitHub's state (operation succeeded, local lost the record)
@@ -496,7 +497,7 @@ This approach is simpler and safer than truncation-based recovery, which would r
 
 3. **Infer cascade position**: The "current PR" is the first non-merged PR in the stack. If all PRs are merged, the train is complete.
 
-4. **Cannot infer cascade phase**: Without the status comment, the bot cannot know which phase (`preparing`, `reconciling`, etc.) was interrupted. The bot MUST:
+4. **Cannot infer cascade phase**: Without the status comment, the bot cannot know which phase (`Preparing`, `Reconciling`, etc.) was interrupted. The bot MUST:
    - Mark the train as `needs_manual_review` (a new state)
    - Post a NEW status comment explaining the situation: "Train state was lost. Manual review required. The bot has identified [list of descendants] but cannot safely resume mid-operation. Options: (a) Issue `@merge-train stop` then `@merge-train start` to restart from current position, (b) Manually complete the cascade."
    - Do NOT attempt to auto-resume — the risk of data loss (e.g., skipping preparation) is too high.
@@ -589,10 +590,10 @@ Newline-delimited JSON (JSON Lines), one event per line. Each event includes a m
 
 ```json
 {"seq":1,"ts":"2024-01-15T10:00:00Z","type":"train_started","root_pr":123,"current_pr":123}
-{"seq":2,"ts":"2024-01-15T10:01:00Z","type":"phase_transition","train_root":123,"current_pr":123,"predecessor_pr":null,"last_squash_sha":null,"phase":{"Preparing":{"completed":[],"frozen_descendants":[124]}}}
-{"seq":3,"ts":"2024-01-15T10:01:30Z","type":"phase_transition","train_root":123,"current_pr":123,"predecessor_pr":123,"last_squash_sha":null,"phase":"SquashPending"}
+{"seq":2,"ts":"2024-01-15T10:01:00Z","type":"phase_transition","train_root":123,"current_pr":123,"predecessor_pr":null,"last_squash_sha":null,"phase":{"Preparing":{"completed":[],"skipped":[],"frozen_descendants":[124]}}}
+{"seq":3,"ts":"2024-01-15T10:01:30Z","type":"phase_transition","train_root":123,"current_pr":123,"predecessor_pr":123,"last_squash_sha":null,"phase":{"SquashPending":{"frozen_descendants":[124],"skipped":[]}}}
 {"seq":4,"ts":"2024-01-15T10:02:00Z","type":"squash_committed","train_root":123,"pr":123,"sha":"abc123"}
-{"seq":5,"ts":"2024-01-15T10:02:30Z","type":"phase_transition","train_root":123,"current_pr":123,"predecessor_pr":123,"last_squash_sha":"abc123","phase":{"Reconciling":{"completed":[]}}}
+{"seq":5,"ts":"2024-01-15T10:02:30Z","type":"phase_transition","train_root":123,"current_pr":123,"predecessor_pr":123,"last_squash_sha":"abc123","phase":{"Reconciling":{"completed":[],"skipped":[],"frozen_descendants":[124]}}}
 {"seq":6,"ts":"2024-01-15T10:03:00Z","type":"phase_transition","train_root":123,"current_pr":124,"predecessor_pr":123,"last_squash_sha":"abc123","phase":"Idle"}
 {"seq":7,"ts":"2024-01-15T10:10:00Z","type":"train_completed","root_pr":123}
 ```
@@ -706,7 +707,7 @@ The bot persists per-repo state using an append-only event log with periodic sna
 
 **Recovery-critical events** (require fsync before continuing):
 - `train_started`, `train_stopped`, `train_completed`, `train_aborted`
-- `phase_transition` (any phase change: `preparing`, `squash_pending`, `reconciling`, `idle`)
+- `phase_transition` (any phase change: `Preparing`, `SquashPending`, `Reconciling`, `Idle`)
 - `squash_committed` (records the squash SHA needed for reconciliation recovery)
 
 Non-critical events (fsync batched for performance):
@@ -875,10 +876,10 @@ On startup (and on first webhook for an unknown repo), the bot follows a two-pha
 
 **Recovery and completion (both paths)**
 
-13. **Recovery check**: For any train in a non-idle `cascade_phase`, evaluate whether to resume:
-    - If `preparing`: Re-run preparation (merge operations are idempotent if already pushed)
-    - If `squash_pending`: Check if PR is already merged; if not, proceed with squash
-    - If `reconciling`: Use `last_squash_sha` from the train record to complete reconciliation
+13. **Recovery check**: For any train in a non-`Idle` `cascade_phase`, evaluate whether to resume:
+    - If `Preparing`: Re-run preparation (merge operations are idempotent if already pushed)
+    - If `SquashPending`: Check if PR is already merged; if not, proceed with squash
+    - If `Reconciling`: Use `last_squash_sha` from the train record to complete reconciliation
 14. Transition to `Ready` state
 15. Drain queued events, process each in order
 
@@ -1395,7 +1396,7 @@ On restart, the bot:
 1. Loads repo state (snapshot + event log replay) from disk
 2. For each active train, cleans up its worktree (see "Worktree cleanup on restart" below)
 3. Replays any unprocessed webhook deliveries from the spool (files without `.done` markers)
-4. For each active train in a non-`idle` phase, performs recovery check (see "Recovery semantics")
+4. For each active train in a non-`Idle` phase, performs recovery check (see "Recovery semantics")
 5. Optionally refreshes train state from GitHub status comments (see "Supplementary GitHub recovery")
 
 **Worktree cleanup on restart:**
@@ -1617,7 +1618,7 @@ For the final PR in the stack (#125), there is no descendant, so steps 1, 3-5 ar
 
 **Freeze point and logging**: When entering the `Preparing` phase for PR #N:
 1. Query the current descendant set from the `descendants` index
-2. Log the `phase_transition` event with the descendant list frozen in the `completed: []` field
+2. Log the `phase_transition` event with the descendant list frozen in the `frozen_descendants` field
 3. Only process descendants that were captured at this moment
 4. New descendants that arrive after the phase_transition event will be handled in the NEXT cascade step (when #N's successor becomes the current root)
 
@@ -1824,12 +1825,12 @@ The tree SHA is deterministic (same file content = same tree), so it serves as a
 
 The `cascade_phase` transitions map to these commit points:
 
-- `idle` → `preparing`: Write `phase_transition{Preparing{...}}` + fsync before starting preparation
-- `preparing` → `squash_pending`: Write `phase_transition{SquashPending{...}}` + fsync after all prep pushes complete
-- `squash_pending` → `reconciling`: Write `squash_committed{sha}` + `phase_transition{Reconciling{...}}` + fsync **immediately after** receiving squash SHA from API
-- `reconciling` → `catching_up`: Write `phase_transition{CatchingUp{...}}` + fsync after all ours-merge pushes complete
-- `catching_up` → `retargeting`: Write `phase_transition{Retargeting{...}}` + fsync after all catch-up pushes complete
-- `retargeting` → `idle`: Write `phase_transition{Idle}` + fsync after all retarget API calls complete
+- `Idle` → `Preparing`: Write `phase_transition{Preparing{...}}` + fsync before starting preparation
+- `Preparing` → `SquashPending`: Write `phase_transition{SquashPending{...}}` + fsync after all prep pushes complete
+- `SquashPending` → `Reconciling`: Write `squash_committed{sha}` + `phase_transition{Reconciling{...}}` + fsync **immediately after** receiving squash SHA from API
+- `Reconciling` → `CatchingUp`: Write `phase_transition{CatchingUp{...}}` + fsync after all ours-merge pushes complete
+- `CatchingUp` → `Retargeting`: Write `phase_transition{Retargeting{...}}` + fsync after all catch-up pushes complete
+- `Retargeting` → `Idle`: Write `phase_transition{Idle}` + fsync after all retarget API calls complete
 
 **Per-phase intent/done events:**
 
@@ -1954,21 +1955,21 @@ This means `completed` tracks "successfully processed" and we implicitly have "f
 
 ---
 
-## Abort Conditions
+## Pause Conditions
 
-The bot aborts the cascade (and comments with diagnostics) if:
+The bot pauses the cascade (and comments with diagnostics) when it encounters issues. The resulting state (`waiting_ci` or `aborted`) determines whether the cascade can auto-resume:
 
-| Condition | Likely cause | Recovery hint |
-|-----------|--------------|---------------|
-| Preparation merge fails | Conflict between predecessor/main and descendant | Resolve locally, push to descendant branch, re-trigger |
-| `git push` rejected (non-fast-forward) | Someone else pushed to the branch during cascade | See "Concurrent push handling" below |
-| PR closed without merge | Human intervention | Re-open or restructure stack |
-| Required check fails on descendant | Code issue | Fix, push, bot will auto-continue |
-| Cycle detected | Misconfigured predecessor | Fix comments |
-| Approval withdrawn | Review state changed | Re-approve |
-| Review dismissed | Reviewer dismissed their approval or requested changes | Re-approve; cascade will not auto-resume |
-| Squash-merge API fails (transient) | Propagation delay, rate limit, 5xx | Auto-retry with backoff; wait for status event if retries exhausted |
-| Squash-merge API fails (permanent) | Conflicts, missing approval, signing required | Check PR status, satisfy requirements, re-trigger |
+| Condition | Resulting state | Recovery |
+|-----------|-----------------|----------|
+| Required check fails on descendant | `waiting_ci` | Fix, push — bot auto-resumes on `check_suite.completed` |
+| Approval withdrawn (temporarily missing) | `waiting_ci` | Re-approve — bot auto-resumes on `pull_request_review.submitted` |
+| Squash-merge API fails (transient) | `waiting_ci` | Auto-retry with backoff; waits for status event if retries exhausted |
+| Preparation merge fails | `aborted` | Resolve conflict locally, push, then `@merge-train start` |
+| `git push` rejected (non-fast-forward) | `aborted` | See "Concurrent push handling" below |
+| PR closed without merge | `aborted` | Re-open or restructure stack |
+| Cycle detected | `aborted` | Fix predecessor comments |
+| Review dismissed | `aborted` | Re-approve, then `@merge-train start` (no auto-resume) |
+| Squash-merge API fails (permanent) | `aborted` | Check PR status, satisfy requirements, then `@merge-train start` |
 
 **Review dismissal behaviour**: If a review is dismissed (either by the reviewer or due to new commits in repos with "dismiss stale reviews" enabled), the cascade aborts immediately. Unlike CI failure, review dismissal does **not** auto-resume — a new approval must be obtained and `@merge-train start` must be re-issued to continue.
 
@@ -2346,6 +2347,8 @@ enum MergeStateStatus {
 	    cascade_phase: CascadePhase,
 	    /// PR number of predecessor (for fetching via refs/pull/<n>/head during recovery)
 	    predecessor_pr: Option<PrNumber>,
+	    /// Head SHA of predecessor at preparation time (for verifying preparation during recovery)
+	    predecessor_head_sha: Option<Sha>,
 	    /// SHA of last squash commit (for reconciliation recovery)
 	    last_squash_sha: Option<Sha>,
 	    /// When the train was started (ISO 8601)
@@ -2359,6 +2362,7 @@ enum MergeStateStatus {
 	}
 
 #[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 enum TrainState {
     Running,
     Stopped,
@@ -2506,7 +2510,7 @@ struct TrainError {
 	enum StateEventPayload {
 	    // ─── Train lifecycle (always critical) ───
 	    #[serde(rename = "train_started")]
-	    TrainStarted { root_pr: u64 },
+	    TrainStarted { root_pr: u64, current_pr: u64 },
 	    #[serde(rename = "train_stopped")]
 	    TrainStopped { root_pr: u64 },
 	    #[serde(rename = "train_completed")]
@@ -3393,6 +3397,15 @@ async fn process_github_event(
         }
         GitHubEvent::PullRequestReview(r) if r.action == "submitted" && r.review.state == "approved" => {
             evaluate_cascade(&stacks, repo_state, stack_cancel, ctx).await?;
+        }
+        GitHubEvent::PullRequestReview(r) if r.action == "dismissed" => {
+            // Review dismissal aborts the train (does NOT auto-resume on subsequent approval)
+            // See "Review dismissal behaviour" section
+            if let Some(root) = repo_state.find_stack_root(r.pull_request.number) {
+                if let Some(train) = repo_state.active_trains.get(&root) {
+                    abort_train(train, AbortReason::ReviewDismissed, repo_state, ctx).await?;
+                }
+            }
         }
         _ => {}
     }

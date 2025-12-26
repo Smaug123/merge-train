@@ -25,4 +25,4 @@ This bot implements a merge train, following [my standard workflow](https://www.
 
 # Licence
 
-Licenced to you under the MIT licence, a copy of which can be found at [LICENCE.md](LICENCE.md).
+Licensed to you under the MIT licence, a copy of which can be found at [LICENCE.md](LICENCE.md).
