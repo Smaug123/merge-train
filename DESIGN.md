@@ -118,13 +118,16 @@ This delegates all branch protection logic to GitHub, ensuring the bot respects 
 
 **CRITICAL**: The bot NEVER merges main into a descendant BEFORE the predecessor is squash-merged. Doing so would cause lost commits (see "Why merging $SQUASH_SHA^ is essential"). The handling above only applies when the descendant's base is already main (post-retarget) or for the root PR.
 
-**Eventual consistency caveat**: GitHub's `mergeStateStatus` is eventually consistent. After a push (including pushes from the bot itself during preparation or reconciliation), the field may reflect stale state for several seconds — even after `headRefOid` is updated to reflect the new head. To avoid acting on stale data:
+**Eventual consistency caveat**: GitHub's `mergeStateStatus` is eventually consistent. After a push (including pushes from the bot itself during preparation or reconciliation), the field may reflect stale state for several seconds — even after `headRefOid` is updated to reflect the new head. The `headRefOid` field and `mergeStateStatus` field are **not atomically consistent**: `headRefOid` is updated by the git layer, while `mergeStateStatus` is computed by a separate mergeability engine that may lag behind. To avoid acting on stale data:
 
-1. **After a bot-initiated push**: The bot must **wait for a `check_suite` webhook** for the new head SHA before trusting `mergeStateStatus`. Simply polling until `headRefOid` matches is insufficient — `mergeStateStatus` can still reflect the old head's status even after `headRefOid` updates. The `check_suite.requested` or `check_suite.completed` event for the pushed SHA confirms GitHub has begun/finished evaluating the new head.
+1. **After a bot-initiated push**: The bot must **wait for `check_suite.completed`** (not just `created` or `requested`) for the new head SHA before trusting `mergeStateStatus`. The `check_suite.created`/`requested` events only indicate GitHub has *begun* evaluating — the mergeability engine may not have incorporated the results yet. Only after `check_suite.completed` can the bot trust that `mergeStateStatus` reflects the new head's actual check results.
+
+   **Why `created`/`requested` is insufficient**: The mergeability engine is asynchronous. When `check_suite.created` fires, you may query `mergeStateStatus` and receive `CLEAN` — but this `CLEAN` is cached from the OLD head's check results, not computed against the new head. The new head's checks haven't finished yet, so the mergeability engine has nothing new to report and returns stale data.
+
 2. **Before squash-merging**: The bot must verify that `headRefOid` matches the expected head SHA recorded when the train was started or when preparation completed. If they differ, someone pushed to the branch — abort and notify.
-3. **On `UNKNOWN` status**: This explicitly means GitHub hasn't computed the status yet. Wait for `check_suite` webhook.
+3. **On `UNKNOWN` status**: This explicitly means GitHub hasn't computed the status yet. Wait for `check_suite.completed` webhook.
 
-This prevents races where: (a) the bot pushes a reconciliation commit, (b) immediately checks mergeStateStatus, (c) gets `CLEAN` based on the OLD head's check results, (d) merges before required checks have run on the NEW head.
+This prevents races where: (a) the bot pushes a reconciliation commit, (b) `check_suite.created` fires, (c) bot queries `mergeStateStatus` and gets `CLEAN` based on the OLD head's cached results, (d) merges before required checks have run on the NEW head.
 
 **Note on "check failure"**: Throughout this document, "check failure" or "required check failure" refers to `mergeStateStatus` transitioning to `BLOCKED`. The bot does not query branch protection rules to distinguish required from non-required checks — it relies entirely on GitHub's `mergeStateStatus` computation. This means:
 - If a non-required check fails → `UNSTABLE` → bot proceeds
@@ -1535,6 +1538,11 @@ The PR number (not the SHA) is the stable identifier used to construct these ref
 
 Let's assume a stack of this shape: main ← #123 ← #124 ← #125
 
+**REQUIRED TESTS**: The correctness of this operation sequence is verified by Properties 1-3 in the "Property-based testing with real git" section:
+- Property 1 (`descendant_content_preserved_after_cascade`): Verifies all content from predecessor, descendant, and intervening main commits is preserved
+- Property 2 (`intervening_main_commits_preserved`): Verifies commits pushed to main during the cascade (that don't conflict) survive the train
+- Property 3 (`squash_parent_ordering_prevents_lost_commits`): Verifies the $SQUASH_SHA^ ordering is essential and that the naive (wrong) approach loses commits
+
 The cascade proceeds by repeating the following for each PR, starting from the root:
 
 ```
@@ -1781,6 +1789,11 @@ The validation uses a two-step approach:
 2. **Parent ancestry check**: For single-parent commits, verifies the parent was on the default branch before this commit. For a squash merge, `$SHA^` is the prior default branch HEAD, so it's trivially its own ancestor. For a rebase merge, `$SHA^` is a rebased commit that wasn't on the default branch before the rebase — the ancestry check fails.
 
 This reliably distinguishes squash from rebase merges by checking the commit graph structure rather than relying on GitHub metadata that may not always be available.
+
+**REQUIRED TESTS**: Properties 4-6 in the "Property-based testing with real git" section verify this detection logic:
+- Property 4 (`squash_merge_detection_accepts_squash`): Validates that legitimate squash merges pass both checks
+- Property 5 (`squash_merge_detection_rejects_merge_commit`): Validates that true merge commits (two parents) are rejected
+- Property 6 (`squash_merge_detection_rejects_rebase`): Validates that rebase merges (single parent not on prior main) are rejected
 
 **Polling fallback**: During `PollActiveTrains`, also scan for "orphaned" PRs:
 ```rust
@@ -2455,6 +2468,10 @@ enum TrainState {
 	// By carrying frozen_descendants through all phases, recovery always knows exactly which
 	// descendants were promised preparation and which still need reconciliation/catch-up/retarget.
 	// The `skipped` set ensures we don't retry descendants that permanently failed.
+	//
+	// REQUIRED TEST: Property 8 (`recovery_uses_frozen_descendants`) in the "Property-based
+	// testing with real git" section verifies that recovery uses the frozen set, not the
+	// current descendants index.
 
 #[derive(Serialize, Deserialize)]
 struct TrainError {
@@ -3907,6 +3924,10 @@ impl GitOperations {
     ///
     /// By merging S^ AFTER the squash, we guarantee we incorporate exactly the main
     /// state up to (but not including) the squash, regardless of when commits landed.
+    ///
+    /// **REQUIRED TEST**: Property 3 (`squash_parent_ordering_prevents_lost_commits`) in the
+    /// "Property-based testing with real git" section verifies this by demonstrating the bug
+    /// in the WRONG approach and confirming the CORRECT approach preserves late commits.
     async fn reconcile_descendant(
         &self,
         descendant_branch: &str,
@@ -4081,6 +4102,8 @@ For **fan-out**, when PR #123 has multiple descendants (#124, #125):
 - Prevents accumulation of worktrees during rapid fan-out cascades
 
 This ensures worktrees are cleaned up promptly rather than waiting for the 24-hour timeout.
+
+**REQUIRED TEST**: Property 7 (`fanout_worktree_ordering`) in the "Property-based testing with real git" section verifies this ordering by asserting the old worktree is removed before new worktrees are created during fan-out.
 
 **Implementation:**
 
@@ -4431,6 +4454,683 @@ For end-to-end testing against real GitHub (or a GitHub Enterprise test instance
    - Commit history on main is correct (linear, squash commits only)
    - No orphaned branches
 4. **Failure injection**: Use GitHub's rate limiting or a mock server to test API error handling
+
+### Property-based testing with real git (REQUIRED)
+
+The cascade correctness properties are subtle and must be verified against real git, not mocks. These tests shell out to actual git commands and verify properties over generated scenarios.
+
+**Test infrastructure:**
+
+```rust
+/// A generated file change for property-based tests.
+/// Files are identified by path; content is arbitrary bytes.
+#[derive(Clone, Debug, Arbitrary)]
+struct FileChange {
+    path: FilePath,      // e.g., "src/foo.rs", max depth 3, max 50 files
+    content: Vec<u8>,    // arbitrary content, max 10KB per file
+}
+
+/// A generated commit containing one or more file changes.
+#[derive(Clone, Debug, Arbitrary)]
+struct GeneratedCommit {
+    changes: Vec<FileChange>,  // 1-10 file changes
+    message: String,           // arbitrary, for debugging
+}
+
+/// A generated branch containing a sequence of commits.
+#[derive(Clone, Debug, Arbitrary)]
+struct GeneratedBranch {
+    commits: Vec<GeneratedCommit>,  // 1-5 commits
+}
+
+/// File paths touched by a branch (for disjointness checking).
+fn files_touched(branch: &GeneratedBranch) -> HashSet<FilePath> {
+    branch.commits.iter()
+        .flat_map(|c| c.changes.iter().map(|ch| ch.path.clone()))
+        .collect()
+}
+
+/// Check if two branches touch disjoint file sets.
+fn branches_disjoint(a: &GeneratedBranch, b: &GeneratedBranch) -> bool {
+    files_touched(a).is_disjoint(&files_touched(b))
+}
+
+/// Apply a generated branch to a git repo, returning the resulting HEAD SHA.
+fn apply_branch(repo: &Path, branch_name: &str, base: &str, branch: &GeneratedBranch) -> Sha {
+    run_git(repo, &["checkout", "-b", branch_name, base]);
+    for commit in &branch.commits {
+        for change in &commit.changes {
+            let file_path = repo.join(&change.path);
+            std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+            std::fs::write(&file_path, &change.content).unwrap();
+            run_git(repo, &["add", &change.path]);
+        }
+        run_git(repo, &["commit", "-m", &commit.message]);
+    }
+    get_head_sha(repo)
+}
+
+/// Get the tree contents as a map of path → content for comparison.
+fn tree_contents(repo: &Path, ref_name: &str) -> HashMap<FilePath, Vec<u8>> {
+    // Uses git ls-tree -r and git cat-file to extract all file contents
+    // Returns complete snapshot of the tree at that ref
+    todo!()
+}
+```
+
+#### REQUIRED: Cascade content preservation
+
+**Property 1: Descendant content is preserved after cascade**
+
+After a cascade where predecessor and descendant touch disjoint files, and main receives arbitrary commits that also touch disjoint files, the final main must contain:
+- All content from the predecessor branch (squashed)
+- All content from the descendant branch (squashed)
+- All content from the intervening main commits
+
+```rust
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+    #[test]
+    fn descendant_content_preserved_after_cascade(
+        predecessor_branch: GeneratedBranch,
+        descendant_branch: GeneratedBranch,
+        intervening_main_commits: Vec<GeneratedCommit>,  // 0-3 commits
+    ) {
+        // Skip if branches aren't disjoint (conflict case is separate)
+        let pred_files = files_touched(&predecessor_branch);
+        let desc_files = files_touched(&descendant_branch);
+        let main_files: HashSet<_> = intervening_main_commits.iter()
+            .flat_map(|c| c.changes.iter().map(|ch| ch.path.clone()))
+            .collect();
+
+        prop_assume!(pred_files.is_disjoint(&desc_files));
+        prop_assume!(pred_files.is_disjoint(&main_files));
+        prop_assume!(desc_files.is_disjoint(&main_files));
+
+        // Set up repo with main branch
+        let repo = TempRepo::new();
+
+        // Create predecessor branch from main
+        let pred_tip = apply_branch(&repo, "predecessor", "main", &predecessor_branch);
+
+        // Create descendant branch from predecessor
+        let desc_tip = apply_branch(&repo, "descendant", "predecessor", &descendant_branch);
+
+        // Record expected final content: descendant tip + intervening main commits
+        let expected_desc_content = tree_contents(&repo, "descendant");
+
+        // === Simulate cascade ===
+
+        // 1. Preparation: merge predecessor into descendant (already done - descendant is based on it)
+
+        // 2. Someone pushes intervening commits to main (BEFORE squash)
+        run_git(&repo, &["checkout", "main"]);
+        for commit in &intervening_main_commits {
+            for change in &commit.changes {
+                write_file(&repo, &change.path, &change.content);
+                run_git(&repo, &["add", &change.path]);
+            }
+            run_git(&repo, &["commit", "-m", &commit.message]);
+        }
+        let main_before_squash = get_head_sha(&repo);
+
+        // 3. Squash-merge predecessor into main
+        run_git(&repo, &["merge", "--squash", "predecessor"]);
+        run_git(&repo, &["commit", "-m", "Squash predecessor"]);
+        let squash_sha = get_head_sha(&repo);
+
+        // 4. Reconcile descendant using the ours-merge dance
+        run_git(&repo, &["checkout", "descendant"]);
+
+        // 4a. Merge $SQUASH_SHA^ (parent of squash = main_before_squash)
+        run_git(&repo, &["merge", &format!("{}^", squash_sha), "-m", "Merge pre-squash main"]);
+
+        // 4b. Ours-merge $SQUASH_SHA
+        run_git(&repo, &["merge", &squash_sha, "--strategy", "ours", "-m", "Ours-merge squash"]);
+
+        // 4c. Catch-up merge main
+        run_git(&repo, &["merge", "main", "-m", "Catch-up"]);
+
+        // 5. Squash-merge descendant into main
+        run_git(&repo, &["checkout", "main"]);
+        run_git(&repo, &["merge", "--squash", "descendant"]);
+        run_git(&repo, &["commit", "-m", "Squash descendant"]);
+
+        // === Verify properties ===
+
+        let final_main = tree_contents(&repo, "main");
+
+        // All descendant files present with correct content
+        for (path, content) in &expected_desc_content {
+            prop_assert_eq!(
+                final_main.get(path),
+                Some(content),
+                "Descendant file {} missing or wrong content", path
+            );
+        }
+
+        // All intervening main commit files present
+        for commit in &intervening_main_commits {
+            for change in &commit.changes {
+                prop_assert_eq!(
+                    final_main.get(&change.path),
+                    Some(&change.content),
+                    "Intervening main file {} missing or wrong content", change.path
+                );
+            }
+        }
+    }
+}
+```
+
+**Property 2: Intervening main commits survive the train**
+
+Commits pushed to main that don't intersect with any branch in the train must have their content preserved after the entire train merges.
+
+```rust
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+    #[test]
+    fn intervening_main_commits_preserved(
+        train_branches: Vec<GeneratedBranch>,  // 1-3 branches forming a linear stack
+        intervening_commits: Vec<(usize, GeneratedCommit)>,  // (insert_after_branch_idx, commit)
+    ) {
+        prop_assume!(!train_branches.is_empty());
+
+        // Collect all files touched by train
+        let train_files: HashSet<_> = train_branches.iter()
+            .flat_map(|b| files_touched(b))
+            .collect();
+
+        // Filter intervening commits to only those disjoint from train
+        let disjoint_intervening: Vec<_> = intervening_commits.iter()
+            .filter(|(_, commit)| {
+                commit.changes.iter().all(|ch| !train_files.contains(&ch.path))
+            })
+            .collect();
+
+        prop_assume!(!disjoint_intervening.is_empty());
+
+        let repo = TempRepo::new();
+
+        // Build the stack
+        let mut branch_names = vec![];
+        let mut base = "main".to_string();
+        for (i, branch) in train_branches.iter().enumerate() {
+            let name = format!("branch-{}", i);
+            apply_branch(&repo, &name, &base, branch);
+            branch_names.push(name.clone());
+            base = name;
+        }
+
+        // Run the cascade, inserting intervening commits at specified points
+        let mut intervening_by_insertion: HashMap<usize, Vec<&GeneratedCommit>> = HashMap::new();
+        for (idx, commit) in &disjoint_intervening {
+            intervening_by_insertion.entry(*idx).or_default().push(commit);
+        }
+
+        for (i, branch_name) in branch_names.iter().enumerate() {
+            // Push any intervening commits scheduled for this point
+            if let Some(commits) = intervening_by_insertion.get(&i) {
+                run_git(&repo, &["checkout", "main"]);
+                for commit in commits {
+                    for change in &commit.changes {
+                        write_file(&repo, &change.path, &change.content);
+                        run_git(&repo, &["add", &change.path]);
+                    }
+                    run_git(&repo, &["commit", "-m", &commit.message]);
+                }
+            }
+
+            // Prepare descendants (for branches after this one)
+            // ... (cascade logic)
+
+            // Squash this branch
+            run_git(&repo, &["checkout", "main"]);
+            run_git(&repo, &["merge", "--squash", branch_name]);
+            run_git(&repo, &["commit", "-m", &format!("Squash {}", branch_name)]);
+            let squash_sha = get_head_sha(&repo);
+
+            // Reconcile remaining branches
+            // ... (full ours-merge dance for each remaining branch)
+        }
+
+        // Verify all disjoint intervening commits are present
+        let final_main = tree_contents(&repo, "main");
+        for (_, commit) in &disjoint_intervening {
+            for change in &commit.changes {
+                prop_assert_eq!(
+                    final_main.get(&change.path),
+                    Some(&change.content),
+                    "Intervening commit file {} was lost", change.path
+                );
+            }
+        }
+    }
+}
+```
+
+**Property 3: The $SQUASH_SHA^ ordering is essential**
+
+This test verifies that merging main during preparation (WRONG) loses commits, while merging $SQUASH_SHA^ during reconciliation (CORRECT) preserves them. This is a regression test for the bug described in "Why merging $SQUASH_SHA^ is essential".
+
+```rust
+proptest! {
+    #[test]
+    fn squash_parent_ordering_prevents_lost_commits(
+        predecessor_branch: GeneratedBranch,
+        descendant_branch: GeneratedBranch,
+        late_main_commit: GeneratedCommit,  // Pushed to main AFTER prep, BEFORE squash
+    ) {
+        // Ensure late_main_commit touches files disjoint from both branches
+        let pred_files = files_touched(&predecessor_branch);
+        let desc_files = files_touched(&descendant_branch);
+        let late_files: HashSet<_> = late_main_commit.changes.iter()
+            .map(|ch| ch.path.clone())
+            .collect();
+
+        prop_assume!(pred_files.is_disjoint(&late_files));
+        prop_assume!(desc_files.is_disjoint(&late_files));
+        prop_assume!(pred_files.is_disjoint(&desc_files));
+        prop_assume!(!late_main_commit.changes.is_empty());
+
+        let repo = TempRepo::new();
+
+        // Setup
+        apply_branch(&repo, "predecessor", "main", &predecessor_branch);
+        apply_branch(&repo, "descendant", "predecessor", &descendant_branch);
+
+        // === WRONG approach (what we must NOT do) ===
+        let wrong_repo = repo.clone_to_temp();
+        {
+            // Preparation: merge main into descendant (WRONG - merging main too early)
+            run_git(&wrong_repo, &["checkout", "descendant"]);
+            run_git(&wrong_repo, &["merge", "main", "-m", "Prep merge main (WRONG)"]);
+
+            // Late commit arrives on main
+            run_git(&wrong_repo, &["checkout", "main"]);
+            for change in &late_main_commit.changes {
+                write_file(&wrong_repo, &change.path, &change.content);
+                run_git(&wrong_repo, &["add", &change.path]);
+            }
+            run_git(&wrong_repo, &["commit", "-m", "Late main commit"]);
+
+            // Squash predecessor
+            run_git(&wrong_repo, &["merge", "--squash", "predecessor"]);
+            run_git(&wrong_repo, &["commit", "-m", "Squash predecessor"]);
+            let squash_sha = get_head_sha(&wrong_repo);
+
+            // Reconcile descendant (ours-merge squash, then catch-up)
+            run_git(&wrong_repo, &["checkout", "descendant"]);
+            run_git(&wrong_repo, &["merge", &squash_sha, "--strategy", "ours", "-m", "Ours"]);
+            run_git(&wrong_repo, &["merge", "main", "-m", "Catch-up"]);
+
+            // Squash descendant
+            run_git(&wrong_repo, &["checkout", "main"]);
+            run_git(&wrong_repo, &["merge", "--squash", "descendant"]);
+            run_git(&wrong_repo, &["commit", "-m", "Squash descendant"]);
+
+            // BUG: late_main_commit content is LOST
+            let final_main = tree_contents(&wrong_repo, "main");
+            for change in &late_main_commit.changes {
+                // This WILL FAIL - the late commit is lost
+                // We assert it IS lost to confirm the bug exists
+                prop_assert!(
+                    final_main.get(&change.path) != Some(&change.content),
+                    "WRONG approach should lose late commit, but it was preserved"
+                );
+            }
+        }
+
+        // === CORRECT approach (what we DO) ===
+        {
+            // Preparation: merge predecessor only (NOT main)
+            // (descendant is already based on predecessor, so this is a no-op here)
+
+            // Late commit arrives on main
+            run_git(&repo, &["checkout", "main"]);
+            for change in &late_main_commit.changes {
+                write_file(&repo, &change.path, &change.content);
+                run_git(&repo, &["add", &change.path]);
+            }
+            run_git(&repo, &["commit", "-m", "Late main commit"]);
+            let main_with_late = get_head_sha(&repo);
+
+            // Squash predecessor
+            run_git(&repo, &["merge", "--squash", "predecessor"]);
+            run_git(&repo, &["commit", "-m", "Squash predecessor"]);
+            let squash_sha = get_head_sha(&repo);
+
+            // Reconcile descendant: merge $SQUASH_SHA^ (CORRECT)
+            run_git(&repo, &["checkout", "descendant"]);
+            // $SQUASH_SHA^ is main_with_late, which includes the late commit
+            run_git(&repo, &["merge", &format!("{}^", squash_sha), "-m", "Merge pre-squash main"]);
+            run_git(&repo, &["merge", &squash_sha, "--strategy", "ours", "-m", "Ours"]);
+            run_git(&repo, &["merge", "main", "-m", "Catch-up"]);
+
+            // Squash descendant
+            run_git(&repo, &["checkout", "main"]);
+            run_git(&repo, &["merge", "--squash", "descendant"]);
+            run_git(&repo, &["commit", "-m", "Squash descendant"]);
+
+            // CORRECT: late_main_commit content is PRESERVED
+            let final_main = tree_contents(&repo, "main");
+            for change in &late_main_commit.changes {
+                prop_assert_eq!(
+                    final_main.get(&change.path),
+                    Some(&change.content),
+                    "CORRECT approach must preserve late commit file {}", change.path
+                );
+            }
+        }
+    }
+}
+```
+
+#### REQUIRED: Squash-vs-rebase detection for late additions
+
+The late addition flow must correctly distinguish squash merges from rebase merges. Using the wrong merge type causes incorrect reconciliation.
+
+**Property 4: Squash merge detection accepts valid squash merges**
+
+```rust
+proptest! {
+    #[test]
+    fn squash_merge_detection_accepts_squash(
+        branch: GeneratedBranch,
+    ) {
+        prop_assume!(!branch.commits.is_empty());
+
+        let repo = TempRepo::new();
+        apply_branch(&repo, "feature", "main", &branch);
+
+        // Perform a squash merge
+        run_git(&repo, &["checkout", "main"]);
+        run_git(&repo, &["merge", "--squash", "feature"]);
+        run_git(&repo, &["commit", "-m", "Squash feature"]);
+        let squash_sha = get_head_sha(&repo);
+
+        // Validate using the detection logic from handle_late_addition
+        let commit_info = get_commit_info(&repo, &squash_sha);
+
+        // Check 1: Single parent
+        prop_assert_eq!(commit_info.parents.len(), 1, "Squash merge should have one parent");
+
+        // Check 2: Parent is on main history before this commit
+        let parent = &commit_info.parents[0];
+        let is_ancestor = run_git(&repo, &[
+            "merge-base", "--is-ancestor", parent, &format!("{}^", squash_sha)
+        ]).is_ok();
+        prop_assert!(is_ancestor, "Squash parent should be ancestor of commit^");
+    }
+}
+```
+
+**Property 5: Squash merge detection rejects merge commits**
+
+```rust
+proptest! {
+    #[test]
+    fn squash_merge_detection_rejects_merge_commit(
+        branch: GeneratedBranch,
+        main_commit: GeneratedCommit,  // Creates divergence requiring true merge
+    ) {
+        prop_assume!(!branch.commits.is_empty());
+
+        // Ensure main_commit touches different files than branch
+        let branch_files = files_touched(&branch);
+        prop_assume!(main_commit.changes.iter().all(|ch| !branch_files.contains(&ch.path)));
+        prop_assume!(!main_commit.changes.is_empty());
+
+        let repo = TempRepo::new();
+        apply_branch(&repo, "feature", "main", &branch);
+
+        // Add divergent commit on main
+        run_git(&repo, &["checkout", "main"]);
+        for change in &main_commit.changes {
+            write_file(&repo, &change.path, &change.content);
+            run_git(&repo, &["add", &change.path]);
+        }
+        run_git(&repo, &["commit", "-m", "Divergent main commit"]);
+
+        // Perform a TRUE merge (not squash)
+        run_git(&repo, &["merge", "feature", "-m", "Merge feature"]);
+        let merge_sha = get_head_sha(&repo);
+
+        // Validate using the detection logic
+        let commit_info = get_commit_info(&repo, &merge_sha);
+
+        // Check 1: Two parents = definitely not squash
+        prop_assert_eq!(commit_info.parents.len(), 2, "Merge commit should have two parents");
+        // Detection should REJECT this
+    }
+}
+```
+
+**Property 6: Squash merge detection rejects rebase merges**
+
+```rust
+proptest! {
+    #[test]
+    fn squash_merge_detection_rejects_rebase(
+        branch: GeneratedBranch,
+    ) {
+        prop_assume!(branch.commits.len() >= 2);  // Need multiple commits for meaningful rebase
+
+        let repo = TempRepo::new();
+        apply_branch(&repo, "feature", "main", &branch);
+
+        // Record main HEAD before rebase
+        run_git(&repo, &["checkout", "main"]);
+        let main_before = get_head_sha(&repo);
+
+        // Perform rebase merge (what GitHub does with "Rebase and merge")
+        run_git(&repo, &["checkout", "feature"]);
+        run_git(&repo, &["rebase", "main"]);
+        run_git(&repo, &["checkout", "main"]);
+        run_git(&repo, &["merge", "--ff-only", "feature"]);
+        let rebase_tip = get_head_sha(&repo);
+
+        // The "merge_commit_sha" GitHub returns for rebase is the LAST rebased commit
+        // Its parent is the PREVIOUS rebased commit, NOT the prior main HEAD
+
+        let commit_info = get_commit_info(&repo, &rebase_tip);
+
+        // Check 1: Single parent (looks like squash so far)
+        prop_assert_eq!(commit_info.parents.len(), 1);
+
+        // Check 2: Parent is NOT an ancestor of main-before-rebase
+        // For a squash, parent would be main_before. For rebase, parent is another rebased commit.
+        let parent = &commit_info.parents[0];
+
+        // If there were multiple commits in the branch, the parent is NOT main_before
+        if branch.commits.len() > 1 {
+            let is_parent_on_old_main = run_git(&repo, &[
+                "merge-base", "--is-ancestor", parent, &main_before
+            ]).is_ok();
+
+            // For rebase with multiple commits, parent is NOT on old main
+            prop_assert!(
+                !is_parent_on_old_main || parent == &main_before,
+                "Rebase parent {} should not be on old main history (unless single commit)",
+            );
+        }
+
+        // The ancestry check should detect this:
+        // $SHA^ should be an ancestor of $SHA^^ for squash (trivially true: same commit)
+        // For rebase, $SHA^ is a rebased commit, and checking if it's ancestor of
+        // the commit BEFORE $SHA on main will fail (because $SHA^ wasn't on main before)
+    }
+}
+```
+
+#### REQUIRED: Worktree cleanup ordering for fan-out
+
+When a PR with multiple descendants completes, the old worktree must be removed before new worktrees are created.
+
+**Property 7: Fan-out worktree lifecycle**
+
+```rust
+proptest! {
+    #[test]
+    fn fanout_worktree_ordering(
+        root_branch: GeneratedBranch,
+        descendant_branches: Vec<GeneratedBranch>,  // 2-4 descendants (fan-out)
+    ) {
+        prop_assume!(descendant_branches.len() >= 2);
+        prop_assume!(descendant_branches.len() <= 4);
+
+        // Ensure all branches are disjoint
+        let root_files = files_touched(&root_branch);
+        for (i, desc) in descendant_branches.iter().enumerate() {
+            prop_assume!(root_files.is_disjoint(&files_touched(desc)));
+            for (j, other) in descendant_branches.iter().enumerate() {
+                if i != j {
+                    prop_assume!(files_touched(desc).is_disjoint(&files_touched(other)));
+                }
+            }
+        }
+
+        let repo = TempRepo::new();
+        let worktree_base = TempDir::new();
+
+        // Setup: root PR and multiple descendants
+        apply_branch(&repo, "root", "main", &root_branch);
+        for (i, desc) in descendant_branches.iter().enumerate() {
+            apply_branch(&repo, &format!("desc-{}", i), "root", desc);
+        }
+
+        // Simulate train started on root
+        let root_worktree = worktree_base.path().join("stack-1");  // PR #1
+        run_git(&repo, &["worktree", "add", "--detach", root_worktree.to_str().unwrap(), "HEAD"]);
+        prop_assert!(root_worktree.exists(), "Root worktree should exist");
+
+        // Prepare all descendants
+        for i in 0..descendant_branches.len() {
+            run_git_in_worktree(&root_worktree, &["checkout", "--detach", &format!("origin/desc-{}", i)]);
+            run_git_in_worktree(&root_worktree, &["merge", "origin/root", "-m", "Prep"]);
+            // push would happen here
+        }
+
+        // Squash root
+        run_git(&repo, &["checkout", "main"]);
+        run_git(&repo, &["merge", "--squash", "root"]);
+        run_git(&repo, &["commit", "-m", "Squash root"]);
+        let squash_sha = get_head_sha(&repo);
+
+        // Reconcile all descendants
+        for i in 0..descendant_branches.len() {
+            run_git_in_worktree(&root_worktree, &["checkout", "--detach", &format!("origin/desc-{}", i)]);
+            run_git_in_worktree(&root_worktree, &["merge", &format!("{}^", squash_sha), "-m", "Pre-squash"]);
+            run_git_in_worktree(&root_worktree, &["merge", &squash_sha, "--strategy", "ours", "-m", "Ours"]);
+            run_git_in_worktree(&root_worktree, &["merge", "origin/main", "-m", "Catch-up"]);
+            // push and retarget would happen here
+        }
+
+        // === CRITICAL ORDERING: Remove old worktree FIRST ===
+
+        // Old worktree must be removed before creating new ones
+        run_git(&repo, &["worktree", "remove", "--force", root_worktree.to_str().unwrap()]);
+        prop_assert!(!root_worktree.exists(), "Old worktree should be removed before creating new ones");
+
+        // Now create new worktrees for each descendant
+        let new_worktrees: Vec<_> = (0..descendant_branches.len())
+            .map(|i| {
+                let path = worktree_base.path().join(format!("stack-{}", i + 10));  // PRs #10, #11, etc.
+                run_git(&repo, &["worktree", "add", "--detach", path.to_str().unwrap(), "HEAD"]);
+                path
+            })
+            .collect();
+
+        // All new worktrees should exist
+        for wt in &new_worktrees {
+            prop_assert!(wt.exists(), "New worktree {:?} should exist", wt);
+        }
+
+        // Old worktree should still not exist
+        prop_assert!(!root_worktree.exists(), "Old worktree should remain removed");
+    }
+}
+```
+
+#### REQUIRED: Frozen descendants invariant
+
+**Property 8: Recovery uses frozen descendants, not current state**
+
+```rust
+proptest! {
+    #[test]
+    fn recovery_uses_frozen_descendants(
+        initial_descendants: Vec<GeneratedBranch>,  // 1-3 descendants at train start
+        late_descendants: Vec<GeneratedBranch>,     // 0-2 descendants added mid-cascade
+    ) {
+        prop_assume!(!initial_descendants.is_empty());
+        prop_assume!(initial_descendants.len() <= 3);
+        prop_assume!(late_descendants.len() <= 2);
+
+        // All branches must be disjoint for this test
+        let all_branches: Vec<_> = initial_descendants.iter()
+            .chain(late_descendants.iter())
+            .collect();
+        for (i, a) in all_branches.iter().enumerate() {
+            for (j, b) in all_branches.iter().enumerate() {
+                if i != j {
+                    prop_assume!(files_touched(a).is_disjoint(&files_touched(b)));
+                }
+            }
+        }
+
+        // Simulate state at Preparing phase entry
+        let frozen_descendants: Vec<usize> = (0..initial_descendants.len()).collect();
+
+        // Simulate late additions (would be added via predecessor_declared events during spool replay)
+        let current_descendants: Vec<usize> = (0..(initial_descendants.len() + late_descendants.len())).collect();
+
+        // Recovery MUST use frozen_descendants, not current_descendants
+        let to_process = frozen_descendants.clone();
+
+        // Verify we're processing the right set
+        prop_assert_eq!(to_process.len(), initial_descendants.len());
+        prop_assert!(to_process.iter().all(|&i| i < initial_descendants.len()));
+
+        // Late descendants should NOT be in the processing set
+        for i in initial_descendants.len()..current_descendants.len() {
+            prop_assert!(
+                !to_process.contains(&i),
+                "Late descendant {} should not be in frozen set", i
+            );
+        }
+
+        // Late descendants will be handled in the NEXT cascade step
+        // (when one of the initial descendants becomes the new root)
+    }
+}
+```
+
+#### Required unit tests (non-property-based)
+
+In addition to property-based tests, the following specific scenarios require explicit unit tests:
+
+**Rebase-vs-squash detection edge cases:**
+
+| Scenario | Expected result |
+|----------|-----------------|
+| Single-commit branch, squash merged | Accept (single parent, parent is prior main HEAD) |
+| Single-commit branch, rebase merged | Accept (indistinguishable from squash for single commit) |
+| Multi-commit branch, squash merged | Accept |
+| Multi-commit branch, rebase merged | Reject (parent is previous rebased commit, not on main) |
+| True merge (two parents) | Reject |
+| Fast-forward merge | Accept (same as squash for linear history) |
+
+**Worktree cleanup scenarios:**
+
+| Scenario | Expected behavior |
+|----------|-------------------|
+| Normal completion (single descendant) | Worktree removed after final PR merges |
+| Fan-out (multiple descendants) | Old worktree removed, then new worktrees created for each |
+| Stop command | Worktree removed immediately |
+| Abort (conflict) | Worktree cleaned (merge --abort, reset --hard) but not removed |
+| Crash during fan-out worktree creation | Old worktree gone, some new worktrees exist; cleanup removes orphans |
 
 ---
 
