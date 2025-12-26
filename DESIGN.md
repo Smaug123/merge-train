@@ -104,6 +104,8 @@ This delegates all branch protection logic to GitHub, ensuring the bot respects 
    ```
    This is safe because the root has no predecessor — there's no cascade state to protect. After pushing, the bot waits for CI to run on the updated branch before proceeding.
 
+   **If the merge conflicts**: The bot aborts with `git merge --abort`, cleans the worktree (see "Worktree cleanup on abort"), transitions the train to `aborted` state, and posts a comment: "Cannot update PR #N: merge conflicts with main. Please resolve conflicts locally and push, then re-issue `@merge-train start`." This matches the `DIRTY` status handling — the train cannot proceed until the human resolves the conflict.
+
 2. **Descendant during PREPARATION phase** (before predecessor squash): Should not happen — the descendant's base is the predecessor's branch, and we just merged the predecessor's head. If this occurs:
    - Log warning: "Descendant #N is BEHIND after preparation — unexpected state"
    - Re-merge the predecessor's head (idempotent if already merged)
@@ -557,7 +559,7 @@ This allows debugging of recently processed events.
 - For `issue_comment.created` events: `(PR number, comment ID, "created")` — a comment can only be created once
 - For `issue_comment.edited` events: `(PR number, comment ID, "edited", updated_at)` — each edit has a distinct timestamp; using just `(comment ID, "edited")` would incorrectly drop subsequent edits
 - For `pull_request` events: `(PR number, action, head SHA)` for most actions; for `pull_request.edited`: `(PR number, "edited", updated_at)` — edits that don't change head SHA (base retargets, title changes) must not be deduplicated against each other
-- For `check_suite` events: `(check suite ID)`
+- For `check_suite` events: `(check suite ID, action, updated_at)` — reruns reuse the same check suite ID, so `updated_at` is needed to distinguish subsequent completions
 
 This handles GitHub's redelivery with new delivery IDs for the same logical event.
 
