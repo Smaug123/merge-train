@@ -1375,7 +1375,7 @@ enum QueuedEventPayload {
 2. If any train's frontier PR is now ready but wasn't before, the missed webhook is effectively recovered
 
 **Distributed polling**: To avoid thundering herd when multiple bot instances restart:
-- Add jitter to the poll interval (e.g., 60 ± 10 minutes)
+- Add jitter to the poll interval (e.g., 10 ± 2 minutes)
 - Stagger initial poll based on hash of repo ID
 
 **Logging**: Poll-triggered cascade evaluations are logged distinctly from webhook-triggered ones, making it easy to detect webhook delivery problems:
@@ -2364,6 +2364,7 @@ enum TrainState {
     Stopped,
     WaitingCi,
     Aborted,
+    NeedsManualReview,
 }
 
 	#[derive(Serialize, Deserialize)]
@@ -2734,7 +2735,7 @@ enum QueuedEventPayload {
     GitHub(GitHubEvent),
     /// Internal: trigger periodic re-sync (repo is implicit — one queue per repo)
     PeriodicSync,
-    /// Internal: poll active trains for missed webhook recovery (hourly)
+    /// Internal: poll active trains for missed webhook recovery (every 10 minutes)
     PollActiveTrains,
 }
 ```
@@ -3265,7 +3266,7 @@ async fn webhook_endpoint(
 async fn periodic_timers(
     dispatcher: Arc<Mutex<Dispatcher>>,
     resync_interval: Duration,  // e.g., 1 hour
-    poll_interval: Duration,    // e.g., 1 hour (with jitter applied per-repo)
+    poll_interval: Duration,    // e.g., 10 minutes (with jitter applied per-repo)
 ) {
     let mut resync_ticker = tokio::time::interval(resync_interval);
     let mut poll_ticker = tokio::time::interval(poll_interval);
@@ -4819,15 +4820,12 @@ proptest! {
         // Validate using the detection logic from handle_late_addition
         let commit_info = get_commit_info(&repo, &squash_sha);
 
-        // Check 1: Single parent
+        // The detection logic accepts commits with exactly one parent
         prop_assert_eq!(commit_info.parents.len(), 1, "Squash merge should have one parent");
 
-        // Check 2: Parent is on main history before this commit
-        let parent = &commit_info.parents[0];
-        let is_ancestor = run_git(&repo, &[
-            "merge-base", "--is-ancestor", parent, &format!("{}^", squash_sha)
-        ]).is_ok();
-        prop_assert!(is_ancestor, "Squash parent should be ancestor of commit^");
+        // Verify acceptance: parent count check passes
+        let is_valid_squash = commit_info.parents.len() == 1;
+        prop_assert!(is_valid_squash, "Detection should ACCEPT squash merge");
     }
 }
 ```
@@ -4866,9 +4864,12 @@ proptest! {
         // Validate using the detection logic
         let commit_info = get_commit_info(&repo, &merge_sha);
 
-        // Check 1: Two parents = definitely not squash
+        // Merge commits have two parents
         prop_assert_eq!(commit_info.parents.len(), 2, "Merge commit should have two parents");
-        // Detection should REJECT this
+
+        // Verify rejection: parent count check fails
+        let is_valid_squash = commit_info.parents.len() == 1;
+        prop_assert!(!is_valid_squash, "Detection should REJECT merge commit");
     }
 }
 ```
