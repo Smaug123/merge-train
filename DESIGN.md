@@ -190,7 +190,7 @@ This "warn and proceed" approach balances operational flexibility with user awar
 
 ### Merge method preflight check
 
-Before starting a train, the bot verifies that squash merge is enabled on the repository. The bot **requires** squash merge — other merge methods (merge commit, rebase) would not maintain the linear history that the cascade logic depends on.
+Before starting a train, the bot verifies that the repository is configured for squash-only merges. The bot **requires** squash merge and **prohibits** merge commits and rebase merges — other merge methods would not maintain the linear history that the cascade logic depends on, and would cause incorrect results in late-addition scenarios.
 
 **Detection**: On `@merge-train start`, the bot queries repository settings:
 
@@ -198,14 +198,31 @@ Before starting a train, the bot verifies that squash merge is enabled on the re
 GET /repos/{owner}/{repo}
 ```
 
-The response includes `allow_squash_merge`. If `false`, the bot **refuses to start** and posts an error:
+The response includes `allow_squash_merge`, `allow_merge_commit`, and `allow_rebase_merge`. The bot requires ALL of:
+
+- `allow_squash_merge: true`
+- `allow_merge_commit: false`
+- `allow_rebase_merge: false`
+
+If any condition fails, the bot **refuses to start** and posts an error:
 
 ```
-Cannot start merge train: this repository has squash merge disabled.
+Cannot start merge train: this repository must be configured for squash-only merges.
 
-The merge train bot requires squash merge to maintain linear history on the default branch.
-Please enable "Allow squash merging" in repository settings.
+The merge train bot requires:
+  ✓ "Allow squash merging" enabled
+  ✗ "Allow merge commits" disabled
+  ✗ "Allow rebase merging" disabled
+
+Current settings:
+  allow_squash_merge: {value}
+  allow_merge_commit: {value}
+  allow_rebase_merge: {value}
+
+Please update repository settings to allow only squash merging.
 ```
+
+**Why squash-only?**: The cascade logic relies on squash commits having a single parent that is the prior default branch HEAD. Merge commits have two parents (breaking the parent assumption), and rebase merges add multiple commits (making `merge_commit_sha^` point to another rebased commit, not the prior main HEAD). Late-addition reconciliation would produce incorrect results if a predecessor was merged with a non-squash method.
 
 **Caching**: This check uses the same per-repo cache as branch protection queries (1 hour TTL). Repository merge method settings rarely change.
 
@@ -1162,8 +1179,8 @@ From the cached state, stacks are computed by traversing predecessor relationshi
 | `issue_comment.deleted` | If deleted comment was a predecessor declaration, remove predecessor relationship |
 | `pull_request` merged | If merged PR has descendants, cascade to next |
 | `pull_request` closed (not merged) | Notify descendants they're orphaned |
-| `check_suite` / `status` completed | If cascade waiting on this PR, continue |
-| `pull_request_review` submitted (approved) | If cascade waiting on this PR, continue |
+| `check_suite` / `status` completed | If cascade waiting on this PR, re-evaluate readiness |
+| `pull_request_review` submitted (approved) | If cascade waiting on this PR, re-evaluate readiness (but see "Review dismissal behaviour" — dismissed reviews require `@merge-train start` to resume) |
 
 **Comment edit handling**: When a predecessor declaration is edited, the bot handles several cases:
 
@@ -1254,8 +1271,8 @@ Each per-repo worker loop:
 fn create_marker(path: &Path) -> io::Result<()> {
     // Create marker with a unique temp name first
     let temp = path.with_extension("tmp");
-    File::create(&temp)?;
-    temp.sync_all()?;  // fsync the (empty) file
+    let file = File::create(&temp)?;
+    file.sync_all()?;  // fsync the (empty) file
     std::fs::rename(&temp, path)?;  // atomic rename
     // Directory fsync happens separately after all markers in batch
     Ok(())
@@ -1682,70 +1699,15 @@ async fn handle_late_addition(
         });
     }
 
-    // Check for rebase merges: verify the parent is on the default branch
-    // For a squash merge, $SHA^ is the prior default branch HEAD.
-    // For a rebase merge, $SHA^ is the previous rebased commit (NOT on default branch history
-    // before the rebase).
+    // Rebase detection is handled by the preflight check: the bot only operates on
+    // repositories with squash-only merge configuration (allow_squash_merge: true,
+    // allow_merge_commit: false, allow_rebase_merge: false). Since non-squash merges
+    // are disabled at the repository level, we can trust that any merged PR was
+    // squash-merged. See "Merge method preflight check" section.
     //
-    // We verify by checking if $SHA^ is an ancestor of the default branch HEAD BEFORE
-    // the merge_commit_sha was added. Since we're processing after the merge, we check
-    // if the parent of merge_commit_sha is reachable from (default_branch - merge_commit_sha).
-    //
-    // Simpler check: verify the commit is directly on the default branch AND its parent
-    // was the default branch HEAD before this commit.
+    // We still verify the commit has exactly one parent (checked above) to catch
+    // edge cases like repository settings being changed after a merge.
     let parent_sha = &commit.parents[0];
-
-    // Fetch the default branch and check if parent_sha is the direct predecessor
-    // of squash_sha on the default branch
-    git.run_git(&["fetch", "origin", default_branch], cancel).await?;
-    let origin_default = format!("origin/{}", default_branch);
-
-    // Check if squash_sha is on the default branch
-    let is_on_default = git.run_git(
-        &["merge-base", "--is-ancestor", &squash_sha, &origin_default],
-        cancel
-    ).await.is_ok();
-
-    if !is_on_default {
-        return Err(Error::NonSquashMerge {
-            pr: merged_predecessor,
-            message: format!(
-                "Predecessor #{}'s merge_commit_sha {} is not on the default branch. \
-                 This may indicate a rebase merge or unusual merge state. \
-                 Manual intervention required.",
-                merged_predecessor.0, squash_sha
-            ),
-        });
-    }
-
-    // Check if the parent of squash_sha was the default branch HEAD before squash_sha
-    // For squash: parent is directly on default branch history
-    // For rebase: parent is another rebased commit, not the prior default branch HEAD
-    //
-    // We check this by verifying parent_sha is an ancestor of the commit BEFORE squash_sha
-    // on the default branch. If squash_sha is a squash commit, there should be a path
-    // from parent_sha to the default branch that doesn't go through squash_sha.
-    //
-    // Simpler: check if parent_sha is reachable from default branch excluding squash_sha
-    let is_parent_on_default = git.run_git(
-        &["merge-base", "--is-ancestor", parent_sha, &format!("{}^", squash_sha)],
-        cancel
-    ).await;
-
-    // For a squash merge: parent_sha IS {}^ (they're the same), so is_ancestor is trivially true
-    // For a rebase merge: parent_sha is a rebased commit, NOT an ancestor of the prior default HEAD
-    if is_parent_on_default.is_err() {
-        return Err(Error::NonSquashMerge {
-            pr: merged_predecessor,
-            message: format!(
-                "Predecessor #{} appears to have been merged with rebase (not squash). \
-                 The merge_commit_sha's parent {} is not on the default branch history. \
-                 Late-addition reconciliation requires squash merge. \
-                 Manual intervention required: rebase the late PR onto {}.",
-                merged_predecessor.0, parent_sha, default_branch
-            ),
-        });
-    }
 
     // 4. Fetch and checkout the late PR branch
     git.fetch_and_checkout_detached(late_pr_branch).await?;
@@ -1782,18 +1744,16 @@ The key insight is that `reconcile_descendant` already does the correct ours-mer
 - **Merge commit**: Has two parents, so `$SHA^` doesn't mean "main before squash" — it could be the PR branch head. The ours-merge would incorporate wrong history.
 - **Rebase merge**: GitHub's `merge_commit_sha` points to the LAST rebased commit. This has a single parent, but that parent is the PREVIOUS rebased commit, not the prior default branch HEAD. Using `$SHA^` would incorporate the wrong commit, potentially dropping changes or creating duplicates.
 
-The validation uses a two-step approach:
+The validation uses a two-pronged approach:
 
-1. **Parent count check**: Detects merge commits (two parents → definitely not squash).
+1. **Preflight enforcement** (see "Merge method preflight check"): The bot refuses to start on repositories that allow non-squash merge methods. By requiring `allow_merge_commit: false` and `allow_rebase_merge: false` at the repository level, we guarantee that any merged PR was squash-merged. This eliminates the need for complex post-hoc detection.
 
-2. **Parent ancestry check**: For single-parent commits, verifies the parent was on the default branch before this commit. For a squash merge, `$SHA^` is the prior default branch HEAD, so it's trivially its own ancestor. For a rebase merge, `$SHA^` is a rebased commit that wasn't on the default branch before the rebase — the ancestry check fails.
+2. **Parent count check** (defense in depth): Even with preflight enforcement, we verify that `merge_commit_sha` has exactly one parent. This catches edge cases where repository settings were changed after a PR was merged, or where GitHub's behavior differs from expectations.
 
-This reliably distinguishes squash from rebase merges by checking the commit graph structure rather than relying on GitHub metadata that may not always be available.
-
-**REQUIRED TESTS**: Properties 4-6 in the "Property-based testing with real git" section verify this detection logic:
-- Property 4 (`squash_merge_detection_accepts_squash`): Validates that legitimate squash merges pass both checks
+**REQUIRED TESTS**: The property-based testing section verifies merge method handling:
+- Property 4 (`squash_merge_detection_accepts_squash`): Validates that legitimate squash merges (single parent) pass the parent count check
 - Property 5 (`squash_merge_detection_rejects_merge_commit`): Validates that true merge commits (two parents) are rejected
-- Property 6 (`squash_merge_detection_rejects_rebase`): Validates that rebase merges (single parent not on prior main) are rejected
+- Preflight test (`squash_only_preflight_check`): Validates that the bot refuses to start when `allow_merge_commit` or `allow_rebase_merge` is true (see "Merge method preflight check" section)
 
 **Polling fallback**: During `PollActiveTrains`, also scan for "orphaned" PRs:
 ```rust
@@ -2085,14 +2045,22 @@ The cleanup is called synchronously as part of the abort transition, before pers
 
 ### Auto-resume on check fix
 
-If the cascade aborted because `mergeStateStatus` became `BLOCKED` (required checks failing), the bot will automatically resume when:
+If the cascade is waiting because `mergeStateStatus` is `BLOCKED`, the bot will automatically re-evaluate and potentially resume when:
 
-- A `check_suite` success event fires for that PR
+- A `check_suite` or `status` completed event fires for that PR
 - The PR is still open
-- The predecessor is still merged
+- The predecessor is still merged (if applicable)
 - No `@merge-train stop` command was issued
 
 This means "fix the CI and push" is sufficient to resume — no manual re-trigger needed.
+
+**Distinguishing BLOCKED causes**: GitHub's `mergeStateStatus` returns `BLOCKED` for both check failures AND missing approvals — it doesn't distinguish between them. The bot handles this by:
+
+1. **Event-driven re-evaluation**: When `check_suite.completed` or `pull_request_review.submitted` fires, the bot re-queries `mergeStateStatus`. If now `CLEAN`, the cascade continues regardless of what caused the prior `BLOCKED`.
+
+2. **Review dismissal is special**: When a review is dismissed (detected via `pull_request_review.dismissed` event), the cascade transitions to `aborted` state with a specific reason. This state does NOT auto-resume on subsequent approval — the user must re-issue `@merge-train start`. See "Review dismissal behaviour" above.
+
+3. **Why the asymmetry?**: Check failures are typically transient (CI flakes, missing dependencies) and fixing + pushing is the natural workflow. Review dismissal is an explicit human action that may indicate the reviewer wants changes — auto-resuming could bypass that intent.
 
 ---
 
@@ -2120,7 +2088,7 @@ The "Update comment" endpoint is used to update status comments (which contain m
 When calling the merge endpoint, **always** pass the expected head SHA:
 
 ```json
-POST /repos/{o}/{r}/pulls/{n}/merge
+PUT /repos/{o}/{r}/pulls/{n}/merge
 {
   "merge_method": "squash",
   "sha": "<expected_head_sha>"
@@ -2410,7 +2378,7 @@ enum TrainState {
 	enum CascadePhase {
 	    /// Not currently performing any operation; waiting for CI or next event
 	    Idle,
-	    /// Merging predecessor head and default branch into descendants.
+	    /// Merging predecessor head into descendants (NOT default branch — see "Why merging $SQUASH_SHA^ is essential").
 	    /// `frozen_descendants` is captured at phase entry and used for recovery —
 	    /// new descendants that arrive mid-phase are NOT included (see "Descendant set freezing").
 	    Preparing {
@@ -4134,7 +4102,9 @@ impl GitOperations {
         Ok(worktree_path)
     }
 
-    /// Remove a stack's worktree. Called on stop or after stack completes.
+    /// Remove a stack's worktree. Called after stack completes successfully,
+    /// or when cleanup_worktree_on_abort fails (worktree corrupted beyond repair).
+    /// Note: Normal stop does NOT remove the worktree — it cleans in place for resume.
     async fn remove_worktree(&self, root_pr: PrNumber) -> Result<()> {
         let worktree_path = self.base_dir
             .join("worktrees")
@@ -4907,59 +4877,44 @@ proptest! {
 }
 ```
 
-**Property 6: Squash merge detection rejects rebase merges**
+**Property 6: Preflight check rejects non-squash-only repositories**
+
+The bot requires squash-only merge configuration at the repository level. This is enforced by the preflight check, not by post-hoc detection of rebase merges.
 
 ```rust
 proptest! {
     #[test]
-    fn squash_merge_detection_rejects_rebase(
-        branch: GeneratedBranch,
+    fn preflight_rejects_non_squash_only(
+        allow_squash: bool,
+        allow_merge: bool,
+        allow_rebase: bool,
     ) {
-        prop_assume!(branch.commits.len() >= 2);  // Need multiple commits for meaningful rebase
+        // The bot should only accept repos where squash is the ONLY allowed method
+        let should_accept = allow_squash && !allow_merge && !allow_rebase;
 
-        let repo = TempRepo::new();
-        apply_branch(&repo, "feature", "main", &branch);
+        let repo_settings = RepoSettings {
+            allow_squash_merge: allow_squash,
+            allow_merge_commit: allow_merge,
+            allow_rebase_merge: allow_rebase,
+        };
 
-        // Record main HEAD before rebase
-        run_git(&repo, &["checkout", "main"]);
-        let main_before = get_head_sha(&repo);
+        let result = check_merge_method_preflight(&repo_settings);
 
-        // Perform rebase merge (what GitHub does with "Rebase and merge")
-        run_git(&repo, &["checkout", "feature"]);
-        run_git(&repo, &["rebase", "main"]);
-        run_git(&repo, &["checkout", "main"]);
-        run_git(&repo, &["merge", "--ff-only", "feature"]);
-        let rebase_tip = get_head_sha(&repo);
+        if should_accept {
+            prop_assert!(result.is_ok(), "Should accept squash-only config");
+        } else {
+            prop_assert!(result.is_err(), "Should reject non-squash-only config");
 
-        // The "merge_commit_sha" GitHub returns for rebase is the LAST rebased commit
-        // Its parent is the PREVIOUS rebased commit, NOT the prior main HEAD
-
-        let commit_info = get_commit_info(&repo, &rebase_tip);
-
-        // Check 1: Single parent (looks like squash so far)
-        prop_assert_eq!(commit_info.parents.len(), 1);
-
-        // Check 2: Parent is NOT an ancestor of main-before-rebase
-        // For a squash, parent would be main_before. For rebase, parent is another rebased commit.
-        let parent = &commit_info.parents[0];
-
-        // If there were multiple commits in the branch, the parent is NOT main_before
-        if branch.commits.len() > 1 {
-            let is_parent_on_old_main = run_git(&repo, &[
-                "merge-base", "--is-ancestor", parent, &main_before
-            ]).is_ok();
-
-            // For rebase with multiple commits, parent is NOT on old main
-            prop_assert!(
-                !is_parent_on_old_main || parent == &main_before,
-                "Rebase parent {} should not be on old main history (unless single commit)",
-            );
+            // Verify error message mentions the specific issue
+            let err = result.unwrap_err();
+            if !allow_squash {
+                prop_assert!(err.contains("squash merge disabled"));
+            } else if allow_merge {
+                prop_assert!(err.contains("merge commit") || err.contains("allow_merge_commit"));
+            } else if allow_rebase {
+                prop_assert!(err.contains("rebase") || err.contains("allow_rebase_merge"));
+            }
         }
-
-        // The ancestry check should detect this:
-        // $SHA^ should be an ancestor of $SHA^^ for squash (trivially true: same commit)
-        // For rebase, $SHA^ is a rebased commit, and checking if it's ancestor of
-        // the commit BEFORE $SHA on main will fail (because $SHA^ wasn't on main before)
     }
 }
 ```
