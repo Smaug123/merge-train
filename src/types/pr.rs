@@ -70,6 +70,12 @@ pub enum MergeStateStatus {
 
     /// State not yet computed by GitHub - wait and re-check.
     Unknown,
+
+    /// PR is a draft - wait for it to be marked ready for review.
+    Draft,
+
+    /// Repository has merge hooks or merge queue enabled - wait.
+    HasHooks,
 }
 
 impl MergeStateStatus {
@@ -82,7 +88,11 @@ impl MergeStateStatus {
     pub fn should_wait(&self) -> bool {
         matches!(
             self,
-            MergeStateStatus::Blocked | MergeStateStatus::Behind | MergeStateStatus::Unknown
+            MergeStateStatus::Blocked
+                | MergeStateStatus::Behind
+                | MergeStateStatus::Unknown
+                | MergeStateStatus::Draft
+                | MergeStateStatus::HasHooks
         )
     }
 
@@ -127,7 +137,7 @@ pub struct CachedPr {
 
     /// SHA of the predecessor's squash commit that this PR was reconciled against.
     /// Set after normal cascade or late-addition reconciliation completes.
-    /// Required for `is_root()` to return true when predecessor is merged.
+    /// When set, indicates this PR is ready to become a new train root.
     pub predecessor_squash_reconciled: Option<Sha>,
 }
 
@@ -186,6 +196,8 @@ mod tests {
             Just(MergeStateStatus::Behind),
             Just(MergeStateStatus::Dirty),
             Just(MergeStateStatus::Unknown),
+            Just(MergeStateStatus::Draft),
+            Just(MergeStateStatus::HasHooks),
         ]
     }
 
@@ -243,6 +255,8 @@ mod tests {
             assert!(!MergeStateStatus::Behind.is_mergeable());
             assert!(!MergeStateStatus::Dirty.is_mergeable());
             assert!(!MergeStateStatus::Unknown.is_mergeable());
+            assert!(!MergeStateStatus::Draft.is_mergeable());
+            assert!(!MergeStateStatus::HasHooks.is_mergeable());
         }
 
         #[test]
@@ -253,6 +267,8 @@ mod tests {
             assert!(MergeStateStatus::Behind.should_wait());
             assert!(!MergeStateStatus::Dirty.should_wait());
             assert!(MergeStateStatus::Unknown.should_wait());
+            assert!(MergeStateStatus::Draft.should_wait());
+            assert!(MergeStateStatus::HasHooks.should_wait());
         }
 
         #[test]
@@ -263,6 +279,8 @@ mod tests {
             assert!(!MergeStateStatus::Behind.is_permanent_failure());
             assert!(MergeStateStatus::Dirty.is_permanent_failure());
             assert!(!MergeStateStatus::Unknown.is_permanent_failure());
+            assert!(!MergeStateStatus::Draft.is_permanent_failure());
+            assert!(!MergeStateStatus::HasHooks.is_permanent_failure());
         }
     }
 

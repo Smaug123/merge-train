@@ -31,7 +31,7 @@ pub struct Sha(pub String);
 impl Sha {
     /// Creates a new Sha from a string.
     ///
-    /// Note: This does not validate the format. Use `try_from` for validation.
+    /// Note: This does not validate the format. Valid SHAs are 40 hex characters.
     pub fn new(s: impl Into<String>) -> Self {
         Sha(s.into())
     }
@@ -43,11 +43,9 @@ impl Sha {
 
     /// Returns a short (7-character) version of the SHA for display.
     pub fn short(&self) -> &str {
-        if self.0.len() >= 7 {
-            &self.0[..7]
-        } else {
-            &self.0
-        }
+        // Use get() to avoid panic if string contains non-ASCII (shouldn't happen
+        // for valid SHAs, but can occur via Sha::new or Deserialize on bad input).
+        self.0.get(..7).unwrap_or(&self.0)
     }
 }
 

@@ -232,7 +232,11 @@ pub enum CascadeStepOutcome {
 }
 
 impl CascadeStepOutcome {
-    /// Returns true if the cascade can continue (not blocked or aborted).
+    /// Returns true if the cascade can immediately proceed to the next step.
+    ///
+    /// True for `Merged` (advance to next PR) and `FanOut` (spawn new trains).
+    /// False for terminal states (`Complete`, `Aborted`) and waiting states
+    /// (`WaitingOnCi`, `Blocked`).
     pub fn can_continue(&self) -> bool {
         matches!(
             self,
