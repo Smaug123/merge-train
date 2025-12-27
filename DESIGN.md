@@ -67,8 +67,7 @@ The bot will:
 1. Persist a "train started" record for this stack in the local state store
 2. Walk the linked list to find all descendants (including any added after this command)
 3. Validate the root PR is mergeable (approved, required checks passing — see below)
-4. Squash-merge the root PR
-5. Begin the cascade (persisting phase transitions to disk and posting/updating a status comment — see "Status comments")
+4. Begin the cascade: prepare the root's descendants, squash-merge the root, then reconcile, catch-up, and retarget descendants (persisting phase transitions to disk and posting/updating a status comment — see "Status comments" and "Operation sequence")
 
 **Definition of "ready to merge"**: The bot uses GitHub's `mergeStateStatus` field (via GraphQL) to determine readiness. A PR is ready when `mergeStateStatus` is `CLEAN` or `UNSTABLE`:
 
@@ -147,9 +146,11 @@ This prevents races where: (a) the bot pushes a reconciliation commit, (b) `chec
 **Note on "check failure"**: Throughout this document, "check failure" or "required check failure" refers to `mergeStateStatus` transitioning to `BLOCKED`. The bot does not query branch protection rules to distinguish required from non-required checks — it relies entirely on GitHub's `mergeStateStatus` computation. This means:
 - If a non-required check fails → `UNSTABLE` → bot proceeds
 - If a required check fails → `BLOCKED` → bot enters `waiting_ci` state
-- If approval is withdrawn → `BLOCKED` → bot enters `waiting_ci` state (same signal as check failure)
+- If approval is withdrawn (detected via `mergeStateStatus` polling) → `BLOCKED` → bot enters `waiting_ci` state
 
-All `BLOCKED` conditions from check failures or missing approvals result in `waiting_ci` state — the bot assumes these are potentially transient (flaky tests, CI outages, or code that will be fixed). The cascade auto-resumes when `mergeStateStatus` becomes `CLEAN` or `UNSTABLE`. Users can issue `@merge-train stop` if the failure is known to be permanent.
+When the bot detects `BLOCKED` via `mergeStateStatus` polling (without knowing the specific cause), it enters `waiting_ci` state — assuming the condition is potentially transient (flaky tests, CI outages, or code that will be fixed). The cascade auto-resumes when `mergeStateStatus` becomes `CLEAN` or `UNSTABLE`. Users can issue `@merge-train stop` if the failure is known to be permanent.
+
+**Exception — review dismissal events**: If the bot receives a `pull_request_review.dismissed` webhook (explicit review dismissal, or automatic dismissal due to "dismiss stale reviews" on new commits), it immediately transitions to `aborted` state rather than `waiting_ci`. This is because review dismissals often indicate a deliberate action requiring human attention, not a transient condition. See "Pause Conditions" for the full table of abort vs waiting conditions.
 
 Once started, the cascade proceeds automatically through all descendants. New PRs that declare themselves as descendants mid-cascade will be picked up when the cascade reaches their predecessor — but with an important constraint: see "Descendant set freezing" below.
 
@@ -478,7 +479,7 @@ The bot MUST post and update a status comment on the current root PR at each pha
 Train running — reconciling PR #124 after squash (1/2 descendants complete)
 ```
 
-**JSON fields:** Same as the `TrainRecord` fields documented in "Local train state" above: `version`, `recovery_seq`, `state`, `original_root_pr`, `current_pr`, `cascade_phase` (as full `CascadePhase` object), `predecessor_pr`, `predecessor_head_sha`, `last_squash_sha`, `started_at`. The `recovery_seq` is a monotonic counter incremented on each state change, used to determine which record is "ahead" during recovery.
+**JSON fields:** Same as the `TrainRecord` fields documented in "Local train state" above: `version`, `recovery_seq`, `state`, `original_root_pr`, `current_pr`, `cascade_phase` (as full `CascadePhase` object), `predecessor_pr`, `predecessor_head_sha`, `last_squash_sha`, `started_at`, `stopped_at`, `error`. The `recovery_seq` is a monotonic counter incremented on each state change, used to determine which record is "ahead" during recovery.
 
 **Critical for recovery:** The `cascade_phase` MUST include the full object with `completed`, `skipped`, AND `frozen_descendants`. Without `frozen_descendants`, GitHub-based recovery cannot correctly identify which descendants were promised preparation — it might include new descendants added after the freeze point, leading to unprepared PRs being reconciled (data loss). Without `skipped`, recovery would endlessly retry failed descendants.
 
@@ -1627,7 +1628,7 @@ For PR #N with descendants {#D1, #D2, ...} (may be one or multiple):
 7. REPEAT: For single descendant, it becomes the new #N, loop from step 1
 ```
 
-For the root PR (#123), there is no predecessor to merge, so the sequence starts at step 2.
+For the root PR (#123), there is no predecessor whose content needs to be merged *into* the root (since the root's base is main). However, step 1 still applies: if #123 has descendants, they must be prepared (by merging #123's head into them) before squashing #123.
 
 For the final PR in the stack (#125), there is no descendant, so steps 1, 3-5 are skipped.
 
@@ -1917,10 +1918,10 @@ When an operation fails or state doesn't match expectations:
 
 **Frozen descendants and failure handling**: When a descendant in `frozen_descendants` fails (closed, branch deleted, etc.), we:
 1. Log the failure clearly
-2. Remove it from the working set for subsequent phases (but keep it in `frozen_descendants` for the record)
+2. Add it to the `skipped` list for this phase (persisted alongside `completed` and `frozen_descendants`)
 3. Continue with remaining descendants
 
-This means `completed` tracks "successfully processed" and we implicitly have "failed/skipped" = `frozen_descendants - completed - remaining`. On recovery, we attempt remaining descendants again (they might have been transiently unavailable).
+The `completed` list tracks successfully processed descendants; the `skipped` list tracks descendants that failed during processing. On recovery, we skip descendants in `completed` OR `skipped`, and only attempt `remaining = frozen_descendants - completed - skipped`. Failed descendants are NOT retried automatically — the user must manually resolve the issue (reopen the PR, restore the branch, etc.) and restart the train.
 
 **Why merging $SQUASH_SHA^ is essential**: If main has independent changes (commits that landed outside this stack), the descendant must incorporate them. This happens in reconciliation by merging `$SQUASH_SHA^` (the parent of the squash commit, i.e., main immediately before the squash). The ours-merge then marks the squash commit as an ancestor without changing the tree (which already has all pre-squash content).
 
