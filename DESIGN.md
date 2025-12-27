@@ -362,7 +362,7 @@ If recovery finds `cascade_phase = "reconciling"` but `last_squash_sha` is null 
    - Initial delay: 1 second
    - Max delay: 30 seconds (cap)
    - Max attempts: 10
-   - Total max wait: ~60 seconds
+   - Total max wait: ~150 seconds (1+2+4+8+16+30+30+30+30)
 
    ```rust
    async fn fetch_merge_commit_sha_with_retry(
@@ -401,7 +401,7 @@ If recovery finds `cascade_phase = "reconciling"` but `last_squash_sha` is null 
 
 This derives the squash SHA from GitHub rather than hard-failing, since the squash-merge is recorded in GitHub's PR state even if our local record was lost.
 
-**Why 60 seconds total?** GitHub's API typically propagates `merge_commit_sha` within a few seconds, but under heavy load or during incidents, propagation can take 10-30 seconds. A 60-second total wait covers the vast majority of cases without making recovery unacceptably slow. The exponential backoff (1s, 2s, 4s, 8s, 16s, 30s, 30s...) front-loads fast retries for the common case while backing off for edge cases.
+**Why ~150 seconds total?** GitHub's API typically propagates `merge_commit_sha` within a few seconds, but under heavy load or during incidents, propagation can take 10-30 seconds. A 150-second total wait covers the vast majority of cases without making recovery unacceptably slow. The exponential backoff (1s, 2s, 4s, 8s, 16s, then 30s capped for the remaining attempts) front-loads fast retries for the common case while backing off for edge cases.
 
 **GitHub-based recovery**: If the local state files are missing or corrupted, the bot can recover train state from GitHub during bootstrap by scanning for status comments on open root PRs. The status comment contains the full `TrainRecord` as machine-readable JSON, enabling precise recovery without inference. See "Status comments" below.
 
@@ -476,7 +476,7 @@ Rather than attempting truncated recovery (which is fragile and can violate free
 5. **Unbounded field truncation**: The `error.message` field and other variable-length strings (git command output, API error responses) are truncated before serialization to ensure the total JSON stays within bounds:
    - `error.message`: Maximum 4KB (truncated with "... [truncated]" suffix)
    - `error.stderr`: Maximum 2KB
-   - Branch names: Maximum 256 characters each (GitHub's limit is 255)
+   - Branch names: Maximum 255 characters each (GitHub's limit)
 
    Truncation happens **before** JSON serialization, ensuring the size estimate remains valid. The full error details are preserved in the local event log for debugging.
 
@@ -2943,14 +2943,41 @@ async fn repo_worker(
         }
 
         // Process highest-priority event
+        // Use select! to handle cancel requests DURING event processing.
+        // This is critical: without it, cancel tokens wouldn't be set until
+        // processing completes, making "prompt" interruption impossible.
         if let Some(event) = queue.pop() {
-            let result = process_event_for_repo(
+            let processing = process_event_for_repo(
                 &repo_id,
                 event,
                 &mut repo_state,
                 &mut stack_cancel,
                 &ctx,
-            ).await;
+            );
+            tokio::pin!(processing);
+
+            let result = loop {
+                tokio::select! {
+                    biased;
+
+                    // Priority: handle cancel requests immediately
+                    Some(req) = cancel_rx.recv() => {
+                        if let Some(ref state) = repo_state {
+                            if let Some(root) = state.find_stack_root(req.pr_number) {
+                                stack_cancel.cancel(root);
+                                tracing::info!(?repo_id, ?root, "cancelled stack during processing");
+                            }
+                        }
+                        // Continue processing — the cancelled token will cause
+                        // the in-flight operation to return Err(Cancelled)
+                    }
+
+                    // Process the event (will check cancel token periodically)
+                    result = &mut processing => {
+                        break result;
+                    }
+                }
+            };
 
             match result {
                 Err(Error::Cancelled) => {
@@ -3131,10 +3158,16 @@ async fn recover_in_progress_trains(
                 let pr = repo_state.prs.get(&train.current_pr);
                 match pr.map(|p| &p.state) {
                     Some(PrState::Merged { .. }) => {
-                        // Already merged, move to reconciliation with frozen_descendants
+                        // Already merged — recover the squash SHA from GitHub.
+                        // We can't trust train.last_squash_sha here because we may have
+                        // crashed after the squash but before durably writing the SHA.
+                        // See "Reconciling recovery with missing last_squash_sha".
+                        let squash_sha = fetch_merge_commit_sha_with_retry(github, train.current_pr)
+                            .await?
+                            .ok_or(Error::MissingRecoverySha)?;
                         resume_reconciliation(
                             train.current_pr,
-                            train.last_squash_sha.as_ref(),
+                            &squash_sha,
                             frozen_descendants,
                             repo_state,
                             &cancel,
