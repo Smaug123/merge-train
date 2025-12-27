@@ -176,19 +176,25 @@ And checks each ruleset for `dismiss_stale_reviews_on_push: true` in the `pull_r
 
 **API permission**: The bot requires `administration:read` permission (or higher) to query branch protection rules, and `repository_metadata:read` for rulesets. If permissions are missing:
 
-1. The bot logs a **warning** and posts a visible notice on the PR: "⚠️ Unable to verify branch protection settings (missing permissions). If 'dismiss stale approvals' is enabled, the cascade may stall. Consider granting `administration:read` permission."
+1. The bot logs a **warning** and posts a visible notice on the PR: "⚠️ Unable to verify branch protection settings (missing permissions). If 'dismiss stale approvals' is enabled, the cascade may abort. Consider granting `administration:read` permission."
 2. The bot **proceeds anyway** — this is a deliberate choice to avoid blocking workflows entirely when the admin hasn't granted full permissions.
-3. If the cascade later stalls due to dismissed approvals, the error message explicitly suggests checking this setting.
+3. If the cascade later aborts due to dismissed approvals, the error message explicitly suggests checking this setting.
 
 This "warn and proceed" approach balances operational flexibility with user awareness. Admins who want strict enforcement can grant the permission; those who know their settings are compatible can proceed without it.
 
 **Caching**: Branch protection and ruleset queries are cached per-repo for 1 hour (configurable via `MERGE_TRAIN_BRANCH_PROTECTION_CACHE_TTL_MINS`). This cache is appropriate because:
 
 1. Branch protection changes during an active cascade are rare
-2. If the setting IS changed mid-cascade, the cascade will stall with a clear error (dismissed approvals → `BLOCKED` state)
-3. The user can `@merge-train stop`, wait for cache expiry (or restart the bot), then re-evaluate
+2. If the setting IS changed mid-cascade, the cascade aborts (see below)
+3. The user can then fix the setting, or `@merge-train stop` and re-evaluate
 
-**Refresh on stall**: When a cascade stalls due to `mergeStateStatus` becoming `BLOCKED` after a bot push (the exact symptom of dismissed approvals), the bot **invalidates the protection cache** and re-queries. If it now detects `dismiss_stale_reviews: true`, it posts an updated error message explaining the root cause rather than a generic "waiting for approval" message.
+**Interaction with review dismissal events**: When "dismiss stale reviews" is enabled and the bot pushes a merge commit, GitHub dismisses the existing approvals **and** emits `pull_request_review.dismissed` webhook events. The bot's event handler intercepts these events and transitions the cascade to `aborted` state (see "Review dismissal behaviour" in the Error Handling section). This means:
+
+1. If the setting is enabled mid-cascade, the cascade **aborts immediately** via the dismissed event — it does not merely stall on `BLOCKED`.
+2. The abort reason will be `ReviewDismissed`, and the user must re-approve and issue `@merge-train start` to resume.
+3. When handling the abort, the bot **invalidates the protection cache** and re-queries branch protection. If it now detects `dismiss_stale_reviews: true`, it posts an error message explaining that the setting is incompatible (rather than a generic "review was dismissed" message).
+
+This is intentional: review dismissal is treated as a deliberate human action that should not auto-resume. The preflight check exists to prevent this situation from occurring in the first place.
 
 ### Merge method preflight check
 
@@ -3869,15 +3875,22 @@ async fn persist_state_file(
 ) -> Result<()> {
     // Read current generation (or start at 0)
     let gen_path = state_dir.join("generation");
-    let gen: u64 = match tokio::fs::read_to_string(&gen_path).await {
-        Ok(s) => s.trim().parse().unwrap_or(0),
-        Err(_) => 0,
+    let (gen, gen_existed): (u64, bool) = match tokio::fs::read_to_string(&gen_path).await {
+        Ok(s) => (s.trim().parse().unwrap_or(0), true),
+        Err(_) => (0, false),
     };
 
     let snapshot = build_snapshot(state);
     let bytes = serde_json::to_vec_pretty(&snapshot)?;
     let snapshot_path = state_dir.join(format!("snapshot.{}.json", gen));
     atomic_write(&snapshot_path, &bytes).await?;
+
+    // Write generation file if it didn't exist (first persist).
+    // This ensures load_from_disk finds the generation file on restart.
+    if !gen_existed {
+        atomic_write(&gen_path, b"0\n").await?;
+    }
+
     tracing::debug!(?repo_id, path = %snapshot_path.display(), gen, "snapshot persisted");
     Ok(())
 }
