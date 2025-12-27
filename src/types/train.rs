@@ -623,6 +623,7 @@ mod tests {
 
     mod train_record {
         use super::*;
+        use crate::types::ids::CommentId;
 
         fn arb_train_error() -> impl Strategy<Value = TrainError> {
             (
@@ -639,6 +640,16 @@ mod tests {
                 })
         }
 
+        fn arb_datetime() -> impl Strategy<Value = DateTime<Utc>> {
+            // Generate timestamps in a reasonable range (year 2000-2100)
+            (946684800i64..4102444800i64)
+                .prop_map(|secs| DateTime::from_timestamp(secs, 0).unwrap())
+        }
+
+        fn arb_comment_id() -> impl Strategy<Value = CommentId> {
+            any::<u64>().prop_map(CommentId)
+        }
+
         fn arb_train_record() -> impl Strategy<Value = TrainRecord> {
             (
                 arb_pr_number(),
@@ -650,6 +661,9 @@ mod tests {
                 prop::option::of(arb_sha()),
                 prop::option::of(arb_train_error()),
                 any::<u64>(),
+                arb_datetime(),
+                prop::option::of(arb_datetime()),
+                prop::option::of(arb_comment_id()),
             )
                 .prop_map(
                     |(
@@ -662,6 +676,9 @@ mod tests {
                         last_squash_sha,
                         error,
                         recovery_seq,
+                        started_at,
+                        stopped_at,
+                        status_comment_id,
                     )| {
                         TrainRecord {
                             version: 1,
@@ -673,10 +690,10 @@ mod tests {
                             predecessor_pr,
                             predecessor_head_sha,
                             last_squash_sha,
-                            started_at: Utc::now(),
-                            stopped_at: None,
+                            started_at,
+                            stopped_at,
                             error,
-                            status_comment_id: None,
+                            status_comment_id,
                         }
                     },
                 )
@@ -687,17 +704,8 @@ mod tests {
             fn serde_roundtrip(record in arb_train_record()) {
                 let json = serde_json::to_string(&record).unwrap();
                 let parsed: TrainRecord = serde_json::from_str(&json).unwrap();
-                // Compare all fields except started_at (which may have subsecond drift)
-                prop_assert_eq!(record.version, parsed.version);
-                prop_assert_eq!(record.recovery_seq, parsed.recovery_seq);
-                prop_assert_eq!(record.state, parsed.state);
-                prop_assert_eq!(record.original_root_pr, parsed.original_root_pr);
-                prop_assert_eq!(record.current_pr, parsed.current_pr);
-                prop_assert_eq!(record.cascade_phase, parsed.cascade_phase);
-                prop_assert_eq!(record.predecessor_pr, parsed.predecessor_pr);
-                prop_assert_eq!(record.predecessor_head_sha, parsed.predecessor_head_sha);
-                prop_assert_eq!(record.last_squash_sha, parsed.last_squash_sha);
-                prop_assert_eq!(record.error, parsed.error);
+                // Full equality check - serde roundtrip should be lossless
+                prop_assert_eq!(record, parsed);
             }
 
             #[test]
