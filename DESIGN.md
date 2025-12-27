@@ -265,7 +265,7 @@ Due to inherent race conditions, the stop takes effect at the next opportunity �
 1. Cancel any in-flight git operations
 2. Clean up the stack's dedicated worktree (abort any in-progress merge, reset to clean state)
 3. Persist the stack as `"state": "stopped"` in the local state store
-4. Optionally post/update a status comment describing the current state
+4. Post/update the status comment to reflect `stopped` state (required for recovery consistency)
 5. Take no further action on this stack until `@merge-train start` is issued again
 
 The stop command is scoped to a single stack — other independent stacks in the same repo are unaffected. Each stack has its own isolated worktree (see "Per-stack worktrees" section), so stopping one stack has no effect on others.
@@ -481,7 +481,7 @@ The bot MUST post and update a status comment on the current root PR at each pha
 Train running — reconciling PR #124 after squash (1/2 descendants complete)
 ```
 
-**JSON fields:** Same as the `TrainRecord` fields documented in "Local train state" above: `version`, `recovery_seq`, `state`, `original_root_pr`, `current_pr`, `cascade_phase` (as full `CascadePhase` object), `predecessor_pr`, `predecessor_head_sha`, `last_squash_sha`, `started_at`, `stopped_at`, `error`. The `recovery_seq` is a monotonic counter incremented on each state change, used to determine which record is "ahead" during recovery.
+**JSON fields:** Same as the `TrainRecord` fields documented in "Local train state" above, **except** `status_comment_id` (which is only known locally after the comment is created): `version`, `recovery_seq`, `state`, `original_root_pr`, `current_pr`, `cascade_phase` (as full `CascadePhase` object), `predecessor_pr`, `predecessor_head_sha`, `last_squash_sha`, `started_at`, `stopped_at`, `error`. The `recovery_seq` is a monotonic counter incremented on each state change, used to determine which record is "ahead" during recovery. Deserialization must tolerate a missing `status_comment_id` field.
 
 **Critical for recovery:** The `cascade_phase` MUST include the full object with `completed`, `skipped`, AND `frozen_descendants`. Without `frozen_descendants`, GitHub-based recovery cannot correctly identify which descendants were promised preparation — it might include new descendants added after the freeze point, leading to unprepared PRs being reconciled (data loss). Without `skipped`, recovery would endlessly retry failed descendants.
 
@@ -1193,6 +1193,7 @@ From the cached state, stacks are computed by traversing predecessor relationshi
 | `pull_request` closed (not merged) | Notify descendants they're orphaned |
 | `check_suite.completed` / `status` (terminal state) | If cascade waiting on this PR AND event SHA matches expected head, re-evaluate `mergeStateStatus` (see "Eventual consistency caveat") |
 | `pull_request_review` submitted (approved) | If cascade waiting on this PR, re-evaluate readiness (but see "Review dismissal behaviour" — dismissed reviews require `@merge-train start` to resume) |
+| `pull_request.ready_for_review` | If cascade waiting on this PR due to draft status, re-evaluate readiness |
 
 **Comment edit handling**: When a predecessor declaration is edited, the bot handles several cases:
 
@@ -1358,9 +1359,9 @@ receive webhook
   └─► (for Ready state) evaluate cascade:
         │
         ├─ Find frontier of each started stack
-        ├─ If frontier ready and predecessor merged: cascade
-        ├─ If frontier pending (BLOCKED/UNKNOWN): wait
-        └─ If frontier blocked (required checks/approvals): abort, notify
+        ├─ If frontier ready (CLEAN/UNSTABLE) and predecessor merged: cascade
+        ├─ If frontier waiting (BLOCKED/UNKNOWN/isDraft): enter waiting_ci, poll for resolution
+        └─ If frontier has permanent failure (DIRTY, review dismissed): abort, notify
 ```
 
 ### Polling fallback for active trains
@@ -1396,9 +1397,9 @@ enum QueuedEventPayload {
 **Poll action**: When processing `PollActiveTrains`:
 
 1. For each active train in `active_trains`:
-   a. Fetch current `mergeStateStatus` for the frontier PR via GraphQL
-   b. Compare with cached `merge_state`
-   c. If changed (e.g., now `CLEAN` when previously `BLOCKED`), trigger cascade evaluation
+   a. Fetch current `mergeStateStatus` and `isDraft` for the frontier PR via GraphQL
+   b. Compare with cached `merge_state` and `is_draft`
+   c. If changed (e.g., now `CLEAN` when previously `BLOCKED`, or `isDraft` changed from `true` to `false`), trigger cascade evaluation
 2. If any train's frontier PR is now ready but wasn't before, the missed webhook is effectively recovered
 
 **Distributed polling**: To avoid thundering herd when multiple bot instances restart:
@@ -1992,7 +1993,7 @@ The bot pauses the cascade (and comments with diagnostics) when it encounters is
 | Approval withdrawn (temporarily missing) | `waiting_ci` | Re-approve — bot auto-resumes on `pull_request_review.submitted` |
 | Squash-merge API fails (transient) | `waiting_ci` | Auto-retry with backoff; waits for status event if retries exhausted |
 | Preparation merge fails | `aborted` | Resolve conflict locally, push, then `@merge-train start` |
-| `git push` rejected (non-fast-forward) | `aborted` | See "Concurrent push handling" below |
+| `git push` rejected (non-fast-forward) | depends on phase | During preparation: retry if no conflict, else `aborted`. After reconciliation: always `aborted`. See "Concurrent push handling" below |
 | PR closed without merge | `aborted` | Re-open or restructure stack |
 | Cycle detected | `aborted` | Fix predecessor comments |
 | Review dismissed | `aborted` | Re-approve, then `@merge-train start` (no auto-resume) |
@@ -2361,7 +2362,8 @@ enum MergeStateStatus {
 	//   - The old train (keyed by 123) is removed from active_trains
 
 	/// Train record stored in the local state file.
-	/// This is the authoritative source of truth for train state.
+	/// During normal operation, state is written here first, then mirrored to GitHub.
+	/// During recovery, the record with higher `recovery_seq` wins (see "Recovery precedence").
 	#[derive(Serialize, Deserialize)]
 	struct TrainRecord {
 	    /// Schema version for forward compatibility
