@@ -122,12 +122,20 @@ This delegates all branch protection logic to GitHub, ensuring the bot respects 
 
 **Eventual consistency caveat**: GitHub's `mergeStateStatus` is eventually consistent. After a push (including pushes from the bot itself during preparation or reconciliation), the field may reflect stale state for several seconds — even after `headRefOid` is updated to reflect the new head. The `headRefOid` field and `mergeStateStatus` field are **not atomically consistent**: `headRefOid` is updated by the git layer, while `mergeStateStatus` is computed by a separate mergeability engine that may lag behind. To avoid acting on stale data:
 
-1. **After a bot-initiated push**: The bot must **wait for `check_suite.completed`** (not just `created` or `requested`) for the new head SHA before trusting `mergeStateStatus`. The `check_suite.created`/`requested` events only indicate GitHub has *begun* evaluating — the mergeability engine may not have incorporated the results yet. Only after `check_suite.completed` can the bot trust that `mergeStateStatus` reflects the new head's actual check results.
+1. **After a bot-initiated push**: The bot must wait for CI completion events **for the new head SHA** before trusting `mergeStateStatus`. The bot accepts EITHER:
+   - `check_suite.completed` (GitHub Checks API — most modern CI systems)
+   - `status` context updates with state `success`/`failure`/`error` (legacy GitHub Status API — some CI systems still use this)
 
-   **Why `created`/`requested` is insufficient**: The mergeability engine is asynchronous. When `check_suite.created` fires, you may query `mergeStateStatus` and receive `CLEAN` — but this `CLEAN` is cached from the OLD head's check results, not computed against the new head. The new head's checks haven't finished yet, so the mergeability engine has nothing new to report and returns stale data.
+   The bot tracks which SHA it pushed and ignores events for older SHAs. Only when the appropriate event arrives for the NEW head does the bot re-query `mergeStateStatus`.
+
+   **Why `check_suite.created`/`requested` is insufficient**: The mergeability engine is asynchronous. When `check_suite.created` fires, you may query `mergeStateStatus` and receive `CLEAN` — but this `CLEAN` is cached from the OLD head's check results, not computed against the new head. The new head's checks haven't finished yet, so the mergeability engine has nothing new to report and returns stale data.
+
+   **Why both event types are needed**: Repositories may use the Checks API (check suites), the Status API (status contexts), or a mix of both. A repo using only status contexts would never receive `check_suite.completed`, causing a deadlock if we only listened for that event. Conversely, treating an early status update as sufficient when check suites are still running risks proceeding before all checks finish. The solution: the bot tracks which CI mechanism(s) are active per-repo (inferred from received events) and waits for the appropriate completion signals.
+
+   **Fallback for mixed repos**: If both event types are observed for a PR, the bot waits until `mergeStateStatus` becomes `CLEAN` or `UNSTABLE` (indicating ALL checks have resolved). This prevents races where status contexts complete but check suites are still pending.
 
 2. **Before squash-merging**: The bot must verify that `headRefOid` matches the expected head SHA recorded when the train was started or when preparation completed. If they differ, someone pushed to the branch — abort and notify.
-3. **On `UNKNOWN` status**: This explicitly means GitHub hasn't computed the status yet. Wait for `check_suite.completed` webhook.
+3. **On `UNKNOWN` status**: This explicitly means GitHub hasn't computed the status yet. Wait for CI completion events (check_suite or status) for the current head SHA.
 
 This prevents races where: (a) the bot pushes a reconciliation commit, (b) `check_suite.created` fires, (c) bot queries `mergeStateStatus` and gets `CLEAN` based on the OLD head's cached results, (d) merges before required checks have run on the NEW head.
 
@@ -300,9 +308,11 @@ When the bot takes ownership of a stack (via `@merge-train start`), it persists 
 | Field | Type | Description |
 |-------|------|-------------|
 | `version` | `number` | Schema version (currently `1`) |
+| `recovery_seq` | `number` | Monotonic counter incremented on each state change; used to determine which record (local vs GitHub) is "ahead" during recovery (see "Recovery precedence") |
 | `state` | `string` | One of: `running`, `stopped`, `waiting_ci`, `aborted`, `needs_manual_review` |
-| `current_pr` | `number` | PR currently being processed (the train's current root PR) |
-| `cascade_phase` | `object` | Phase with optional `completed` list (see below) |
+| `original_root_pr` | `number` | The PR that received `@merge-train start`; stays constant as cascade advances |
+| `current_pr` | `number` | PR currently being processed (advances as each PR merges) |
+| `cascade_phase` | `object` | Phase with `completed`, `skipped`, and `frozen_descendants` lists (see below) |
 | `predecessor_pr` | `number?` | PR number of predecessor (for fetching via `refs/pull/<n>/head` during recovery) |
 | `predecessor_head_sha` | `string?` | Head SHA of predecessor at preparation time (for verifying preparation during recovery) |
 | `last_squash_sha` | `string?` | SHA of last squash commit (for reconciliation recovery) |
@@ -313,13 +323,18 @@ When the bot takes ownership of a stack (via `@merge-train start`), it persists 
 **Cascade phases** (serialized as `{ "PhaseName": {...} }` for phases with data, or `"PhaseName"` for unit variants):
 
 - `Idle`: Not currently performing any operation; waiting for CI or next event
-- `Preparing`: Merging predecessor head into descendants (before squash) — NOT main, only predecessor head
-- `SquashPending`: Preparation complete; about to squash-merge current PR
+- `Preparing`: Merging predecessor head into descendants (before squash) — NOT main, only predecessor head. Captures `frozen_descendants` at entry (see "Descendant set freezing").
+- `SquashPending`: Preparation complete; about to squash-merge current PR. Carries forward `frozen_descendants` and `skipped` from `Preparing`.
 - `Reconciling`: Squash complete; performing ours-strategy merges into descendants
 - `CatchingUp`: Ours-merge complete; performing regular merge of origin/main
 - `Retargeting`: Catch-up complete; retargeting descendant PRs to default branch
 
-Phases with multiple descendants (`Preparing`, `Reconciling`, `CatchingUp`, `Retargeting`) include a `completed` list tracking which descendants have finished that phase.
+Phases with multiple descendants (`Preparing`, `Reconciling`, `CatchingUp`, `Retargeting`) include:
+- `completed`: Which descendants have finished this phase
+- `skipped`: Descendants that failed during processing (PR closed, branch deleted, etc.) — not retried
+- `frozen_descendants`: The descendant set captured when entering `Preparing`; carried through ALL subsequent phases
+
+**CRITICAL**: Recovery MUST use `frozen_descendants` from the persisted state, NOT re-query `repo_state.descendants`. Between crash and recovery, new descendants may have been added via `predecessor_declared` events during spool replay. These new descendants were never prepared and must not be reconciled in the current cascade step — they'll be handled when the next PR becomes the root.
 
 **Recovery semantics:**
 
@@ -439,7 +454,13 @@ The bot MUST post and update a status comment on the current root PR at each pha
   "state": "running",
   "original_root_pr": 123,
   "current_pr": 124,
-  "cascade_phase": { "Reconciling": { "completed": [125] } },
+  "cascade_phase": {
+    "Reconciling": {
+      "completed": [125],
+      "skipped": [],
+      "frozen_descendants": [125, 126]
+    }
+  },
   "predecessor_pr": 123,
   "last_squash_sha": "abc123def456",
   "started_at": "2024-01-15T09:00:00Z"
@@ -450,9 +471,9 @@ The bot MUST post and update a status comment on the current root PR at each pha
 Train running — reconciling PR #124 after squash (1/2 descendants complete)
 ```
 
-**JSON fields:** Same as the `TrainRecord` fields documented in "Local train state" above: `version`, `recovery_seq`, `state`, `original_root_pr`, `current_pr`, `cascade_phase` (as full `CascadePhase` object including `completed` lists), `predecessor_pr`, `last_squash_sha`, `started_at`. The `recovery_seq` is a monotonic counter incremented on each state change, used to determine which record is "ahead" during recovery.
+**JSON fields:** Same as the `TrainRecord` fields documented in "Local train state" above: `version`, `recovery_seq`, `state`, `original_root_pr`, `current_pr`, `cascade_phase` (as full `CascadePhase` object), `predecessor_pr`, `last_squash_sha`, `started_at`. The `recovery_seq` is a monotonic counter incremented on each state change, used to determine which record is "ahead" during recovery.
 
-**Critical for recovery:** The `cascade_phase` must be serialized as a full object (not just a string) to include the `completed` list. Without this, GitHub-based recovery cannot resume mid-phase for multi-descendant operations — it would have to redo work on already-completed descendants.
+**Critical for recovery:** The `cascade_phase` MUST include the full object with `completed`, `skipped`, AND `frozen_descendants`. Without `frozen_descendants`, GitHub-based recovery cannot correctly identify which descendants were promised preparation — it might include new descendants added after the freeze point, leading to unprepared PRs being reconciled (data loss). Without `skipped`, recovery would endlessly retry failed descendants.
 
 **Comment size limits and train size validation:** GitHub comments have a 65536-character limit. Since the status comment contains the full `TrainRecord` JSON (including `frozen_descendants` and `completed` lists), excessively large trains would exceed this limit.
 
@@ -479,12 +500,15 @@ Rather than attempting truncated recovery (which is fragile and can violate free
 
    Truncation happens **before** JSON serialization, ensuring the size estimate remains valid. The full error details are preserved in the local event log for debugging.
 
-6. **Final size check**: Before posting/updating the status comment, the bot verifies the serialized JSON is under 60KB. If it exceeds this (which should not happen with the above limits, but is a safety net):
-   - The `error.message` and `error.stderr` fields are aggressively truncated to 500 characters each
-   - If still too large, the bot posts a minimal status comment without the embedded JSON and logs an error
-   - Recovery falls back to local state only; GitHub-based recovery is degraded
+6. **Final size check**: Before posting/updating the status comment, the bot verifies the serialized JSON is under 60KB. If it exceeds this (which should not happen with the above limits):
+   - First, aggressively truncate `error.message` and `error.stderr` to 500 characters each and retry
+   - If STILL too large after aggressive truncation, this indicates a bug in the size estimation (the 50 PR limit with truncation should always fit). The bot MUST NOT post a minimal comment without JSON, as this would silently disable GitHub-based recovery:
+     - Abort the train with error: "Status comment size limit exceeded unexpectedly. This is a bug — please report it with the train configuration. Train aborted to prevent recovery data loss."
+     - Transition to `aborted` state
+     - Log the full serialized JSON size and structure for debugging
+   - The local state remains authoritative; the user can retry after the bug is investigated
 
-This defense-in-depth approach ensures a large git error (e.g., a merge conflict with extensive diff output) cannot break status comment updates or recovery.
+**Why not degrade gracefully?** Posting a status comment without the embedded JSON would allow the cascade to continue, but if the bot crashes, GitHub-based recovery cannot determine which descendants were frozen, which were skipped, or what phase was interrupted. The train would transition to `needs_manual_review` on restart, forcing manual intervention anyway — but with the added risk that the cascade made progress that can't be safely resumed. It's better to fail fast when we detect the size limit is exceeded.
 
 This approach is simpler and safer than truncation-based recovery, which would require reconstructing `frozen_descendants` from current declarations — a process that violates the freeze invariant by potentially including PRs added after preparation began or missing PRs that were removed via comment edits.
 
@@ -1151,7 +1175,7 @@ From the cached state, stacks are computed by traversing predecessor relationshi
 | `issue_comment.deleted` | If deleted comment was a predecessor declaration, remove predecessor relationship |
 | `pull_request` merged | If merged PR has descendants, cascade to next |
 | `pull_request` closed (not merged) | Notify descendants they're orphaned |
-| `check_suite` / `status` completed | If cascade waiting on this PR, re-evaluate readiness |
+| `check_suite.completed` / `status` (terminal state) | If cascade waiting on this PR AND event SHA matches expected head, re-evaluate `mergeStateStatus` (see "Eventual consistency caveat") |
 | `pull_request_review` submitted (approved) | If cascade waiting on this PR, re-evaluate readiness (but see "Review dismissal behaviour" — dismissed reviews require `@merge-train start` to resume) |
 
 **Comment edit handling**: When a predecessor declaration is edited, the bot handles several cases:
@@ -1490,7 +1514,7 @@ git merge --no-edit -m "Merge main into <descendant-branch>" origin/main
 git push origin <descendant-branch>
 ```
 
-Then, for every PR on top of `<descendant-branch>` in the merge train, we use the GitHub API to cascade the new history back up, performing a standard recursive merge of `descendant-branch` into `PR-immediately-above-descendant-branch` and so on up the stack.
+This workflow is performed for EACH descendant PR (i.e., for every PR that had the just-merged PR as its predecessor). All descendants are processed using local git — the GitHub API is NOT used for merge operations because GitHub's recursive/ort merge strategy would cause spurious conflicts or incorrect results (see "Why local git is required" above). Once all descendants have been prepared, reconciled, caught up, and retargeted, the cascade proceeds to the next level as described in "Operation sequence" below.
 
 ### Commit signing
 
