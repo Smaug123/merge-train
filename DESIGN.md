@@ -456,7 +456,9 @@ This eliminates ambiguity in "which is ahead" — the monotonic sequence provide
 
 ### Status comments (required, non-authoritative for normal operation)
 
-The bot MUST post and update a status comment on the current root PR at each phase transition. This comment includes:
+The bot MUST post and update a status comment on the **original root PR** (the PR that received `@merge-train start`) at each phase transition. The comment remains on this PR for the train's entire lifecycle, even as `current_pr` advances through descendants. This provides a single stable location for observability and recovery; users watching descendant PRs can follow the link to the root PR's status comment for current state.
+
+This comment includes:
 
 - Full machine-readable train state in `<!-- merge-train-state {...} -->` JSON
 - Human-readable status for user visibility
@@ -651,10 +653,11 @@ Newline-delimited JSON (JSON Lines), one event per line. Each event includes a m
 - `phase_transition`: ALL of `train_root`, `current_pr`, `predecessor_pr`, `last_squash_sha`, `phase` (as full `CascadePhase` object including `completed` lists for multi-descendant phases)
 - `squash_committed`: `train_root`, `pr`, `sha`
 - `train_completed`/`train_stopped`/`train_aborted`: `root_pr`
-- `intent_push_prep`/`intent_push_reconcile`/`intent_push_catchup`: `train_root`, `pr`, `branch`, `pre_push_sha`, `expected_tree`
-- `done_push_prep`/`done_push_reconcile`/`done_push_catchup`: `train_root`, `pr`, `branch`, `sha`
+- `intent_push_prep`/`intent_push_reconcile`/`intent_push_catchup`: `train_root`, `branch`, `pre_push_sha`, `expected_tree`
+- `done_push_prep`/`done_push_reconcile`/`done_push_catchup`: `train_root`, `branch`
+- `intent_squash`: `train_root`, `pr`
 - `intent_retarget`: `train_root`, `pr`, `new_base`
-- `done_retarget`: `train_root`, `pr`, `new_base`
+- `done_retarget`: `train_root`, `pr`
 
 Without these fields durably logged, recovery cannot determine which PR the train was processing or what SHA to use for reconciliation.
 
@@ -1654,7 +1657,7 @@ For the final PR in the stack (#125), there is no descendant, so steps 1, 3-5 ar
 1. Query the current descendant set from the `descendants` index
 2. Log the `phase_transition` event with the descendant list frozen in the `frozen_descendants` field
 3. Only process descendants that were captured at this moment
-4. New descendants that arrive after the phase_transition event will be handled in the NEXT cascade step (when #N's successor becomes the current root)
+4. New descendants declared **before #N merges** (but after freeze) will be handled in the NEXT cascade step (when #N's successor becomes the current root). New descendants declared **after #N merges** are "late additions" requiring special handling — see below.
 
 **Late additions recovery**: If a new PR declares #N as predecessor after #N has already merged:
 
@@ -1726,15 +1729,49 @@ async fn handle_late_addition(
         });
     }
 
-    // Rebase detection is handled by the preflight check: the bot only operates on
-    // repositories with squash-only merge configuration (allow_squash_merge: true,
-    // allow_merge_commit: false, allow_rebase_merge: false). Since non-squash merges
-    // are disabled at the repository level, we can trust that any merged PR was
-    // squash-merged. See "Merge method preflight check" section.
-    //
-    // We still verify the commit has exactly one parent (checked above) to catch
-    // edge cases like repository settings being changed after a merge.
+    // Defense in depth: The preflight check requires squash-only repo config, but
+    // settings can change after preflight or be bypassed by force-push. We MUST
+    // validate the parent is the prior default branch HEAD (not just single-parent).
     let parent_sha = &commit.parents[0];
+
+    // CRITICAL: Verify parent is the prior default branch HEAD.
+    // For a valid squash: the parent of squash_sha should be where main pointed
+    // just before the merge. For a rebase merge, the parent would be the previous
+    // rebased commit (NOT on main's history), which would cause reconciliation
+    // to use $SHA^ incorrectly.
+    git.fetch_ref(&format!("refs/heads/{}", default_branch)).await?;
+
+    // Check: is parent_sha an ancestor of current main HEAD?
+    // If not, this wasn't a squash onto main — it's a rebase or force-push.
+    let main_head = git.rev_parse(&format!("origin/{}", default_branch)).await?;
+    if !git.is_ancestor(parent_sha, &main_head).await? {
+        return Err(Error::NonSquashMerge {
+            pr: merged_predecessor,
+            message: format!(
+                "Predecessor #{}'s merge commit parent {} is not in the default branch history. \
+                 This may indicate a rebase merge or force-push. \
+                 Late-addition reconciliation requires a squash merge. \
+                 Manual intervention required: rebase the late PR onto main.",
+                merged_predecessor.0, parent_sha
+            ),
+        });
+    }
+
+    // Additional check: verify parent_sha is the commit just before squash_sha on main.
+    // This catches edge cases where parent is on main's history but isn't the immediate
+    // predecessor (e.g., if other commits landed between the merge and our check).
+    // squash_sha should be a direct child of parent_sha AND squash_sha should be
+    // reachable from main_head.
+    if !git.is_ancestor(&squash_sha, &main_head).await? {
+        return Err(Error::NonSquashMerge {
+            pr: merged_predecessor,
+            message: format!(
+                "Predecessor #{}'s merge_commit_sha {} is not in the default branch history. \
+                 This is unexpected for a merged PR. Manual intervention required.",
+                merged_predecessor.0, squash_sha
+            ),
+        });
+    }
 
     // 4. Fetch and checkout the late PR branch
     git.fetch_and_checkout_detached(late_pr_branch).await?;
@@ -2194,6 +2231,10 @@ GitHub App installation token with permissions:
 - `contents`: write (push via git)
 - `checks`: read (receive `check_suite` webhooks to trigger re-evaluation)
 - `issues`: write (comments, reactions)
+- `administration`: read (query branch protection rules for dismiss-stale-approvals detection) — **optional but recommended**
+- `metadata`: read (query rulesets) — **optional but recommended**
+
+**Note on optional permissions:** Without `administration:read` and `metadata:read`, the bot cannot detect "dismiss stale approvals" settings during preflight. It will warn and proceed, risking mid-cascade aborts if the setting is enabled. See "Dismiss stale approvals preflight check" section.
 
 ### Git operations
 
@@ -2422,7 +2463,8 @@ enum MergeStateStatus {
 	    stopped_at: Option<String>, // ISO 8601
 	    /// Error details if aborted
 	    error: Option<TrainError>,
-	    /// Comment ID of the status comment (contains machine-readable JSON for recovery)
+	    /// Comment ID of the status comment on `original_root_pr` (not `current_pr`).
+	    /// The comment stays on the original root for the train's lifetime — see "Status comments".
 	    status_comment_id: Option<u64>,
 	}
 
