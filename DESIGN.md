@@ -130,9 +130,14 @@ This delegates all branch protection logic to GitHub, ensuring the bot respects 
 
    **Why `check_suite.created`/`requested` is insufficient**: The mergeability engine is asynchronous. When `check_suite.created` fires, you may query `mergeStateStatus` and receive `CLEAN` — but this `CLEAN` is cached from the OLD head's check results, not computed against the new head. The new head's checks haven't finished yet, so the mergeability engine has nothing new to report and returns stale data.
 
-   **Why both event types are needed**: Repositories may use the Checks API (check suites), the Status API (status contexts), or a mix of both. A repo using only status contexts would never receive `check_suite.completed`, causing a deadlock if we only listened for that event. Conversely, treating an early status update as sufficient when check suites are still running risks proceeding before all checks finish. The solution: the bot tracks which CI mechanism(s) are active per-repo (inferred from received events) and waits for the appropriate completion signals.
+   **Why both event types are needed**: Repositories may use the Checks API (check suites), the Status API (status contexts), or a mix of both — and this can vary per-PR due to path-based CI triggers or workflow conditions. A PR using only status contexts would never receive `check_suite.completed`, causing a deadlock if we only listened for that event. Conversely, treating an early status update as sufficient when check suites are still running risks proceeding before all checks finish.
 
-   **Fallback for mixed repos**: If both event types are observed for a PR, the bot waits until `mergeStateStatus` becomes `CLEAN` or `UNSTABLE` (indicating ALL checks have resolved). This prevents races where status contexts complete but check suites are still pending.
+   **Per-PR tracking**: The bot tracks which CI mechanism(s) are active **per-PR, per-SHA** by observing events as they arrive:
+   - If `check_suite.created` or `check_suite.requested` is received for a SHA → the bot must wait for `check_suite.completed` for that SHA
+   - If a `status` context update with state `pending` is received → the bot must wait for that context to reach a terminal state (`success`/`failure`/`error`)
+   - If both mechanisms are observed, the bot waits for both to complete
+
+   Only when all observed mechanisms have reached terminal states does the bot re-query `mergeStateStatus`. This per-PR approach avoids deadlocks (waiting for events that will never arrive) and avoids premature merges (proceeding before all checks complete).
 
 2. **Before squash-merging**: The bot must verify that `headRefOid` matches the expected head SHA recorded when the train was started or when preparation completed. If they differ, someone pushed to the branch — abort and notify.
 3. **On `UNKNOWN` status**: This explicitly means GitHub hasn't computed the status yet. Wait for CI completion events (check_suite or status) for the current head SHA.
@@ -1749,13 +1754,14 @@ The key insight is that `reconcile_descendant` already does the correct ours-mer
 
 The validation uses a two-pronged approach:
 
-1. **Preflight enforcement** (see "Merge method preflight check"): The bot refuses to start on repositories that allow non-squash merge methods. By requiring `allow_merge_commit: false` and `allow_rebase_merge: false` at the repository level, we guarantee that any merged PR was squash-merged. This eliminates the need for complex post-hoc detection.
+1. **Preflight enforcement** (see "Merge method preflight check"): The bot refuses to start on repositories that allow non-squash merge methods. By requiring `allow_merge_commit: false` and `allow_rebase_merge: false` at the repository level, we make non-squash merges unlikely during normal operation. However, this check can be bypassed (e.g., by re-enabling other merge methods after preflight, or by force-pushing directly to the default branch) — see README for caveats.
 
-2. **Parent count check** (defense in depth): Even with preflight enforcement, we verify that `merge_commit_sha` has exactly one parent. This catches edge cases where repository settings were changed after a PR was merged, or where GitHub's behavior differs from expectations.
+2. **Parent validation** (required, not optional): We verify that `merge_commit_sha` has exactly one parent AND that parent is the prior default branch HEAD. This catches: (a) repository settings changed after preflight, (b) force-pushed commits, (c) multi-commit rebase or fast-forward merges. Without this check, reconciliation would use `$SHA^` incorrectly and could lose commits.
 
 **REQUIRED TESTS**: The property-based testing section verifies merge method handling:
-- Property 4 (`squash_merge_detection_accepts_squash`): Validates that legitimate squash merges (single parent) pass the parent count check
+- Property 4 (`squash_merge_detection_accepts_squash`): Validates that legitimate squash merges (single parent, parent is prior main HEAD) pass validation
 - Property 5 (`squash_merge_detection_rejects_merge_commit`): Validates that true merge commits (two parents) are rejected
+- Property 6 (`squash_merge_detection_rejects_wrong_parent`): Validates that commits whose parent is NOT the prior main HEAD are rejected (catches multi-commit rebase/fast-forward)
 - Preflight test (`squash_only_preflight_check`): Validates that the bot refuses to start when `allow_merge_commit` or `allow_rebase_merge` is true (see "Merge method preflight check" section)
 
 **Polling fallback**: During `PollActiveTrains`, also scan for "orphaned" PRs:
@@ -4944,6 +4950,9 @@ proptest! {
         let repo = TempRepo::new();
         apply_branch(&repo, "feature", "main", &branch);
 
+        // Record main HEAD before squash
+        let main_head_before = get_head_sha(&repo);
+
         // Perform a squash merge
         run_git(&repo, &["checkout", "main"]);
         run_git(&repo, &["merge", "--squash", "feature"]);
@@ -4956,9 +4965,16 @@ proptest! {
         // The detection logic accepts commits with exactly one parent
         prop_assert_eq!(commit_info.parents.len(), 1, "Squash merge should have one parent");
 
-        // Verify acceptance: parent count check passes
-        let is_valid_squash = commit_info.parents.len() == 1;
-        prop_assert!(is_valid_squash, "Detection should ACCEPT squash merge");
+        // AND that parent is the prior main HEAD
+        prop_assert_eq!(
+            &commit_info.parents[0], &main_head_before,
+            "Squash merge parent should be prior main HEAD"
+        );
+
+        // Verify acceptance: full validation passes
+        let is_valid = commit_info.parents.len() == 1
+            && commit_info.parents[0] == main_head_before;
+        prop_assert!(is_valid, "Detection should ACCEPT squash merge");
     }
 }
 ```
@@ -5007,7 +5023,53 @@ proptest! {
 }
 ```
 
-**Property 6: Preflight check rejects non-squash-only repositories**
+**Property 6: Squash merge detection rejects wrong parent**
+
+This catches multi-commit rebase merges and multi-commit fast-forward merges, where the commit has a single parent but that parent is NOT the prior main HEAD.
+
+```rust
+proptest! {
+    #[test]
+    fn squash_merge_detection_rejects_wrong_parent(
+        branch: GeneratedBranch,
+    ) {
+        prop_assume!(branch.commits.len() >= 2); // Multi-commit branch required
+
+        let repo = TempRepo::new();
+        apply_branch(&repo, "feature", "main", &branch);
+
+        // Record the current main HEAD (what parent SHOULD be)
+        let main_head_before = get_head_sha_for_branch(&repo, "main");
+
+        // Simulate a rebase merge: rebase the branch onto main, then fast-forward main
+        run_git(&repo, &["checkout", "feature"]);
+        run_git(&repo, &["rebase", "main"]);
+        run_git(&repo, &["checkout", "main"]);
+        run_git(&repo, &["merge", "--ff-only", "feature"]);
+        let result_sha = get_head_sha(&repo);
+
+        // Get parent of the result
+        let commit_info = get_commit_info(&repo, &result_sha);
+
+        // Single parent (looks like squash at first glance)
+        prop_assert_eq!(commit_info.parents.len(), 1, "Rebase result should have one parent");
+
+        // But parent is NOT the prior main HEAD — it's the second-to-last rebased commit
+        let parent_sha = &commit_info.parents[0];
+        prop_assert_ne!(
+            parent_sha, &main_head_before,
+            "Rebase/fast-forward parent should NOT be prior main HEAD"
+        );
+
+        // Verify rejection: full validation fails
+        let is_valid = commit_info.parents.len() == 1
+            && commit_info.parents[0] == main_head_before;
+        prop_assert!(!is_valid, "Detection should REJECT multi-commit rebase/fast-forward");
+    }
+}
+```
+
+**Property 7: Preflight check rejects non-squash-only repositories**
 
 The bot requires squash-only merge configuration at the repository level. This is enforced by the preflight check, not by post-hoc detection of rebase merges.
 
@@ -5053,7 +5115,7 @@ proptest! {
 
 When a PR with multiple descendants completes, the old worktree must be removed before new worktrees are created.
 
-**Property 7: Fan-out worktree lifecycle**
+**Property 8: Fan-out worktree lifecycle**
 
 ```rust
 proptest! {
@@ -5140,7 +5202,7 @@ proptest! {
 
 #### REQUIRED: Frozen descendants invariant
 
-**Property 8: Recovery uses frozen descendants, not current state**
+**Property 9: Recovery uses frozen descendants, not current state**
 
 ```rust
 proptest! {
@@ -5198,6 +5260,8 @@ In addition to property-based tests, the following specific scenarios require ex
 
 **Rebase-vs-squash detection edge cases:**
 
+The detection criteria is: **the merge result must have exactly one parent, and that parent must be the prior main HEAD**. This is the invariant that makes the $SQUASH_SHA^ reconciliation logic work correctly.
+
 | Scenario | Expected result |
 |----------|-----------------|
 | Single-commit branch, squash merged | Accept (single parent, parent is prior main HEAD) |
@@ -5205,7 +5269,8 @@ In addition to property-based tests, the following specific scenarios require ex
 | Multi-commit branch, squash merged | Accept |
 | Multi-commit branch, rebase merged | Reject (parent is previous rebased commit, not on main) |
 | True merge (two parents) | Reject |
-| Fast-forward merge | Accept (same as squash for linear history) |
+| Single-commit fast-forward | Accept (indistinguishable from squash — parent is prior main HEAD) |
+| Multi-commit fast-forward | Reject (parent is in-branch commit, not prior main HEAD — same issue as multi-commit rebase) |
 
 **Worktree cleanup scenarios:**
 
