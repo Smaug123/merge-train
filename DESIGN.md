@@ -765,6 +765,12 @@ The bot persists per-repo state using an append-only event log with periodic sna
 - `phase_transition` (any phase change: `Preparing`, `SquashPending`, `Reconciling`, `Idle`)
 - `squash_committed` (records the squash SHA needed for reconciliation recovery)
 
+**Relationship to operation commit points**: These recovery-critical events are **phase-level** markers — they record state machine transitions, not individual operations. Irreversible operations (git push, squash-merge, retarget) use a separate **intent/done commit-point pattern** described in "Durability and commit points" below. The distinction:
+- Phase-level events (above): Recorded once per phase transition, enable recovery to the correct phase
+- Operation-level commit points: Bracket each irreversible operation with intent→operation→done, enabling idempotent retry
+
+Note that `squash_committed` serves a dual role: it's both the completion event for the squash-merge operation (part of the intent/done pattern) AND a recovery-critical event requiring immediate fsync.
+
 Non-critical events (fsync batched for performance):
 - `pr_merged`, `pr_state_changed`, `predecessor_declared`
 
@@ -1187,6 +1193,8 @@ From the cached state, stacks are computed by traversing predecessor relationshi
 - They proceed as independent trains; whichever passes CI first merges next
 - The `cascade_step` returns `FanOut { descendants }` to trigger train record creation and status comment posting on each new root
 
+Note: `FanOut` is a **cascade-internal** mechanism — it's a return value from the cascade step function, not a webhook event type. The cascade that processes the fan-out point handles train record creation synchronously before returning.
+
 ---
 
 ## Event Handling
@@ -1227,11 +1235,13 @@ To identify predecessor comments for deletion handling, the bot tracks `(PR numb
 
 If the authoritative predecessor comment is deleted and other predecessor comments exist, the bot does NOT automatically promote another comment — the PR becomes orphaned. The user must create a fresh declaration to re-establish the relationship. This avoids silently switching predecessors based on comment ordering races.
 
-**Fan-out discovery**: After a fan-out point merges, each descendant is discovered as a new root on subsequent events. Since each descendant now targets the default branch and its predecessor is merged, `is_root()` returns true and `compute_stacks()` includes it. No special event handling is needed — the normal cascade flow applies to each independent branch.
+**Fan-out discovery**: After a fan-out point merges, each descendant is discovered as a new root on subsequent events. Since each descendant now targets the default branch and its predecessor is merged, `is_root()` returns true and `compute_stacks()` includes it. No special **webhook event handling** is needed — the normal `pr_merged` webhook triggers the cascade which internally handles fan-out via the `FanOut` return value (see "Fan-out handling" above). After that, each new independent branch follows the normal cascade flow.
 
 ### Per-repo serial event processing
 
 The server processes webhook events **serially per repository** via per-repo queues. Different repositories are processed concurrently, but events within a single repository are strictly serialized. Webhook deliveries are durably spooled to disk before being enqueued so a crash/restart cannot drop events after a `202 Accepted`.
+
+**Important distinction**: "Serial event processing" refers to **webhook event dispatch**, not stack execution. Multiple stacks can make progress concurrently within a single repo worker through timer-based yielding (see "Non-blocking polling" below). Events are dequeued one at a time, but each event handler yields control during long waits, allowing other stacks' timers to fire.
 
 ```
                                          ┌─────────────────────────────────┐
@@ -1338,7 +1348,7 @@ This allows long-running operations like `git merge` or `git push` to be interru
    - Treats this as a transient failure (see retry logic above)
    - Does NOT abort permanently — GitHub may be experiencing delays
 
-This ensures stop commands are processed promptly (within one timer interval) even while waiting for state propagation, and independent stacks in the same repo can proceed concurrently.
+This ensures stop commands are processed promptly (within one timer interval) even while waiting for state propagation, and independent stacks in the same repo can proceed concurrently. (This is how "per-repo serial event processing" coexists with concurrent stack execution — see the "Important distinction" note in that section.)
 
 This design means:
 - Each stack has its own git worktree (see "Per-stack worktrees" section)
@@ -1657,15 +1667,17 @@ For the final PR in the stack (#125), there is no descendant, so steps 1, 3-5 ar
 1. Query the current descendant set from the `descendants` index
 2. Log the `phase_transition` event with the descendant list frozen in the `frozen_descendants` field
 3. Only process descendants that were captured at this moment
-4. New descendants declared **before #N merges** (but after freeze) will be handled in the NEXT cascade step (when #N's successor becomes the current root). New descendants declared **after #N merges** are "late additions" requiring special handling — see below.
+4. New descendants declared **after the freeze** (whether before or after #N merges) are effectively "late additions" — by the time the cascade could process them, their predecessor is already merged. They're caught by either (a) the `predecessor_declared` event handler checking if the predecessor is already merged, or (b) the polling-based catch-up mechanism that scans for PRs with merged predecessors but unretargeted `base_ref`. See "Late additions recovery" below.
 
-**Late additions recovery**: If a new PR declares #N as predecessor after #N has already merged:
+**Late additions recovery**: A "late addition" is any PR whose predecessor is already merged by the time the cascade could process it. This includes PRs declared after the freeze (whether before or after the predecessor merges) and PRs declared after the predecessor has already merged.
 
-The late descendant's `base_ref` still points to #N's branch (not the default branch), so `is_root()` returns false and `compute_stacks()` won't discover it. This requires explicit detection:
+The late descendant's `base_ref` still points to the predecessor's branch (not the default branch), so `is_root()` returns false and `compute_stacks()` won't discover it. This requires explicit detection:
 
-**Detection trigger**: When processing a `predecessor_declared` event:
+**Detection trigger 1 — event-driven**: When processing a `predecessor_declared` event:
 1. Look up the predecessor PR from the cache
 2. If predecessor is `Merged`, this is a late addition — trigger immediate reconciliation
+
+**Detection trigger 2 — polling-based catch-up**: During `PollActiveTrains`, scan for PRs whose predecessor is merged but whose `base_ref` hasn't been retargeted. This catches late additions where the `predecessor_declared` event arrived before the predecessor merged (and thus wasn't detected at event time).
 
 **Late addition reconciliation flow**:
 
@@ -2038,7 +2050,8 @@ The bot pauses the cascade (and comments with diagnostics) when it encounters is
 | Squash-merge API fails (transient) | `waiting_ci` | Auto-retry with backoff; waits for status event if retries exhausted |
 | Preparation merge fails | `aborted` | Resolve conflict locally, push, then `@merge-train start` |
 | `git push` rejected (non-fast-forward) | depends on phase | During preparation: retry if no conflict, else `aborted`. After reconciliation: always `aborted`. See "Concurrent push handling" below |
-| PR closed without merge | `aborted` | Re-open or restructure stack |
+| Root PR closed without merge | `aborted` | Re-open or restructure stack |
+| Descendant PR closed during cascade | continues | Descendant skipped with warning; cascade proceeds with remaining descendants (see "Diagnosing divergence" above) |
 | Cycle detected | `aborted` | Fix predecessor comments |
 | Review dismissed | `aborted` | Re-approve, then `@merge-train start` (no auto-resume) |
 | Squash-merge API fails (permanent) | `aborted` | Check PR status, satisfy requirements, then `@merge-train start` |
