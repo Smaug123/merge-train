@@ -14,7 +14,7 @@ This bot implements a merge train, following [my standard workflow](https://www.
 * The system is incompatible with "dismiss stale approvals" branch protection, because the system will push to each branch, invalidating approvals on that branch.
 * The bot doesn't work across forks, because it pushes to the incoming branches.
 * Hard cap of 50 PRs per merge train, for internal implementation reasons (we store some state in GitHub comments, which limits that state's size).
-* If you change the structure of the train while the stack is in flight, expect it to abort: we generally assume that the DAG of PRs remains connected.
+* You can add leaf nodes to the DAG that is a merge train, but if you change the internal structure of the train while the stack is in flight, expect it to abort: we generally assume that the DAG of PRs remains connected, for example.
 * The "stop" command is inherently pretty racy, so in-flight operations may or may not actually stop precisely when you ask them to.
 
 # Non-goals

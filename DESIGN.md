@@ -2,7 +2,7 @@
 
 ## Overview
 
-A GitHub bot that orchestrates sequential squash-merging of stacked PRs into the repository's default branch (usually `main`). The bot maintains in-memory state per repository and persists it to a local on-disk state store so it can recover cleanly after restarts. GitHub is used as the command surface (comments/webhooks) and as the system of record for PRs, branches, and checks — but not as a persistence layer for the bot's own operational/structural state. It uses local git for merge operations (required for ours-strategy merges) and the GitHub API for everything else.
+A GitHub bot that orchestrates sequential squash-merging of stacked PRs into the repository's default branch (usually `main`). The bot maintains in-memory state per repository and persists it to a local on-disk state store so it can recover cleanly after restarts. GitHub is used as the command surface (comments/webhooks) and as the system of record for PRs, branches, and checks. The bot's own operational state is persisted primarily to a local filesystem; status comments on PRs contain a backup copy of train state for recovery when local state is lost. It uses local git for merge operations (required for ours-strategy merges) and the GitHub API for everything else.
 
 ## Goals
 
@@ -727,7 +727,7 @@ Use the **generation-based compaction** approach (see "Compaction" in the Data M
 
 **Critical**: All directory fsyncs (for both spool and snapshot directories) are **mandatory**, not best-effort. Without directory fsync, a power loss can drop files even after the file contents were fsynced, because the directory entry wasn't persisted.
 
-**Concurrency**: This design assumes a single active bot process per `state_dir`. Multi-instance deployments require external coordination (leader election, sticky routing, or a shared database) and are out of scope for this document.
+**Concurrency**: This design assumes a single active bot process per `state_dir`. Multi-instance deployment is a non-goal.
 
 **Startup lock**: To prevent accidental multi-instance split-brain (which could cause double-merges), the bot acquires an exclusive `flock` on `<state_dir>/lock` at startup:
 
@@ -746,34 +746,6 @@ fn acquire_state_lock(state_dir: &Path) -> Result<File> {
 ```
 
 If the lock is already held, the bot fails immediately with a clear error message. The lock is released automatically when the process exits.
-
-**Critical limitation of flock**: The `flock` mechanism ONLY prevents split-brain when all instances share the same filesystem for `state_dir`. In distributed deployments (multiple hosts, container orchestration, etc.), two instances with separate local disks can BOTH acquire their local flock and run simultaneously, causing double-merges and corrupted cascade state.
-
-**Distributed deployment requirements**: If running multiple instances (for HA, rolling deploys, etc.), you MUST use one of:
-
-1. **Shared persistent storage**: Mount `state_dir` on shared storage (NFS, EFS, etc.) so flock works across instances. The storage must support POSIX advisory locks.
-
-2. **External leader election**: Use a distributed coordination service (etcd, ZooKeeper, Consul) to elect a single active instance. Only the leader processes webhooks; standbys just healthcheck.
-
-3. **GitHub-based mutual exclusion**: Before performing any irreversible operation (squash-merge, git push), atomically create a "lock comment" on the PR:
-   - Check if a lock comment from another instance exists
-   - If not, create your lock comment (includes instance ID and timestamp)
-   - Re-fetch and verify your comment was first
-   - Only proceed if you hold the lock
-   - Delete the lock comment when operation completes or on error
-
-   This provides distributed mutual exclusion using GitHub as the coordination point.
-
-4. **Sticky routing + health checks**: Route all webhooks for a given repo to a single instance (hash by repo ID). The load balancer must drain connections and wait for handoff during deploys.
-
-**Recommended for production**: Option 1 (shared storage) or option 2 (leader election) provide the strongest guarantees. Option 3 adds latency and GitHub API calls but works without infrastructure changes.
-
-**Split-brain detection**: Even with the above mitigations, defense in depth is valuable. Before each squash-merge:
-1. Fetch the PR's current state from GitHub
-2. Verify it matches our cached state (head SHA, merge status)
-3. If there's a mismatch (another instance may have acted), abort and re-bootstrap
-
-This catch-all check ensures that even if coordination fails, we detect the problem before causing damage.
 
 The bot maintains in-memory state per repository for fast event processing. On startup it loads existing snapshots and replays event logs from disk; for unknown repos it bootstraps on the first relevant webhook (or via an operator-initiated full sync), then persists state.
 
