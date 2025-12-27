@@ -2,7 +2,7 @@
 
 ## Overview
 
-A GitHub bot that orchestrates sequential squash-merging of stacked PRs into the repository's default branch (usually `main`). The bot maintains in-memory state per repository and persists it to a local on-disk state store so it can recover cleanly after restarts. GitHub is used as the command surface (comments/webhooks) and as the system of record for PRs, branches, and checks. The bot's own operational state is persisted primarily to a local filesystem; status comments on PRs contain a backup copy of train state for recovery when local state is lost. It uses local git for merge operations (required for ours-strategy merges) and the GitHub API for everything else.
+A GitHub bot that orchestrates sequential squash-merging of stacked PRs into the repository's default branch (usually `main`). The bot maintains in-memory state per repository and persists it to a local on-disk state store so it can recover cleanly after restarts. GitHub is used as the command surface (comments/webhooks) and as the system of record for PRs, branches, and checks. The bot's own operational state is persisted primarily to a local filesystem; status comments on PRs contain a backup copy of train state for recovery when local state is lost. It uses local git for reconciliation merge operations (required for ours-strategy merges) and the GitHub API for squash-merges into the default branch and other operations.
 
 ## Goals
 
@@ -144,6 +144,8 @@ This delegates all branch protection logic to GitHub, ensuring the bot respects 
 
 This prevents races where: (a) the bot pushes a reconciliation commit, (b) `check_suite.created` fires, (c) bot queries `mergeStateStatus` and gets `CLEAN` based on the OLD head's cached results, (d) merges before required checks have run on the NEW head.
 
+**Handling repos with no required checks**: Before entering the CI wait loop, the bot queries branch protection rules to check for required status checks. If no required checks are configured, the bot skips the CI wait entirely and proceeds based on `mergeStateStatus` alone. This uses the same per-repo branch protection cache (1-hour TTL) already used for the "dismiss stale approvals" preflight check. This is distinct from the dismiss stale approvals check — that one blocks `@merge-train start` entirely, while this one simply skips the CI wait when there are no checks to wait for.
+
 **Note on "check failure"**: Throughout this document, "check failure" or "required check failure" refers to `mergeStateStatus` transitioning to `BLOCKED`. The bot does not query branch protection rules to distinguish required from non-required checks — it relies entirely on GitHub's `mergeStateStatus` computation. This means:
 - If a non-required check fails → `UNSTABLE` → bot proceeds
 - If a required check fails → `BLOCKED` → bot enters `waiting_ci` state
@@ -152,6 +154,8 @@ This prevents races where: (a) the bot pushes a reconciliation commit, (b) `chec
 When the bot detects `BLOCKED` via `mergeStateStatus` polling (without knowing the specific cause), it enters `waiting_ci` state — assuming the condition is potentially transient (flaky tests, CI outages, or code that will be fixed). The cascade auto-resumes when `mergeStateStatus` becomes `CLEAN` or `UNSTABLE`. Users can issue `@merge-train stop` if the failure is known to be permanent.
 
 **Exception — review dismissal events**: If the bot receives a `pull_request_review.dismissed` webhook (explicit review dismissal, or automatic dismissal due to "dismiss stale reviews" on new commits), it immediately transitions to `aborted` state rather than `waiting_ci`. This is because review dismissals often indicate a deliberate action requiring human attention, not a transient condition. See "Pause Conditions" for the full table of abort vs waiting conditions.
+
+**Note on webhook vs polling detection**: The distinction between webhook-detected review dismissal (`aborted`) and polling-detected missing approval (`waiting_ci`) is intentional. Webhook events indicate an explicit action occurred; polling only reveals current state. If the bot misses a `pull_request_review.dismissed` webhook (e.g., due to a brief outage), it may subsequently detect the missing approval via `mergeStateStatus` polling and enter `waiting_ci` instead of `aborted`. This is acceptable: in both cases, a new approval is required before the cascade can proceed. The only difference is whether the restart is automatic (on new approval, if `waiting_ci`) or requires re-issuing `@merge-train start` (if `aborted`).
 
 Once started, the cascade proceeds automatically through all descendants. New PRs that declare themselves as descendants mid-cascade will be picked up when the cascade reaches their predecessor — but with an important constraint: see "Descendant set freezing" below.
 
@@ -264,7 +268,7 @@ Requests a halt of the cascade for the stack containing this PR. Unlike `start` 
 Due to inherent race conditions, the stop takes effect at the next opportunity — any in-flight git operation or API call may complete before the halt is observed. The bot will:
 
 1. Cancel any in-flight git operations
-2. Clean up the stack's dedicated worktree (abort any in-progress merge, reset to clean state)
+2. Remove the stack's dedicated worktree (abort any in-progress merge first, then remove via `git worktree remove --force`)
 3. Persist the stack as `"state": "stopped"` in the local state store
 4. Post/update the status comment to reflect `stopped` state (required for recovery consistency)
 5. Take no further action on this stack until `@merge-train start` is issued again
@@ -295,7 +299,7 @@ main ← PR #123 ←┬─ PR #124              (fan-out)
         (root)  └─ PR #125
 ```
 
-Each non-root PR has exactly one `@merge-train predecessor #N` comment. The root PR targets the default branch directly and has no predecessor comment.
+Each non-root PR has exactly one `@merge-train predecessor #N` comment. A root PR targets the default branch directly and either has no predecessor declaration, or has a predecessor declaration pointing to a PR that has already been merged (a "resolved" predecessor — see `is_root()` below). In the latter case, the predecessor comment is preserved but the relationship is considered resolved; the PR is eligible to be the root of a new train.
 
 Multiple PRs may declare the same predecessor (fan-out). Each non-root PR has exactly one predecessor, but a PR may have multiple descendants.
 
@@ -303,8 +307,10 @@ Multiple PRs may declare the same predecessor (fan-out). Each non-root PR has ex
 
 A PR is "in a train" if:
 
-- It has a `@merge-train predecessor` comment pointing to another PR, and
-- That predecessor chain eventually reaches a PR targeting `main`
+- It has a `@merge-train predecessor` comment pointing to an open predecessor PR, and
+- That predecessor chain eventually reaches a root PR (one targeting `main` with no open predecessor)
+
+A PR whose predecessor was closed without merge is **orphaned**, not "in a train" — it has a broken predecessor chain and will not be processed until the predecessor is re-opened or the declaration is updated.
 
 Being in a train does not require the train to have started. Once the root receives `@merge-train start`, all current and future descendants will be processed.
 
@@ -1167,7 +1173,7 @@ GET /api/v1/repos/{owner}/{repo}/state
 
 From the cached state, stacks are computed by traversing predecessor relationships:
 
-1. Find all root PRs (target default branch, no open predecessor)
+1. Find all root PRs (target default branch, no predecessor or predecessor merged — see `is_root()` below)
 2. Build linear chains from each root by following `descendants` index
 3. Validate: no cycles, predecessors exist
 4. Check `active_trains` to determine if each stack is started/stopped
