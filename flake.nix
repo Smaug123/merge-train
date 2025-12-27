@@ -24,7 +24,7 @@
       };
 
       rustToolchain = pkgs.rust-bin.stable.latest.default.override {
-        extensions = ["rust-src" "clippy" "rust-analyzer"];
+        extensions = ["rust-src" "clippy" "rust-analyzer" "rustfmt"];
       };
 
       merge-train-bot = pkgs.rustPlatform.buildRustPackage {
