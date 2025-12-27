@@ -819,7 +819,7 @@ pub struct RepoState {
     /// Use TrainRecord.current_pr to find which PR is currently being processed.
     active_trains: HashMap<PrNumber, TrainRecord>,
 
-    /// Filesystem path for this repo's state file
+    /// Filesystem path for this repo's state directory
     state_path: PathBuf,
 
     /// When bootstrap completed
@@ -2236,7 +2236,7 @@ enum RepoLifecycle {
     },
 }
 
-/// Per-repository cached state
+/// Per-repository cached state (see canonical definition in "Per-repo state" section)
 struct RepoState {
     /// The repository's default branch (e.g., "main", "master", "develop")
     /// Fetched from GitHub during bootstrap; all "targets main" logic uses this
@@ -2245,13 +2245,19 @@ struct RepoState {
     prs: HashMap<PrNumber, CachedPr>,
     /// Reverse index: predecessor → set of descendants
     descendants: HashMap<PrNumber, HashSet<PrNumber>>,
-	/// Active trains, keyed by root PR number.
-	/// Loaded from the local state file during bootstrap.
-	active_trains: HashMap<PrNumber, TrainRecord>,
+    /// Active trains, keyed by root PR number.
+    /// Loaded from the local state file during bootstrap.
+    active_trains: HashMap<PrNumber, TrainRecord>,
+    /// Filesystem path for this repo's state directory
+    state_path: PathBuf,
     /// When bootstrap completed
     bootstrapped_at: Instant,
     /// Last re-sync time
     last_sync: Instant,
+    /// When state was last persisted to disk
+    last_persisted: Option<Instant>,
+    /// Whether in-memory state has changed since last persistence
+    dirty: bool,
     /// Cache miss counter (triggers re-bootstrap if too high)
     miss_count: u32,
 }
@@ -3626,23 +3632,23 @@ async fn bootstrap_repo(
     ctx: &AppContext,
 ) -> Result<RepoState> {
     let github = ctx.github_for_repo(repo_id);
-    let state_path = ctx.state_path_for_repo(repo_id);
+    let state_dir = ctx.state_dir_for_repo(repo_id);
 
     // Phase 1: Try to load from disk (fast path)
-    match load_from_disk(&state_path, ctx).await {
+    match load_from_disk(&state_dir, ctx).await {
         Ok(Some(persisted)) if !persisted.is_stale(ctx.config.staleness_threshold) => {
-            let state = build_state_from_persisted(persisted)?;
+            let state = build_state_from_persisted(persisted, state_dir.clone())?;
             let state = refresh_merge_states(state, &github).await?;
             return Ok(state);
         }
         Ok(Some(_stale)) => {
-            tracing::info!(?repo_id, "state file stale, performing full bootstrap");
+            tracing::info!(?repo_id, "state stale, performing full bootstrap");
         }
         Ok(None) => {
-            tracing::info!(?repo_id, "state file not found, performing full bootstrap");
+            tracing::info!(?repo_id, "state not found, performing full bootstrap");
         }
         Err(e) => {
-            tracing::warn!(?repo_id, ?e, "state file load failed, performing full bootstrap");
+            tracing::warn!(?repo_id, ?e, "state load failed, performing full bootstrap");
         }
     }
 
@@ -3650,7 +3656,7 @@ async fn bootstrap_repo(
     let state = full_bootstrap(repo_id, &github, ctx).await?;
 
     // Persist the freshly bootstrapped state
-    persist_state_file(repo_id, &state, &state_path).await?;
+    persist_state_file(repo_id, &state, &state_dir).await?;
 
     Ok(state)
 }
@@ -3730,7 +3736,10 @@ async fn load_from_disk(
 
 /// Convert persisted snapshot to in-memory RepoState.
 /// IMPORTANT: Rebuilds derived indexes (like `descendants`) that aren't persisted.
-fn build_state_from_persisted(snapshot: PersistedRepoSnapshot) -> Result<RepoState> {
+fn build_state_from_persisted(
+    snapshot: PersistedRepoSnapshot,
+    state_dir: PathBuf,
+) -> Result<RepoState> {
     // Convert persisted PRs to CachedPr
     let prs: HashMap<PrNumber, CachedPr> = snapshot.prs
         .into_iter()
@@ -3760,7 +3769,7 @@ fn build_state_from_persisted(snapshot: PersistedRepoSnapshot) -> Result<RepoSta
         prs,
         descendants,
         active_trains,
-        state_path: PathBuf::new(), // Set by caller
+        state_path: state_dir,
         bootstrapped_at: Instant::now(),
         last_sync: Instant::now(),
         last_persisted: Some(Instant::now()),
@@ -3817,7 +3826,7 @@ async fn full_bootstrap(
         prs,
         descendants,
         active_trains,
-        state_path: ctx.state_path_for_repo(repo_id),
+        state_path: ctx.state_dir_for_repo(repo_id),
         bootstrapped_at: Instant::now(),
         last_sync: Instant::now(),
         last_persisted: None,
@@ -3830,16 +3839,25 @@ async fn full_bootstrap(
 ### State file persistence
 
 ```rust
-/// Persist state to disk via atomic rename (write temp → fsync → rename).
+/// Persist state to disk using generation-based naming.
+/// Writes snapshot.<gen>.json under state_dir, matching load_from_disk's expectations.
 async fn persist_state_file(
     repo_id: &RepoId,
     state: &RepoState,
-    state_path: &Path,
+    state_dir: &Path,
 ) -> Result<()> {
+    // Read current generation (or start at 0)
+    let gen_path = state_dir.join("generation");
+    let gen: u64 = match tokio::fs::read_to_string(&gen_path).await {
+        Ok(s) => s.trim().parse().unwrap_or(0),
+        Err(_) => 0,
+    };
+
     let snapshot = build_snapshot(state);
     let bytes = serde_json::to_vec_pretty(&snapshot)?;
-    atomic_write(state_path, &bytes).await?;
-    tracing::debug!(?repo_id, path = %state_path.display(), "snapshot persisted");
+    let snapshot_path = state_dir.join(format!("snapshot.{}.json", gen));
+    atomic_write(&snapshot_path, &bytes).await?;
+    tracing::debug!(?repo_id, path = %snapshot_path.display(), gen, "snapshot persisted");
     Ok(())
 }
 
