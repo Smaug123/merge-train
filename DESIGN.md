@@ -355,10 +355,9 @@ This verification is fast (local git operation after fetching refs) and prevents
 
 If recovery finds `cascade_phase = "reconciling"` but `last_squash_sha` is null (lost due to crash after squash but before durable write):
 
-1. Check if `predecessor_pr` is recorded (should be set during preparation)
-2. Fetch the predecessor PR from GitHub API
-3. If `state == "merged"`, extract `merge_commit_sha` — this is the squash SHA
-4. **If `merge_commit_sha` is null**: GitHub's API has eventual consistency — the merge may have succeeded but `merge_commit_sha` may not be populated yet. Retry with exponential backoff:
+1. Fetch `current_pr` from GitHub API (the PR that was just squash-merged)
+2. If `state == "merged"`, extract `merge_commit_sha` — this is the squash SHA
+3. **If `merge_commit_sha` is null**: GitHub's API has eventual consistency — the merge may have succeeded but `merge_commit_sha` may not be populated yet. Retry with exponential backoff:
    - Initial delay: 1 second
    - Max delay: 30 seconds (cap)
    - Max attempts: 10
@@ -396,8 +395,8 @@ If recovery finds `cascade_phase = "reconciling"` but `last_squash_sha` is null 
 
    If still null after all retries, log a warning and abort with a recoverable error. The user can retry recovery later.
 
-5. Continue reconciliation with the recovered SHA
-6. If predecessor is not merged, the squash didn't actually happen — revert to `SquashPending`
+4. Continue reconciliation with the recovered SHA
+5. If `current_pr` is not merged, the squash didn't actually happen — revert to `SquashPending`
 
 This derives the squash SHA from GitHub rather than hard-failing, since the squash-merge is recorded in GitHub's PR state even if our local record was lost.
 
@@ -3189,13 +3188,13 @@ async fn recover_in_progress_trains(
                 // for remaining descendants (those in frozen_descendants but not in completed)
                 //
                 // If last_squash_sha is missing (crash after squash but before durable write),
-                // recover it from GitHub using the predecessor_pr (or current_pr for root).
+                // recover it from GitHub. During Reconciling, current_pr is the PR that was
+                // just squash-merged, so we fetch its merge_commit_sha.
                 // See "Reconciling recovery with missing last_squash_sha".
                 let squash_sha = match train.last_squash_sha.as_ref() {
                     Some(sha) => sha.clone(),
                     None => {
-                        let merged_pr = train.predecessor_pr.unwrap_or(train.current_pr);
-                        fetch_merge_commit_sha_with_retry(github, merged_pr)
+                        fetch_merge_commit_sha_with_retry(github, train.current_pr)
                             .await?
                             .ok_or(Error::MissingRecoverySha)?
                     }
@@ -3214,12 +3213,11 @@ async fn recover_in_progress_trains(
                 // Resume catch-up (merge origin/main) for remaining descendants
                 //
                 // Same recovery logic as Reconciling — if last_squash_sha is missing,
-                // fetch it from GitHub with retry.
+                // fetch it from GitHub. current_pr is the PR that was just squash-merged.
                 let squash_sha = match train.last_squash_sha.as_ref() {
                     Some(sha) => sha.clone(),
                     None => {
-                        let merged_pr = train.predecessor_pr.unwrap_or(train.current_pr);
-                        fetch_merge_commit_sha_with_retry(github, merged_pr)
+                        fetch_merge_commit_sha_with_retry(github, train.current_pr)
                             .await?
                             .ok_or(Error::MissingRecoverySha)?
                     }
