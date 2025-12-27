@@ -68,7 +68,7 @@ The bot will:
 2. Walk the linked list to find all descendants (including any added after this command)
 3. Validate the root PR is mergeable (approved, required checks passing — see below)
 4. Squash-merge the root PR
-5. Begin the cascade (persisting phase transitions to disk and optionally posting/updating a human-readable status comment)
+5. Begin the cascade (persisting phase transitions to disk and posting/updating a status comment — see "Status comments")
 
 **Definition of "ready to merge"**: The bot uses GitHub's `mergeStateStatus` field (via GraphQL) to determine readiness. A PR is ready when `mergeStateStatus` is `CLEAN` or `UNSTABLE`:
 
@@ -593,9 +593,9 @@ Newline-delimited JSON (JSON Lines), one event per line. Each event includes a m
 ```json
 {"seq":1,"ts":"2024-01-15T10:00:00Z","type":"train_started","root_pr":123,"current_pr":123}
 {"seq":2,"ts":"2024-01-15T10:01:00Z","type":"phase_transition","train_root":123,"current_pr":123,"predecessor_pr":null,"last_squash_sha":null,"phase":{"Preparing":{"completed":[],"skipped":[],"frozen_descendants":[124]}}}
-{"seq":3,"ts":"2024-01-15T10:01:30Z","type":"phase_transition","train_root":123,"current_pr":123,"predecessor_pr":123,"last_squash_sha":null,"phase":{"SquashPending":{"frozen_descendants":[124],"skipped":[]}}}
+{"seq":3,"ts":"2024-01-15T10:01:30Z","type":"phase_transition","train_root":123,"current_pr":123,"predecessor_pr":null,"last_squash_sha":null,"phase":{"SquashPending":{"frozen_descendants":[124],"skipped":[]}}}
 {"seq":4,"ts":"2024-01-15T10:02:00Z","type":"squash_committed","train_root":123,"pr":123,"sha":"abc123"}
-{"seq":5,"ts":"2024-01-15T10:02:30Z","type":"phase_transition","train_root":123,"current_pr":123,"predecessor_pr":123,"last_squash_sha":"abc123","phase":{"Reconciling":{"completed":[],"skipped":[],"frozen_descendants":[124]}}}
+{"seq":5,"ts":"2024-01-15T10:02:30Z","type":"phase_transition","train_root":123,"current_pr":123,"predecessor_pr":null,"last_squash_sha":"abc123","phase":{"Reconciling":{"completed":[],"skipped":[],"frozen_descendants":[124]}}}
 {"seq":6,"ts":"2024-01-15T10:03:00Z","type":"phase_transition","train_root":123,"current_pr":124,"predecessor_pr":123,"last_squash_sha":"abc123","phase":"Idle"}
 {"seq":7,"ts":"2024-01-15T10:10:00Z","type":"train_completed","root_pr":123}
 ```
@@ -3176,11 +3176,22 @@ async fn recover_in_progress_trains(
             CascadePhase::Reconciling { completed, frozen_descendants, .. } => {
                 // Use last_squash_sha and frozen_descendants to complete reconciliation
                 // for remaining descendants (those in frozen_descendants but not in completed)
-                let squash_sha = train.last_squash_sha.as_ref()
-                    .ok_or(Error::MissingRecoverySha)?;
+                //
+                // If last_squash_sha is missing (crash after squash but before durable write),
+                // recover it from GitHub using the predecessor_pr (or current_pr for root).
+                // See "Reconciling recovery with missing last_squash_sha".
+                let squash_sha = match train.last_squash_sha.as_ref() {
+                    Some(sha) => sha.clone(),
+                    None => {
+                        let merged_pr = train.predecessor_pr.unwrap_or(train.current_pr);
+                        fetch_merge_commit_sha_with_retry(github, merged_pr)
+                            .await?
+                            .ok_or(Error::MissingRecoverySha)?
+                    }
+                };
                 resume_reconciliation_with_completed(
                     train.current_pr,
-                    squash_sha,
+                    &squash_sha,
                     frozen_descendants,
                     completed,
                     repo_state,
@@ -3190,11 +3201,21 @@ async fn recover_in_progress_trains(
             }
             CascadePhase::CatchingUp { completed, frozen_descendants, .. } => {
                 // Resume catch-up (merge origin/main) for remaining descendants
-                let squash_sha = train.last_squash_sha.as_ref()
-                    .ok_or(Error::MissingRecoverySha)?;
+                //
+                // Same recovery logic as Reconciling — if last_squash_sha is missing,
+                // fetch it from GitHub with retry.
+                let squash_sha = match train.last_squash_sha.as_ref() {
+                    Some(sha) => sha.clone(),
+                    None => {
+                        let merged_pr = train.predecessor_pr.unwrap_or(train.current_pr);
+                        fetch_merge_commit_sha_with_retry(github, merged_pr)
+                            .await?
+                            .ok_or(Error::MissingRecoverySha)?
+                    }
+                };
                 resume_catch_up(
                     train.current_pr,
-                    squash_sha,
+                    &squash_sha,
                     frozen_descendants,
                     completed,
                     repo_state,
