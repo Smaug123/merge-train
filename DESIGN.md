@@ -19,7 +19,7 @@ A GitHub bot that orchestrates sequential squash-merging of stacked PRs into the
 - Managing the GPT-5 review bot (separate system)
 - Cross-fork PRs (the bot only operates when the PR's head and base are in the same repository; fork-based PRs are ignored because the bot cannot push to arbitrary forks)
 - GitHub merge queue compatibility (the bot assumes users are not using GitHub's built-in merge queue feature; running both systems simultaneously on the same repository would cause conflicts)
-- Repos with "dismiss stale approvals" enabled (the bot pushes merge commits to PR branches during cascade operations; if branch protection dismisses approvals when new commits are pushed, every cascade step invalidates approvals and the train stalls — see "Dismiss stale approvals preflight check" below)
+- Repos with "dismiss stale approvals" enabled (the bot pushes merge commits to PR branches during cascade operations; if branch protection dismisses approvals when new commits are pushed, each cascade step would invalidate approvals. Without mitigation the train would stall waiting for re-approval; instead, the bot aborts immediately on review dismissal events — see "Dismiss stale approvals preflight check" and "Exception — review dismissal events" below)
 
 ---
 
@@ -65,7 +65,7 @@ When the root PR (the one targeting `main`) is ready to merge, comment:
 The bot will:
 
 1. Persist a "train started" record for this stack in the local state store
-2. Walk the linked list to find all descendants (including any added after this command)
+2. Walk the linked list to find all current descendants (the set is frozen per-PR when entering each PR's Preparing phase — see "Descendant set freezing")
 3. Validate the root PR is mergeable (approved, required checks passing — see below)
 4. Begin the cascade: prepare the root's descendants, squash-merge the root, then reconcile, catch-up, and retarget descendants (persisting phase transitions to disk and posting/updating a status comment — see "Status comments" and "Operation sequence")
 
@@ -307,9 +307,9 @@ A PR is "in a train" if:
 
 Being in a train does not require the train to have started. Once the root receives `@merge-train start`, all current and future descendants will be processed.
 
-### Local train state (authoritative)
+### Local train state (primary)
 
-When the bot takes ownership of a stack (via `@merge-train start`), it persists the train's operational state to disk. This local record is the authoritative source of truth for restart recovery.
+When the bot takes ownership of a stack (via `@merge-train start`), it persists the train's operational state to disk. This local record is the primary persistence target. See "Recovery precedence" below for how conflicts between local and GitHub state are resolved during restart.
 
 **Train record fields:**
 
@@ -445,6 +445,8 @@ This handles the scenario where: local state shows `SquashPending`, but GitHub s
 
 This eliminates ambiguity in "which is ahead" — the monotonic sequence provides a total ordering.
 
+**Note:** This recovery precedence rule supersedes any references to the local event log being "authoritative" or "source of truth." Those terms describe where state is *written* during normal operation, not where it is *read* during recovery.
+
 ### Status comments (required, non-authoritative for normal operation)
 
 The bot MUST post and update a status comment on the current root PR at each phase transition. This comment includes:
@@ -520,7 +522,7 @@ Rather than attempting truncated recovery (which is fragile and can violate free
 
 This approach is simpler and safer than truncation-based recovery, which would require reconstructing `frozen_descendants` from current declarations — a process that violates the freeze invariant by potentially including PRs added after preparation began or missing PRs that were removed via comment edits.
 
-**Authoritative source of truth:** During normal operation, the local event log is authoritative. Status comments serve as:
+**Primary vs recovery sources:** During normal operation, the local event log is the primary target for state changes. Status comments mirror this state for disaster recovery. On restart, "Recovery precedence" (above) determines which source to use when they disagree. Status comments serve as:
 - User-facing observability (what is the bot doing?)
 - Fallback recovery source if local state is lost
 
@@ -625,7 +627,7 @@ The event log is persistent (state changes are retained for recovery/debugging).
 
 **Event log format (`events.<N>.log`):**
 
-Newline-delimited JSON (JSON Lines), one event per line. Each event includes a monotonic sequence number. **Critical**: All fields needed to reconstruct train state must be durably logged — the event log is the source of truth for recovery.
+Newline-delimited JSON (JSON Lines), one event per line. Each event includes a monotonic sequence number. **Critical**: All fields needed to reconstruct train state must be durably logged — the event log is the primary persistence mechanism. During recovery, GitHub status comments may supersede local state when `recovery_seq` indicates they are ahead (see "Recovery precedence").
 
 ```json
 {"seq":1,"ts":"2024-01-15T10:00:00Z","type":"train_started","root_pr":123,"current_pr":123}
@@ -1528,7 +1530,7 @@ git merge --no-edit -m "Merge main into <descendant-branch>" origin/main
 git push origin <descendant-branch>
 ```
 
-This workflow is performed for EACH descendant PR (i.e., for every PR that had the just-merged PR as its predecessor). All descendants are processed using local git — the GitHub API is NOT used for merge operations because GitHub's recursive/ort merge strategy would cause spurious conflicts or incorrect results (see "Why local git is required" above). Once all descendants have been prepared, reconciled, caught up, and retargeted, the cascade proceeds to the next level as described in "Operation sequence" below.
+This workflow is performed for EACH descendant PR (i.e., for every PR that had the just-merged PR as its predecessor). All descendants are processed using local git — the GitHub API is NOT used for these reconciliation merges because GitHub's recursive/ort merge strategy would cause spurious conflicts or incorrect results (see "Why local git is required" above). The one exception is the squash-merge into `main`, which uses the GitHub API (see "Commit signing" below). Once all descendants have been prepared, reconciled, caught up, and retargeted, the cascade proceeds to the next level as described in "Operation sequence" below.
 
 ### Commit signing
 
@@ -1634,7 +1636,7 @@ For the final PR in the stack (#125), there is no descendant, so steps 1, 3-5 ar
 
 ### Descendant set freezing
 
-**Invariant**: The descendant set for PR #N is frozen at the moment we begin preparing descendants for #N's squash. Any new PRs that declare #N as their predecessor after this point are **not** included in the current cascade step for #N.
+**Invariant**: The descendant set for PR #N is frozen at the moment we begin preparing descendants for #N's squash. Any new PRs that declare #N as their predecessor after this point are **not** included in the current cascade step for #N. However, new descendants for PRs that haven't been processed yet (further down the stack) ARE still discovered when the cascade reaches them — this is a per-PR freeze, not a per-train freeze.
 
 **Why this matters**: Preparation must happen for ALL descendants BEFORE squashing #N (step 1 completes entirely before step 2). If a new descendant appears after preparation started but before the squash, that descendant:
 - Would not have been prepared (no merge of #N's head)
@@ -5328,12 +5330,11 @@ A monitoring/ops dashboard is planned to provide visibility into active trains, 
 
   **Rationale for stop permissions**: If a train enters a bad state (e.g., stuck on a failing check, endless loop) and the PR author is unavailable (vacation, left company, different timezone), maintainers need the ability to halt the cascade. Without this, a stuck train blocks the entire stack indefinitely.
 
-  **Force stop**: `@merge-train stop --force` performs additional cleanup:
+  **Force stop**: `@merge-train stop --force` performs additional admin actions beyond normal stop:
   - Closes the status comment with "Train forcibly stopped by admin"
   - Optionally closes the affected PRs (if `--close-prs` flag added)
-  - Clears all local state for the train (allows fresh start)
 
-  This is restricted to admins because it's destructive — normal `stop` leaves state intact for resumption.
+  This is restricted to admins because closing PRs is destructive. Normal `stop` also clears train state (a subsequent `start` begins a fresh cascade from the current stack topology), but does not close PRs or post admin-specific messaging.
 
   **Audit trail**: All commands are logged with: timestamp, command, issuer user ID, issuer permission level, PR number, outcome. This provides accountability for admin overrides.
 - **Webhook validation**: Verify `X-Hub-Signature-256` header against webhook secret.
