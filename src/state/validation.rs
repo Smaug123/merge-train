@@ -390,7 +390,7 @@ mod tests {
     ) -> CachedPr {
         CachedPr::new(
             PrNumber(number),
-            Sha::new("abc123def456789012345678901234567890abcd"),
+            Sha::parse("abc123def456789012345678901234567890abcd").unwrap(),
             head_ref.to_string(),
             base_ref.to_string(),
             predecessor.map(PrNumber),
@@ -403,12 +403,12 @@ mod tests {
     fn make_merged_pr(number: u64, head_ref: &str, merge_sha: &str) -> CachedPr {
         CachedPr::new(
             PrNumber(number),
-            Sha::new("abc123def456789012345678901234567890abcd"),
+            Sha::parse("abc123def456789012345678901234567890abcd").unwrap(),
             head_ref.to_string(),
             "main".to_string(),
             None,
             PrState::Merged {
-                merge_commit_sha: Sha::new(merge_sha),
+                merge_commit_sha: Sha::parse(merge_sha).unwrap(),
             },
             MergeStateStatus::Clean,
             false,
@@ -418,7 +418,7 @@ mod tests {
     fn make_closed_pr(number: u64) -> CachedPr {
         CachedPr::new(
             PrNumber(number),
-            Sha::new("abc123def456789012345678901234567890abcd"),
+            Sha::parse("abc123def456789012345678901234567890abcd").unwrap(),
             "branch".to_string(),
             "main".to_string(),
             None,

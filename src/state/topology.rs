@@ -241,7 +241,7 @@ mod tests {
     fn make_pr(number: u64, base_ref: &str, predecessor: Option<u64>, state: PrState) -> CachedPr {
         CachedPr::new(
             PrNumber(number),
-            Sha::new("abc123def456789012345678901234567890abcd"),
+            Sha::parse("abc123def456789012345678901234567890abcd").unwrap(),
             format!("branch-{}", number),
             base_ref.to_string(),
             predecessor.map(PrNumber),
@@ -261,7 +261,7 @@ mod tests {
             "main",
             None,
             PrState::Merged {
-                merge_commit_sha: Sha::new(merge_sha),
+                merge_commit_sha: Sha::parse(merge_sha).unwrap(),
             },
         )
     }
@@ -310,7 +310,7 @@ mod tests {
             let pred = make_merged_pr(1, "abc123def456789012345678901234567890abcd");
             let mut pr = make_open_pr(2, "main", Some(1));
             pr.predecessor_squash_reconciled =
-                Some(Sha::new("abc123def456789012345678901234567890abcd"));
+                Some(Sha::parse("abc123def456789012345678901234567890abcd").unwrap());
 
             let prs = HashMap::from([(PrNumber(1), pred), (PrNumber(2), pr.clone())]);
 

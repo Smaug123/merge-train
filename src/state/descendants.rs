@@ -131,7 +131,7 @@ mod tests {
     fn make_open_pr(number: u64, predecessor: Option<u64>) -> CachedPr {
         CachedPr::new(
             PrNumber(number),
-            Sha::new("abc123def456789012345678901234567890abcd"),
+            Sha::parse("abc123def456789012345678901234567890abcd").unwrap(),
             format!("branch-{}", number),
             "main".to_string(),
             predecessor.map(PrNumber),
@@ -144,7 +144,7 @@ mod tests {
     fn make_closed_pr(number: u64, predecessor: Option<u64>) -> CachedPr {
         CachedPr::new(
             PrNumber(number),
-            Sha::new("abc123def456789012345678901234567890abcd"),
+            Sha::parse("abc123def456789012345678901234567890abcd").unwrap(),
             format!("branch-{}", number),
             "main".to_string(),
             predecessor.map(PrNumber),
@@ -221,7 +221,7 @@ mod tests {
         fn preparing_with_no_completed_returns_all_frozen() {
             let frozen = vec![PrNumber(2), PrNumber(3)];
             let progress = DescendantProgress::new(frozen.clone());
-            let phase = CascadePhase::Preparing(progress);
+            let phase = CascadePhase::Preparing { progress };
 
             let remaining = remaining_descendants(&phase);
 
@@ -236,7 +236,7 @@ mod tests {
             let mut progress = DescendantProgress::new(frozen);
             progress.mark_completed(PrNumber(2));
 
-            let phase = CascadePhase::Preparing(progress);
+            let phase = CascadePhase::Preparing { progress };
             let remaining = remaining_descendants(&phase);
 
             assert_eq!(remaining.len(), 2);
@@ -251,7 +251,7 @@ mod tests {
             let mut progress = DescendantProgress::new(frozen);
             progress.mark_skipped(PrNumber(3));
 
-            let phase = CascadePhase::Preparing(progress);
+            let phase = CascadePhase::Preparing { progress };
             let remaining = remaining_descendants(&phase);
 
             assert_eq!(remaining.len(), 1);
@@ -266,7 +266,7 @@ mod tests {
             progress.mark_completed(PrNumber(2));
             progress.mark_skipped(PrNumber(3));
 
-            let phase = CascadePhase::Preparing(progress);
+            let phase = CascadePhase::Preparing { progress };
             let remaining = remaining_descendants(&phase);
 
             assert!(remaining.is_empty());
@@ -405,7 +405,7 @@ mod tests {
                     }
                 }
 
-                let phase = CascadePhase::Preparing(progress.clone());
+                let phase = CascadePhase::Preparing { progress: progress.clone() };
                 let remaining = remaining_descendants(&phase);
 
                 // Verify: remaining is exactly frozen - completed - skipped

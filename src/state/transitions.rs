@@ -88,7 +88,7 @@ pub fn next_phase(
         // === Preparing transitions ===
 
         // A descendant completed preparation
-        (CascadePhase::Preparing(progress), PhaseOutcome::DescendantCompleted { pr }) => {
+        (CascadePhase::Preparing { progress }, PhaseOutcome::DescendantCompleted { pr }) => {
             let mut new_progress = progress.clone();
             new_progress.mark_completed(pr);
 
@@ -97,12 +97,14 @@ pub fn next_phase(
                     progress: new_progress,
                 })
             } else {
-                Ok(CascadePhase::Preparing(new_progress))
+                Ok(CascadePhase::Preparing {
+                    progress: new_progress,
+                })
             }
         }
 
         // A descendant was skipped during preparation
-        (CascadePhase::Preparing(progress), PhaseOutcome::DescendantSkipped { pr }) => {
+        (CascadePhase::Preparing { progress }, PhaseOutcome::DescendantSkipped { pr }) => {
             let mut new_progress = progress.clone();
             new_progress.mark_skipped(pr);
 
@@ -111,12 +113,14 @@ pub fn next_phase(
                     progress: new_progress,
                 })
             } else {
-                Ok(CascadePhase::Preparing(new_progress))
+                Ok(CascadePhase::Preparing {
+                    progress: new_progress,
+                })
             }
         }
 
         // All descendants prepared (explicit signal, alternative to checking is_complete)
-        (CascadePhase::Preparing(progress), PhaseOutcome::AllComplete) => {
+        (CascadePhase::Preparing { progress }, PhaseOutcome::AllComplete) => {
             Ok(CascadePhase::SquashPending {
                 progress: progress.clone(),
             })
@@ -368,7 +372,9 @@ pub fn start_preparing(descendants: Vec<PrNumber>) -> CascadePhase {
             progress: DescendantProgress::new(vec![]),
         }
     } else {
-        CascadePhase::Preparing(DescendantProgress::new(descendants))
+        CascadePhase::Preparing {
+            progress: DescendantProgress::new(descendants),
+        }
     }
 }
 
@@ -421,7 +427,9 @@ mod tests {
     use proptest::prelude::*;
 
     fn make_sha(s: &str) -> Sha {
-        Sha::new(format!("{}0000000000000000000000000000000000000", s))
+        // Pad to exactly 40 hex characters
+        let padded = format!("{:0<40}", s);
+        Sha::parse(padded).unwrap()
     }
 
     fn make_progress(frozen: &[u64]) -> DescendantProgress {
@@ -448,7 +456,9 @@ mod tests {
             complete_progress.mark_completed(PrNumber(2));
             complete_progress.mark_completed(PrNumber(3));
 
-            let phase = CascadePhase::Preparing(complete_progress);
+            let phase = CascadePhase::Preparing {
+                progress: complete_progress,
+            };
             let result = next_phase(&phase, PhaseOutcome::AllComplete);
 
             assert!(result.is_ok());
@@ -461,7 +471,7 @@ mod tests {
         #[test]
         fn preparing_stays_preparing_when_not_all_complete() {
             let progress = make_progress(&[1, 2, 3]);
-            let phase = CascadePhase::Preparing(progress);
+            let phase = CascadePhase::Preparing { progress };
 
             let result = next_phase(
                 &phase,
@@ -470,9 +480,9 @@ mod tests {
 
             assert!(result.is_ok());
             let new_phase = result.unwrap();
-            assert!(matches!(new_phase, CascadePhase::Preparing(_)));
+            assert!(matches!(new_phase, CascadePhase::Preparing { .. }));
 
-            if let CascadePhase::Preparing(p) = new_phase {
+            if let CascadePhase::Preparing { progress: p } = new_phase {
                 assert!(p.completed.contains(&PrNumber(1)));
                 assert!(!p.is_complete());
             }
@@ -572,7 +582,7 @@ mod tests {
             progress.mark_skipped(PrNumber(1));
             progress.mark_completed(PrNumber(2));
 
-            let phase = CascadePhase::Preparing(progress);
+            let phase = CascadePhase::Preparing { progress };
             let result = next_phase(&phase, PhaseOutcome::AllComplete);
 
             assert!(result.is_ok());
@@ -589,8 +599,8 @@ mod tests {
         fn with_descendants_returns_preparing() {
             let phase = start_preparing(vec![PrNumber(1), PrNumber(2)]);
 
-            assert!(matches!(phase, CascadePhase::Preparing(_)));
-            if let CascadePhase::Preparing(p) = phase {
+            assert!(matches!(phase, CascadePhase::Preparing { .. }));
+            if let CascadePhase::Preparing { progress: p } = phase {
                 assert_eq!(p.frozen_descendants.len(), 2);
             }
         }
@@ -609,7 +619,9 @@ mod tests {
         #[test]
         fn same_frozen_descendants_is_valid() {
             let progress = make_progress(&[1, 2, 3]);
-            let from = CascadePhase::Preparing(progress.clone());
+            let from = CascadePhase::Preparing {
+                progress: progress.clone(),
+            };
             let to = CascadePhase::SquashPending { progress };
 
             assert!(verify_transition_invariants(&from, &to).is_ok());
@@ -617,7 +629,9 @@ mod tests {
 
         #[test]
         fn different_frozen_descendants_is_invalid() {
-            let from = CascadePhase::Preparing(make_progress(&[1, 2, 3]));
+            let from = CascadePhase::Preparing {
+                progress: make_progress(&[1, 2, 3]),
+            };
             let to = CascadePhase::SquashPending {
                 progress: make_progress(&[1, 2, 4]), // Different!
             };
@@ -632,7 +646,9 @@ mod tests {
         #[test]
         fn idle_to_preparing_is_valid() {
             let from = CascadePhase::Idle;
-            let to = CascadePhase::Preparing(make_progress(&[1, 2]));
+            let to = CascadePhase::Preparing {
+                progress: make_progress(&[1, 2]),
+            };
 
             assert!(verify_transition_invariants(&from, &to).is_ok());
         }
@@ -658,7 +674,7 @@ mod tests {
         }
 
         fn arb_sha() -> impl Strategy<Value = Sha> {
-            "[0-9a-f]{40}".prop_map(Sha::new)
+            "[0-9a-f]{40}".prop_map(|s| Sha::parse(s).unwrap())
         }
 
         fn arb_descendants() -> impl Strategy<Value = Vec<PrNumber>> {
@@ -675,7 +691,7 @@ mod tests {
                 // start_preparing with non-empty descendants will create Preparing phase
                 let initial = start_preparing(descendants.clone());
                 let frozen = match &initial {
-                    CascadePhase::Preparing(p) => p.frozen_descendants.clone(),
+                    CascadePhase::Preparing { progress: p } => p.frozen_descendants.clone(),
                     CascadePhase::SquashPending { progress } => progress.frozen_descendants.clone(),
                     _ => Vec::new(),
                 };
@@ -683,7 +699,7 @@ mod tests {
                 // Complete all descendants in preparing
                 let mut phase = initial;
                 for &pr in &descendants {
-                    if let CascadePhase::Preparing(_) = &phase {
+                    if let CascadePhase::Preparing { .. } = &phase {
                         phase = next_phase(&phase, PhaseOutcome::DescendantCompleted { pr })
                             .expect("transition should succeed");
                     }
@@ -715,7 +731,7 @@ mod tests {
 
                 // Skip one, complete the rest
                 for (i, &pr) in descendants.iter().enumerate() {
-                    if let CascadePhase::Preparing(_) = &phase {
+                    if let CascadePhase::Preparing { .. } = &phase {
                         if i == skip_idx % descendants.len() {
                             phase = next_phase(&phase, PhaseOutcome::DescendantSkipped { pr })
                                 .expect("transition should succeed");
