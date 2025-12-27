@@ -98,9 +98,16 @@ impl DescendantProgress {
 
 /// The cascade phase indicates which operation is currently in progress.
 ///
-/// INVARIANT: `frozen_descendants` is captured once when entering `Preparing`
-/// and carried through all subsequent phases. It is NEVER re-queried from the
-/// descendants index.
+/// # Descendant Set Invariant
+///
+/// `frozen_descendants` is captured when transitioning out of `Idle`:
+/// - `Idle -> Preparing`: descendants exist; captured at `Preparing` entry
+/// - `Idle -> SquashPending`: no descendants; uses empty `frozen_descendants`
+///
+/// Once captured, `frozen_descendants` is carried through all subsequent phases
+/// and NEVER re-queried from the descendants index. This prevents late-arriving
+/// descendants (added during spool replay after a crash) from corrupting the
+/// cascade.
 ///
 /// Serializes with external tagging per the design: `{"Preparing": {...}}` for
 /// phases with data, `"Idle"` for unit variants.
@@ -119,7 +126,9 @@ pub enum CascadePhase {
 
     /// Preparation complete; about to squash-merge current PR.
     SquashPending {
-        /// Carried forward from Preparing.
+        /// Descendant tracking. When entered via `Preparing`, carries forward
+        /// from that phase. When entered directly from `Idle` (no descendants),
+        /// contains empty `frozen_descendants`.
         #[serde(flatten)]
         progress: DescendantProgress,
     },
@@ -311,7 +320,9 @@ pub struct TrainRecord {
     /// ISO 8601 timestamp when started.
     pub started_at: DateTime<Utc>,
 
-    /// ISO 8601 timestamp when the train ended (whether stopped, aborted, or completed).
+    /// ISO 8601 timestamp when the train was stopped or aborted.
+    /// Note: Completed trains are removed from `active_trains` entirely rather than
+    /// being marked with a timestamp.
     pub ended_at: Option<DateTime<Utc>>,
 
     /// Error details if aborted.
