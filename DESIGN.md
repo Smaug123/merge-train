@@ -146,7 +146,7 @@ This prevents races where: (a) the bot pushes a reconciliation commit, (b) `chec
 
 **Handling repos with no required checks**: Before entering the CI wait loop, the bot queries branch protection rules to check for required status checks. If no required checks are configured, the bot skips the CI wait entirely and proceeds based on `mergeStateStatus` alone. This uses the same per-repo branch protection cache (1-hour TTL) already used for the "dismiss stale approvals" preflight check. This is distinct from the dismiss stale approvals check — that one blocks `@merge-train start` entirely, while this one simply skips the CI wait when there are no checks to wait for.
 
-**Note on "check failure"**: Throughout this document, "check failure" or "required check failure" refers to `mergeStateStatus` transitioning to `BLOCKED`. The bot does not query branch protection rules to distinguish required from non-required checks — it relies entirely on GitHub's `mergeStateStatus` computation. This means:
+**Note on "check failure"**: Throughout this document, "check failure" or "required check failure" refers to `mergeStateStatus` transitioning to `BLOCKED`. During the CI wait, the bot does not query branch protection rules to distinguish which specific checks are required vs non-required — it relies entirely on GitHub's `mergeStateStatus` computation. (The branch protection query described above for skipping CI wait when no required checks exist is a separate, one-time check at cascade start.) This means:
 - If a non-required check fails → `UNSTABLE` → bot proceeds
 - If a required check fails → `BLOCKED` → bot enters `waiting_ci` state
 - If approval is withdrawn (detected via `mergeStateStatus` polling) → `BLOCKED` → bot enters `waiting_ci` state
@@ -432,7 +432,7 @@ This derives the squash SHA from GitHub rather than hard-failing, since the squa
 
 **Why ~150 seconds total?** GitHub's API typically propagates `merge_commit_sha` within a few seconds, but under heavy load or during incidents, propagation can take 10-30 seconds. A 150-second total wait covers the vast majority of cases without making recovery unacceptably slow. The exponential backoff (1s, 2s, 4s, 8s, 16s, then 30s capped for the remaining attempts) front-loads fast retries for the common case while backing off for edge cases.
 
-**GitHub-based recovery**: If the local state files are missing or corrupted, the bot can recover train state from GitHub during bootstrap by scanning for status comments on open root PRs. The status comment contains the full `TrainRecord` as machine-readable JSON, enabling precise recovery without inference. See "Status comments" below.
+**GitHub-based recovery**: If the local state files are missing or corrupted, the bot can recover train state from GitHub during bootstrap by scanning for status comments on open and recently merged PRs that target the default branch. The status comment contains the full `TrainRecord` as machine-readable JSON, enabling precise recovery without inference. See "Status comments" below.
 
 **Supplementary GitHub recovery**: Even when local state exists, the bot may consult GitHub status comments to fill gaps caused by crashes between event log writes and status comment updates. On restart with existing local state:
 
@@ -1182,7 +1182,7 @@ From the cached state, stacks are computed by traversing predecessor relationshi
 - Each descendant is retargeted to the default branch
 - Each descendant receives its own train record in the local state store (inheriting "started" status from the parent train)
 - They proceed as independent trains; whichever passes CI first merges next
-- The `cascade_step` returns `FanOut { descendants }` to trigger train record creation (and optional status comment updates)
+- The `cascade_step` returns `FanOut { descendants }` to trigger train record creation and status comment posting on each new root
 
 ---
 
