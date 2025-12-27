@@ -394,7 +394,7 @@ mod tests {
     use proptest::strategy::Strategy;
 
     fn arb_sha() -> impl Strategy<Value = Sha> {
-        "[0-9a-f]{40}".prop_map(Sha::new)
+        "[0-9a-f]{40}".prop_map(|s| Sha::parse(s).unwrap())
     }
 
     fn arb_pr_number() -> impl Strategy<Value = PrNumber> {
@@ -586,7 +586,7 @@ mod tests {
         #[test]
         fn valid_transitions() {
             let progress = DescendantProgress::new(vec![PrNumber(1)]);
-            let sha = Sha::new("abc123def456789012345678901234567890abcd");
+            let sha = Sha::parse("abc123def456789012345678901234567890abcd").unwrap();
 
             let idle = CascadePhase::Idle;
             let preparing = CascadePhase::Preparing {
@@ -622,7 +622,7 @@ mod tests {
         #[test]
         fn invalid_transitions() {
             let progress = DescendantProgress::new(vec![PrNumber(1)]);
-            let sha = Sha::new("abc123def456789012345678901234567890abcd");
+            let sha = Sha::parse("abc123def456789012345678901234567890abcd").unwrap();
 
             let idle = CascadePhase::Idle;
             let preparing = CascadePhase::Preparing {

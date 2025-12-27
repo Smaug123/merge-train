@@ -175,7 +175,7 @@ mod tests {
     use proptest::prelude::*;
 
     fn arb_sha() -> impl Strategy<Value = Sha> {
-        "[0-9a-f]{40}".prop_map(Sha::new)
+        "[0-9a-f]{40}".prop_map(|s| Sha::parse(s).unwrap())
     }
 
     fn arb_pr_state() -> impl Strategy<Value = PrState> {
@@ -216,7 +216,7 @@ mod tests {
         #[test]
         fn merged_requires_sha() {
             let merged = PrState::Merged {
-                merge_commit_sha: Sha::new("abc123def456789012345678901234567890abcd"),
+                merge_commit_sha: Sha::parse("abc123def456789012345678901234567890abcd").unwrap(),
             };
             assert!(merged.is_merged());
             assert!(merged.merge_commit_sha().is_some());
@@ -228,7 +228,8 @@ mod tests {
             assert!(!PrState::Closed.is_open());
             assert!(
                 !PrState::Merged {
-                    merge_commit_sha: Sha::new("abc")
+                    merge_commit_sha: Sha::parse("abc123def456789012345678901234567890abcd")
+                        .unwrap()
                 }
                 .is_open()
             );
