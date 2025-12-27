@@ -1126,6 +1126,10 @@ struct PersistedPr {
     /// When the PR was merged or closed (ISO 8601). Null for open PRs.
     /// Used for retention-based pruning.
     closed_at: Option<String>,
+    /// SHA of the predecessor's squash commit that this PR was reconciled against.
+    /// Set after normal cascade or late-addition reconciliation completes.
+    /// Required for is_root() to return true when predecessor is merged.
+    predecessor_squash_reconciled: Option<String>,
 }
 ```
 
@@ -1204,7 +1208,7 @@ Note: `FanOut` is a **cascade-internal** mechanism — it's a return value from 
 | `issue_comment.created` with `@merge-train predecessor #N` | Validate, record, ack |
 | `issue_comment.created` with `@merge-train start` | Squash-merge root, begin cascade |
 | `issue_comment.created` with `@merge-train stop` | Mark stack stopped, report state |
-| `issue_comment.edited` with `@merge-train predecessor #N` | Update predecessor (replaces previous declaration) |
+| `issue_comment.edited` with `@merge-train predecessor #N` | Validate (same as new), update predecessor if valid |
 | `issue_comment.edited` where authoritative predecessor comment no longer contains command | Remove predecessor relationship (see below) |
 | `issue_comment.deleted` | If deleted comment was a predecessor declaration, remove predecessor relationship |
 | `pull_request` merged | If merged PR has descendants, cascade to next |
@@ -1215,7 +1219,12 @@ Note: `FanOut` is a **cascade-internal** mechanism — it's a return value from 
 
 **Comment edit handling**: When a predecessor declaration is edited, the bot handles several cases:
 
-1. **Command changed** (e.g., `#123` to `#456`): Update the predecessor relationship to point to the new PR.
+1. **Command changed** (e.g., `#123` to `#456`):
+   - **Re-run full validation** (same as new declarations):
+     a. Validate that `#456` either targets the default branch or itself has a predecessor declaration
+     b. Validate that the current PR's base branch matches `#456`'s head branch (unless `#456` is already merged — see "Continuous base branch validation")
+   - If validation **passes**: Update the predecessor relationship to point to the new PR. React with 👍 on the edited comment.
+   - If validation **fails**: **Reject the edit**. Post an error comment explaining the validation failure. The predecessor relationship remains unchanged (still pointing to the old predecessor). This prevents edited comments from creating invalid stacks that only fail mid-cascade.
 2. **Command removed** (e.g., editing to remove `@merge-train predecessor` entirely): If this was the authoritative predecessor comment for the PR (tracked via comment ID), remove the predecessor relationship. The PR becomes orphaned unless another predecessor comment exists (which would be an error state — see "Multiple predecessor comments").
 3. **Command added to non-predecessor comment**: Rejected if the PR already has a predecessor declaration.
 
@@ -1804,7 +1813,13 @@ async fn handle_late_addition(
     // 7. Retarget the PR to the default branch
     github.update_pr_base(late_pr, default_branch).await?;
 
-    // 8. Now the PR has base_ref == default_branch, so is_root() will return true
+    // 8. Record that reconciliation completed — this is CRITICAL for is_root()
+    //    Without this, is_root() would return false even after reconciliation,
+    //    because predecessor_squash_reconciled would still be None.
+    repo_state.update_pr_reconciliation(late_pr, squash_sha.clone());
+
+    // 9. Now the PR has base_ref == default_branch AND predecessor_squash_reconciled
+    //    is set, so is_root() will return true.
     Ok(())
 }
 ```
@@ -1851,6 +1866,41 @@ for pr in repo_state.prs.values() {
 ```
 
 This ensures late additions are handled promptly (on predecessor_declared) and caught during polling if the event was missed. After reconciliation and retargeting, `is_root()` returns true and the PR joins normal cascade processing.
+
+**Manually-retargeted PR detection**: A parallel scan catches PRs that were manually retargeted to the default branch before reconciliation could run:
+
+```rust
+// Find PRs that were manually retargeted but NOT reconciled
+// These are dangerous: base_ref == default_branch but ours-merge was never done
+for pr in repo_state.prs.values() {
+    if pr.state != PrState::Open { continue; }
+    if pr.base_ref != repo_state.default_branch { continue; }
+
+    if let Some(pred) = pr.predecessor {
+        if let Some(pred_pr) = repo_state.prs.get(&pred) {
+            if matches!(pred_pr.state, PrState::Merged { .. })
+                && pr.predecessor_squash_reconciled.is_none()
+            {
+                // PR was manually retargeted before reconciliation!
+                // Post warning and trigger reconciliation.
+                github.post_comment(pr.number, &format!(
+                    "⚠️ **Warning**: This PR was retargeted to `{}` but has not been \
+                     reconciled with predecessor #{}'s squash commit. This PR cannot be \
+                     safely merged until reconciliation completes.\n\n\
+                     The bot will now attempt reconciliation automatically.",
+                    repo_state.default_branch, pred
+                )).await?;
+
+                // Reconciliation still works even though base_ref is already main.
+                // The git operations (ours-merge) are what matter, not the GitHub base_ref.
+                handle_late_addition(pr.number, pred, repo_state, ctx).await?;
+            }
+        }
+    }
+}
+```
+
+This scan prevents manually-retargeted PRs from being discovered as roots (via `is_root()`) until proper reconciliation completes. The warning comment alerts the PR author to the unusual state.
 
 **Event log format for frozen descendants**:
 ```json
@@ -2362,6 +2412,14 @@ struct CachedPr {
     merge_state: MergeStateStatus,
     /// Declared predecessor (from @merge-train predecessor comment)
     predecessor: Option<PrNumber>,
+    /// SHA of the predecessor's squash commit that this PR was reconciled against.
+    /// Set after:
+    /// - Normal cascade reconciliation completes (reconcile_descendant)
+    /// - Late addition reconciliation completes (handle_late_addition)
+    /// Used by is_root() to verify proper reconciliation before allowing
+    /// the PR to become a new root. Prevents manually-retargeted PRs from
+    /// bypassing the ours-merge chain.
+    predecessor_squash_reconciled: Option<Sha>,
 }
 
 enum PrState {
@@ -2607,6 +2665,10 @@ struct TrainError {
 	    /// When the PR was merged or closed (ISO 8601). Null for open PRs.
 	    /// Used for retention-based pruning of the local state file.
 	    closed_at: Option<String>,
+	    /// SHA of the predecessor's squash commit that this PR was reconciled against.
+	    /// Set after normal cascade or late-addition reconciliation completes.
+	    /// Required for is_root() to return true when predecessor is merged.
+	    predecessor_squash_reconciled: Option<String>,
 	}
 
 	// ─────────────────────────────────────────────────────────────
@@ -3626,7 +3688,7 @@ impl RepoState {
 
     /// A PR is a root if it targets the default branch AND either:
     /// - Has no predecessor declaration, OR
-    /// - Its predecessor has been merged (and the PR was retargeted to default branch)
+    /// - Its predecessor has been merged AND reconciliation has completed
     ///
     /// The second case represents a "resolved" predecessor relationship — see "Continuous
     /// base branch validation" in the User Interface section. After a cascade step completes,
@@ -3636,6 +3698,12 @@ impl RepoState {
     /// IMPORTANT: We always require base_ref == default_branch. A PR whose predecessor
     /// merged but which hasn't been retargeted yet is NOT a root — it's in a transitional
     /// state and should not be squash-merged until retargeting completes.
+    ///
+    /// CRITICAL: For the merged-predecessor case, we also require `predecessor_squash_reconciled`
+    /// to be set. This prevents a race where someone manually retargets a late descendant to
+    /// main before the bot's reconciliation (handle_late_addition) runs. Without this check,
+    /// such a PR would be discovered as a root and squash-merged WITHOUT the ours-merge chain,
+    /// risking lost predecessor content or conflicts.
     ///
     /// PRIVATE: This function is for stack *discovery* only — finding new stacks that
     /// aren't yet being processed. Once a train is active, all progress is driven by the
@@ -3653,8 +3721,11 @@ impl RepoState {
             None => true,
             Some(pred) => {
                 match self.prs.get(&pred) {
-                    // Predecessor merged + we target default branch = root
-                    Some(p) if matches!(p.state, PrState::Merged { .. }) => true,
+                    // Predecessor merged — but ONLY a root if reconciliation completed.
+                    // This prevents manually-retargeted PRs from bypassing ours-merge.
+                    Some(p) if matches!(p.state, PrState::Merged { .. }) => {
+                        pr.predecessor_squash_reconciled.is_some()
+                    }
                     // Predecessor exists but not merged = not a root (still stacked)
                     Some(_) => false,
                     // Predecessor missing from cache = NOT a root (data integrity issue)
@@ -4479,6 +4550,10 @@ async fn cascade_step(
     for desc in descendants {
         git.reconcile_descendant(&desc.head_ref, &squash_sha, default_branch, cancel).await?;
         github.retarget_pr(desc.number, default_branch).await?;
+        // Record that reconciliation completed — CRITICAL for is_root() to return true
+        // Without this, a manually-retargeted PR could be discovered as a root
+        // without the ours-merge chain being applied.
+        repo_state.update_pr_reconciliation(desc.number, squash_sha.clone());
     }
 
     // Return based on descendant count
