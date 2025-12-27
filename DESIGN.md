@@ -43,12 +43,13 @@ This declares that the current PR is stacked on top of PR #123. The bot will:
 
 **Continuous base branch validation**: Base branch matching is validated not just at declaration time, but also:
 
-1. **On `pull_request.edited` events**: When a PR's base branch changes (retargeting), the bot re-validates the predecessor relationship. If the new base no longer matches the predecessor's head branch:
-   - The predecessor relationship is marked **invalid** (but not removed — the declaration still exists)
-   - The PR is excluded from any active cascade until the mismatch is resolved
+1. **On `pull_request.edited` events**: When a PR's base branch changes (retargeting), the bot re-validates the predecessor relationship. If the new base no longer matches the predecessor's head branch **and the predecessor is still open**:
+   - The PR is excluded from any active cascade while the mismatch exists
    - The bot posts a warning: "PR #N was retargeted to 'X', which no longer matches predecessor #123's head branch 'Y'. This PR will not be included in the cascade until the base branch is corrected."
 
-2. **At cascade time**: Before entering the `Preparing` phase for any descendant, the bot re-validates that the descendant's base branch matches the predecessor's head branch. This catches any retargeting that occurred between declaration and cascade. If validation fails, the cascade aborts for that PR with a clear error.
+   **Exception — merged predecessor**: If the predecessor is already merged, a base branch mismatch is expected. After the bot squash-merges a predecessor and retargets its descendants to main, the descendant's base (`main`) no longer matches the predecessor's former head branch. This is the normal post-cascade state — the predecessor relationship is considered **resolved**, not invalid. No warning is posted, and the PR is eligible to be discovered as a new root (see `is_root()` below).
+
+2. **At cascade time**: Before entering the `Preparing` phase for any descendant, the bot re-validates that the descendant's base branch matches the predecessor's head branch. This catches any retargeting that occurred between declaration and cascade. If validation fails (and the predecessor is still open), the cascade aborts for that PR with a clear error.
 
 This prevents stale predecessor links from causing merges into wrong branches.
 
@@ -110,12 +111,12 @@ This delegates all branch protection logic to GitHub, ensuring the bot respects 
    - Re-merge the predecessor's head (idempotent if already merged)
    - If still BEHIND: Abort with error. Someone may have pushed to the predecessor branch after we prepared.
 
-3. **Descendant during RECONCILIATION phase** (after predecessor squash): Should not happen — after reconciliation, the descendant's base is retargeted to main and should include all main history. If this occurs:
-   - The catch-up step may have failed or been skipped
-   - Re-run catch-up: `git merge origin/main`
-   - If conflicts: Abort (genuine conflict with new main content)
+3. **Descendant during RECONCILIATION or CATCH-UP phase** (after predecessor squash, before retarget): The descendant's base branch (`base_ref`) still refers to the predecessor's branch, which no longer exists (squash-merged and deleted). GitHub may report `BEHIND`, `UNKNOWN`, or even stale status since the base branch reference is invalid. The bot should:
+   - **Ignore `mergeStateStatus` entirely** during these phases — it's meaningless when the base branch doesn't exist
+   - Continue with reconciliation/catch-up operations as normal (these operate on git history, not GitHub's mergeability status)
+   - The base will be corrected to `main` during the RETARGET step (step 5 in the operation sequence)
 
-4. **Descendant during WAITING_CI phase**: The bot already pushed updates. If BEHIND, main advanced after our push. Re-run catch-up merge and wait for CI again.
+4. **Descendant after RETARGET** (base = main, waiting for CI): The bot has retargeted the PR to main and pushed updates. If `BEHIND`, main advanced after our catch-up push. Re-run catch-up merge (`git merge origin/main`) and wait for CI again.
 
 **CRITICAL**: The bot NEVER merges main into a descendant BEFORE the predecessor is squash-merged. Doing so would cause lost commits (see "Why merging $SQUASH_SHA^ is essential"). The handling above only applies when the descendant's base is already main (post-retarget) or for the root PR.
 
@@ -318,7 +319,7 @@ When the bot takes ownership of a stack (via `@merge-train start`), it persists 
 | `version` | `number` | Schema version (currently `1`) |
 | `recovery_seq` | `number` | Monotonic counter incremented on each state change; used to determine which record (local vs GitHub) is "ahead" during recovery (see "Recovery precedence") |
 | `state` | `string` | One of: `running`, `stopped`, `waiting_ci`, `aborted`, `needs_manual_review` |
-| `original_root_pr` | `number` | The PR that received `@merge-train start`; stays constant as cascade advances |
+| `original_root_pr` | `number` | The PR that originated this train. For the initial train, this is the PR that received `@merge-train start`. For trains created by fan-out, this is the descendant PR that became a new root. Constant **within** a single train's lifetime, but fan-out creates new trains with different values (see "Fan-out handling" below). |
 | `current_pr` | `number` | PR currently being processed (advances as each PR merges) |
 | `cascade_phase` | `object` | Phase with `completed`, `skipped`, and `frozen_descendants` lists (see below) |
 | `predecessor_pr` | `number?` | PR number of predecessor (for fetching via `refs/pull/<n>/head` during recovery) |
@@ -2360,6 +2361,27 @@ enum MergeStateStatus {
 	//   - Two NEW trains are created: one with original_root_pr=124, one with original_root_pr=125
 	//   - Each gets its own worktree, its own entry in active_trains
 	//   - The old train (keyed by 123) is removed from active_trains
+	//
+	// STATUS COMMENT HANDOFF AT FAN-OUT:
+	// When fan-out completes successfully:
+	//   1. Update #123's status comment to final state: "Train completed. Descendants #124, #125
+	//      are now independent trains."
+	//   2. Create new TrainRecords for #124 and #125 with their own original_root_pr values
+	//   3. Post initial status comments on #124 and #125
+	//   4. Remove #123 from active_trains
+	//
+	// FAN-OUT RECOVERY:
+	// If the bot crashes during fan-out (between removing the old train and creating all new trains):
+	//   1. On recovery, scan for status comments on merged PRs with state = "running"
+	//   2. If a merged PR (#123) has a running status comment:
+	//      - The train was mid-fan-out when the crash occurred
+	//      - Query #123's descendants from predecessor declarations in the PR cache
+	//      - For each descendant targeting main (already retargeted): create a new train if none exists
+	//      - For each descendant NOT targeting main: these weren't fully processed; mark needs_manual_review
+	//   3. Update #123's status comment to indicate completion (or the error state)
+	//
+	// The status comment on #123 serves as a breadcrumb that fan-out was in progress. The new trains
+	// (#124, #125) get their own status comments once created.
 
 	/// Train record stored in the local state file.
 	/// During normal operation, state is written here first, then mirrored to GitHub.
@@ -2374,7 +2396,9 @@ enum MergeStateStatus {
 	    recovery_seq: u64,
 	    /// Current train state
 	    state: TrainState,
-	    /// PR that originally received @merge-train start (used for worktree path)
+	    /// PR that originated this train. For the initial train, this is the PR that received
+	    /// @merge-train start. For trains created by fan-out, this is the descendant PR that
+	    /// became a new root. Used as the key in active_trains and for worktree naming.
 	    original_root_pr: PrNumber,
 	    /// PR currently being processed (the train's current root)
 	    current_pr: PrNumber,
@@ -3542,6 +3566,11 @@ impl RepoState {
     /// A PR is a root if it targets the default branch AND either:
     /// - Has no predecessor declaration, OR
     /// - Its predecessor has been merged (and the PR was retargeted to default branch)
+    ///
+    /// The second case represents a "resolved" predecessor relationship — see "Continuous
+    /// base branch validation" in the User Interface section. After a cascade step completes,
+    /// the descendant targets main but still has its predecessor declaration. This is NOT
+    /// an invalid state; it's the expected post-cascade state where the PR becomes a new root.
     ///
     /// IMPORTANT: We always require base_ref == default_branch. A PR whose predecessor
     /// merged but which hasn't been retargeted yet is NOT a root — it's in a transitional
