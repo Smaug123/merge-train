@@ -2867,11 +2867,16 @@ enum BlockReason {
     Blocked,
     /// GitHub reports BEHIND (head branch behind base, strict mode)
     Behind,
-    /// GitHub reports DIRTY (merge conflicts)
-    MergeConflict,
     /// User issued @merge-train stop
     Stopped,
+    /// PR is still a draft
+    Draft,
+    /// GitHub reports UNKNOWN (state not yet computed)
+    Unknown,
 }
+// Note: DIRTY (merge conflicts) is NOT a BlockReason—it causes an immediate
+// Aborted { reason: AbortReason::MergeConflict { .. } } since conflicts require
+// explicit user intervention and cannot auto-resolve.
 
 /// Outcome of attempting a cascade step
 enum CascadeStepOutcome {
@@ -2883,7 +2888,9 @@ enum CascadeStepOutcome {
     Complete,
     /// Fan-out: multiple descendants, each becomes an independent root
     FanOut { descendants: Vec<PrNumber> },
-    /// Something went wrong
+    /// Cascade is blocked, waiting for condition to change
+    Blocked { pr_number: PrNumber, reason: BlockReason },
+    /// Something went wrong, cascade aborted
     Aborted { pr_number: PrNumber, reason: AbortReason },
 }
 

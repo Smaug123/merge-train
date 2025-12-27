@@ -66,6 +66,10 @@ pub enum MergeStateStatus {
     Behind,
 
     /// Merge conflicts exist - abort cascade.
+    ///
+    /// This is a permanent failure that maps to `AbortReason::MergeConflict`,
+    /// not a `BlockReason`. The cascade cannot proceed until the user resolves
+    /// conflicts locally and re-issues `@merge-train start`.
     Dirty,
 
     /// State not yet computed by GitHub - wait and re-check.
