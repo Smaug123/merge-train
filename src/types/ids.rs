@@ -5,6 +5,15 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use thiserror::Error;
+
+/// Error returned when parsing an invalid SHA.
+#[derive(Debug, Clone, Error)]
+#[error("invalid SHA: expected 40 hex characters, got {len} chars: {preview}")]
+pub struct InvalidSha {
+    len: usize,
+    preview: String,
+}
 
 /// A pull request number within a repository.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -24,16 +33,28 @@ impl From<u64> for PrNumber {
 }
 
 /// A git commit SHA (40 hex characters).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// This type guarantees that the contained string is exactly 40 lowercase hex characters.
+/// Construction is only possible via `Sha::parse`, which validates the input.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
-pub struct Sha(pub String);
+pub struct Sha(String);
 
 impl Sha {
-    /// Creates a new Sha from a string.
+    /// Parses a string as a SHA, validating that it is exactly 40 hex characters.
     ///
-    /// Note: This does not validate the format. Valid SHAs are 40 hex characters.
-    pub fn new(s: impl Into<String>) -> Self {
-        Sha(s.into())
+    /// Returns an error if the input is not a valid SHA.
+    pub fn parse(s: impl Into<String>) -> Result<Self, InvalidSha> {
+        let s = s.into();
+        if s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit()) {
+            // Normalize to lowercase for consistent comparison
+            Ok(Sha(s.to_ascii_lowercase()))
+        } else {
+            Err(InvalidSha {
+                len: s.len(),
+                preview: s.chars().take(20).collect(),
+            })
+        }
     }
 
     /// Returns the SHA as a string slice.
@@ -43,9 +64,7 @@ impl Sha {
 
     /// Returns a short (7-character) version of the SHA for display.
     pub fn short(&self) -> &str {
-        // Use get() to avoid panic if string contains non-ASCII (shouldn't happen
-        // for valid SHAs, but can occur via Sha::new or Deserialize on bad input).
-        self.0.get(..7).unwrap_or(&self.0)
+        &self.0[..7]
     }
 }
 
@@ -55,15 +74,13 @@ impl fmt::Display for Sha {
     }
 }
 
-impl From<String> for Sha {
-    fn from(s: String) -> Self {
-        Sha(s)
-    }
-}
-
-impl From<&str> for Sha {
-    fn from(s: &str) -> Self {
-        Sha(s.to_string())
+impl<'de> Deserialize<'de> for Sha {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Sha::parse(s).map_err(serde::de::Error::custom)
     }
 }
 
@@ -172,7 +189,7 @@ mod tests {
         proptest! {
             #[test]
             fn serde_roundtrip(s in "[0-9a-f]{40}") {
-                let sha = Sha::new(&s);
+                let sha = Sha::parse(&s).unwrap();
                 let json = serde_json::to_string(&sha).unwrap();
                 let parsed: Sha = serde_json::from_str(&json).unwrap();
                 prop_assert_eq!(sha, parsed);
@@ -180,23 +197,40 @@ mod tests {
 
             #[test]
             fn short_returns_7_chars(s in "[0-9a-f]{40}") {
-                let sha = Sha::new(&s);
+                let sha = Sha::parse(&s).unwrap();
                 prop_assert_eq!(sha.short().len(), 7);
                 prop_assert_eq!(sha.short(), &s[..7]);
             }
 
             #[test]
             fn comparison_matches_underlying(a in "[0-9a-f]{40}", b in "[0-9a-f]{40}") {
-                let sha_a = Sha::new(&a);
-                let sha_b = Sha::new(&b);
+                let sha_a = Sha::parse(&a).unwrap();
+                let sha_b = Sha::parse(&b).unwrap();
                 prop_assert_eq!(sha_a == sha_b, a == b);
+            }
+
+            #[test]
+            fn parse_rejects_invalid_length(s in "[0-9a-f]{0,39}|[0-9a-f]{41,80}") {
+                prop_assert!(Sha::parse(&s).is_err());
+            }
+
+            #[test]
+            fn parse_rejects_non_hex(s in "[0-9a-f]{39}[g-z]") {
+                prop_assert!(Sha::parse(&s).is_err());
+            }
+
+            #[test]
+            fn parse_normalizes_to_lowercase(s in "[0-9A-Fa-f]{40}") {
+                let sha = Sha::parse(&s).unwrap();
+                prop_assert_eq!(sha.as_str(), s.to_ascii_lowercase());
             }
         }
 
         #[test]
-        fn short_handles_short_input() {
-            let sha = Sha::new("abc");
-            assert_eq!(sha.short(), "abc");
+        fn deserialize_rejects_invalid_sha() {
+            let json = r#""not-a-valid-sha""#;
+            let result: Result<Sha, _> = serde_json::from_str(json);
+            assert!(result.is_err());
         }
     }
 
