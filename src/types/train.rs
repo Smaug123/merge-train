@@ -98,28 +98,45 @@ impl DescendantProgress {
 
 /// The cascade phase indicates which operation is currently in progress.
 ///
-/// INVARIANT: `frozen_descendants` is captured once when entering `Preparing`
-/// and carried through all subsequent phases. It is NEVER re-queried from the
-/// descendants index.
+/// # Descendant Set Invariant
+///
+/// `frozen_descendants` is captured when transitioning out of `Idle`:
+/// - `Idle -> Preparing`: descendants exist; captured at `Preparing` entry
+/// - `Idle -> SquashPending`: no descendants; uses empty `frozen_descendants`
+///
+/// Once captured, `frozen_descendants` is carried through all subsequent phases
+/// and NEVER re-queried from the descendants index. This prevents late-arriving
+/// descendants (added during spool replay after a crash) from corrupting the
+/// cascade.
+///
+/// Serializes with external tagging per the design: `{"Preparing": {...}}` for
+/// phases with data, `"Idle"` for unit variants.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "phase", rename_all = "snake_case")]
 pub enum CascadePhase {
     /// Not currently performing any operation; waiting for CI or next event.
     Idle,
 
     /// Merging predecessor head into descendants (before squash).
     /// NOT main - only predecessor head.
-    Preparing(DescendantProgress),
+    Preparing {
+        /// Descendant tracking carried through all subsequent phases.
+        #[serde(flatten)]
+        progress: DescendantProgress,
+    },
 
     /// Preparation complete; about to squash-merge current PR.
     SquashPending {
-        /// Carried forward from Preparing.
+        /// Descendant tracking. When entered via `Preparing`, carries forward
+        /// from that phase. When entered directly from `Idle` (no descendants),
+        /// contains empty `frozen_descendants`.
+        #[serde(flatten)]
         progress: DescendantProgress,
     },
 
     /// Squash complete; performing ours-strategy merges into descendants.
     Reconciling {
         /// Carried forward from SquashPending.
+        #[serde(flatten)]
         progress: DescendantProgress,
 
         /// The SHA of the squash commit on main.
@@ -129,6 +146,7 @@ pub enum CascadePhase {
     /// Ours-merge complete; performing regular merge of origin/main.
     CatchingUp {
         /// Carried forward from Reconciling.
+        #[serde(flatten)]
         progress: DescendantProgress,
 
         /// The SHA of the squash commit on main.
@@ -138,6 +156,7 @@ pub enum CascadePhase {
     /// Catch-up complete; retargeting descendant PRs to default branch.
     Retargeting {
         /// Carried forward from CatchingUp.
+        #[serde(flatten)]
         progress: DescendantProgress,
 
         /// The SHA of the squash commit on main.
@@ -150,7 +169,7 @@ impl CascadePhase {
     pub fn name(&self) -> &'static str {
         match self {
             CascadePhase::Idle => "idle",
-            CascadePhase::Preparing(_) => "preparing",
+            CascadePhase::Preparing { .. } => "preparing",
             CascadePhase::SquashPending { .. } => "squash_pending",
             CascadePhase::Reconciling { .. } => "reconciling",
             CascadePhase::CatchingUp { .. } => "catching_up",
@@ -162,11 +181,11 @@ impl CascadePhase {
     pub fn progress(&self) -> Option<&DescendantProgress> {
         match self {
             CascadePhase::Idle => None,
-            CascadePhase::Preparing(p) => Some(p),
-            CascadePhase::SquashPending { progress } => Some(progress),
-            CascadePhase::Reconciling { progress, .. } => Some(progress),
-            CascadePhase::CatchingUp { progress, .. } => Some(progress),
-            CascadePhase::Retargeting { progress, .. } => Some(progress),
+            CascadePhase::Preparing { progress }
+            | CascadePhase::SquashPending { progress }
+            | CascadePhase::Reconciling { progress, .. }
+            | CascadePhase::CatchingUp { progress, .. }
+            | CascadePhase::Retargeting { progress, .. } => Some(progress),
         }
     }
 
@@ -174,11 +193,11 @@ impl CascadePhase {
     pub fn progress_mut(&mut self) -> Option<&mut DescendantProgress> {
         match self {
             CascadePhase::Idle => None,
-            CascadePhase::Preparing(p) => Some(p),
-            CascadePhase::SquashPending { progress } => Some(progress),
-            CascadePhase::Reconciling { progress, .. } => Some(progress),
-            CascadePhase::CatchingUp { progress, .. } => Some(progress),
-            CascadePhase::Retargeting { progress, .. } => Some(progress),
+            CascadePhase::Preparing { progress }
+            | CascadePhase::SquashPending { progress }
+            | CascadePhase::Reconciling { progress, .. }
+            | CascadePhase::CatchingUp { progress, .. }
+            | CascadePhase::Retargeting { progress, .. } => Some(progress),
         }
     }
 
@@ -192,24 +211,26 @@ impl CascadePhase {
         }
     }
 
-    /// Checks if a transition from this phase to the target phase is valid.
+    /// Checks if a transition from this phase to the target phase is structurally valid.
     ///
-    /// Valid transitions:
-    /// - Idle -> Preparing (has descendants)
-    /// - Idle -> SquashPending (no descendants)
+    /// This only validates the phase sequence, not contextual constraints like
+    /// whether descendants exist. The cascade engine enforces those constraints
+    /// when performing the actual transition.
+    ///
+    /// Valid phase sequences:
+    /// - Idle -> Preparing | SquashPending
     /// - Preparing -> SquashPending
-    /// - SquashPending -> Reconciling (has descendants)
-    /// - SquashPending -> Idle (no descendants, advancing to next PR)
+    /// - SquashPending -> Reconciling | Idle
     /// - Reconciling -> CatchingUp
     /// - CatchingUp -> Retargeting
     /// - Retargeting -> Idle
     pub fn can_transition_to(&self, target: &CascadePhase) -> bool {
         matches!(
             (self, target),
-            (CascadePhase::Idle, CascadePhase::Preparing(_))
+            (CascadePhase::Idle, CascadePhase::Preparing { .. })
                 | (CascadePhase::Idle, CascadePhase::SquashPending { .. })
                 | (
-                    CascadePhase::Preparing(_),
+                    CascadePhase::Preparing { .. },
                     CascadePhase::SquashPending { .. }
                 )
                 | (
@@ -299,8 +320,10 @@ pub struct TrainRecord {
     /// ISO 8601 timestamp when started.
     pub started_at: DateTime<Utc>,
 
-    /// ISO 8601 timestamp if stopped.
-    pub stopped_at: Option<DateTime<Utc>>,
+    /// ISO 8601 timestamp when the train was stopped or aborted.
+    /// Note: Completed trains are removed from `active_trains` entirely rather than
+    /// being marked with a timestamp.
+    pub ended_at: Option<DateTime<Utc>>,
 
     /// Error details if aborted.
     pub error: Option<TrainError>,
@@ -324,7 +347,7 @@ impl TrainRecord {
             predecessor_head_sha: None,
             last_squash_sha: None,
             started_at: Utc::now(),
-            stopped_at: None,
+            ended_at: None,
             error: None,
             status_comment_id: None,
         }
@@ -339,14 +362,14 @@ impl TrainRecord {
     /// Marks the train as stopped.
     pub fn stop(&mut self) {
         self.state = TrainState::Stopped;
-        self.stopped_at = Some(Utc::now());
+        self.ended_at = Some(Utc::now());
         self.increment_seq();
     }
 
     /// Marks the train as aborted with an error.
     pub fn abort(&mut self, error: TrainError) {
         self.state = TrainState::Aborted;
-        self.stopped_at = Some(Utc::now());
+        self.ended_at = Some(Utc::now());
         self.error = Some(error);
         self.increment_seq();
     }
@@ -427,7 +450,7 @@ mod tests {
     fn arb_cascade_phase() -> impl Strategy<Value = CascadePhase> {
         prop_oneof![
             Just(CascadePhase::Idle),
-            arb_descendant_progress().prop_map(CascadePhase::Preparing),
+            arb_descendant_progress().prop_map(|progress| CascadePhase::Preparing { progress }),
             arb_descendant_progress().prop_map(|progress| CascadePhase::SquashPending { progress }),
             (arb_descendant_progress(), arb_sha()).prop_map(|(progress, sha)| {
                 CascadePhase::Reconciling {
@@ -537,7 +560,7 @@ mod tests {
             ) {
                 let progress = DescendantProgress::new(frozen.clone());
 
-                let preparing = CascadePhase::Preparing(progress.clone());
+                let preparing = CascadePhase::Preparing { progress: progress.clone() };
                 let squash_pending = CascadePhase::SquashPending { progress: progress.clone() };
                 let reconciling = CascadePhase::Reconciling {
                     progress: progress.clone(),
@@ -566,7 +589,9 @@ mod tests {
             let sha = Sha::new("abc123def456789012345678901234567890abcd");
 
             let idle = CascadePhase::Idle;
-            let preparing = CascadePhase::Preparing(progress.clone());
+            let preparing = CascadePhase::Preparing {
+                progress: progress.clone(),
+            };
             let squash_pending = CascadePhase::SquashPending {
                 progress: progress.clone(),
             };
@@ -600,7 +625,9 @@ mod tests {
             let sha = Sha::new("abc123def456789012345678901234567890abcd");
 
             let idle = CascadePhase::Idle;
-            let preparing = CascadePhase::Preparing(progress.clone());
+            let preparing = CascadePhase::Preparing {
+                progress: progress.clone(),
+            };
             let reconciling = CascadePhase::Reconciling {
                 progress: progress.clone(),
                 squash_sha: sha.clone(),
@@ -677,7 +704,7 @@ mod tests {
                         error,
                         recovery_seq,
                         started_at,
-                        stopped_at,
+                        ended_at,
                         status_comment_id,
                     )| {
                         TrainRecord {
@@ -691,7 +718,7 @@ mod tests {
                             predecessor_head_sha,
                             last_squash_sha,
                             started_at,
-                            stopped_at,
+                            ended_at,
                             error,
                             status_comment_id,
                         }
@@ -733,7 +760,7 @@ mod tests {
             assert!(record.predecessor_pr.is_none());
             assert!(record.predecessor_head_sha.is_none());
             assert!(record.last_squash_sha.is_none());
-            assert!(record.stopped_at.is_none());
+            assert!(record.ended_at.is_none());
             assert!(record.error.is_none());
             assert!(record.status_comment_id.is_none());
         }
@@ -746,7 +773,7 @@ mod tests {
             record.stop();
 
             assert_eq!(record.state, TrainState::Stopped);
-            assert!(record.stopped_at.is_some());
+            assert!(record.ended_at.is_some());
             assert_eq!(record.recovery_seq, initial_seq + 1);
         }
 
@@ -758,7 +785,7 @@ mod tests {
             record.abort(TrainError::new("merge_conflict", "Cannot merge"));
 
             assert_eq!(record.state, TrainState::Aborted);
-            assert!(record.stopped_at.is_some());
+            assert!(record.ended_at.is_some());
             assert!(record.error.is_some());
             assert_eq!(record.error.as_ref().unwrap().error_type, "merge_conflict");
             assert_eq!(record.recovery_seq, initial_seq + 1);
