@@ -58,6 +58,12 @@ pub fn frozen_descendants(phase: &CascadePhase) -> Vec<PrNumber> {
 /// Uses the descendants index to walk the tree and collect all PRs
 /// that are transitively descended from the given root.
 ///
+/// IMPORTANT: Closed PRs are neither returned NOR traversed. This means that
+/// closing a PR in a train stops the cascade for that PR and all its dependents.
+/// For example, if `#1 <- #2 (closed) <- #3 (open)`, calling
+/// `collect_all_descendants(#1, ...)` will NOT find #3 because #2 blocks traversal.
+/// This is intentional: closing a PR should stop the train for that branch.
+///
 /// Traversal order is not guaranteed.
 pub fn collect_all_descendants(
     root: PrNumber,
@@ -72,7 +78,7 @@ pub fn collect_all_descendants(
     if let Some(direct) = descendants_index.get(&root) {
         for &desc in direct {
             if !visited.contains(&desc) {
-                // Only include open PRs
+                // Only enqueue open PRs - closed PRs block traversal
                 if prs.get(&desc).map(|p| p.state.is_open()).unwrap_or(false) {
                     queue.push(desc);
                     visited.insert(desc);
@@ -81,14 +87,14 @@ pub fn collect_all_descendants(
         }
     }
 
-    // Collect all transitive descendants
+    // Collect all transitive descendants (only open PRs are in queue)
     while let Some(current) = queue.pop() {
         result.push(current);
 
         if let Some(children) = descendants_index.get(&current) {
             for &child in children {
                 if !visited.contains(&child) {
-                    // Only include open PRs
+                    // Only enqueue open PRs - closed PRs block traversal
                     if prs.get(&child).map(|p| p.state.is_open()).unwrap_or(false) {
                         queue.push(child);
                         visited.insert(child);
@@ -428,6 +434,217 @@ mod tests {
                     .collect();
                 let actual: HashSet<_> = remaining.iter().copied().collect();
                 prop_assert_eq!(expected, actual, "remaining should equal frozen - completed - skipped");
+            }
+
+            /// Closing a PR in a linear chain cuts off all descendants behind it.
+            /// Given: main <- #1 <- #2 <- ... <- #N, with one PR closed
+            /// PRs before the closed one should be found, PRs at or after should not.
+            #[test]
+            fn closed_pr_cuts_linear_chain(
+                chain_length in 3usize..8,
+                closed_idx in 1usize..6  // Which PR in the chain to close (0 = root)
+            ) {
+                let closed_idx = closed_idx.min(chain_length - 1);
+
+                // Build a linear chain: #1 <- #2 <- #3 <- ... <- #N
+                let mut prs = HashMap::new();
+
+                // Root PR (no predecessor)
+                prs.insert(PrNumber(1), make_open_pr(1, None));
+
+                // Chain of PRs
+                for i in 2..=chain_length as u64 {
+                    let pr_idx = (i - 1) as usize; // 0-indexed position in chain
+                    if pr_idx == closed_idx {
+                        prs.insert(PrNumber(i), make_closed_pr(i, Some(i - 1)));
+                    } else {
+                        prs.insert(PrNumber(i), make_open_pr(i, Some(i - 1)));
+                    }
+                }
+
+                let index = build_descendants_index(&prs);
+                let descendants = collect_all_descendants(PrNumber(1), &index, &prs);
+
+                // PRs before the closed one should be found
+                for i in 2..=(closed_idx as u64) {
+                    if i <= closed_idx as u64 {
+                        // This PR is before the closed one, should be found (if open)
+                        let is_closed = (i - 1) as usize == closed_idx;
+                        if !is_closed {
+                            prop_assert!(
+                                descendants.contains(&PrNumber(i)),
+                                "PR #{} should be found (before closed PR #{})",
+                                i, closed_idx + 1
+                            );
+                        }
+                    }
+                }
+
+                // The closed PR should NOT be found
+                let closed_pr_num = (closed_idx + 1) as u64;
+                prop_assert!(
+                    !descendants.contains(&PrNumber(closed_pr_num)),
+                    "Closed PR #{} should not be found",
+                    closed_pr_num
+                );
+
+                // PRs after the closed one should NOT be found (blocked by closed PR)
+                for i in (closed_pr_num + 1)..=(chain_length as u64) {
+                    prop_assert!(
+                        !descendants.contains(&PrNumber(i)),
+                        "PR #{} should not be found (blocked by closed PR #{})",
+                        i, closed_pr_num
+                    );
+                }
+            }
+
+            /// Closing a PR with fan-out blocks all its descendants.
+            /// Given: main <- #1 <- #2 (closed) <- {#3, #4, #5, ...}
+            /// None of the fan-out descendants should be found.
+            #[test]
+            fn closed_pr_blocks_fanout_descendants(
+                num_fanout in 2usize..6
+            ) {
+                let mut prs = HashMap::new();
+
+                // Root: #1 (open, no predecessor)
+                prs.insert(PrNumber(1), make_open_pr(1, None));
+
+                // #2 is closed, depends on #1
+                prs.insert(PrNumber(2), make_closed_pr(2, Some(1)));
+
+                // #3, #4, #5, ... all depend on #2 (fan-out from closed PR)
+                for i in 3..=(num_fanout as u64 + 2) {
+                    prs.insert(PrNumber(i), make_open_pr(i, Some(2)));
+                }
+
+                let index = build_descendants_index(&prs);
+                let descendants = collect_all_descendants(PrNumber(1), &index, &prs);
+
+                // No descendants should be found - #2 is closed and blocks all
+                prop_assert!(
+                    descendants.is_empty(),
+                    "No descendants should be found when direct descendant is closed. Found: {:?}",
+                    descendants
+                );
+            }
+
+            /// Closing a PR does not affect unrelated branches in the DAG.
+            /// Given: main <- #1 <- {#2 (closed) <- #3, #4 <- #5}
+            /// #4 and #5 should be found; #2 and #3 should not.
+            #[test]
+            fn closed_pr_does_not_affect_other_branches(
+                closed_branch_depth in 1usize..4,
+                open_branch_depth in 1usize..4
+            ) {
+                let mut prs = HashMap::new();
+
+                // Root: #1 (open, no predecessor)
+                prs.insert(PrNumber(1), make_open_pr(1, None));
+
+                // Closed branch: #2 (closed) <- #3 <- #4 <- ...
+                // Start numbering at 2
+                let closed_branch_start = 2u64;
+                prs.insert(PrNumber(closed_branch_start), make_closed_pr(closed_branch_start, Some(1)));
+                for i in 1..closed_branch_depth as u64 {
+                    let pr_num = closed_branch_start + i;
+                    prs.insert(PrNumber(pr_num), make_open_pr(pr_num, Some(pr_num - 1)));
+                }
+
+                // Open branch: starts after closed branch
+                // Numbering: closed_branch_start + closed_branch_depth, ...
+                let open_branch_start = closed_branch_start + closed_branch_depth as u64;
+                prs.insert(PrNumber(open_branch_start), make_open_pr(open_branch_start, Some(1)));
+                for i in 1..open_branch_depth as u64 {
+                    let pr_num = open_branch_start + i;
+                    prs.insert(PrNumber(pr_num), make_open_pr(pr_num, Some(pr_num - 1)));
+                }
+
+                let index = build_descendants_index(&prs);
+                let descendants = collect_all_descendants(PrNumber(1), &index, &prs);
+                let descendants_set: HashSet<_> = descendants.iter().copied().collect();
+
+                // Closed branch PRs should NOT be found
+                for i in 0..closed_branch_depth as u64 {
+                    let pr_num = closed_branch_start + i;
+                    prop_assert!(
+                        !descendants_set.contains(&PrNumber(pr_num)),
+                        "PR #{} (closed branch) should not be found",
+                        pr_num
+                    );
+                }
+
+                // Open branch PRs SHOULD be found
+                for i in 0..open_branch_depth as u64 {
+                    let pr_num = open_branch_start + i;
+                    prop_assert!(
+                        descendants_set.contains(&PrNumber(pr_num)),
+                        "PR #{} (open branch) should be found",
+                        pr_num
+                    );
+                }
+            }
+
+            /// PRs earlier in the train (before any closed PR) are still found.
+            /// Given: main <- #1 <- #2 <- #3 (closed) <- #4
+            /// #2 should be found even though #3 and #4 are blocked.
+            #[test]
+            fn prs_before_closed_pr_are_found(
+                prs_before_closed in 1usize..5,
+                prs_after_closed in 1usize..4
+            ) {
+                let mut prs = HashMap::new();
+
+                // Root: #1 (open, no predecessor)
+                prs.insert(PrNumber(1), make_open_pr(1, None));
+
+                // Open PRs before the closed one: #2, #3, ...
+                for i in 2..=(prs_before_closed as u64 + 1) {
+                    prs.insert(PrNumber(i), make_open_pr(i, Some(i - 1)));
+                }
+
+                // Closed PR
+                let closed_pr_num = prs_before_closed as u64 + 2;
+                prs.insert(
+                    PrNumber(closed_pr_num),
+                    make_closed_pr(closed_pr_num, Some(closed_pr_num - 1)),
+                );
+
+                // Open PRs after the closed one
+                for i in 1..=prs_after_closed as u64 {
+                    let pr_num = closed_pr_num + i;
+                    prs.insert(PrNumber(pr_num), make_open_pr(pr_num, Some(pr_num - 1)));
+                }
+
+                let index = build_descendants_index(&prs);
+                let descendants = collect_all_descendants(PrNumber(1), &index, &prs);
+                let descendants_set: HashSet<_> = descendants.iter().copied().collect();
+
+                // All open PRs before the closed one should be found
+                for i in 2..=(prs_before_closed as u64 + 1) {
+                    prop_assert!(
+                        descendants_set.contains(&PrNumber(i)),
+                        "PR #{} (before closed) should be found",
+                        i
+                    );
+                }
+
+                // The closed PR and all after should NOT be found
+                for i in closed_pr_num..=(closed_pr_num + prs_after_closed as u64) {
+                    prop_assert!(
+                        !descendants_set.contains(&PrNumber(i)),
+                        "PR #{} (closed or after) should not be found",
+                        i
+                    );
+                }
+
+                // Verify the count is exactly the number of open PRs before closed
+                prop_assert_eq!(
+                    descendants.len(),
+                    prs_before_closed,
+                    "Should find exactly {} PRs (those before closed)",
+                    prs_before_closed
+                );
             }
         }
     }

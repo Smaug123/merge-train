@@ -146,12 +146,11 @@ pub fn next_phase(
             }
         }
 
-        // SquashPending with no descendants (skip to Idle for next PR)
-        (CascadePhase::SquashPending { progress }, PhaseOutcome::AllComplete)
-            if progress.frozen_descendants.is_empty() =>
-        {
-            Ok(CascadePhase::Idle)
-        }
+        // NOTE: SquashPending does NOT accept AllComplete. The only valid exit
+        // is via SquashComplete, which provides the squash_sha. Even with empty
+        // frozen_descendants, the squash must actually happen before transitioning.
+        // The SquashComplete arm handles empty descendants by going to CatchingUp
+        // (which will immediately complete and proceed to Retargeting -> Idle).
 
         // === Reconciling transitions ===
 
@@ -576,6 +575,21 @@ mod tests {
         }
 
         #[test]
+        fn squash_pending_requires_squash_complete_not_all_complete() {
+            // SquashPending must exit via SquashComplete (with squash_sha),
+            // not AllComplete. Even with empty descendants, the squash must happen.
+            let progress = make_progress(&[]);
+            let phase = CascadePhase::SquashPending { progress };
+
+            let result = next_phase(&phase, PhaseOutcome::AllComplete);
+
+            assert!(
+                result.is_err(),
+                "SquashPending + AllComplete should be invalid"
+            );
+        }
+
+        #[test]
         fn skipped_descendants_are_preserved_across_phases() {
             let mut progress = make_progress(&[1, 2]);
             progress.mark_skipped(PrNumber(1));
@@ -681,7 +695,8 @@ mod tests {
         }
 
         proptest! {
-            /// Transitions preserve frozen_descendants across all phases.
+            /// Transitions preserve frozen_descendants through the COMPLETE cascade:
+            /// Preparing → SquashPending → Reconciling → CatchingUp → Retargeting → Idle
             #[test]
             fn frozen_descendants_preserved_through_full_cascade(
                 descendants in prop::collection::vec(arb_pr_number(), 1..10),
@@ -695,25 +710,82 @@ mod tests {
                     _ => Vec::new(),
                 };
 
-                // Complete all descendants in preparing
+                // === Phase 1: Preparing ===
                 let mut phase = initial;
                 for &pr in &descendants {
                     if let CascadePhase::Preparing { .. } = &phase {
                         phase = next_phase(&phase, PhaseOutcome::DescendantCompleted { pr })
-                            .expect("transition should succeed");
+                            .expect("Preparing transition should succeed");
                     }
                 }
+                prop_assert!(
+                    matches!(phase, CascadePhase::SquashPending { .. }),
+                    "After completing all Preparing, should be in SquashPending"
+                );
 
-                // Move through SquashPending -> Reconciling
-                if let CascadePhase::SquashPending { .. } = &phase {
-                    phase = next_phase(&phase, PhaseOutcome::SquashComplete { squash_sha: sha.clone() })
-                        .expect("transition should succeed");
-                }
-
-                // Check frozen_descendants is preserved
+                // Verify frozen_descendants preserved after Preparing
                 if let Some(progress) = phase.progress() {
-                    prop_assert_eq!(&progress.frozen_descendants, &frozen);
+                    prop_assert_eq!(&progress.frozen_descendants, &frozen, "frozen_descendants changed after Preparing");
                 }
+
+                // === Phase 2: SquashPending → Reconciling ===
+                phase = next_phase(&phase, PhaseOutcome::SquashComplete { squash_sha: sha.clone() })
+                    .expect("SquashPending transition should succeed");
+                prop_assert!(
+                    matches!(phase, CascadePhase::Reconciling { .. }),
+                    "After SquashComplete, should be in Reconciling"
+                );
+
+                // Verify frozen_descendants preserved after SquashPending
+                if let Some(progress) = phase.progress() {
+                    prop_assert_eq!(&progress.frozen_descendants, &frozen, "frozen_descendants changed after SquashPending");
+                }
+
+                // === Phase 3: Reconciling → CatchingUp ===
+                for &pr in &descendants {
+                    if let CascadePhase::Reconciling { .. } = &phase {
+                        phase = next_phase(&phase, PhaseOutcome::DescendantCompleted { pr })
+                            .expect("Reconciling transition should succeed");
+                    }
+                }
+                prop_assert!(
+                    matches!(phase, CascadePhase::CatchingUp { .. }),
+                    "After completing all Reconciling, should be in CatchingUp"
+                );
+
+                // Verify frozen_descendants preserved after Reconciling
+                if let Some(progress) = phase.progress() {
+                    prop_assert_eq!(&progress.frozen_descendants, &frozen, "frozen_descendants changed after Reconciling");
+                }
+
+                // === Phase 4: CatchingUp → Retargeting ===
+                for &pr in &descendants {
+                    if let CascadePhase::CatchingUp { .. } = &phase {
+                        phase = next_phase(&phase, PhaseOutcome::DescendantCompleted { pr })
+                            .expect("CatchingUp transition should succeed");
+                    }
+                }
+                prop_assert!(
+                    matches!(phase, CascadePhase::Retargeting { .. }),
+                    "After completing all CatchingUp, should be in Retargeting"
+                );
+
+                // Verify frozen_descendants preserved after CatchingUp
+                if let Some(progress) = phase.progress() {
+                    prop_assert_eq!(&progress.frozen_descendants, &frozen, "frozen_descendants changed after CatchingUp");
+                }
+
+                // === Phase 5: Retargeting → Idle ===
+                for &pr in &descendants {
+                    if let CascadePhase::Retargeting { .. } = &phase {
+                        phase = next_phase(&phase, PhaseOutcome::DescendantCompleted { pr })
+                            .expect("Retargeting transition should succeed");
+                    }
+                }
+                prop_assert!(
+                    matches!(phase, CascadePhase::Idle),
+                    "After completing all Retargeting, should be in Idle"
+                );
             }
 
             /// Skipped descendants are preserved through all phase transitions.
