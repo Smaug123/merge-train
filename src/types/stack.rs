@@ -129,6 +129,13 @@ pub enum AbortReason {
         /// The descendant that wasn't prepared.
         descendant: PrNumber,
     },
+
+    /// Repository has merge hooks or merge queue enabled (incompatible config).
+    ///
+    /// This occurs when GitHub reports `HAS_HOOKS` status, indicating either
+    /// GitHub Enterprise pre-receive hooks or GitHub's merge queue is enabled.
+    /// Both are incompatible with merge-train (see DESIGN.md non-goals).
+    MergeHooksEnabled,
 }
 
 impl AbortReason {
@@ -148,6 +155,7 @@ impl AbortReason {
             AbortReason::StatusCommentTooLarge => "status_comment_too_large",
             AbortReason::TrainTooLarge { .. } => "train_too_large",
             AbortReason::PreparationMissing { .. } => "preparation_missing",
+            AbortReason::MergeHooksEnabled => "merge_hooks_enabled",
         }
     }
 
@@ -192,6 +200,9 @@ impl AbortReason {
             }
             AbortReason::PreparationMissing { descendant } => {
                 format!("Descendant {} was not prepared before squash", descendant)
+            }
+            AbortReason::MergeHooksEnabled => {
+                "Repository has merge hooks or merge queue enabled, which is incompatible with merge-train".to_string()
             }
         }
     }
@@ -326,6 +337,7 @@ mod tests {
                 }
             }),
             arb_pr_number().prop_map(|descendant| AbortReason::PreparationMissing { descendant }),
+            Just(AbortReason::MergeHooksEnabled),
         ]
     }
 
@@ -445,6 +457,7 @@ mod tests {
                 AbortReason::PreparationMissing {
                     descendant: PrNumber(2),
                 },
+                AbortReason::MergeHooksEnabled,
             ];
 
             for reason in &reasons {

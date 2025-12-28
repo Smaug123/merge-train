@@ -2439,9 +2439,10 @@ enum MergeStateStatus {
     Blocked,
     /// Head branch behind base (when "require up-to-date" is enabled)
     Behind,
-    /// Merge conflicts with base branch
+    /// Merge conflicts with base branch — abort cascade
     Dirty,
-    /// GitHub Enterprise: has pre-receive hooks
+    /// GitHub Enterprise pre-receive hooks or merge queue enabled — abort cascade
+    /// (incompatible with merge-train, see non-goals)
     HasHooks,
     /// State not yet computed by GitHub
     Unknown,
@@ -2902,6 +2903,8 @@ enum AbortReason {
     CycleDetected,
     ApprovalWithdrawn,
     ApiError { details: String },
+    /// Repository has merge hooks or merge queue enabled (HAS_HOOKS status)
+    MergeHooksEnabled,
 }
 
 // ─────────────────────────────────────────────────────────────
