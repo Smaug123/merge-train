@@ -694,12 +694,20 @@ mod tests {
             prop::collection::vec(arb_pr_number(), 0..10)
         }
 
+        /// Generate a vector of unique PR numbers (no duplicates).
+        /// Duplicates would cause issues because progress tracking uses HashSets,
+        /// so completing PR #X once completes all instances of #X in frozen_descendants.
+        fn arb_unique_descendants(min: usize, max: usize) -> impl Strategy<Value = Vec<PrNumber>> {
+            prop::collection::hash_set(arb_pr_number(), min..max)
+                .prop_map(|set| set.into_iter().collect())
+        }
+
         proptest! {
             /// Transitions preserve frozen_descendants through the COMPLETE cascade:
             /// Preparing → SquashPending → Reconciling → CatchingUp → Retargeting → Idle
             #[test]
             fn frozen_descendants_preserved_through_full_cascade(
-                descendants in prop::collection::vec(arb_pr_number(), 1..10),
+                descendants in arb_unique_descendants(1, 10),
                 sha in arb_sha()
             ) {
                 // start_preparing with non-empty descendants will create Preparing phase
@@ -791,7 +799,7 @@ mod tests {
             /// Skipped descendants are preserved through all phase transitions.
             #[test]
             fn skipped_preserved_through_transitions(
-                descendants in prop::collection::vec(arb_pr_number(), 2..10),
+                descendants in arb_unique_descendants(2, 10),
                 skip_idx in 0usize..2,
                 sha in arb_sha()
             ) {

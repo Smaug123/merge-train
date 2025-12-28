@@ -1673,7 +1673,7 @@ For the final PR in the stack (#125), there is no descendant, so steps 1, 3-5 ar
 - Would break after the squash (its base becomes invalid)
 
 **Freeze point and logging**: When entering the `Preparing` phase for PR #N:
-1. Query the current descendant set from the `descendants` index
+1. Query the current descendant set from the `descendants` index, traversing only through **open** PRs. Closed PRs are neither included nor traversed — if PR #A has a closed descendant #B which has an open descendant #C, only #A's other open descendants are frozen; #C is not reachable because #B blocks traversal. This is consistent with the "orphaned" semantics above: #C's predecessor chain is broken.
 2. Log the `phase_transition` event with the descendant list frozen in the `frozen_descendants` field
 3. Only process descendants that were captured at this moment
 4. New descendants declared **after the freeze** (whether before or after #N merges) are effectively "late additions" — by the time the cascade could process them, their predecessor is already merged. They're caught by either (a) the `predecessor_declared` event handler checking if the predecessor is already merged, or (b) the polling-based catch-up mechanism that scans for PRs with merged predecessors but unretargeted `base_ref`. See "Late additions recovery" below.
