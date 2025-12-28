@@ -165,6 +165,18 @@ impl CachedPr {
         merge_state_status: MergeStateStatus,
         is_draft: bool,
     ) -> Self {
+        // Catch obviously inconsistent states. These mirror GitHub's API fields
+        // which may have precedence rules we don't fully know, but some combinations
+        // are definitely wrong.
+        debug_assert!(
+            !(is_draft && merge_state_status == MergeStateStatus::Clean),
+            "Draft PR cannot have Clean merge state"
+        );
+        debug_assert!(
+            merge_state_status != MergeStateStatus::Draft || is_draft,
+            "MergeStateStatus::Draft requires is_draft = true"
+        );
+
         CachedPr {
             number,
             head_sha,
@@ -303,6 +315,23 @@ mod tests {
             "[a-zA-Z][a-zA-Z0-9_-]{0,49}".prop_map(|s| s.to_string())
         }
 
+        /// Generate valid (merge_state_status, is_draft) pairs.
+        ///
+        /// Constraints:
+        /// - If merge_state_status = Draft, then is_draft must be true
+        /// - If merge_state_status = Clean, then is_draft must be false
+        /// - Otherwise, is_draft can be either (we don't know GitHub's precedence)
+        fn arb_merge_state_and_draft() -> impl Strategy<Value = (MergeStateStatus, bool)> {
+            arb_merge_state_status().prop_flat_map(|status| {
+                let is_draft_strategy: proptest::strategy::BoxedStrategy<bool> = match status {
+                    MergeStateStatus::Draft => Just(true).boxed(),
+                    MergeStateStatus::Clean => Just(false).boxed(),
+                    _ => any::<bool>().boxed(),
+                };
+                is_draft_strategy.prop_map(move |is_draft| (status, is_draft))
+            })
+        }
+
         fn arb_cached_pr() -> impl Strategy<Value = CachedPr> {
             (
                 any::<u64>(),
@@ -311,8 +340,7 @@ mod tests {
                 arb_branch_name(),
                 prop::option::of(any::<u64>().prop_map(PrNumber)),
                 arb_pr_state(),
-                arb_merge_state_status(),
-                any::<bool>(),
+                arb_merge_state_and_draft(),
             )
                 .prop_map(
                     |(
@@ -322,8 +350,7 @@ mod tests {
                         base_ref,
                         predecessor,
                         state,
-                        merge_state_status,
-                        is_draft,
+                        (merge_state_status, is_draft),
                     )| {
                         CachedPr::new(
                             PrNumber(number),

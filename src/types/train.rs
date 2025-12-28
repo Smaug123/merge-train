@@ -381,7 +381,18 @@ impl TrainRecord {
     }
 
     /// Resumes the train after waiting for CI.
+    ///
+    /// # Panics
+    ///
+    /// Debug-asserts that the train is in `WaitingCi` state. Restarting from
+    /// `Stopped` or `Aborted` requires a new `TrainRecord` via `@merge-train start`,
+    /// not calling `resume()` on the existing record.
     pub fn resume(&mut self) {
+        debug_assert!(
+            self.state == TrainState::WaitingCi,
+            "resume() is only valid from WaitingCi state, not {:?}",
+            self.state
+        );
         self.state = TrainState::Running;
         self.increment_seq();
     }
