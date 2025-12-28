@@ -7,15 +7,16 @@ use crate::types::PrNumber;
 
 use super::types::Command;
 
-/// The trigger string that starts a command.
-/// Case-sensitive because GitHub mentions are case-sensitive.
+/// The trigger string that starts a command (lowercase for comparison).
+/// Matched case-insensitively because GitHub mentions are case-insensitive.
 const TRIGGER: &str = "@merge-train";
 
 /// Parses the first `@merge-train` command found in comment text.
 ///
 /// # Parsing Rules
 ///
-/// - The trigger `@merge-train` is case-sensitive
+/// - The trigger `@merge-train` is case-insensitive (like GitHub mentions)
+/// - The trigger must be at a word boundary (not preceded by alphanumeric chars)
 /// - Command names (`start`, `stop`, `predecessor`) are case-insensitive
 /// - Whitespace between tokens is flexible (spaces, tabs)
 /// - If multiple commands are present, the first valid one wins
@@ -29,18 +30,19 @@ const TRIGGER: &str = "@merge-train";
 /// use merge_train::types::PrNumber;
 ///
 /// assert_eq!(parse_command("@merge-train start"), Some(Command::Start));
-/// assert_eq!(parse_command("@merge-train stop"), Some(Command::Stop));
+/// assert_eq!(parse_command("@Merge-Train stop"), Some(Command::Stop));
 /// assert_eq!(
-///     parse_command("@merge-train predecessor #42"),
+///     parse_command("@MERGE-TRAIN predecessor #42"),
 ///     Some(Command::Predecessor(PrNumber(42)))
 /// );
 /// assert_eq!(parse_command("no command here"), None);
+/// // Not a valid mention (preceded by alphanumeric):
+/// assert_eq!(parse_command("foo@merge-train start"), None);
 /// ```
 pub fn parse_command(text: &str) -> Option<Command> {
-    // Find all occurrences of @merge-train and try to parse each
+    // Find all occurrences of @merge-train (case-insensitive, at word boundary)
     let mut search_start = 0;
-    while let Some(pos) = text[search_start..].find(TRIGGER) {
-        let abs_pos = search_start + pos;
+    while let Some(abs_pos) = find_trigger(text, search_start) {
         let after_trigger = &text[abs_pos + TRIGGER.len()..];
 
         if let Some(cmd) = try_parse_after_trigger(after_trigger) {
@@ -49,6 +51,39 @@ pub fn parse_command(text: &str) -> Option<Command> {
 
         // Move past this trigger and continue searching
         search_start = abs_pos + TRIGGER.len();
+    }
+    None
+}
+
+/// Finds the next occurrence of the trigger (case-insensitive) at a valid word boundary.
+/// Returns the byte position of the `@` character if found.
+fn find_trigger(text: &str, start: usize) -> Option<usize> {
+    let mut search_pos = start;
+
+    while search_pos < text.len() {
+        // Find the next '@' character
+        let at_pos = text[search_pos..].find('@')?;
+        let abs_pos = search_pos + at_pos;
+
+        // Try to get the candidate slice. This may return None if the end position
+        // lands in the middle of a multi-byte UTF-8 character.
+        if let Some(candidate) = text.get(abs_pos..abs_pos + TRIGGER.len()) {
+            // Check if it matches "@merge-train" case-insensitively
+            if candidate.eq_ignore_ascii_case(TRIGGER) {
+                // Check left boundary: must be start of string or preceded by non-alphanumeric
+                let valid_boundary = abs_pos == 0 || {
+                    // Safe: abs_pos > 0, so there's at least one char before
+                    let prev_char = text[..abs_pos].chars().next_back().unwrap();
+                    !prev_char.is_alphanumeric()
+                };
+                if valid_boundary {
+                    return Some(abs_pos);
+                }
+            }
+        }
+
+        // Move past this '@' and continue searching
+        search_pos = abs_pos + 1;
     }
     None
 }
@@ -184,13 +219,24 @@ mod tests {
         }
 
         /// Commands embedded in longer text should still parse.
+        /// The prefix must end with a non-alphanumeric char for the @ to be at a word boundary.
         #[test]
         fn command_embedded_in_text(
-            prefix in "[a-zA-Z ]{0,20}",
+            prefix in "[a-zA-Z]{0,10}[ !:.,;?]{1,2}",
             n in 1u64..1_000_000u64
         ) {
-            let text = format!("{} @merge-train predecessor #{}", prefix, n);
+            let text = format!("{}@merge-train predecessor #{}", prefix, n);
             prop_assert_eq!(parse_command(&text), Some(Command::Predecessor(PrNumber(n))));
+        }
+
+        /// Trigger preceded by alphanumeric should not match.
+        #[test]
+        fn trigger_after_alphanumeric_is_ignored(
+            prefix in "[a-zA-Z0-9]{1,10}",
+            n in 1u64..1_000_000u64
+        ) {
+            let text = format!("{}@merge-train predecessor #{}", prefix, n);
+            prop_assert_eq!(parse_command(&text), None);
         }
     }
 
@@ -330,11 +376,6 @@ mod tests {
         // Similar but not exact trigger
         assert_eq!(parse_command("@merge-trains start"), None);
 
-        // Case matters for the trigger (GitHub mentions are case-sensitive)
-        assert_eq!(parse_command("@Merge-Train start"), None);
-        assert_eq!(parse_command("@MERGE-TRAIN start"), None);
-        assert_eq!(parse_command("@Merge-train start"), None);
-
         // Negative number (the - is not part of number parsing)
         assert_eq!(parse_command("@merge-train predecessor #-1"), None);
 
@@ -345,6 +386,61 @@ mod tests {
         assert_eq!(
             parse_command("@merge-train predecessor #007"),
             Some(Command::Predecessor(PrNumber(7)))
+        );
+    }
+
+    // ==================== Trigger case insensitivity ====================
+
+    #[test]
+    fn trigger_case_insensitive() {
+        // GitHub mentions are case-insensitive
+        assert_eq!(parse_command("@Merge-Train start"), Some(Command::Start));
+        assert_eq!(parse_command("@MERGE-TRAIN start"), Some(Command::Start));
+        assert_eq!(parse_command("@Merge-train start"), Some(Command::Start));
+        assert_eq!(parse_command("@mErGe-TrAiN start"), Some(Command::Start));
+
+        // Also works with other commands
+        assert_eq!(parse_command("@MERGE-TRAIN stop"), Some(Command::Stop));
+        assert_eq!(
+            parse_command("@Merge-Train predecessor #42"),
+            Some(Command::Predecessor(PrNumber(42)))
+        );
+        assert_eq!(
+            parse_command("@MERGE-TRAIN stop --force"),
+            Some(Command::StopForce)
+        );
+    }
+
+    // ==================== Left boundary check ====================
+
+    #[test]
+    fn trigger_requires_word_boundary() {
+        // Alphanumeric before @ is NOT a valid boundary (looks like email)
+        assert_eq!(parse_command("foo@merge-train start"), None);
+        assert_eq!(parse_command("user123@merge-train start"), None);
+        assert_eq!(parse_command("A@merge-train start"), None);
+        assert_eq!(parse_command("9@merge-train start"), None);
+
+        // Non-alphanumeric before @ IS a valid boundary
+        assert_eq!(parse_command("(@merge-train start"), Some(Command::Start));
+        assert_eq!(parse_command("[@merge-train start"), Some(Command::Start));
+        assert_eq!(parse_command(":@merge-train start"), Some(Command::Start));
+        assert_eq!(parse_command(".@merge-train start"), Some(Command::Start));
+        assert_eq!(parse_command("!@merge-train start"), Some(Command::Start));
+        assert_eq!(parse_command("-@merge-train start"), Some(Command::Start));
+
+        // Whitespace before @ is valid
+        assert_eq!(parse_command(" @merge-train start"), Some(Command::Start));
+        assert_eq!(parse_command("\t@merge-train start"), Some(Command::Start));
+        assert_eq!(parse_command("\n@merge-train start"), Some(Command::Start));
+
+        // Start of string is valid
+        assert_eq!(parse_command("@merge-train start"), Some(Command::Start));
+
+        // Invalid trigger followed by valid one should find the valid one
+        assert_eq!(
+            parse_command("foo@merge-train bar @merge-train start"),
+            Some(Command::Start)
         );
     }
 
@@ -439,5 +535,48 @@ This builds on top of the auth refactor in #123."#
         assert_eq!(split_first_word(""), ("", ""));
         assert_eq!(split_first_word("a b c"), ("a", " b c"));
         assert_eq!(split_first_word("hello\tworld"), ("hello", "\tworld"));
+    }
+
+    #[test]
+    fn find_trigger_works() {
+        // Basic cases
+        assert_eq!(find_trigger("@merge-train start", 0), Some(0));
+        assert_eq!(find_trigger("hello @merge-train start", 0), Some(6));
+        assert_eq!(find_trigger("no trigger here", 0), None);
+
+        // Case insensitive
+        assert_eq!(find_trigger("@MERGE-TRAIN start", 0), Some(0));
+        assert_eq!(find_trigger("@Merge-Train start", 0), Some(0));
+
+        // Boundary checks
+        assert_eq!(find_trigger("foo@merge-train start", 0), None);
+        assert_eq!(find_trigger("(@merge-train start", 0), Some(1));
+        assert_eq!(find_trigger(" @merge-train start", 0), Some(1));
+
+        // Start offset
+        assert_eq!(
+            find_trigger("@merge-train @merge-train", TRIGGER.len()),
+            Some(13)
+        );
+
+        // Invalid followed by valid
+        assert_eq!(find_trigger("foo@merge-train @merge-train", 0), Some(16));
+    }
+
+    proptest! {
+        /// Trigger case variations should all be found.
+        #[test]
+        fn trigger_case_variations_found(
+            case_pattern in proptest::collection::vec(proptest::bool::ANY, TRIGGER.len())
+        ) {
+            // Build a case-varied version of the trigger
+            let varied: String = TRIGGER
+                .chars()
+                .zip(case_pattern.iter())
+                .map(|(c, &upper)| if upper { c.to_ascii_uppercase() } else { c })
+                .collect();
+            let text = format!("{} start", varied);
+            prop_assert_eq!(parse_command(&text), Some(Command::Start));
+        }
     }
 }
