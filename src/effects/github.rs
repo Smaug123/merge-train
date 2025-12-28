@@ -115,6 +115,10 @@ pub enum GitHubEffect {
 ///
 /// This is a subset of the information in `CachedPr`, containing only what
 /// the API returns directly.
+///
+/// Note: The merge commit SHA is stored in `PrState::Merged { merge_commit_sha }`
+/// rather than as a separate field, ensuring consistency (a merged PR always
+/// has a SHA, and a non-merged PR never does).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrData {
     /// The PR number.
@@ -125,12 +129,10 @@ pub struct PrData {
     pub head_ref: String,
     /// The base branch name.
     pub base_ref: String,
-    /// The PR state (open, merged, closed).
+    /// The PR state (open, merged, closed). If merged, contains the merge commit SHA.
     pub state: PrState,
     /// Whether the PR is a draft.
     pub is_draft: bool,
-    /// The merge commit SHA, if merged.
-    pub merge_commit_sha: Option<Sha>,
 }
 
 /// Comment data returned from the GitHub API.
@@ -303,19 +305,15 @@ mod tests {
             arb_branch_name(),
             arb_pr_state(),
             any::<bool>(),
-            prop::option::of(arb_sha()),
         )
             .prop_map(
-                |(number, head_sha, head_ref, base_ref, state, is_draft, merge_commit_sha)| {
-                    PrData {
-                        number,
-                        head_sha,
-                        head_ref,
-                        base_ref,
-                        state,
-                        is_draft,
-                        merge_commit_sha,
-                    }
+                |(number, head_sha, head_ref, base_ref, state, is_draft)| PrData {
+                    number,
+                    head_sha,
+                    head_ref,
+                    base_ref,
+                    state,
+                    is_draft,
                 },
             )
     }

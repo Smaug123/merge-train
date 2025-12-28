@@ -9,25 +9,34 @@ use serde::{Deserialize, Serialize};
 use crate::types::Sha;
 
 /// Git merge strategy.
+///
+/// Note: These are merge *strategies* (`-s <strategy>`), not strategy *options* (`-X <option>`).
+/// Git's `-s ours` strategy is fundamentally different from `-X ours` option:
+/// - `-s ours`: Completely ignores the other branch's tree; result is always our tree
+/// - `-X ours`: Uses recursive/ort strategy but prefers our changes on conflict
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MergeStrategy {
     /// Default merge strategy (recursive/ort).
     Default,
-    /// Ours strategy: keep our tree, ignore theirs entirely.
-    /// Used during reconciliation to mark squash commit as merged without changing content.
+    /// Ours strategy (`git merge -s ours`): keep our tree entirely, ignore theirs.
+    ///
+    /// This creates a merge commit with the other branch as a parent, but the
+    /// resulting tree is identical to our HEAD. Used during reconciliation to
+    /// mark the squash commit as an ancestor without changing the working tree
+    /// (which already has the correct content from merging `$SQUASH_SHA^`).
     Ours,
-    /// Theirs strategy: prefer their changes on conflict.
-    Theirs,
 }
 
 impl MergeStrategy {
-    /// Returns the git command-line argument for this strategy.
+    /// Returns the git command-line argument for this strategy, if any.
+    ///
+    /// Returns `None` for `Default` (no `-s` flag needed).
+    /// Returns `Some("ours")` for `Ours` (use with `-s ours`).
     pub fn as_git_arg(&self) -> Option<&'static str> {
         match self {
             MergeStrategy::Default => None,
             MergeStrategy::Ours => Some("ours"),
-            MergeStrategy::Theirs => Some("theirs"),
         }
     }
 }
@@ -173,11 +182,7 @@ mod tests {
     }
 
     fn arb_merge_strategy() -> impl Strategy<Value = MergeStrategy> {
-        prop_oneof![
-            Just(MergeStrategy::Default),
-            Just(MergeStrategy::Ours),
-            Just(MergeStrategy::Theirs),
-        ]
+        prop_oneof![Just(MergeStrategy::Default), Just(MergeStrategy::Ours),]
     }
 
     fn arb_message() -> impl Strategy<Value = String> {
@@ -252,7 +257,6 @@ mod tests {
         fn git_arg_values() {
             assert_eq!(MergeStrategy::Default.as_git_arg(), None);
             assert_eq!(MergeStrategy::Ours.as_git_arg(), Some("ours"));
-            assert_eq!(MergeStrategy::Theirs.as_git_arg(), Some("theirs"));
         }
     }
 
