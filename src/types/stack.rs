@@ -8,6 +8,11 @@ use serde::{Deserialize, Serialize};
 use super::ids::PrNumber;
 
 /// Reason why a cascade step is blocked and waiting.
+///
+/// Note: `MergeStateStatus::Dirty` (merge conflicts) is NOT a block reason—it causes
+/// an immediate abort with `AbortReason::MergeConflict`. Block reasons are conditions
+/// that may resolve on their own or with minor user action, whereas merge conflicts
+/// require explicit intervention and cannot auto-resolve.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BlockReason {
@@ -16,9 +21,6 @@ pub enum BlockReason {
 
     /// GitHub reports BEHIND (head branch behind base, strict mode).
     Behind,
-
-    /// GitHub reports DIRTY (merge conflicts exist).
-    MergeConflict,
 
     /// User issued `@merge-train stop`.
     Stopped,
@@ -32,6 +34,10 @@ pub enum BlockReason {
 
 impl BlockReason {
     /// Returns true if this block reason can auto-resolve.
+    ///
+    /// Most block reasons can auto-resolve when external conditions change
+    /// (CI passes, approvals granted, branch updated, etc.). The exception
+    /// is `Stopped`, which requires explicit user action to restart.
     pub fn can_auto_resolve(&self) -> bool {
         matches!(
             self,
@@ -40,8 +46,11 @@ impl BlockReason {
     }
 
     /// Returns true if this block reason requires human intervention.
+    ///
+    /// Currently only `Stopped` requires intervention—the user must issue
+    /// `@merge-train start` to resume.
     pub fn requires_intervention(&self) -> bool {
-        matches!(self, BlockReason::MergeConflict | BlockReason::Stopped)
+        matches!(self, BlockReason::Stopped)
     }
 
     /// Returns a human-readable description of the block reason.
@@ -49,7 +58,6 @@ impl BlockReason {
         match self {
             BlockReason::Blocked => "Required checks or approvals not satisfied",
             BlockReason::Behind => "Head branch is behind base branch",
-            BlockReason::MergeConflict => "Merge conflicts exist",
             BlockReason::Stopped => "Train was stopped by user",
             BlockReason::Draft => "PR is a draft",
             BlockReason::Unknown => "GitHub is still computing merge status",
@@ -121,6 +129,13 @@ pub enum AbortReason {
         /// The descendant that wasn't prepared.
         descendant: PrNumber,
     },
+
+    /// Repository has merge hooks or merge queue enabled (incompatible config).
+    ///
+    /// This occurs when GitHub reports `HAS_HOOKS` status, indicating either
+    /// GitHub Enterprise pre-receive hooks or GitHub's merge queue is enabled.
+    /// Both are incompatible with merge-train (see DESIGN.md non-goals).
+    MergeHooksEnabled,
 }
 
 impl AbortReason {
@@ -140,6 +155,7 @@ impl AbortReason {
             AbortReason::StatusCommentTooLarge => "status_comment_too_large",
             AbortReason::TrainTooLarge { .. } => "train_too_large",
             AbortReason::PreparationMissing { .. } => "preparation_missing",
+            AbortReason::MergeHooksEnabled => "merge_hooks_enabled",
         }
     }
 
@@ -184,6 +200,9 @@ impl AbortReason {
             }
             AbortReason::PreparationMissing { descendant } => {
                 format!("Descendant {} was not prepared before squash", descendant)
+            }
+            AbortReason::MergeHooksEnabled => {
+                "Repository has merge hooks or merge queue enabled, which is incompatible with merge-train".to_string()
             }
         }
     }
@@ -287,7 +306,6 @@ mod tests {
         prop_oneof![
             Just(BlockReason::Blocked),
             Just(BlockReason::Behind),
-            Just(BlockReason::MergeConflict),
             Just(BlockReason::Stopped),
             Just(BlockReason::Draft),
             Just(BlockReason::Unknown),
@@ -319,6 +337,7 @@ mod tests {
                 }
             }),
             arb_pr_number().prop_map(|descendant| AbortReason::PreparationMissing { descendant }),
+            Just(AbortReason::MergeHooksEnabled),
         ]
     }
 
@@ -362,7 +381,6 @@ mod tests {
             assert!(BlockReason::Behind.can_auto_resolve());
             assert!(BlockReason::Draft.can_auto_resolve());
             assert!(BlockReason::Unknown.can_auto_resolve());
-            assert!(!BlockReason::MergeConflict.can_auto_resolve());
             assert!(!BlockReason::Stopped.can_auto_resolve());
         }
 
@@ -372,7 +390,6 @@ mod tests {
             assert!(!BlockReason::Behind.requires_intervention());
             assert!(!BlockReason::Draft.requires_intervention());
             assert!(!BlockReason::Unknown.requires_intervention());
-            assert!(BlockReason::MergeConflict.requires_intervention());
             assert!(BlockReason::Stopped.requires_intervention());
         }
 
@@ -381,7 +398,6 @@ mod tests {
             let all_reasons = [
                 BlockReason::Blocked,
                 BlockReason::Behind,
-                BlockReason::MergeConflict,
                 BlockReason::Stopped,
                 BlockReason::Draft,
                 BlockReason::Unknown,
@@ -441,6 +457,7 @@ mod tests {
                 AbortReason::PreparationMissing {
                     descendant: PrNumber(2),
                 },
+                AbortReason::MergeHooksEnabled,
             ];
 
             for reason in &reasons {

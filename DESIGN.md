@@ -2439,9 +2439,10 @@ enum MergeStateStatus {
     Blocked,
     /// Head branch behind base (when "require up-to-date" is enabled)
     Behind,
-    /// Merge conflicts with base branch
+    /// Merge conflicts with base branch — abort cascade
     Dirty,
-    /// GitHub Enterprise: has pre-receive hooks
+    /// GitHub Enterprise pre-receive hooks or merge queue enabled — abort cascade
+    /// (incompatible with merge-train, see non-goals)
     HasHooks,
     /// State not yet computed by GitHub
     Unknown,
@@ -2867,11 +2868,16 @@ enum BlockReason {
     Blocked,
     /// GitHub reports BEHIND (head branch behind base, strict mode)
     Behind,
-    /// GitHub reports DIRTY (merge conflicts)
-    MergeConflict,
     /// User issued @merge-train stop
     Stopped,
+    /// PR is still a draft
+    Draft,
+    /// GitHub reports UNKNOWN (state not yet computed)
+    Unknown,
 }
+// Note: DIRTY (merge conflicts) is NOT a BlockReason—it causes an immediate
+// Aborted { reason: AbortReason::MergeConflict { .. } } since conflicts require
+// explicit user intervention and cannot auto-resolve.
 
 /// Outcome of attempting a cascade step
 enum CascadeStepOutcome {
@@ -2883,7 +2889,9 @@ enum CascadeStepOutcome {
     Complete,
     /// Fan-out: multiple descendants, each becomes an independent root
     FanOut { descendants: Vec<PrNumber> },
-    /// Something went wrong
+    /// Cascade is blocked, waiting for condition to change
+    Blocked { pr_number: PrNumber, reason: BlockReason },
+    /// Something went wrong, cascade aborted
     Aborted { pr_number: PrNumber, reason: AbortReason },
 }
 
@@ -2895,6 +2903,8 @@ enum AbortReason {
     CycleDetected,
     ApprovalWithdrawn,
     ApiError { details: String },
+    /// Repository has merge hooks or merge queue enabled (HAS_HOOKS status)
+    MergeHooksEnabled,
 }
 
 // ─────────────────────────────────────────────────────────────

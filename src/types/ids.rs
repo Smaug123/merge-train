@@ -9,7 +9,7 @@ use thiserror::Error;
 
 /// Error returned when parsing an invalid SHA.
 #[derive(Debug, Clone, Error)]
-#[error("invalid SHA: expected 40 hex characters, got {len} chars: {preview}")]
+#[error("invalid SHA: expected 40 hex characters, got {len} bytes: {preview}")]
 pub struct InvalidSha {
     len: usize,
     preview: String,

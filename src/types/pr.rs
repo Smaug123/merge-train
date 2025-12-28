@@ -66,6 +66,10 @@ pub enum MergeStateStatus {
     Behind,
 
     /// Merge conflicts exist - abort cascade.
+    ///
+    /// This is a permanent failure that maps to `AbortReason::MergeConflict`,
+    /// not a `BlockReason`. The cascade cannot proceed until the user resolves
+    /// conflicts locally and re-issues `@merge-train start`.
     Dirty,
 
     /// State not yet computed by GitHub - wait and re-check.
@@ -74,7 +78,11 @@ pub enum MergeStateStatus {
     /// PR is a draft - wait for it to be marked ready for review.
     Draft,
 
-    /// Repository has merge hooks or merge queue enabled - wait.
+    /// Repository has merge hooks or merge queue enabled - abort cascade.
+    ///
+    /// This status appears on GitHub Enterprise with pre-receive hooks, or when
+    /// GitHub's merge queue is enabled. Both are incompatible with merge-train
+    /// (see DESIGN.md non-goals). Maps to `AbortReason::MergeHooksEnabled`.
     HasHooks,
 }
 
@@ -92,13 +100,16 @@ impl MergeStateStatus {
                 | MergeStateStatus::Behind
                 | MergeStateStatus::Unknown
                 | MergeStateStatus::Draft
-                | MergeStateStatus::HasHooks
         )
     }
 
     /// Returns true if the PR has a permanent issue requiring human intervention.
+    ///
+    /// These conditions cannot auto-resolve and cause an immediate abort:
+    /// - `Dirty`: Merge conflicts exist
+    /// - `HasHooks`: Repository has merge hooks or merge queue (incompatible config)
     pub fn is_permanent_failure(&self) -> bool {
-        matches!(self, MergeStateStatus::Dirty)
+        matches!(self, MergeStateStatus::Dirty | MergeStateStatus::HasHooks)
     }
 }
 
@@ -269,7 +280,7 @@ mod tests {
             assert!(!MergeStateStatus::Dirty.should_wait());
             assert!(MergeStateStatus::Unknown.should_wait());
             assert!(MergeStateStatus::Draft.should_wait());
-            assert!(MergeStateStatus::HasHooks.should_wait());
+            assert!(!MergeStateStatus::HasHooks.should_wait());
         }
 
         #[test]
@@ -281,7 +292,7 @@ mod tests {
             assert!(MergeStateStatus::Dirty.is_permanent_failure());
             assert!(!MergeStateStatus::Unknown.is_permanent_failure());
             assert!(!MergeStateStatus::Draft.is_permanent_failure());
-            assert!(!MergeStateStatus::HasHooks.is_permanent_failure());
+            assert!(MergeStateStatus::HasHooks.is_permanent_failure());
         }
     }
 
