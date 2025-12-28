@@ -19,9 +19,6 @@ pub enum PhaseOutcome {
 
     /// The squash-merge was performed.
     SquashComplete { squash_sha: Sha },
-
-    /// An error occurred that requires aborting.
-    Error { message: String },
 }
 
 /// Error returned when a phase transition is invalid.
@@ -67,7 +64,8 @@ impl std::error::Error for TransitionError {}
 /// This is the core state machine transition logic. It ensures:
 /// - Phases proceed in order: Idle -> Preparing -> SquashPending -> Reconciling -> CatchingUp -> Retargeting -> Idle
 /// - frozen_descendants is preserved through all phases after Preparing
-/// - completed/skipped sets are carried forward and only grow
+/// - skipped set is preserved and only grows across phases
+/// - completed set is reset at phase boundaries (tracks per-phase progress)
 ///
 /// Returns the new phase, or an error if the transition is invalid.
 pub fn next_phase(
@@ -382,8 +380,9 @@ pub fn start_preparing(descendants: Vec<PrNumber>) -> CascadePhase {
 ///
 /// Checks:
 /// - frozen_descendants is unchanged from the previous phase
-/// - completed set only grows (never shrinks)
-/// - skipped set only grows (never shrinks)
+///
+/// Note: completed is reset at phase boundaries (intentionally), so growth
+/// is not checked. Skipped set preservation is handled by next_phase logic.
 pub fn verify_transition_invariants(
     from: &CascadePhase,
     to: &CascadePhase,

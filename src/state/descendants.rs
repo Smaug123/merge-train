@@ -58,7 +58,7 @@ pub fn frozen_descendants(phase: &CascadePhase) -> Vec<PrNumber> {
 /// Uses the descendants index to walk the tree and collect all PRs
 /// that are transitively descended from the given root.
 ///
-/// Returns PRs in breadth-first order.
+/// Traversal order is not guaranteed.
 pub fn collect_all_descendants(
     root: PrNumber,
     descendants_index: &HashMap<PrNumber, HashSet<PrNumber>>,
@@ -81,7 +81,7 @@ pub fn collect_all_descendants(
         }
     }
 
-    // BFS to collect all transitive descendants
+    // Collect all transitive descendants
     while let Some(current) = queue.pop() {
         result.push(current);
 
@@ -369,9 +369,13 @@ mod tests {
                 // Verify: for each PR with a predecessor, that predecessor has it in descendants
                 for pr in prs.values() {
                     if let Some(pred) = pr.predecessor {
-                        if let Some(descs) = index.get(&pred) {
-                            prop_assert!(descs.contains(&pr.number));
-                        }
+                        let descs = index.get(&pred);
+                        prop_assert!(
+                            descs.is_some(),
+                            "PR {} has predecessor {} but index has no entry for {}",
+                            pr.number, pred, pred
+                        );
+                        prop_assert!(descs.unwrap().contains(&pr.number));
                     }
                 }
             }
@@ -409,17 +413,21 @@ mod tests {
                 let remaining = remaining_descendants(&phase);
 
                 // Verify: remaining is exactly frozen - completed - skipped
+
+                // All returned elements are valid (in frozen, not in completed/skipped)
                 for pr in &remaining {
                     prop_assert!(frozen.contains(pr));
                     prop_assert!(!progress.completed.contains(pr));
                     prop_assert!(!progress.skipped.contains(pr));
                 }
 
-                // Verify: no late additions (PRs not in frozen) appear
-                // Since we only use frozen list, this is guaranteed
-                for pr in &remaining {
-                    prop_assert!(frozen.contains(pr));
-                }
+                // All expected elements are returned (completeness)
+                let expected: HashSet<_> = frozen.iter()
+                    .filter(|pr| !progress.completed.contains(pr) && !progress.skipped.contains(pr))
+                    .copied()
+                    .collect();
+                let actual: HashSet<_> = remaining.iter().copied().collect();
+                prop_assert_eq!(expected, actual, "remaining should equal frozen - completed - skipped");
             }
         }
     }
