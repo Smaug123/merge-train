@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a9d27af9ed162dc3482e24ede111bc81bc430bfe90e96b5d44e6c62303ef2875 # shrinks to descendants = [PrNumber(51), PrNumber(51)], skip_idx = 1, sha = Sha("0a000a000aa00a0aa00aa0aaa00aaa0000a00a00")
