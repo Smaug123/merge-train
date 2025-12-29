@@ -134,6 +134,40 @@ pub fn validate_predecessor_declaration(
         });
     }
 
+    validate_predecessor_common(pr, predecessor_number, prs, default_branch)
+}
+
+/// Validates an update to an existing predecessor declaration.
+///
+/// This is called when a `@merge-train predecessor #N` comment is edited to change
+/// the predecessor (e.g., from `#123` to `#456`). Per DESIGN.md "Comment edit handling",
+/// this re-runs full validation (same as new declarations) except that having an
+/// existing predecessor is expected and allowed.
+///
+/// Returns `Ok(())` if the new predecessor is valid, or an error describing the problem.
+/// If validation passes, the caller should update the predecessor relationship.
+/// If validation fails, the predecessor relationship should remain unchanged.
+pub fn validate_predecessor_update(
+    pr: &CachedPr,
+    new_predecessor_number: PrNumber,
+    prs: &HashMap<PrNumber, CachedPr>,
+    default_branch: &str,
+) -> Result<(), PredecessorValidationError> {
+    // For updates, we explicitly allow the PR to already have a predecessor.
+    // The caller is expected to update the relationship if validation passes.
+    validate_predecessor_common(pr, new_predecessor_number, prs, default_branch)
+}
+
+/// Common validation logic for predecessor declarations and updates.
+///
+/// This performs all validations except the "already has predecessor" check,
+/// which differs between new declarations and updates.
+fn validate_predecessor_common(
+    pr: &CachedPr,
+    predecessor_number: PrNumber,
+    prs: &HashMap<PrNumber, CachedPr>,
+    default_branch: &str,
+) -> Result<(), PredecessorValidationError> {
     // Look up the predecessor
     let predecessor =
         prs.get(&predecessor_number)
@@ -567,6 +601,93 @@ mod tests {
                 result,
                 Err(PredecessorValidationError::CycleDetected { .. })
             ));
+        }
+    }
+
+    mod validate_predecessor_update_tests {
+        use super::*;
+
+        #[test]
+        fn update_with_existing_predecessor_is_allowed() {
+            // PR #2 already has predecessor #3, but we're updating to #1
+            let predecessor_old = make_open_pr(3, "feature-3", "main", None);
+            let predecessor_new = make_open_pr(1, "feature-1", "main", None);
+            let pr = make_open_pr(2, "feature-2", "feature-1", Some(3));
+
+            let prs = HashMap::from([
+                (PrNumber(1), predecessor_new),
+                (PrNumber(2), pr.clone()),
+                (PrNumber(3), predecessor_old),
+            ]);
+
+            // validate_predecessor_declaration would reject this
+            let decl_result = validate_predecessor_declaration(&pr, PrNumber(1), &prs, "main");
+            assert!(matches!(
+                decl_result,
+                Err(PredecessorValidationError::AlreadyHasPredecessor { .. })
+            ));
+
+            // But validate_predecessor_update allows it
+            let update_result = validate_predecessor_update(&pr, PrNumber(1), &prs, "main");
+            assert!(update_result.is_ok());
+        }
+
+        #[test]
+        fn update_still_validates_predecessor_exists() {
+            let pr = make_open_pr(2, "feature-2", "feature-1", Some(3));
+            let prs = HashMap::from([(PrNumber(2), pr.clone())]);
+
+            let result = validate_predecessor_update(&pr, PrNumber(1), &prs, "main");
+
+            assert!(matches!(
+                result,
+                Err(PredecessorValidationError::PredecessorNotFound {
+                    predecessor: PrNumber(1)
+                })
+            ));
+        }
+
+        #[test]
+        fn update_still_validates_base_branch() {
+            let predecessor = make_open_pr(1, "feature-1", "main", None);
+            let pr = make_open_pr(2, "feature-2", "wrong-branch", Some(3));
+
+            let prs = HashMap::from([(PrNumber(1), predecessor), (PrNumber(2), pr.clone())]);
+
+            let result = validate_predecessor_update(&pr, PrNumber(1), &prs, "main");
+
+            assert!(matches!(
+                result,
+                Err(PredecessorValidationError::BaseBranchMismatch { .. })
+            ));
+        }
+
+        #[test]
+        fn update_still_detects_cycles() {
+            // #1 has predecessor #2, we try to update #2 to have predecessor #1
+            let pr1 = make_open_pr(1, "feature-1", "feature-2", Some(2));
+            let pr2 = make_open_pr(2, "feature-2", "feature-1", Some(99)); // existing pred
+
+            let prs = HashMap::from([(PrNumber(1), pr1), (PrNumber(2), pr2.clone())]);
+
+            let result = validate_predecessor_update(&pr2, PrNumber(1), &prs, "main");
+
+            assert!(matches!(
+                result,
+                Err(PredecessorValidationError::CycleDetected { .. })
+            ));
+        }
+
+        #[test]
+        fn update_to_merged_predecessor_is_ok() {
+            let predecessor =
+                make_merged_pr(1, "feature-1", "abc123def456789012345678901234567890abcd");
+            let pr = make_open_pr(2, "feature-2", "main", Some(3)); // existing pred
+
+            let prs = HashMap::from([(PrNumber(1), predecessor), (PrNumber(2), pr.clone())]);
+
+            let result = validate_predecessor_update(&pr, PrNumber(1), &prs, "main");
+            assert!(result.is_ok());
         }
     }
 

@@ -32,6 +32,13 @@ pub enum TransitionError {
 
     /// Frozen descendants cannot be modified after entering Preparing.
     FrozenDescendantsModified,
+
+    /// AllComplete was signaled but progress.is_complete() is false.
+    /// This indicates a bug in the caller - remaining descendants were not processed.
+    IncompleteProgress {
+        phase: &'static str,
+        remaining_count: usize,
+    },
 }
 
 impl std::fmt::Display for TransitionError {
@@ -51,6 +58,16 @@ impl std::fmt::Display for TransitionError {
                 write!(
                     f,
                     "Frozen descendants cannot be modified after entering Preparing phase"
+                )
+            }
+            TransitionError::IncompleteProgress {
+                phase,
+                remaining_count,
+            } => {
+                write!(
+                    f,
+                    "AllComplete signaled in {} phase but {} descendants remain unprocessed",
+                    phase, remaining_count
                 )
             }
         }
@@ -117,8 +134,15 @@ pub fn next_phase(
             }
         }
 
-        // All descendants prepared (explicit signal, alternative to checking is_complete)
+        // All descendants prepared (explicit signal)
+        // Guard: verify that progress.is_complete() is actually true
         (CascadePhase::Preparing { progress }, PhaseOutcome::AllComplete) => {
+            if !progress.is_complete() {
+                return Err(TransitionError::IncompleteProgress {
+                    phase: "Preparing",
+                    remaining_count: progress.remaining().count(),
+                });
+            }
             Ok(CascadePhase::SquashPending {
                 progress: progress.clone(),
             })
@@ -211,7 +235,8 @@ pub fn next_phase(
             }
         }
 
-        // All descendants reconciled
+        // All descendants reconciled (explicit signal)
+        // Guard: verify that progress.is_complete() is actually true
         (
             CascadePhase::Reconciling {
                 progress,
@@ -219,6 +244,12 @@ pub fn next_phase(
             },
             PhaseOutcome::AllComplete,
         ) => {
+            if !progress.is_complete() {
+                return Err(TransitionError::IncompleteProgress {
+                    phase: "Reconciling",
+                    remaining_count: progress.remaining().count(),
+                });
+            }
             let mut catchup_progress = DescendantProgress::new(progress.frozen_descendants.clone());
             catchup_progress.skipped = progress.skipped.clone();
 
@@ -286,7 +317,8 @@ pub fn next_phase(
             }
         }
 
-        // All descendants caught up
+        // All descendants caught up (explicit signal)
+        // Guard: verify that progress.is_complete() is actually true
         (
             CascadePhase::CatchingUp {
                 progress,
@@ -294,6 +326,12 @@ pub fn next_phase(
             },
             PhaseOutcome::AllComplete,
         ) => {
+            if !progress.is_complete() {
+                return Err(TransitionError::IncompleteProgress {
+                    phase: "CatchingUp",
+                    remaining_count: progress.remaining().count(),
+                });
+            }
             let mut retarget_progress =
                 DescendantProgress::new(progress.frozen_descendants.clone());
             retarget_progress.skipped = progress.skipped.clone();
@@ -348,8 +386,17 @@ pub fn next_phase(
             }
         }
 
-        // All descendants retargeted
-        (CascadePhase::Retargeting { .. }, PhaseOutcome::AllComplete) => Ok(CascadePhase::Idle),
+        // All descendants retargeted (explicit signal)
+        // Guard: verify that progress.is_complete() is actually true
+        (CascadePhase::Retargeting { progress, .. }, PhaseOutcome::AllComplete) => {
+            if !progress.is_complete() {
+                return Err(TransitionError::IncompleteProgress {
+                    phase: "Retargeting",
+                    remaining_count: progress.remaining().count(),
+                });
+            }
+            Ok(CascadePhase::Idle)
+        }
 
         // === Invalid transitions ===
         (phase, outcome) => Err(TransitionError::InvalidTransition {
@@ -602,6 +649,117 @@ mod tests {
             if let CascadePhase::SquashPending { progress: p } = result.unwrap() {
                 assert!(p.skipped.contains(&PrNumber(1)));
             }
+        }
+
+        // === AllComplete guard tests ===
+
+        #[test]
+        fn preparing_all_complete_fails_when_not_complete() {
+            // Progress has 3 descendants, none completed
+            let progress = make_progress(&[1, 2, 3]);
+            let phase = CascadePhase::Preparing { progress };
+
+            let result = next_phase(&phase, PhaseOutcome::AllComplete);
+
+            assert!(matches!(
+                result,
+                Err(TransitionError::IncompleteProgress {
+                    phase: "Preparing",
+                    remaining_count: 3,
+                })
+            ));
+        }
+
+        #[test]
+        fn reconciling_all_complete_fails_when_not_complete() {
+            let progress = make_progress(&[1, 2]);
+            let sha = make_sha("abc123");
+            let phase = CascadePhase::Reconciling {
+                progress,
+                squash_sha: sha,
+            };
+
+            let result = next_phase(&phase, PhaseOutcome::AllComplete);
+
+            assert!(matches!(
+                result,
+                Err(TransitionError::IncompleteProgress {
+                    phase: "Reconciling",
+                    remaining_count: 2,
+                })
+            ));
+        }
+
+        #[test]
+        fn catching_up_all_complete_fails_when_not_complete() {
+            let mut progress = make_progress(&[1, 2, 3]);
+            progress.mark_completed(PrNumber(1)); // Only 1 of 3 completed
+            let sha = make_sha("abc123");
+            let phase = CascadePhase::CatchingUp {
+                progress,
+                squash_sha: sha,
+            };
+
+            let result = next_phase(&phase, PhaseOutcome::AllComplete);
+
+            assert!(matches!(
+                result,
+                Err(TransitionError::IncompleteProgress {
+                    phase: "CatchingUp",
+                    remaining_count: 2,
+                })
+            ));
+        }
+
+        #[test]
+        fn retargeting_all_complete_fails_when_not_complete() {
+            let progress = make_progress(&[1]);
+            let sha = make_sha("abc123");
+            let phase = CascadePhase::Retargeting {
+                progress,
+                squash_sha: sha,
+            };
+
+            let result = next_phase(&phase, PhaseOutcome::AllComplete);
+
+            assert!(matches!(
+                result,
+                Err(TransitionError::IncompleteProgress {
+                    phase: "Retargeting",
+                    remaining_count: 1,
+                })
+            ));
+        }
+
+        #[test]
+        fn all_complete_with_empty_frozen_descendants_succeeds() {
+            // Empty frozen_descendants means is_complete() is true
+            let progress = make_progress(&[]);
+            let sha = make_sha("abc123");
+
+            // Reconciling with no descendants should succeed
+            let phase = CascadePhase::Reconciling {
+                progress: progress.clone(),
+                squash_sha: sha.clone(),
+            };
+            let result = next_phase(&phase, PhaseOutcome::AllComplete);
+            assert!(result.is_ok());
+
+            // CatchingUp with no descendants should succeed
+            let phase = CascadePhase::CatchingUp {
+                progress: progress.clone(),
+                squash_sha: sha.clone(),
+            };
+            let result = next_phase(&phase, PhaseOutcome::AllComplete);
+            assert!(result.is_ok());
+
+            // Retargeting with no descendants should succeed
+            let phase = CascadePhase::Retargeting {
+                progress,
+                squash_sha: sha,
+            };
+            let result = next_phase(&phase, PhaseOutcome::AllComplete);
+            assert!(result.is_ok());
         }
     }
 
