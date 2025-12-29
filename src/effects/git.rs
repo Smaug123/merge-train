@@ -50,7 +50,10 @@ impl MergeStrategy {
 pub enum GitEffect {
     /// Fetch refs from a remote.
     Fetch {
-        /// Refspecs to fetch (e.g., ["origin/main", "refs/pull/123/head:refs/remotes/origin/pr/123"]).
+        /// Refspecs to fetch (e.g., `["main"]` or `["refs/pull/123/head:refs/remotes/origin/pr/123"]`).
+        ///
+        /// These are passed to `git fetch origin <refspec>...`. Use branch names like `"main"`,
+        /// or full refspecs like `"refs/pull/N/head:refs/remotes/origin/pr/N"` for PR refs.
         refspecs: Vec<String>,
     },
 
