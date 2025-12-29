@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc f79d5ba21c8b71cccfd576871c06eeff81202303f6c419b26b90360c76681fef # shrinks to response = Sha(Sha("0aa0a00a0aa00a00a00000aaa0000000a0a000aa"))
