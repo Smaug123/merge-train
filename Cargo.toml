@@ -33,3 +33,7 @@ anyhow = "1"
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
+
+[[example]]
+name = "github_integration_test"
+path = "examples/github_integration_test.rs"
