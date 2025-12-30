@@ -84,6 +84,29 @@ pub type Result<T> = std::result::Result<T, CompactionError>;
 pub fn compact(state_dir: &Path, snapshot: &mut PersistedRepoSnapshot) -> Result<()> {
     // 1. Read current generation
     let old_gen = read_generation(state_dir)?;
+
+    // Guard: verify no snapshots exist at higher generations.
+    // This indicates cleanup_stale_generations wasn't called first.
+    let files = list_generation_files(state_dir)?;
+    let max_snapshot_gen = files
+        .iter()
+        .filter(|(_, ft)| *ft == "snapshot")
+        .map(|(g, _)| *g)
+        .max();
+
+    if let Some(max_gen) = max_snapshot_gen {
+        if max_gen > old_gen {
+            return Err(CompactionError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "snapshot exists at generation {} but generation file says {}; \
+                     call cleanup_stale_generations first",
+                    max_gen, old_gen
+                ),
+            )));
+        }
+    }
+
     let new_gen = old_gen + 1;
 
     // 2. Stage changes in a clone (don't mutate original until disk writes succeed)
@@ -100,12 +123,14 @@ pub fn compact(state_dir: &Path, snapshot: &mut PersistedRepoSnapshot) -> Result
     // This is the commit point - once this completes, the new generation is active
     write_generation(state_dir, new_gen)?;
 
-    // 5. Clean up old generation files
-    // Only do this after the new generation is fully durable
-    delete_old_generation(state_dir, old_gen)?;
-
-    // 6. Commit to in-memory state only after all disk writes succeed
+    // 5. Commit to in-memory state BEFORE deleting old files.
+    // This ensures snapshot.log_generation points to a valid generation if
+    // events are written between here and the deletion below.
     *snapshot = staged;
+
+    // 6. Clean up old generation files
+    // Safe to delete now - any new events will go to the new generation.
+    delete_old_generation(state_dir, old_gen)?;
 
     Ok(())
 }
@@ -123,14 +148,21 @@ pub fn compact(state_dir: &Path, snapshot: &mut PersistedRepoSnapshot) -> Result
 /// 4. Delete files from other generations
 /// 5. Delete any orphaned .tmp files
 ///
-/// # Recovery from stale/missing generation file
+/// # Recovery from stale/missing/corrupt generation file
 ///
-/// If the generation file is missing or points to a lower generation than the
-/// highest existing snapshot, this function uses the snapshot's generation and
-/// restores the generation file. This prevents data loss when the generation
+/// If the generation file is missing, corrupt, or points to a lower generation
+/// than the highest existing snapshot, this function uses the snapshot's generation
+/// and restores the generation file. This prevents data loss when the generation
 /// file is corrupted or lost.
 pub fn cleanup_stale_generations(state_dir: &Path) -> Result<()> {
-    let file_gen = read_generation(state_dir)?;
+    let file_gen = match read_generation(state_dir) {
+        Ok(g) => g,
+        Err(super::generation::GenerationError::InvalidNumber(_)) => {
+            // Treat corrupt generation file like missing - scan snapshots to recover
+            0
+        }
+        Err(e) => return Err(e.into()),
+    };
     let files = list_generation_files(state_dir)?;
 
     // Find the highest generation among existing snapshot files.
@@ -557,6 +589,17 @@ mod tests {
 
             let new_gen = initial_gen + 1;
 
+            // For crash points 1-3, incorporate event-derived state into snapshot
+            // (simulating that events were applied before compaction)
+            if crash_point > 0 {
+                for i in 0..num_events {
+                    snapshot.active_trains.insert(
+                        PrNumber(1000 + i as u64),
+                        TrainRecord::new(PrNumber(1000 + i as u64))
+                    );
+                }
+            }
+
             // Simulate compaction with crash at different points
             match crash_point {
                 0 => {
@@ -565,7 +608,6 @@ mod tests {
                 }
                 1 => {
                     // Crash after writing new snapshot, before updating generation
-                    // In real usage, next_seq would be updated as events are applied
                     snapshot.next_seq = num_events as u64;
                     snapshot.log_generation = new_gen;
                     snapshot.log_position = 0;
@@ -583,7 +625,6 @@ mod tests {
                 }
                 3 => {
                     // Complete compaction (no crash)
-                    // In real usage, next_seq would already be updated as events are applied
                     snapshot.next_seq = num_events as u64;
                     compact(dir.path(), &mut snapshot).unwrap();
                 }
@@ -671,6 +712,31 @@ mod tests {
                 crash_point, num_events, loaded.next_seq, replayed_events.len()
             );
 
+            // === Verify event-derived state is preserved ===
+            if crash_point == 0 {
+                // Events not yet incorporated - verify they're in the replayed events
+                for (i, event) in replayed_events.iter().enumerate() {
+                    match &event.payload {
+                        StateEventPayload::TrainStarted { root_pr, .. } => {
+                            prop_assert_eq!(
+                                root_pr.0, 1000 + i as u64,
+                                "Replayed event {} should be TrainStarted for PR {}", i, 1000 + i
+                            );
+                        }
+                        _ => prop_assert!(false, "Expected TrainStarted event at position {}", i),
+                    }
+                }
+            } else {
+                // Events incorporated into snapshot - verify trains exist
+                for i in 0..num_events {
+                    prop_assert!(
+                        loaded.active_trains.contains_key(&PrNumber(1000 + i as u64)),
+                        "Train from event {} should be preserved in snapshot after crash at point {}",
+                        i, crash_point
+                    );
+                }
+            }
+
             // === Verify only current generation files exist ===
             let files = list_generation_files(dir.path()).unwrap();
             for (file_gen, _) in &files {
@@ -736,8 +802,8 @@ mod tests {
         /// When generation file is stale/missing, cleanup should preserve newer snapshots.
         ///
         /// If the generation file points to an older generation than actually exists,
-        /// cleanup should detect this (e.g., by scanning existing files) and NOT delete
-        /// the newer data. Currently this bug exists and this test fails.
+        /// cleanup should detect this (by scanning existing files) and NOT delete
+        /// the newer data.
         #[test]
         fn stale_generation_file_preserves_newer_snapshots(
             stale_gen in 0u64..5,
@@ -1066,9 +1132,6 @@ mod tests {
         // When the generation file is missing but snapshots exist at higher generations,
         // cleanup_stale_generations should detect this by scanning existing files and
         // preserve the newest snapshot rather than deleting it.
-        //
-        // Currently this test FAILS because read_generation returns 0 for missing file,
-        // and cleanup deletes all files with generation != 0.
         let dir = tempdir().unwrap();
 
         // Create valid snapshot at generation 3 (simulating prior successful compactions)
@@ -1108,9 +1171,9 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_with_corrupt_generation_file_returns_error() {
-        // When the generation file is corrupt, cleanup_stale_generations returns an error.
-        // This is safer than the missing file case - at least data isn't silently deleted.
+    fn cleanup_with_corrupt_generation_file_recovers_from_snapshots() {
+        // When the generation file is corrupt but snapshots exist, cleanup
+        // treats it like a missing file and recovers from the highest snapshot.
         let dir = tempdir().unwrap();
 
         // Create valid snapshot at generation 2
@@ -1122,25 +1185,27 @@ mod tests {
         // Write corrupt generation file
         std::fs::write(dir.path().join("generation"), "garbage_data\n").unwrap();
 
-        // cleanup_stale_generations fails with an error
-        let result = cleanup_stale_generations(dir.path());
-        assert!(
-            result.is_err(),
-            "Should fail when generation file is corrupt"
-        );
+        // cleanup_stale_generations should succeed by using the highest snapshot
+        cleanup_stale_generations(dir.path()).unwrap();
 
-        // Importantly, the snapshots are preserved (not deleted)
+        // Snapshot should be preserved
         assert!(
             snapshot_path(dir.path(), 2).exists(),
-            "Snapshot should be preserved when cleanup fails due to corrupt generation"
+            "Snapshot should be preserved"
         );
         assert!(
             events_path(dir.path(), 2).exists(),
-            "Events should be preserved when cleanup fails due to corrupt generation"
+            "Events should be preserved"
         );
 
-        // Data can be recovered manually by fixing the generation file
-        write_generation(dir.path(), 2).unwrap();
+        // Generation file should be fixed to match the highest snapshot
+        assert_eq!(
+            read_generation(dir.path()).unwrap(),
+            2,
+            "Generation file should be restored to match highest snapshot"
+        );
+
+        // Data should be accessible
         let loaded =
             crate::persistence::snapshot::load_snapshot(&snapshot_path(dir.path(), 2)).unwrap();
         assert!(loaded.active_trains.contains_key(&PrNumber(888)));
@@ -1178,5 +1243,92 @@ mod tests {
             result.is_err(),
             "compact should fail with corrupt generation file"
         );
+    }
+
+    #[test]
+    fn compact_fails_when_cleanup_not_called() {
+        // If cleanup_stale_generations wasn't called and higher snapshots exist,
+        // compact() should fail rather than silently create conflicts.
+        let dir = tempdir().unwrap();
+
+        // Create snapshot at generation 5 but generation file says 2
+        let mut snapshot = create_snapshot_with_train(999);
+        snapshot.log_generation = 5;
+        save_snapshot_atomic(&snapshot_path(dir.path(), 5), &snapshot).unwrap();
+        write_generation(dir.path(), 2).unwrap();
+
+        // compact() should detect the inconsistency and fail
+        let result = compact(dir.path(), &mut snapshot);
+        assert!(
+            result.is_err(),
+            "compact should fail when higher snapshot exists"
+        );
+
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("generation 5") && err.contains("generation file says 2"),
+            "Error should explain the conflict: {}",
+            err
+        );
+    }
+
+    proptest! {
+        /// Verifies that events written after compact() are preserved.
+        ///
+        /// This is a regression test for issue 2: compact() must update the in-memory
+        /// snapshot before deleting old files to ensure snapshot.log_generation always
+        /// points to a valid generation.
+        #[test]
+        fn events_after_compact_are_preserved(
+            train_pr in arb_pr_number(),
+            initial_gen in 1u64..5,
+        ) {
+            use crate::persistence::log::EventLog;
+            use crate::persistence::event::StateEventPayload;
+
+            let dir = tempdir().unwrap();
+
+            // Set up initial state
+            let mut snapshot = create_test_snapshot();
+            snapshot.active_trains.insert(train_pr, TrainRecord::new(train_pr));
+            snapshot.log_generation = initial_gen;
+            snapshot.log_position = 0;
+            snapshot.next_seq = 0;
+
+            write_generation(dir.path(), initial_gen).unwrap();
+            save_snapshot_atomic(&snapshot_path(dir.path(), initial_gen), &snapshot).unwrap();
+            File::create(events_path(dir.path(), initial_gen)).unwrap();
+
+            // Call compact()
+            compact(dir.path(), &mut snapshot).unwrap();
+
+            // After compact(), snapshot.log_generation should point to the new generation
+            let new_gen = initial_gen + 1;
+            prop_assert_eq!(snapshot.log_generation, new_gen);
+
+            // Write an event using snapshot.log_generation
+            {
+                let events_file = events_path(dir.path(), snapshot.log_generation);
+                let mut log = EventLog::open(&events_file).unwrap();
+                log.append(StateEventPayload::TrainStopped { root_pr: train_pr }).unwrap();
+            }
+
+            // Simulate restart: cleanup and reload
+            cleanup_stale_generations(dir.path()).unwrap();
+            let recovered_gen = read_generation(dir.path()).unwrap();
+            let recovered_snapshot = crate::persistence::snapshot::load_snapshot(
+                &snapshot_path(dir.path(), recovered_gen)
+            ).unwrap();
+
+            let events_file = events_path(dir.path(), recovered_gen);
+            let (events, _) = EventLog::replay_from(&events_file, recovered_snapshot.log_position).unwrap();
+
+            // Event should be preserved
+            prop_assert!(
+                events.iter().any(|e| matches!(&e.payload, StateEventPayload::TrainStopped { root_pr } if *root_pr == train_pr)),
+                "Event written after compact() should be preserved; got: {:?}",
+                events.iter().map(|e| &e.payload).collect::<Vec<_>>()
+            );
+        }
     }
 }
