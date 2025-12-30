@@ -191,7 +191,7 @@ mod tests {
             let payloads = &payloads[..count];
 
             // Dedupe IDs (in case proptest generates duplicates)
-            let mut unique_ids: Vec<_> = ids.iter().cloned().collect();
+            let mut unique_ids: Vec<_> = ids.to_vec();
             unique_ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
             unique_ids.dedup_by(|a, b| a.as_str() == b.as_str());
 
@@ -221,7 +221,7 @@ mod tests {
             let payloads = &payloads[..count];
 
             // Dedupe
-            let mut unique_ids: Vec<_> = ids.iter().cloned().collect();
+            let mut unique_ids: Vec<_> = ids.to_vec();
             unique_ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
             unique_ids.dedup_by(|a, b| a.as_str() == b.as_str());
 
@@ -366,5 +366,89 @@ mod tests {
         let path = Path::new("/spool/abc-123.json");
         let id = extract_delivery_id(path).unwrap();
         assert_eq!(id.as_str(), "abc-123");
+    }
+
+    /// Temp files from interrupted spooling are ignored by drain.
+    ///
+    /// If a crash occurs during spool_delivery (after writing the temp file
+    /// but before the atomic rename), the orphaned .json.tmp file should not
+    /// be picked up as a pending delivery.
+    #[test]
+    fn drain_ignores_temp_files() {
+        let dir = tempdir().unwrap();
+        let spool_dir = dir.path();
+
+        // Simulate an orphaned temp file from an interrupted spool operation
+        std::fs::create_dir_all(spool_dir).unwrap();
+        std::fs::write(
+            spool_dir.join("orphan-delivery.json.tmp"),
+            b"partial payload",
+        )
+        .unwrap();
+
+        // Also add a real delivery to ensure drain still works
+        let id = DeliveryId::new("real-delivery");
+        spool_delivery(spool_dir, &id, b"real payload").unwrap();
+
+        let pending = drain_pending(spool_dir).unwrap();
+
+        // Only the real delivery should be returned, not the orphaned temp file
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].delivery_id.as_str(), "real-delivery");
+    }
+
+    /// Drain ignores non-delivery files in the spool directory.
+    ///
+    /// Random files that happen to be in the spool directory (e.g., from
+    /// manual debugging or other tools) should not cause drain to fail.
+    #[test]
+    fn drain_ignores_unrelated_files() {
+        let dir = tempdir().unwrap();
+        let spool_dir = dir.path();
+        std::fs::create_dir_all(spool_dir).unwrap();
+
+        // Create various unrelated files
+        std::fs::write(spool_dir.join("README.txt"), b"notes").unwrap();
+        std::fs::write(spool_dir.join(".DS_Store"), b"macos junk").unwrap();
+        std::fs::write(spool_dir.join("debug.log"), b"log data").unwrap();
+
+        // Add a real delivery
+        let id = DeliveryId::new("actual-delivery");
+        spool_delivery(spool_dir, &id, b"payload").unwrap();
+
+        let pending = drain_pending(spool_dir).unwrap();
+
+        // Only the actual delivery should be returned
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].delivery_id.as_str(), "actual-delivery");
+    }
+
+    /// Drain handles marker files without corresponding payload.
+    ///
+    /// If for some reason marker files exist without a payload file
+    /// (e.g., manual deletion of payload during debugging), drain should
+    /// handle this gracefully.
+    #[test]
+    fn drain_handles_orphaned_markers() {
+        let dir = tempdir().unwrap();
+        let spool_dir = dir.path();
+        std::fs::create_dir_all(spool_dir).unwrap();
+
+        // Create orphaned marker files (no corresponding .json payload)
+        std::fs::write(spool_dir.join("orphan.json.proc"), b"").unwrap();
+        std::fs::write(spool_dir.join("another.json.done"), b"").unwrap();
+
+        // Add a real delivery
+        let id = DeliveryId::new("valid-delivery");
+        spool_delivery(spool_dir, &id, b"payload").unwrap();
+
+        let pending = drain_pending(spool_dir).unwrap();
+
+        // Only the valid delivery should be returned
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].delivery_id.as_str(), "valid-delivery");
+
+        // The orphaned .proc marker should be cleaned up (no .done, so it's "interrupted")
+        assert!(!spool_dir.join("orphan.json.proc").exists());
     }
 }
