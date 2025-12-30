@@ -224,13 +224,14 @@ impl EventLog {
     pub fn replay_from(path: impl AsRef<Path>, offset: u64) -> Result<(Vec<StateEvent>, u64)> {
         let path = path.as_ref();
 
-        // Check if file exists
-        if !path.exists() {
-            return Ok((vec![], 0));
-        }
-
-        // Open for reading
-        let file = File::open(path)?;
+        // Open for reading, treating NotFound as empty log but propagating other errors
+        let file = match File::open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Ok((vec![], 0));
+            }
+            Err(e) => return Err(e.into()),
+        };
         let file_len = file.metadata()?.len();
 
         // If file is empty, nothing to replay
@@ -294,14 +295,15 @@ impl EventLog {
                     // Warn on gaps - doesn't require truncation (events are still valid),
                     // but indicates a logic bug in the writer
                     if let Some(prev) = max_seq
-                        && event.seq != prev + 1 {
-                            tracing::warn!(
-                                prev,
-                                current = event.seq,
-                                path = %path.display(),
-                                "sequence gap detected in event log - possible logic bug"
-                            );
-                        }
+                        && event.seq != prev + 1
+                    {
+                        tracing::warn!(
+                            prev,
+                            current = event.seq,
+                            path = %path.display(),
+                            "sequence gap detected in event log - possible logic bug"
+                        );
+                    }
                     max_seq = Some(event.seq);
                     // Only collect events from the requested offset onwards
                     if line_start >= offset {
