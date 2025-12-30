@@ -2,7 +2,11 @@
 //!
 //! This library provides the core domain types and logic for the merge train bot.
 
+#[cfg(test)]
+pub mod test_utils;
+
 pub mod commands;
 pub mod effects;
+pub mod persistence;
 pub mod state;
 pub mod types;
