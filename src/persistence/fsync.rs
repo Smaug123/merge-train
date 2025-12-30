@@ -30,8 +30,13 @@ pub fn fsync_file(file: &File) -> io::Result<()> {
 ///
 /// # Errors
 ///
-/// Returns an error if the path doesn't exist or isn't a directory,
-/// or if the fsync system call fails.
+/// Returns an error if the path doesn't exist or if the fsync system call fails.
+///
+/// # Note
+///
+/// This function uses `sync_all()` on a file handle, which technically works
+/// on regular files too. However, it's semantically intended for directories
+/// and should only be called with directory paths.
 pub fn fsync_dir(dir_path: &Path) -> io::Result<()> {
     // Open the directory as a file (read-only is sufficient for fsync)
     let dir = OpenOptions::new().read(true).open(dir_path)?;
@@ -69,15 +74,16 @@ mod tests {
     }
 
     #[test]
-    fn fsync_dir_fails_on_file() {
+    fn fsync_dir_on_file_does_not_error() {
+        // sync_all() works on regular files too, even though fsync_dir
+        // is semantically intended for directories. This test documents
+        // that behavior (callers should still only pass directories).
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.txt");
         File::create(&path).unwrap();
 
-        // fsync_dir on a file should still work (it's not a dir but sync_all works)
-        // Actually on most systems this works, but semantically it's for dirs
-        // The important thing is it doesn't panic
-        let _ = fsync_dir(&path);
+        // Should succeed (sync_all works on any file handle)
+        fsync_dir(&path).unwrap();
     }
 
     #[test]
