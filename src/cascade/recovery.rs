@@ -638,4 +638,231 @@ mod tests {
         assert_eq!(updated_train.state, TrainState::NeedsManualReview);
         assert!(abort_reason.is_some());
     }
+
+    mod property_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn arb_pr_number() -> impl Strategy<Value = PrNumber> {
+            (2u64..100).prop_map(PrNumber)
+        }
+
+        fn arb_sha() -> impl Strategy<Value = Sha> {
+            "[0-9a-f]{40}".prop_map(|s| Sha::parse(s).unwrap())
+        }
+
+        fn arb_unique_descendants(min: usize, max: usize) -> impl Strategy<Value = Vec<PrNumber>> {
+            prop::collection::hash_set(arb_pr_number(), min..max)
+                .prop_map(|set| set.into_iter().collect())
+        }
+
+        fn make_open_pr_for_test(
+            number: u64,
+            base_ref: &str,
+            predecessor: Option<PrNumber>,
+            sha: Sha,
+        ) -> CachedPr {
+            CachedPr::new(
+                PrNumber(number),
+                sha,
+                format!("branch-{}", number),
+                base_ref.to_string(),
+                predecessor,
+                PrState::Open,
+                MergeStateStatus::Clean,
+                false,
+            )
+        }
+
+        /// Arbitrary crash phase: generate a valid phase with frozen descendants.
+        fn arb_crash_phase(
+            descendants: Vec<PrNumber>,
+            sha: Sha,
+        ) -> impl Strategy<Value = CascadePhase> {
+            let desc = descendants.clone();
+            let sha2 = sha.clone();
+            prop_oneof![
+                Just(CascadePhase::Preparing {
+                    progress: DescendantProgress::new(descendants.clone()),
+                }),
+                Just(CascadePhase::SquashPending {
+                    progress: DescendantProgress::new(descendants.clone()),
+                }),
+                Just(CascadePhase::Reconciling {
+                    progress: DescendantProgress::new(desc.clone()),
+                    squash_sha: sha.clone(),
+                }),
+                Just(CascadePhase::CatchingUp {
+                    progress: DescendantProgress::new(desc.clone()),
+                    squash_sha: sha.clone(),
+                }),
+                Just(CascadePhase::Retargeting {
+                    progress: DescendantProgress::new(descendants),
+                    squash_sha: sha2,
+                }),
+            ]
+        }
+
+        proptest! {
+            /// Property: Recovery from any crash point produces a valid recovery plan.
+            ///
+            /// For any phase the train might crash in, compute_recovery_plan should:
+            /// 1. Return a plan with at least one action
+            /// 2. Use the frozen_descendants from the train, not re-query
+            /// 3. Produce a plan that can be applied without panicking
+            #[test]
+            fn recovery_from_any_crash_point_produces_valid_plan(
+                frozen_descendants in arb_unique_descendants(1, 5),
+                sha in arb_sha()
+            ) {
+                let phase = arb_crash_phase(frozen_descendants.clone(), sha.clone());
+
+                proptest!(|(crash_phase in phase)| {
+                    let mut train = TrainRecord::new(PrNumber(1));
+                    train.cascade_phase = crash_phase.clone();
+                    train.predecessor_head_sha = Some(sha.clone());
+                    train.last_squash_sha = crash_phase.squash_sha().cloned();
+
+                    // Build PR map with all frozen descendants
+                    let mut prs = HashMap::new();
+                    let root_pr = make_open_pr_for_test(1, "main", None, sha.clone());
+                    prs.insert(PrNumber(1), root_pr);
+
+                    for &desc in &frozen_descendants {
+                        let pr = make_open_pr_for_test(desc.0, "branch-1", Some(PrNumber(1)), sha.clone());
+                        prs.insert(desc, pr);
+                    }
+
+                    let plan = compute_recovery_plan(&train, &prs, &[], "main");
+
+                    // Property 1: Plan should have at least one action
+                    prop_assert!(!plan.actions.is_empty(), "Recovery plan should have at least one action");
+
+                    // Property 2: Train in plan should preserve frozen_descendants
+                    if let Some(progress) = plan.train.cascade_phase.progress() {
+                        prop_assert_eq!(
+                            &progress.frozen_descendants,
+                            &frozen_descendants,
+                            "Recovery plan should preserve frozen_descendants"
+                        );
+                    }
+
+                    // Property 3: Plan can be applied without panicking
+                    let verification_results = HashMap::new();
+                    let (recovered_train, _abort_reason) = apply_recovery_plan(plan.clone(), &verification_results);
+
+                    // The recovered train should be in a valid state
+                    prop_assert!(
+                        recovered_train.state == TrainState::Running
+                            || recovered_train.state == TrainState::NeedsManualReview
+                            || recovered_train.state == TrainState::Aborted,
+                        "Recovered train should be in a valid state, got: {:?}",
+                        recovered_train.state
+                    );
+                });
+            }
+
+            /// Property: Recovery always uses frozen descendants, never re-queries.
+            ///
+            /// Even if new PRs appear in the PR map after a crash, recovery should
+            /// only operate on the descendants that were frozen at cascade start.
+            #[test]
+            fn recovery_uses_frozen_descendants_not_current_state(
+                frozen_descendants in arb_unique_descendants(1, 3),
+                late_addition in arb_pr_number(),
+                sha in arb_sha()
+            ) {
+                prop_assume!(!frozen_descendants.contains(&late_addition));
+
+                let mut train = TrainRecord::new(PrNumber(1));
+                train.cascade_phase = CascadePhase::Preparing {
+                    progress: DescendantProgress::new(frozen_descendants.clone()),
+                };
+                train.predecessor_head_sha = Some(sha.clone());
+
+                // Build PR map with frozen descendants + late addition
+                let mut prs = HashMap::new();
+                let root_pr = make_open_pr_for_test(1, "main", None, sha.clone());
+                prs.insert(PrNumber(1), root_pr);
+
+                for &desc in &frozen_descendants {
+                    let pr = make_open_pr_for_test(desc.0, "branch-1", Some(PrNumber(1)), sha.clone());
+                    prs.insert(desc, pr);
+                }
+
+                // Add the "late" descendant that appeared after crash
+                let late_pr = make_open_pr_for_test(late_addition.0, "branch-1", Some(PrNumber(1)), sha.clone());
+                prs.insert(late_addition, late_pr);
+
+                let plan = compute_recovery_plan(&train, &prs, &[], "main");
+
+                // Recovery should NOT include late_addition in any RetryMerge actions
+                for action in &plan.actions {
+                    if let RecoveryAction::RetryMerge { descendant, .. } = action {
+                        prop_assert!(
+                            frozen_descendants.contains(descendant),
+                            "RetryMerge should only target frozen descendants, but found {}",
+                            descendant
+                        );
+                        prop_assert_ne!(
+                            *descendant, late_addition,
+                            "Late addition {} should not be in recovery plan",
+                            late_addition
+                        );
+                    }
+                }
+            }
+
+            /// Property: Recovery preserves phase-specific data.
+            ///
+            /// When recovering from Reconciling, CatchingUp, or Retargeting phases,
+            /// the squash_sha must be preserved in the recovery plan.
+            #[test]
+            fn recovery_preserves_squash_sha(
+                frozen_descendants in arb_unique_descendants(1, 3),
+                squash_sha in arb_sha()
+            ) {
+                let phases_with_squash = vec![
+                    CascadePhase::Reconciling {
+                        progress: DescendantProgress::new(frozen_descendants.clone()),
+                        squash_sha: squash_sha.clone(),
+                    },
+                    CascadePhase::CatchingUp {
+                        progress: DescendantProgress::new(frozen_descendants.clone()),
+                        squash_sha: squash_sha.clone(),
+                    },
+                    CascadePhase::Retargeting {
+                        progress: DescendantProgress::new(frozen_descendants.clone()),
+                        squash_sha: squash_sha.clone(),
+                    },
+                ];
+
+                for phase in phases_with_squash {
+                    let mut train = TrainRecord::new(PrNumber(1));
+                    train.cascade_phase = phase.clone();
+                    train.last_squash_sha = Some(squash_sha.clone());
+
+                    let mut prs = HashMap::new();
+                    let sha_for_pr = Sha::parse("a".repeat(40)).unwrap();
+                    let root_pr = make_open_pr_for_test(1, "main", None, sha_for_pr.clone());
+                    prs.insert(PrNumber(1), root_pr);
+
+                    for &desc in &frozen_descendants {
+                        let pr = make_open_pr_for_test(desc.0, "branch-1", Some(PrNumber(1)), sha_for_pr.clone());
+                        prs.insert(desc, pr);
+                    }
+
+                    let plan = compute_recovery_plan(&train, &prs, &[], "main");
+
+                    // The recovery plan's train should preserve squash_sha
+                    prop_assert_eq!(
+                        plan.train.cascade_phase.squash_sha(),
+                        Some(&squash_sha),
+                        "Recovery plan should preserve squash_sha for phase {}",
+                        phase.name()
+                    );
+                }
+            }
+        }
+    }
 }

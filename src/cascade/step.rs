@@ -845,4 +845,354 @@ mod tests {
             panic!("Expected Preparing phase");
         }
     }
+
+    mod property_tests {
+        use super::*;
+        use crate::state::transitions::{PhaseOutcome, next_phase};
+        use proptest::prelude::*;
+
+        fn arb_pr_number() -> impl Strategy<Value = PrNumber> {
+            (2u64..100).prop_map(PrNumber) // Start from 2 to avoid conflict with root PR (1)
+        }
+
+        fn arb_sha() -> impl Strategy<Value = Sha> {
+            "[0-9a-f]{40}".prop_map(|s| Sha::parse(s).unwrap())
+        }
+
+        /// Generate a vector of unique PR numbers (no duplicates).
+        fn arb_unique_descendants(min: usize, max: usize) -> impl Strategy<Value = Vec<PrNumber>> {
+            prop::collection::hash_set(arb_pr_number(), min..max)
+                .prop_map(|set| set.into_iter().collect())
+        }
+
+        /// Generate a valid open PR with the given parameters.
+        fn make_pr_with_predecessor(
+            number: u64,
+            head_sha: Sha,
+            base_ref: &str,
+            predecessor: Option<PrNumber>,
+        ) -> CachedPr {
+            CachedPr::new(
+                PrNumber(number),
+                head_sha,
+                format!("branch-{}", number),
+                base_ref.to_string(),
+                predecessor,
+                PrState::Open,
+                MergeStateStatus::Clean,
+                false,
+            )
+        }
+
+        proptest! {
+            /// Property: Phase transitions via next_phase never skip phases.
+            ///
+            /// This tests that the state machine transition logic in next_phase
+            /// follows the correct phase sequence. For any descendant count,
+            /// completing descendants should transition through the proper sequence.
+            #[test]
+            fn phase_transitions_never_skip(
+                descendants in arb_unique_descendants(1, 5),
+                sha in arb_sha()
+            ) {
+                // Start with Preparing (which has descendants)
+                let mut phase = CascadePhase::Preparing {
+                    progress: DescendantProgress::new(descendants.clone()),
+                };
+
+                // Track sequence
+                let mut sequence = vec![phase.name().to_string()];
+
+                // Complete all descendants in Preparing
+                for &desc in &descendants {
+                    phase = next_phase(&phase, PhaseOutcome::DescendantCompleted { pr: desc })
+                        .expect("Valid Preparing transition");
+                }
+                sequence.push(phase.name().to_string());
+
+                // Should be in SquashPending
+                prop_assert!(
+                    matches!(phase, CascadePhase::SquashPending { .. }),
+                    "After Preparing, should be SquashPending, got: {}",
+                    phase.name()
+                );
+
+                // SquashComplete -> Reconciling
+                phase = next_phase(&phase, PhaseOutcome::SquashComplete { squash_sha: sha.clone() })
+                    .expect("Valid SquashPending transition");
+                sequence.push(phase.name().to_string());
+
+                prop_assert!(
+                    matches!(phase, CascadePhase::Reconciling { .. }),
+                    "After SquashComplete, should be Reconciling, got: {}",
+                    phase.name()
+                );
+
+                // Complete all descendants in Reconciling
+                for &desc in &descendants {
+                    phase = next_phase(&phase, PhaseOutcome::DescendantCompleted { pr: desc })
+                        .expect("Valid Reconciling transition");
+                }
+                sequence.push(phase.name().to_string());
+
+                prop_assert!(
+                    matches!(phase, CascadePhase::CatchingUp { .. }),
+                    "After Reconciling, should be CatchingUp, got: {}",
+                    phase.name()
+                );
+
+                // Complete all descendants in CatchingUp
+                for &desc in &descendants {
+                    phase = next_phase(&phase, PhaseOutcome::DescendantCompleted { pr: desc })
+                        .expect("Valid CatchingUp transition");
+                }
+                sequence.push(phase.name().to_string());
+
+                prop_assert!(
+                    matches!(phase, CascadePhase::Retargeting { .. }),
+                    "After CatchingUp, should be Retargeting, got: {}",
+                    phase.name()
+                );
+
+                // Complete all descendants in Retargeting
+                for &desc in &descendants {
+                    phase = next_phase(&phase, PhaseOutcome::DescendantCompleted { pr: desc })
+                        .expect("Valid Retargeting transition");
+                }
+                sequence.push(phase.name().to_string());
+
+                prop_assert!(
+                    matches!(phase, CascadePhase::Idle),
+                    "After Retargeting, should be Idle, got: {}",
+                    phase.name()
+                );
+
+                // Verify the sequence is valid
+                let expected = ["preparing", "squash_pending", "reconciling", "catching_up", "retargeting", "idle"];
+                prop_assert_eq!(
+                    sequence,
+                    expected.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                    "Phase sequence should match expected order"
+                );
+            }
+
+            /// Property: Late additions don't corrupt ongoing cascades.
+            ///
+            /// The frozen_descendants set captured at the start of Preparing
+            /// must remain unchanged through all subsequent phases, even if
+            /// new descendants are added to the PR map.
+            #[test]
+            fn late_additions_dont_corrupt_cascade(
+                initial_descendants in arb_unique_descendants(1, 3),
+                late_addition in arb_pr_number(),
+                sha in arb_sha()
+            ) {
+                // Ensure late_addition is distinct from initial_descendants
+                prop_assume!(!initial_descendants.contains(&late_addition));
+
+                let ctx = StepContext::new("main");
+
+                // Build initial PR map
+                let mut prs = HashMap::new();
+                let root_pr = make_pr_with_predecessor(1, sha.clone(), "main", None);
+                prs.insert(PrNumber(1), root_pr);
+
+                for (i, &pr_num) in initial_descendants.iter().enumerate() {
+                    let predecessor = if i == 0 {
+                        PrNumber(1)
+                    } else {
+                        initial_descendants[i - 1]
+                    };
+                    let base_ref = format!("branch-{}", predecessor.0);
+                    let pr =
+                        make_pr_with_predecessor(pr_num.0, sha.clone(), &base_ref, Some(predecessor));
+                    prs.insert(pr_num, pr);
+                }
+
+                // Start cascade - this freezes the descendants
+                let train = TrainRecord::new(PrNumber(1));
+                let result = execute_cascade_step(train, &prs, &ctx);
+                let train = result.train;
+
+                // Capture frozen set
+                let frozen_set: Vec<PrNumber> = match &train.cascade_phase {
+                    CascadePhase::Preparing { progress } => progress.frozen_descendants.clone(),
+                    CascadePhase::SquashPending { progress } => progress.frozen_descendants.clone(),
+                    _ => vec![],
+                };
+
+                // Now add a "late" descendant to the PR map
+                // This simulates a PR being added after the freeze
+                let late_pr = make_pr_with_predecessor(
+                    late_addition.0,
+                    sha.clone(),
+                    "branch-1",
+                    Some(PrNumber(1)),
+                );
+                prs.insert(late_addition, late_pr);
+
+                // The frozen set should NOT contain the late addition
+                prop_assert!(
+                    !frozen_set.contains(&late_addition),
+                    "Late addition {} should not be in frozen set {:?}",
+                    late_addition,
+                    frozen_set
+                );
+
+                // Verify frozen_descendants is preserved through phase transitions
+                // (using next_phase, not process_operation_result, to test the invariant)
+                let mut phase = train.cascade_phase.clone();
+
+                // Complete preparation
+                for &desc in &frozen_set {
+                    phase = next_phase(&phase, PhaseOutcome::DescendantCompleted { pr: desc })
+                        .expect("transition should succeed");
+                }
+
+                // Verify frozen set after Preparing -> SquashPending
+                if let Some(progress) = phase.progress() {
+                    prop_assert_eq!(
+                        &progress.frozen_descendants, &frozen_set,
+                        "frozen_descendants should not change after Preparing"
+                    );
+                    prop_assert!(
+                        !progress.frozen_descendants.contains(&late_addition),
+                        "Late addition should not be in frozen set after Preparing"
+                    );
+                }
+
+                // SquashComplete
+                phase = next_phase(&phase, PhaseOutcome::SquashComplete { squash_sha: sha.clone() })
+                    .expect("squash transition should succeed");
+
+                // Verify frozen set after SquashPending -> Reconciling
+                if let Some(progress) = phase.progress() {
+                    prop_assert_eq!(
+                        &progress.frozen_descendants, &frozen_set,
+                        "frozen_descendants should not change after SquashPending"
+                    );
+                    prop_assert!(
+                        !progress.frozen_descendants.contains(&late_addition),
+                        "Late addition should not be in frozen set after SquashPending"
+                    );
+                }
+            }
+
+            /// Property: Fan-out detection works correctly.
+            ///
+            /// When determining the outcome for a train with multiple descendants,
+            /// create_step_outcome should return FanOut with all descendants.
+            #[test]
+            fn fan_out_detection_correct(
+                descendants in arb_unique_descendants(2, 5),
+                sha in arb_sha()
+            ) {
+                // Build PR map with multiple descendants of root (fan-out)
+                let mut prs = HashMap::new();
+                let root_pr = make_pr_with_predecessor(1, sha.clone(), "main", None);
+                prs.insert(PrNumber(1), root_pr);
+
+                // All descendants point directly to root (fan-out)
+                for &pr_num in &descendants {
+                    let pr = make_pr_with_predecessor(
+                        pr_num.0,
+                        sha.clone(),
+                        "branch-1",
+                        Some(PrNumber(1)),
+                    );
+                    prs.insert(pr_num, pr);
+                }
+
+                // Create a train in Idle (simulating after one PR completes)
+                let train = TrainRecord::new(PrNumber(1));
+
+                // Test create_step_outcome
+                use crate::cascade::engine::CascadeEngine;
+                let engine = CascadeEngine::new("main");
+                let outcome = engine.create_step_outcome(&train, &prs);
+
+                prop_assert!(
+                    matches!(outcome, CascadeStepOutcome::FanOut { .. }),
+                    "With multiple descendants, outcome should be FanOut, got: {:?}",
+                    outcome
+                );
+
+                if let CascadeStepOutcome::FanOut {
+                    descendants: outcome_descendants,
+                } = outcome
+                {
+                    prop_assert_eq!(
+                        outcome_descendants.len(),
+                        descendants.len(),
+                        "FanOut should contain all descendants"
+                    );
+                    for &desc in &descendants {
+                        prop_assert!(
+                            outcome_descendants.contains(&desc),
+                            "FanOut should contain descendant {}",
+                            desc
+                        );
+                    }
+                }
+            }
+
+            /// Property: Single descendant returns WaitingOnCi, not FanOut.
+            #[test]
+            fn single_descendant_returns_waiting_on_ci(
+                descendant in arb_pr_number(),
+                sha in arb_sha()
+            ) {
+                let mut prs = HashMap::new();
+                let root_pr = make_pr_with_predecessor(1, sha.clone(), "main", None);
+                prs.insert(PrNumber(1), root_pr);
+
+                let desc_pr = make_pr_with_predecessor(
+                    descendant.0,
+                    sha.clone(),
+                    "branch-1",
+                    Some(PrNumber(1)),
+                );
+                prs.insert(descendant, desc_pr);
+
+                let train = TrainRecord::new(PrNumber(1));
+
+                use crate::cascade::engine::CascadeEngine;
+                let engine = CascadeEngine::new("main");
+                let outcome = engine.create_step_outcome(&train, &prs);
+
+                prop_assert!(
+                    matches!(outcome, CascadeStepOutcome::WaitingOnCi { .. }),
+                    "With single descendant, outcome should be WaitingOnCi, got: {:?}",
+                    outcome
+                );
+
+                if let CascadeStepOutcome::WaitingOnCi { pr_number } = outcome {
+                    prop_assert_eq!(
+                        pr_number, descendant,
+                        "WaitingOnCi should contain the single descendant"
+                    );
+                }
+            }
+
+            /// Property: No descendants returns Complete.
+            #[test]
+            fn no_descendants_returns_complete(sha in arb_sha()) {
+                let mut prs = HashMap::new();
+                let root_pr = make_pr_with_predecessor(1, sha, "main", None);
+                prs.insert(PrNumber(1), root_pr);
+
+                let train = TrainRecord::new(PrNumber(1));
+
+                use crate::cascade::engine::CascadeEngine;
+                let engine = CascadeEngine::new("main");
+                let outcome = engine.create_step_outcome(&train, &prs);
+
+                prop_assert!(
+                    matches!(outcome, CascadeStepOutcome::Complete),
+                    "With no descendants, outcome should be Complete, got: {:?}",
+                    outcome
+                );
+            }
+        }
+    }
 }

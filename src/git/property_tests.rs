@@ -505,3 +505,175 @@ fn catch_up_detects_conflicts_with_main() {
         result
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Property 8: Fan-out worktree lifecycle
+// ─────────────────────────────────────────────────────────────────────────────
+
+use crate::git::worktree::remove_worktree;
+
+/// Property 8: Fan-out worktree ordering.
+///
+/// When a PR with multiple descendants completes (fan-out), the old worktree
+/// must be removed BEFORE new worktrees are created. This ensures:
+/// - No stale worktree references causing git errors
+/// - Clean state for new independent trains
+/// - No accumulation of worktrees during rapid fan-out cascades
+#[test]
+fn fanout_worktree_ordering_removes_old_before_creating_new() {
+    let (_temp_dir, config) = create_test_repo();
+
+    // Create the original worktree for the root train
+    let root_pr = PrNumber(100);
+    let root_worktree = worktree_for_stack(&config, root_pr).unwrap();
+    assert!(root_worktree.exists(), "Root worktree should be created");
+
+    // Verify we can list it
+    let initial_worktrees = list_worktrees(&config).unwrap();
+    assert_eq!(initial_worktrees.len(), 1);
+    assert_eq!(initial_worktrees[0].0, root_pr);
+
+    // Simulate fan-out: root completes, multiple descendants become independent
+    let descendant_prs = vec![PrNumber(101), PrNumber(102), PrNumber(103)];
+
+    // === CRITICAL ORDERING: Remove old worktree FIRST ===
+    remove_worktree(&config, root_pr).unwrap();
+    assert!(
+        !root_worktree.exists(),
+        "Old worktree must be removed before creating new ones"
+    );
+
+    // Now create new worktrees for each descendant
+    let mut new_worktrees = Vec::new();
+    for &desc_pr in &descendant_prs {
+        let wt = worktree_for_stack(&config, desc_pr).unwrap();
+        assert!(wt.exists(), "New worktree for {} should exist", desc_pr);
+        new_worktrees.push(wt);
+    }
+
+    // Verify final state
+    assert!(
+        !root_worktree.exists(),
+        "Old worktree should remain removed after fan-out"
+    );
+
+    let final_worktrees = list_worktrees(&config).unwrap();
+    assert_eq!(
+        final_worktrees.len(),
+        descendant_prs.len(),
+        "Should have one worktree per descendant"
+    );
+
+    for &desc_pr in &descendant_prs {
+        assert!(
+            final_worktrees.iter().any(|(pr, _)| *pr == desc_pr),
+            "Descendant {} should have a worktree",
+            desc_pr
+        );
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 20,
+        max_shrink_iters: 100,
+        ..ProptestConfig::default()
+    })]
+
+    /// Property test: Fan-out worktree lifecycle with arbitrary descendant counts.
+    ///
+    /// For any number of descendants (2-5), the fan-out sequence should:
+    /// 1. Start with exactly one root worktree
+    /// 2. Remove the root worktree
+    /// 3. Create worktrees for all descendants
+    /// 4. End with exactly N descendant worktrees (where N is descendant count)
+    #[test]
+    fn fanout_worktree_lifecycle_property(
+        root_pr_num in 100u64..200,
+        descendant_count in 2usize..5,
+    ) {
+        let (_temp_dir, config) = create_test_repo();
+
+        let root_pr = PrNumber(root_pr_num);
+
+        // Create root worktree
+        let root_worktree = worktree_for_stack(&config, root_pr).unwrap();
+        prop_assert!(root_worktree.exists(), "Root worktree should be created");
+
+        // Generate descendant PR numbers (ensure they don't conflict with root)
+        let descendant_prs: Vec<PrNumber> = (0..descendant_count)
+            .map(|i| PrNumber(root_pr_num + 100 + i as u64))
+            .collect();
+
+        // === CRITICAL ORDERING ===
+        // Step 1: Remove old worktree FIRST
+        remove_worktree(&config, root_pr).unwrap();
+        prop_assert!(
+            !root_worktree.exists(),
+            "Old worktree must be removed before creating new ones"
+        );
+
+        // Step 2: Create new worktrees (only after removal)
+        for &desc_pr in &descendant_prs {
+            let wt = worktree_for_stack(&config, desc_pr).unwrap();
+            prop_assert!(wt.exists(), "Worktree for {} should exist", desc_pr);
+        }
+
+        // Verify final state
+        prop_assert!(
+            !root_worktree.exists(),
+            "Old worktree should remain removed"
+        );
+
+        let final_worktrees = list_worktrees(&config).unwrap();
+        prop_assert_eq!(
+            final_worktrees.len(),
+            descendant_count,
+            "Should have exactly {} worktrees after fan-out",
+            descendant_count
+        );
+    }
+
+    /// Property test: Fan-out doesn't leave orphaned worktrees.
+    ///
+    /// After a complete fan-out sequence, the only worktrees that exist
+    /// should be exactly the descendant worktrees - no orphans from the
+    /// original root.
+    #[test]
+    fn fanout_no_orphan_worktrees(
+        root_pr_num in 100u64..200,
+        descendant_nums in prop::collection::vec(200u64..300, 2..4),
+    ) {
+        let (_temp_dir, config) = create_test_repo();
+
+        let root_pr = PrNumber(root_pr_num);
+        let descendant_prs: Vec<PrNumber> = descendant_nums.iter().map(|&n| PrNumber(n)).collect();
+
+        // Create root worktree
+        worktree_for_stack(&config, root_pr).unwrap();
+
+        // Fan-out sequence: remove old, create new
+        remove_worktree(&config, root_pr).unwrap();
+        for &desc_pr in &descendant_prs {
+            worktree_for_stack(&config, desc_pr).unwrap();
+        }
+
+        // Verify: exactly the descendant worktrees exist, nothing else
+        let worktrees = list_worktrees(&config).unwrap();
+        let worktree_prs: HashSet<PrNumber> = worktrees.iter().map(|(pr, _)| *pr).collect();
+        let expected_prs: HashSet<PrNumber> = descendant_prs.iter().copied().collect();
+
+        prop_assert_eq!(
+            worktree_prs.clone(),
+            expected_prs,
+            "Worktrees should exactly match descendant set, got {:?}",
+            worktree_prs
+        );
+
+        // Verify root is not in the set
+        prop_assert!(
+            !worktree_prs.contains(&root_pr),
+            "Root worktree should not exist after fan-out"
+        );
+    }
+}
