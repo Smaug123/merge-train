@@ -680,7 +680,13 @@ struct RequiredStatusChecks {
 }
 
 async fn get_rulesets(client: &OctocrabClient) -> Result<GitHubResponse, GitHubApiError> {
-    let url = format!("/repos/{}/{}/rulesets", client.owner(), client.repo_name());
+    // includes_parents=true is required to include rulesets inherited from parent
+    // organizations, which may also enforce "dismiss stale reviews on push"
+    let url = format!(
+        "/repos/{}/{}/rulesets?includes_parents=true",
+        client.owner(),
+        client.repo_name()
+    );
 
     let result: Result<Vec<RulesetResponse>, _> = client.inner().get(&url, None::<&()>).await;
 

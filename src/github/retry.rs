@@ -121,6 +121,9 @@ pub enum RetryResult<T> {
         /// The last error encountered.
         last_error: GitHubApiError,
         /// Number of attempts made (including the initial attempt).
+        ///
+        /// Useful for logging/diagnostics when handling exhausted retries.
+        #[allow(dead_code)]
         attempts: u32,
     },
 
@@ -143,6 +146,10 @@ impl<T> RetryResult<T> {
     }
 
     /// Returns true if the result is a success.
+    ///
+    /// Part of the public API for callers who want to inspect the result
+    /// without consuming it.
+    #[allow(dead_code)]
     pub fn is_success(&self) -> bool {
         matches!(self, RetryResult::Success(_))
     }

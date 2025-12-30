@@ -190,9 +190,25 @@ impl GitHubApiError {
     }
 
     /// Extracts the HTTP status code from an octocrab error, if present.
+    ///
+    /// # Implementation Note
+    ///
+    /// This uses string parsing which is inherently fragile and may break if
+    /// octocrab changes its error message format. However, this is a pragmatic
+    /// choice because:
+    ///
+    /// 1. octocrab's `Error` type doesn't expose a stable API for extracting
+    ///    HTTP status codes across all error variants
+    /// 2. The fallback behavior (returning `None`) is safe — it results in
+    ///    conservative error categorization via `from_octocrab`
+    /// 3. The patterns matched are well-established HTTP error conventions
+    ///    (e.g., "404" with "not found") that are unlikely to change
+    /// 4. Critical error handling (SHA mismatch detection) also checks error
+    ///    messages directly, so this approach is consistent
+    ///
+    /// If octocrab adds a proper status code accessor in the future, this
+    /// function should be updated to use it.
     fn extract_status_code(err: &octocrab::Error) -> Option<u16> {
-        // Navigate the error chain to find HTTP status codes
-        // octocrab::Error may contain status information
         let err_str = err.to_string();
 
         // Try to extract status code from common error message patterns
