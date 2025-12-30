@@ -18,7 +18,7 @@
 //! - Non-critical events: No fsync (caller batches)
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, Seek, Write};
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
@@ -184,10 +184,15 @@ impl EventLog {
     /// # Returns
     ///
     /// Returns `(events, next_seq)` where:
-    /// - `events` is the list of valid events replayed
-    /// - `next_seq` is the next sequence number to use (max seq + 1)
+    /// - `events` is the list of valid events replayed from the offset
+    /// - `next_seq` is the next sequence number to use (max seq in file + 1)
     ///
     /// If the file doesn't exist or is empty, returns `(vec![], 0)`.
+    ///
+    /// **Note**: `next_seq` is always based on the maximum sequence number in the
+    /// entire file, not just the events replayed from the offset. This ensures
+    /// correct recovery when `offset` is at or past EOF (e.g., when replaying
+    /// from a snapshot's `log_position`).
     ///
     /// # Truncation
     ///
@@ -206,17 +211,18 @@ impl EventLog {
         let file = File::open(path)?;
         let file_len = file.metadata()?.len();
 
-        // If seeking past end or file is empty, nothing to replay
-        if offset >= file_len {
+        // If file is empty, nothing to replay
+        if file_len == 0 {
             return Ok((vec![], 0));
         }
 
+        // Always scan from the beginning to find the true max_seq,
+        // but only collect events from the requested offset.
         let mut reader = BufReader::new(file);
-        reader.seek(SeekFrom::Start(offset))?;
 
         let mut events = Vec::new();
-        let mut last_valid_pos = offset;
-        let mut current_pos = offset;
+        let mut last_valid_pos = 0u64;
+        let mut current_pos = 0u64;
         let mut max_seq: Option<u64> = None;
 
         loop {
@@ -248,7 +254,10 @@ impl EventLog {
                         break;
                     }
                     max_seq = Some(event.seq);
-                    events.push(event);
+                    // Only collect events from the requested offset onwards
+                    if line_start >= offset {
+                        events.push(event);
+                    }
                     last_valid_pos = current_pos;
                 }
                 Err(_) => {
@@ -423,6 +432,44 @@ mod tests {
             }
         }
 
+        /// next_seq is invariant with respect to offset (always equals max_seq_in_file + 1).
+        ///
+        /// This property catches bugs where replay_from returns wrong next_seq
+        /// when called with offset at/past EOF, which would break recovery.
+        #[test]
+        fn next_seq_invariant_of_offset(
+            payloads in prop::collection::vec(arb_simple_payload(), 1..10),
+            // offset_multiplier: 0.0 = start, 1.0 = EOF, >1.0 = past EOF
+            offset_multiplier in 0.0f64..2.0
+        ) {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("events.log");
+
+            // Write events
+            let mut log = EventLog::open(&path).unwrap();
+            for payload in &payloads {
+                log.append(payload.clone()).unwrap();
+            }
+            let file_len = log.position().unwrap();
+            drop(log);
+
+            // Calculate offset (can be past EOF when multiplier > 1.0)
+            let offset = (file_len as f64 * offset_multiplier) as u64;
+
+            // Replay from arbitrary offset
+            let (_, next_seq) = EventLog::replay_from(&path, offset).unwrap();
+
+            // next_seq must always be correct regardless of offset
+            prop_assert_eq!(
+                next_seq,
+                payloads.len() as u64,
+                "next_seq should be {} for offset {} (file_len={})",
+                payloads.len(),
+                offset,
+                file_len
+            );
+        }
+
         /// Partial line at EOF is truncated.
         #[test]
         fn partial_line_recovery(payloads in prop::collection::vec(arb_simple_payload(), 1..10)) {
@@ -506,10 +553,15 @@ mod tests {
         }
     }
 
-    // ─── Critical event fsync tests ───
+    // ─── Critical event tests ───
+    //
+    // Note: These tests verify that critical events are written and can be read back.
+    // They do NOT validate that fsync actually persists to disk (which would require
+    // simulating power loss). The fsync calls provide durability guarantees from the
+    // OS, but we can only test the write-read path here.
 
     #[test]
-    fn critical_events_are_synced() {
+    fn critical_events_written_to_file() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("events.log");
 
@@ -522,7 +574,7 @@ mod tests {
         })
         .unwrap();
 
-        // The file should be readable immediately (fsync was called)
+        // The file should be readable (verifies write succeeded, not durability)
         let (events, _) = EventLog::replay_from(&path, 0).unwrap();
         assert_eq!(events.len(), 1);
     }
@@ -589,10 +641,40 @@ mod tests {
         .unwrap();
         drop(log);
 
-        // Replay from past EOF
+        // Replay from past EOF - should still return correct next_seq
+        // based on existing events in the file (seq 0 exists, so next_seq = 1)
         let (events, next_seq) = EventLog::replay_from(&path, 10000).unwrap();
         assert!(events.is_empty());
-        assert_eq!(next_seq, 0);
+        assert_eq!(
+            next_seq, 1,
+            "next_seq should be 1 (one event with seq=0 exists)"
+        );
+    }
+
+    #[test]
+    fn replay_from_eof_returns_correct_next_seq() {
+        // This test specifically covers the recovery scenario where:
+        // 1. Snapshot was taken at log_position (which is EOF)
+        // 2. replay_from is called with that position
+        // 3. Even though no events are returned, next_seq must be correct
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.log");
+
+        let mut log = EventLog::open(&path).unwrap();
+        for i in 0..5 {
+            log.append(StateEventPayload::TrainStarted {
+                root_pr: PrNumber(i),
+                current_pr: PrNumber(i),
+            })
+            .unwrap();
+        }
+        let eof_position = log.position().unwrap();
+        drop(log);
+
+        // Replay from exactly EOF (simulating recovery with snapshot at end of log)
+        let (events, next_seq) = EventLog::replay_from(&path, eof_position).unwrap();
+        assert!(events.is_empty(), "no new events after EOF");
+        assert_eq!(next_seq, 5, "next_seq should be 5 (events 0-4 exist)");
     }
 
     #[test]

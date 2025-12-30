@@ -15,7 +15,7 @@ use crate::types::{CascadePhase, PrNumber, Sha, TrainError};
 ///
 /// Example JSON:
 /// ```json
-/// {"seq":1,"ts":"2024-01-15T10:00:00Z","type":"train_started","root_pr":123,"current_pr":123}
+/// {"seq":0,"ts":"2024-01-15T10:00:00Z","type":"train_started","root_pr":123,"current_pr":123}
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateEvent {
