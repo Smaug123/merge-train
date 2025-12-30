@@ -279,30 +279,39 @@ pub enum StateEventPayload {
 impl StateEventPayload {
     /// Returns true if this event type requires immediate fsync.
     pub fn is_critical(&self) -> bool {
-        matches!(
-            self,
+        // Exhaustive match ensures new variants force explicit classification.
+        match self {
             // Train lifecycle
             StateEventPayload::TrainStarted { .. }
-                | StateEventPayload::TrainStopped { .. }
-                | StateEventPayload::TrainCompleted { .. }
-                | StateEventPayload::TrainAborted { .. }
-                // Phase transitions
-                | StateEventPayload::PhaseTransition { .. }
-                | StateEventPayload::SquashCommitted { .. }
-                // Intent events (must be durable before performing operation)
-                | StateEventPayload::IntentPushPrep { .. }
-                | StateEventPayload::IntentSquash { .. }
-                | StateEventPayload::IntentPushReconcile { .. }
-                | StateEventPayload::IntentPushCatchup { .. }
-                | StateEventPayload::IntentRetarget { .. }
-                // Done events (must be durable before considering operation complete)
-                | StateEventPayload::DonePushPrep { .. }
-                | StateEventPayload::DonePushReconcile { .. }
-                | StateEventPayload::DonePushCatchup { .. }
-                | StateEventPayload::DoneRetarget { .. }
-                // Fan-out (atomic train record updates)
-                | StateEventPayload::FanOutCompleted { .. }
-        )
+            | StateEventPayload::TrainStopped { .. }
+            | StateEventPayload::TrainCompleted { .. }
+            | StateEventPayload::TrainAborted { .. } => true,
+
+            // Phase transitions
+            StateEventPayload::PhaseTransition { .. }
+            | StateEventPayload::SquashCommitted { .. } => true,
+
+            // Intent events (must be durable before performing operation)
+            StateEventPayload::IntentPushPrep { .. }
+            | StateEventPayload::IntentSquash { .. }
+            | StateEventPayload::IntentPushReconcile { .. }
+            | StateEventPayload::IntentPushCatchup { .. }
+            | StateEventPayload::IntentRetarget { .. } => true,
+
+            // Done events (must be durable before considering operation complete)
+            StateEventPayload::DonePushPrep { .. }
+            | StateEventPayload::DonePushReconcile { .. }
+            | StateEventPayload::DonePushCatchup { .. }
+            | StateEventPayload::DoneRetarget { .. } => true,
+
+            // Fan-out (atomic train record updates)
+            StateEventPayload::FanOutCompleted { .. } => true,
+
+            // Observational events (not critical for recovery)
+            StateEventPayload::PrMerged { .. }
+            | StateEventPayload::PrStateChanged { .. }
+            | StateEventPayload::PredecessorDeclared { .. } => false,
+        }
     }
 }
 
@@ -487,9 +496,7 @@ mod tests {
         fn state_event_serde_roundtrip(event in arb_state_event()) {
             let json = serde_json::to_string(&event).unwrap();
             let parsed: StateEvent = serde_json::from_str(&json).unwrap();
-            // Compare everything except timestamp (which is set at creation time)
-            prop_assert_eq!(event.seq, parsed.seq);
-            prop_assert_eq!(event.payload, parsed.payload);
+            prop_assert_eq!(event, parsed);
         }
 
         /// StateEventPayload serialization roundtrip.

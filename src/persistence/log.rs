@@ -1003,15 +1003,34 @@ mod tests {
 
             let (events, next_seq) = result.unwrap();
 
-            // All valid events should be recovered
-            prop_assert_eq!(
-                events.len(),
-                payloads.len(),
-                "Should recover all {} valid events, got {}",
+            // All valid events should be recovered (at minimum; garbage could
+            // theoretically deserialize into a valid event, though astronomically unlikely)
+            prop_assert!(
+                events.len() >= payloads.len(),
+                "Should recover at least {} valid events, got {}",
                 payloads.len(),
                 events.len()
             );
-            prop_assert_eq!(next_seq, payloads.len() as u64);
+
+            // Verify the original events are present and in order
+            for (i, (event, expected_payload)) in events.iter().zip(payloads.iter()).enumerate() {
+                prop_assert_eq!(
+                    event.seq, i as u64,
+                    "Event {} has wrong seq", i
+                );
+                prop_assert_eq!(
+                    &event.payload, expected_payload,
+                    "Event {} has wrong payload", i
+                );
+            }
+
+            // next_seq should be at least payloads.len() (could be higher if garbage was valid)
+            prop_assert!(
+                next_seq >= payloads.len() as u64,
+                "next_seq should be at least {}, got {}",
+                payloads.len(),
+                next_seq
+            );
 
             // File should be truncated (or have newline appended if garbage was valid JSON)
             let new_len = std::fs::metadata(&path).unwrap().len();
