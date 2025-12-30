@@ -284,6 +284,18 @@ impl EventLog {
                         // Truncate at this line
                         break;
                     }
+                    // Warn on gaps - doesn't require truncation (events are still valid),
+                    // but indicates a logic bug in the writer
+                    if let Some(prev) = max_seq {
+                        if event.seq != prev + 1 {
+                            tracing::warn!(
+                                prev,
+                                current = event.seq,
+                                path = %path.display(),
+                                "sequence gap detected in event log - possible logic bug"
+                            );
+                        }
+                    }
                     max_seq = Some(event.seq);
                     // Only collect events from the requested offset onwards
                     if line_start >= offset {
