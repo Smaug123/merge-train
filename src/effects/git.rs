@@ -75,6 +75,23 @@ pub enum GitEffect {
         message: String,
     },
 
+    /// Reconciliation merge: two-step merge for squash commit integration.
+    ///
+    /// This performs the reconciliation protocol from DESIGN.md:
+    /// 1. `git merge $SQUASH_SHA^` - Merge the parent of the squash commit
+    ///    (the final state of the predecessor's head branch before squash)
+    /// 2. `git merge -s ours $SQUASH_SHA` - Create a merge commit marking the
+    ///    squash as an ancestor without changing the tree
+    ///
+    /// This ensures the descendant branch contains all the predecessor's changes
+    /// and is properly marked as containing the squash commit.
+    MergeReconcile {
+        /// The squash commit SHA to reconcile against.
+        squash_sha: Sha,
+        /// The branch to push the result to.
+        target_branch: String,
+    },
+
     /// Push refs to a remote.
     Push {
         /// The refspec to push (e.g., "HEAD:refs/heads/feature").
@@ -209,6 +226,12 @@ mod tests {
                     message
                 }
             ),
+            (arb_sha(), arb_target()).prop_map(|(squash_sha, target_branch)| {
+                GitEffect::MergeReconcile {
+                    squash_sha,
+                    target_branch,
+                }
+            }),
             (arb_refspec(), any::<bool>())
                 .prop_map(|(refspec, force)| GitEffect::Push { refspec, force }),
             (arb_sha(), arb_sha()).prop_map(|(potential_ancestor, descendant)| {

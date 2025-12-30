@@ -2,6 +2,7 @@
 //!
 //! This library provides the core domain types and logic for the merge train bot.
 
+pub mod cascade;
 pub mod commands;
 pub mod effects;
 pub mod git;
