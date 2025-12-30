@@ -561,26 +561,30 @@ mod tests {
             match crash_point {
                 0 => {
                     // Crash before anything - initial state should be recoverable
+                    // snapshot.next_seq stays 0 (events written but not yet reflected in-memory)
                 }
                 1 => {
                     // Crash after writing new snapshot, before updating generation
+                    // In real usage, next_seq would be updated as events are applied
+                    snapshot.next_seq = num_events as u64;
                     snapshot.log_generation = new_gen;
                     snapshot.log_position = 0;
-                    snapshot.next_seq = num_events as u64;
                     save_snapshot_atomic(&snapshot_path(dir.path(), new_gen), &snapshot).unwrap();
                     // Generation file still points to initial_gen
                 }
                 2 => {
                     // Crash after updating generation, before deleting old files
+                    snapshot.next_seq = num_events as u64;
                     snapshot.log_generation = new_gen;
                     snapshot.log_position = 0;
-                    snapshot.next_seq = num_events as u64;
                     save_snapshot_atomic(&snapshot_path(dir.path(), new_gen), &snapshot).unwrap();
                     write_generation(dir.path(), new_gen).unwrap();
                     // Old files still exist
                 }
                 3 => {
                     // Complete compaction (no crash)
+                    // In real usage, next_seq would already be updated as events are applied
+                    snapshot.next_seq = num_events as u64;
                     compact(dir.path(), &mut snapshot).unwrap();
                 }
                 _ => unreachable!(),
@@ -615,35 +619,57 @@ mod tests {
             let replay_result = EventLog::replay_from(&current_events_path, loaded.log_position);
 
             // Replay should succeed (file might not exist for new generation, which is OK)
-            let (replayed_events, next_seq) = replay_result.unwrap();
+            let (replayed_events, replayed_next_seq) = replay_result.unwrap();
 
             if crash_point == 0 {
                 // Crash before anything: still at initial_gen, replay its events
+                // Snapshot's next_seq is 0 (no events incorporated yet)
+                prop_assert_eq!(
+                    loaded.next_seq, 0,
+                    "After crash at point 0, snapshot next_seq should be 0, got {}",
+                    loaded.next_seq
+                );
                 prop_assert_eq!(
                     replayed_events.len(), num_events,
                     "After crash at point 0, should replay {} events, got {}",
                     num_events, replayed_events.len()
                 );
                 prop_assert_eq!(
-                    next_seq, num_events as u64,
-                    "After crash at point 0, next_seq should be {}, got {}",
-                    num_events, next_seq
+                    replayed_next_seq, num_events as u64,
+                    "After crash at point 0, replayed next_seq should be {}, got {}",
+                    num_events, replayed_next_seq
                 );
             } else {
                 // crash_point 1, 2, 3: Recovery uses the higher generation (new_gen)
                 // The new snapshot already has next_seq = num_events incorporated,
                 // and there's no event log at the new generation yet.
                 prop_assert_eq!(
+                    loaded.next_seq, num_events as u64,
+                    "After crash at point {}, snapshot next_seq should be {}, got {}",
+                    crash_point, num_events, loaded.next_seq
+                );
+                prop_assert_eq!(
                     replayed_events.len(), 0,
                     "After crash at point {}, new generation should have 0 events, got {}",
                     crash_point, replayed_events.len()
                 );
                 prop_assert_eq!(
-                    next_seq, 0,
-                    "After crash at point {}, new generation next_seq should be 0, got {}",
-                    crash_point, next_seq
+                    replayed_next_seq, 0,
+                    "After crash at point {}, replayed next_seq should be 0, got {}",
+                    crash_point, replayed_next_seq
                 );
             }
+
+            // === Validate total sequence count after full recovery ===
+            // The effective next_seq after recovery is snapshot.next_seq + replayed event count
+            // (since replayed events would update next_seq during actual replay application).
+            // This catches sequence mismatches across generations.
+            let effective_next_seq = loaded.next_seq + replayed_events.len() as u64;
+            prop_assert_eq!(
+                effective_next_seq, num_events as u64,
+                "After crash at point {}, effective next_seq should be {} (snapshot.next_seq={} + replayed={})",
+                crash_point, num_events, loaded.next_seq, replayed_events.len()
+            );
 
             // === Verify only current generation files exist ===
             let files = list_generation_files(dir.path()).unwrap();
@@ -784,6 +810,7 @@ mod tests {
         ///
         /// This is critical for callers that may retry or continue after a failure.
         /// They need to know the snapshot still reflects the pre-compaction state.
+        #[cfg(unix)]
         #[test]
         fn compact_failure_preserves_snapshot_state(
             train_pr in arb_pr_number(),
