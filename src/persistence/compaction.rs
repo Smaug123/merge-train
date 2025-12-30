@@ -464,24 +464,45 @@ mod tests {
         /// 2 = crash after updating generation, before deleting old files
         /// 3 = complete (no crash)
         ///
-        /// In all cases, cleanup + load should yield valid state.
+        /// Validates:
+        /// - Snapshot data is preserved
+        /// - `log_position` is correct for the recovered generation
+        /// - Event log replay works and returns correct `next_seq`
+        /// - File cleanup removes stale generations
         #[test]
         fn crash_during_compaction_is_recoverable(
             train_pr in arb_pr_number(),
             initial_gen in 0u64..5,
-            crash_point in 0usize..4
+            crash_point in 0usize..4,
+            num_events in 1usize..5
         ) {
+            use crate::persistence::log::EventLog;
+            use crate::persistence::event::StateEventPayload;
+
             let dir = tempdir().unwrap();
 
             // Set up initial state at generation N
             let mut snapshot = create_test_snapshot();
             snapshot.active_trains.insert(train_pr, TrainRecord::new(train_pr));
             snapshot.log_generation = initial_gen;
+            snapshot.log_position = 0;
+            snapshot.next_seq = 0;
 
             // Write initial generation files
             write_generation(dir.path(), initial_gen).unwrap();
             save_snapshot_atomic(&snapshot_path(dir.path(), initial_gen), &snapshot).unwrap();
-            File::create(events_path(dir.path(), initial_gen)).unwrap();
+
+            // Write events to the event log (simulating activity before compaction)
+            let events_file = events_path(dir.path(), initial_gen);
+            {
+                let mut log = EventLog::open(&events_file).unwrap();
+                for i in 0..num_events {
+                    log.append(StateEventPayload::TrainStarted {
+                        root_pr: PrNumber(1000 + i as u64),
+                        current_pr: PrNumber(1000 + i as u64),
+                    }).unwrap();
+                }
+            }
 
             let new_gen = initial_gen + 1;
 
@@ -494,6 +515,7 @@ mod tests {
                     // Crash after writing new snapshot, before updating generation
                     snapshot.log_generation = new_gen;
                     snapshot.log_position = 0;
+                    snapshot.next_seq = num_events as u64;
                     save_snapshot_atomic(&snapshot_path(dir.path(), new_gen), &snapshot).unwrap();
                     // Generation file still points to initial_gen
                 }
@@ -501,6 +523,7 @@ mod tests {
                     // Crash after updating generation, before deleting old files
                     snapshot.log_generation = new_gen;
                     snapshot.log_position = 0;
+                    snapshot.next_seq = num_events as u64;
                     save_snapshot_atomic(&snapshot_path(dir.path(), new_gen), &snapshot).unwrap();
                     write_generation(dir.path(), new_gen).unwrap();
                     // Old files still exist
@@ -523,13 +546,74 @@ mod tests {
                 &snapshot_path(dir.path(), current_gen)
             ).unwrap();
 
-            // The train data should always be preserved
+            // === Core assertion: Train data should always be preserved ===
             prop_assert!(
                 loaded.active_trains.contains_key(&train_pr),
                 "Train {} should be recoverable after crash at point {}", train_pr, crash_point
             );
 
-            // Verify only current generation files exist
+            // === Validate log_position correctness ===
+            if crash_point == 0 || crash_point == 1 {
+                // Recovery uses old generation - log_position should be at start (0)
+                // since we created snapshot with log_position = 0
+                prop_assert_eq!(
+                    loaded.log_position, 0,
+                    "After crash at point {}, recovered snapshot should have log_position=0 (original)", crash_point
+                );
+            } else {
+                // Recovery uses new generation - log_position should be 0 (fresh log)
+                prop_assert_eq!(
+                    loaded.log_position, 0,
+                    "After crash at point {}, new generation should have log_position=0", crash_point
+                );
+            }
+
+            // === Validate event log replay works ===
+            let current_events_path = events_path(dir.path(), current_gen);
+            let replay_result = EventLog::replay_from(&current_events_path, loaded.log_position);
+
+            // Replay should succeed (file might not exist for new generation, which is OK)
+            let (replayed_events, next_seq) = replay_result.unwrap();
+
+            if crash_point == 0 || crash_point == 1 {
+                // Old generation: should replay all events from log_position (0)
+                prop_assert_eq!(
+                    replayed_events.len(), num_events,
+                    "After crash at point {}, should replay {} events, got {}",
+                    crash_point, num_events, replayed_events.len()
+                );
+                prop_assert_eq!(
+                    next_seq, num_events as u64,
+                    "After crash at point {}, next_seq should be {}, got {}",
+                    crash_point, num_events, next_seq
+                );
+            } else {
+                // New generation: empty event log (no events yet)
+                prop_assert_eq!(
+                    replayed_events.len(), 0,
+                    "After crash at point {}, new generation should have 0 events, got {}",
+                    crash_point, replayed_events.len()
+                );
+                prop_assert_eq!(
+                    next_seq, 0,
+                    "After crash at point {}, new generation next_seq should be 0, got {}",
+                    crash_point, next_seq
+                );
+            }
+
+            // === Validate next_seq in snapshot allows correct continuation ===
+            // After recovery, next_seq should match what replay returns
+            // (For old gen: events exist, for new gen: 0)
+            if crash_point == 0 || crash_point == 1 {
+                // Old generation was recovered, but snapshot.next_seq was 0 initially
+                // The recovery process should use replay to determine correct next_seq
+                prop_assert_eq!(
+                    next_seq, num_events as u64,
+                    "Replay should return next_seq={} for continuing writes", num_events
+                );
+            }
+
+            // === Verify only current generation files exist ===
             let files = list_generation_files(dir.path()).unwrap();
             for (file_gen, _) in &files {
                 prop_assert_eq!(
