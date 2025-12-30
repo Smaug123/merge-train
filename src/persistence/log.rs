@@ -297,11 +297,16 @@ impl EventLog {
                 }
             };
 
-            // Skip empty lines
+            // Skip empty lines that end with newline.
+            // A whitespace-only "line" without trailing newline (e.g., lone \r at EOF)
+            // is garbage and should be truncated, not accepted.
             let trimmed = line.trim();
             if trimmed.is_empty() {
-                last_valid_pos = current_pos;
-                last_line_had_newline = has_newline;
+                if has_newline {
+                    last_valid_pos = current_pos;
+                    last_line_had_newline = true;
+                }
+                // else: whitespace without newline is garbage, don't advance last_valid_pos
                 continue;
             }
 
@@ -1224,5 +1229,56 @@ mod tests {
             "Should recover the one valid event before the corrupted line"
         );
         assert_eq!(next_seq, 1);
+    }
+
+    /// Regression test for flaky proptest failure.
+    /// Trailing carriage return (0x0D) after valid JSON caused recovery issues.
+    #[test]
+    fn trailing_carriage_return_does_not_break_recovery() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.log");
+
+        // Write the specific payload from the proptest failure
+        let mut log = EventLog::open(&path).unwrap();
+        log.append(StateEventPayload::IntentSquash {
+            train_root: PrNumber(249042210413805320),
+            pr: PrNumber(773602773637626364),
+        })
+        .unwrap();
+        let valid_len = log.position().unwrap();
+        drop(log);
+
+        // Append carriage return (byte 13) as garbage
+        {
+            let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+            file.write_all(&[13]).unwrap(); // \r
+        }
+
+        // Recovery must succeed
+        let result = EventLog::replay_from(&path, 0);
+        assert!(
+            result.is_ok(),
+            "replay_from should succeed with trailing \\r, got error: {:?}",
+            result.err()
+        );
+
+        let (events, next_seq) = result.unwrap();
+
+        // The valid event should be recovered
+        assert!(
+            !events.is_empty(),
+            "Should recover at least the valid event"
+        );
+        assert_eq!(events[0].seq, 0);
+        assert_eq!(next_seq, events.len() as u64);
+
+        // File should be truncated to remove the garbage
+        let new_len = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            new_len <= valid_len + 1,
+            "File should be truncated or have at most one newline added. Expected <= {}, got {}",
+            valid_len + 1,
+            new_len
+        );
     }
 }
