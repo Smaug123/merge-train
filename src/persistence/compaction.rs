@@ -622,6 +622,128 @@ mod tests {
                 );
             }
         }
+
+        // ─── Generation file consistency properties ───
+
+        /// Cleanup preserves exactly the files at the generation file's value.
+        ///
+        /// For any generation file value G and any set of existing snapshot generations,
+        /// after cleanup only files at generation G remain.
+        #[test]
+        fn cleanup_preserves_only_current_generation(
+            current_gen in 0u64..10,
+            other_gens in prop::collection::vec(0u64..10, 0..5)
+        ) {
+            let dir = tempdir().unwrap();
+
+            // Set up generation file
+            write_generation(dir.path(), current_gen).unwrap();
+
+            // Create files at current generation
+            File::create(snapshot_path(dir.path(), current_gen)).unwrap();
+            File::create(events_path(dir.path(), current_gen)).unwrap();
+
+            // Create files at other generations (may overlap with current_gen)
+            for g in &other_gens {
+                let _ = File::create(snapshot_path(dir.path(), *g));
+                let _ = File::create(events_path(dir.path(), *g));
+            }
+
+            // Run cleanup
+            cleanup_stale_generations(dir.path()).unwrap();
+
+            // Property: only files at current_gen remain
+            let remaining = list_generation_files(dir.path()).unwrap();
+            for (g, _) in &remaining {
+                prop_assert_eq!(
+                    *g, current_gen,
+                    "After cleanup, only generation {} should remain, found {}", current_gen, g
+                );
+            }
+
+            // And current_gen files should still exist
+            prop_assert!(
+                snapshot_path(dir.path(), current_gen).exists(),
+                "Snapshot at current generation {} should exist", current_gen
+            );
+        }
+
+        /// Stale generation file causes data loss: cleanup deletes snapshots newer than
+        /// the generation file value.
+        ///
+        /// This property documents dangerous behavior: if the generation file points to
+        /// an older generation than actually exists, cleanup will delete the newer data.
+        #[test]
+        fn stale_generation_file_causes_data_loss(
+            stale_gen in 0u64..5,
+            newer_gen in 5u64..10
+        ) {
+            // Precondition: stale_gen < newer_gen (ensured by ranges)
+            prop_assume!(stale_gen < newer_gen);
+
+            let dir = tempdir().unwrap();
+
+            // Generation file points to old value
+            write_generation(dir.path(), stale_gen).unwrap();
+
+            // But valid snapshot exists at newer generation
+            let mut snapshot = create_test_snapshot();
+            snapshot.log_generation = newer_gen;
+            save_snapshot_atomic(&snapshot_path(dir.path(), newer_gen), &snapshot).unwrap();
+            File::create(events_path(dir.path(), newer_gen)).unwrap();
+
+            // Also create files at stale_gen (what the generation file thinks is current)
+            File::create(snapshot_path(dir.path(), stale_gen)).unwrap();
+            File::create(events_path(dir.path(), stale_gen)).unwrap();
+
+            // Cleanup uses generation file value, not actual snapshot content
+            cleanup_stale_generations(dir.path()).unwrap();
+
+            // DATA LOSS: newer snapshot is deleted
+            prop_assert!(
+                !snapshot_path(dir.path(), newer_gen).exists(),
+                "Newer snapshot at gen {} was deleted due to stale generation file pointing to {}",
+                newer_gen, stale_gen
+            );
+
+            // Stale files remain
+            prop_assert!(
+                snapshot_path(dir.path(), stale_gen).exists(),
+                "Stale snapshot at gen {} remains", stale_gen
+            );
+        }
+
+        /// Cleanup is idempotent: running it twice has the same effect as once.
+        #[test]
+        fn cleanup_is_idempotent(
+            current_gen in 0u64..10,
+            other_gens in prop::collection::vec(0u64..10, 0..5)
+        ) {
+            let dir = tempdir().unwrap();
+
+            write_generation(dir.path(), current_gen).unwrap();
+            File::create(snapshot_path(dir.path(), current_gen)).unwrap();
+            File::create(events_path(dir.path(), current_gen)).unwrap();
+
+            for g in &other_gens {
+                let _ = File::create(snapshot_path(dir.path(), *g));
+                let _ = File::create(events_path(dir.path(), *g));
+            }
+
+            // First cleanup
+            cleanup_stale_generations(dir.path()).unwrap();
+            let after_first = list_generation_files(dir.path()).unwrap();
+
+            // Second cleanup
+            cleanup_stale_generations(dir.path()).unwrap();
+            let after_second = list_generation_files(dir.path()).unwrap();
+
+            // Property: same files remain after both cleanups
+            prop_assert_eq!(
+                after_first, after_second,
+                "Cleanup should be idempotent"
+            );
+        }
     }
 
     // ─── Crash simulation tests ───
@@ -767,5 +889,125 @@ mod tests {
         assert!(!snapshot_path(dir.path(), 0).exists());
         assert!(!events_path(dir.path(), 0).exists());
         assert!(snapshot_path(dir.path(), 1).exists());
+    }
+
+    // ─── Missing/corrupt generation file tests ───
+    //
+    // These tests document behavior when the generation file is missing or corrupt
+    // but snapshot files exist. This is critical for understanding data loss risks.
+
+    #[test]
+    fn cleanup_with_missing_generation_file_deletes_all_snapshots() {
+        // CRITICAL: This test documents a data loss scenario!
+        //
+        // If the generation file is missing but snapshots exist at higher generations,
+        // cleanup_stale_generations will delete those snapshots because read_generation
+        // returns 0 (default), and all files with generation != 0 are considered stale.
+        let dir = tempdir().unwrap();
+
+        // Create valid snapshot at generation 3 (simulating prior successful compactions)
+        let mut snapshot = create_snapshot_with_train(999);
+        snapshot.log_generation = 3;
+        save_snapshot_atomic(&snapshot_path(dir.path(), 3), &snapshot).unwrap();
+        File::create(events_path(dir.path(), 3)).unwrap();
+
+        // Verify snapshot exists and contains data
+        assert!(snapshot_path(dir.path(), 3).exists());
+        let loaded =
+            crate::persistence::snapshot::load_snapshot(&snapshot_path(dir.path(), 3)).unwrap();
+        assert!(loaded.active_trains.contains_key(&PrNumber(999)));
+
+        // Delete the generation file (simulating corruption/loss)
+        // Note: generation file doesn't exist yet in this test setup
+        assert!(!dir.path().join("generation").exists());
+
+        // read_generation returns 0 for missing file
+        assert_eq!(read_generation(dir.path()).unwrap(), 0);
+
+        // THIS IS THE DATA LOSS: cleanup thinks gen 0 is current, deletes gen 3
+        cleanup_stale_generations(dir.path()).unwrap();
+
+        // The snapshot is gone!
+        assert!(
+            !snapshot_path(dir.path(), 3).exists(),
+            "Snapshot at gen 3 was deleted because generation file was missing"
+        );
+        assert!(
+            !events_path(dir.path(), 3).exists(),
+            "Events at gen 3 were deleted because generation file was missing"
+        );
+    }
+
+    #[test]
+    fn cleanup_with_corrupt_generation_file_returns_error() {
+        // When the generation file is corrupt, cleanup_stale_generations returns an error.
+        // This is safer than the missing file case - at least data isn't silently deleted.
+        let dir = tempdir().unwrap();
+
+        // Create valid snapshot at generation 2
+        let mut snapshot = create_snapshot_with_train(888);
+        snapshot.log_generation = 2;
+        save_snapshot_atomic(&snapshot_path(dir.path(), 2), &snapshot).unwrap();
+        File::create(events_path(dir.path(), 2)).unwrap();
+
+        // Write corrupt generation file
+        std::fs::write(dir.path().join("generation"), "garbage_data\n").unwrap();
+
+        // cleanup_stale_generations fails with an error
+        let result = cleanup_stale_generations(dir.path());
+        assert!(
+            result.is_err(),
+            "Should fail when generation file is corrupt"
+        );
+
+        // Importantly, the snapshots are preserved (not deleted)
+        assert!(
+            snapshot_path(dir.path(), 2).exists(),
+            "Snapshot should be preserved when cleanup fails due to corrupt generation"
+        );
+        assert!(
+            events_path(dir.path(), 2).exists(),
+            "Events should be preserved when cleanup fails due to corrupt generation"
+        );
+
+        // Data can be recovered manually by fixing the generation file
+        write_generation(dir.path(), 2).unwrap();
+        let loaded =
+            crate::persistence::snapshot::load_snapshot(&snapshot_path(dir.path(), 2)).unwrap();
+        assert!(loaded.active_trains.contains_key(&PrNumber(888)));
+    }
+
+    #[test]
+    fn compact_with_missing_generation_file_starts_from_zero() {
+        // When starting fresh or after generation file loss, compact starts from gen 0
+        let dir = tempdir().unwrap();
+
+        // No generation file exists
+        assert!(!dir.path().join("generation").exists());
+
+        let mut snapshot = create_snapshot_with_train(777);
+
+        // compact reads gen as 0 and creates gen 1
+        compact(dir.path(), &mut snapshot).unwrap();
+
+        assert_eq!(read_generation(dir.path()).unwrap(), 1);
+        assert!(snapshot_path(dir.path(), 1).exists());
+        assert_eq!(snapshot.log_generation, 1);
+    }
+
+    #[test]
+    fn compact_with_corrupt_generation_file_returns_error() {
+        // Compaction fails when generation file is corrupt, preventing further damage
+        let dir = tempdir().unwrap();
+
+        std::fs::write(dir.path().join("generation"), "not_valid\n").unwrap();
+
+        let mut snapshot = create_snapshot_with_train(666);
+        let result = compact(dir.path(), &mut snapshot);
+
+        assert!(
+            result.is_err(),
+            "compact should fail with corrupt generation file"
+        );
     }
 }
