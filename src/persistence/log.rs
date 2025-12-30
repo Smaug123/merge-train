@@ -189,6 +189,13 @@ impl EventLog {
     /// This is a static method because it may need to truncate the file,
     /// which requires opening it in write mode.
     ///
+    /// # Arguments
+    ///
+    /// * `offset` - Byte offset to start collecting events from. Must be line-aligned
+    ///   (i.e., point to the start of a line, not the middle of a JSON record).
+    ///   In practice, this should always come from [`EventLog::position`] which
+    ///   returns the offset immediately after the last written newline.
+    ///
     /// # Returns
     ///
     /// Returns `(events, next_seq)` where:
