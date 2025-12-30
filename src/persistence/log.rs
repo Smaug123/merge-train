@@ -326,34 +326,11 @@ impl EventLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::arb_state_event_payload;
     use crate::types::{CascadePhase, DescendantProgress, PrNumber, Sha};
     use proptest::prelude::*;
     use std::io::Write;
     use tempfile::tempdir;
-
-    // ─── Arbitrary implementations ───
-
-    fn arb_pr_number() -> impl Strategy<Value = PrNumber> {
-        (1u64..10000).prop_map(PrNumber)
-    }
-
-    fn arb_simple_payload() -> impl Strategy<Value = StateEventPayload> {
-        // Use simpler payloads for log tests to focus on log behavior
-        prop_oneof![
-            (arb_pr_number(), arb_pr_number()).prop_map(|(r, c)| StateEventPayload::TrainStarted {
-                root_pr: r,
-                current_pr: c
-            }),
-            arb_pr_number().prop_map(|r| StateEventPayload::TrainStopped { root_pr: r }),
-            arb_pr_number().prop_map(|r| StateEventPayload::TrainCompleted { root_pr: r }),
-            (arb_pr_number(), arb_pr_number()).prop_map(|(pr, pred)| {
-                StateEventPayload::PredecessorDeclared {
-                    pr,
-                    predecessor: pred,
-                }
-            }),
-        ]
-    }
 
     // ─── Basic functionality tests ───
 
@@ -417,7 +394,7 @@ mod tests {
     proptest! {
         /// Write N events, replay yields exactly N events.
         #[test]
-        fn roundtrip_n_events(payloads in prop::collection::vec(arb_simple_payload(), 1..20)) {
+        fn roundtrip_n_events(payloads in prop::collection::vec(arb_state_event_payload(), 1..20)) {
             let dir = tempdir().unwrap();
             let path = dir.path().join("events.log");
 
@@ -444,7 +421,7 @@ mod tests {
 
         /// Offset-based replay returns only events after offset.
         #[test]
-        fn offset_replay(payloads in prop::collection::vec(arb_simple_payload(), 3..10)) {
+        fn offset_replay(payloads in prop::collection::vec(arb_state_event_payload(), 3..10)) {
             let dir = tempdir().unwrap();
             let path = dir.path().join("events.log");
 
@@ -479,7 +456,7 @@ mod tests {
         /// when called with offset at/past EOF, which would break recovery.
         #[test]
         fn next_seq_invariant_of_offset(
-            payloads in prop::collection::vec(arb_simple_payload(), 1..10),
+            payloads in prop::collection::vec(arb_state_event_payload(), 1..10),
             // offset_multiplier: 0.0 = start, 1.0 = EOF, >1.0 = past EOF
             offset_multiplier in 0.0f64..2.0
         ) {
@@ -513,7 +490,7 @@ mod tests {
 
         /// Partial line at EOF is truncated.
         #[test]
-        fn partial_line_recovery(payloads in prop::collection::vec(arb_simple_payload(), 1..10)) {
+        fn partial_line_recovery(payloads in prop::collection::vec(arb_state_event_payload(), 1..10)) {
             let dir = tempdir().unwrap();
             let path = dir.path().join("events.log");
 
@@ -547,7 +524,7 @@ mod tests {
         /// Crash at random byte position recovers valid prefix.
         #[test]
         fn crash_simulation(
-            payloads in prop::collection::vec(arb_simple_payload(), 2..10),
+            payloads in prop::collection::vec(arb_state_event_payload(), 2..10),
             truncate_ratio in 0.1f64..0.99
         ) {
             let dir = tempdir().unwrap();
@@ -843,8 +820,8 @@ mod tests {
         /// 5. Final replay should recover exactly N + M events
         #[test]
         fn recovery_then_append_produces_valid_log(
-            initial_payloads in prop::collection::vec(arb_simple_payload(), 1..5),
-            additional_payloads in prop::collection::vec(arb_simple_payload(), 1..5),
+            initial_payloads in prop::collection::vec(arb_state_event_payload(), 1..5),
+            additional_payloads in prop::collection::vec(arb_state_event_payload(), 1..5),
             strip_final_newline in proptest::bool::ANY,
         ) {
             let dir = tempdir().unwrap();
@@ -904,7 +881,7 @@ mod tests {
         /// after any sequence of open/append operations.
         #[test]
         fn position_equals_file_length(
-            payloads in prop::collection::vec(arb_simple_payload(), 0..10),
+            payloads in prop::collection::vec(arb_state_event_payload(), 0..10),
             reopen_after in prop::collection::vec(0usize..10, 0..3),
         ) {
             let dir = tempdir().unwrap();
@@ -960,7 +937,7 @@ mod tests {
         /// 3. The file is truncated to remove the garbage
         #[test]
         fn arbitrary_trailing_bytes_do_not_prevent_recovery(
-            payloads in prop::collection::vec(arb_simple_payload(), 1..5),
+            payloads in prop::collection::vec(arb_state_event_payload(), 1..5),
             // Generate arbitrary bytes including invalid UTF-8 sequences
             garbage_bytes in prop::collection::vec(prop::num::u8::ANY, 1..100),
         ) {
