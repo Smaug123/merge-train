@@ -5,5 +5,6 @@
 pub mod commands;
 pub mod effects;
 pub mod persistence;
+pub mod spool;
 pub mod state;
 pub mod types;
