@@ -25,7 +25,7 @@ use chrono::Utc;
 use thiserror::Error;
 
 use super::event::{StateEvent, StateEventPayload};
-use super::fsync::fsync_file;
+use super::fsync::{fsync_dir, fsync_file};
 
 /// Errors that can occur during event log operations.
 #[derive(Debug, Error)]
@@ -65,9 +65,12 @@ impl EventLog {
     /// If the file exists, it's opened for append. The `next_seq` is set to 0;
     /// call `replay_from` to determine the actual next sequence number.
     ///
-    /// If the file doesn't exist, it's created.
+    /// If the file doesn't exist, it's created and the parent directory is
+    /// fsynced to ensure the new file survives a crash.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
+        let is_new = !path.exists();
+
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -77,6 +80,13 @@ impl EventLog {
         // Seek to EOF so that position() returns the correct offset.
         // Files opened with append(true) may have cursor at 0 until first write.
         file.seek(SeekFrom::End(0))?;
+
+        // fsync the parent directory when creating a new file to ensure the
+        // directory entry is durable. Without this, a crash could lose the file
+        // even if its contents were fsynced.
+        if is_new && let Some(parent) = path.parent() {
+            fsync_dir(parent)?;
+        }
 
         Ok(EventLog {
             file,
@@ -88,8 +98,13 @@ impl EventLog {
     /// Opens an existing log file or creates a new one, with a known next sequence number.
     ///
     /// Use this after calling `replay_from` to create a log ready for appending.
+    ///
+    /// If the file doesn't exist, it's created and the parent directory is
+    /// fsynced to ensure the new file survives a crash.
     pub fn open_with_seq(path: impl AsRef<Path>, next_seq: u64) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
+        let is_new = !path.exists();
+
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -99,6 +114,13 @@ impl EventLog {
         // Seek to EOF so that position() returns the correct offset.
         // Files opened with append(true) may have cursor at 0 until first write.
         file.seek(SeekFrom::End(0))?;
+
+        // fsync the parent directory when creating a new file to ensure the
+        // directory entry is durable. Without this, a crash could lose the file
+        // even if its contents were fsynced.
+        if is_new && let Some(parent) = path.parent() {
+            fsync_dir(parent)?;
+        }
 
         Ok(EventLog {
             file,
