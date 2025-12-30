@@ -329,4 +329,84 @@ mod tests {
         let files = list_generation_files(&nonexistent).unwrap();
         assert!(files.is_empty());
     }
+
+    // ─── Missing/corrupt generation file tests ───
+    //
+    // These tests document behavior when the generation file is missing or corrupt
+    // but snapshot files exist. This is an important recovery scenario.
+
+    #[test]
+    fn missing_generation_file_with_existing_snapshots_returns_zero() {
+        // Scenario: generation file deleted/missing, but snapshots exist
+        // Risk: read_generation returns 0, which may not match existing snapshots
+        let dir = tempdir().unwrap();
+
+        // Create snapshots at generation 3 (simulating prior successful compactions)
+        File::create(snapshot_path(dir.path(), 3)).unwrap();
+        File::create(events_path(dir.path(), 3)).unwrap();
+
+        // No generation file exists
+        assert!(!dir.path().join("generation").exists());
+
+        // read_generation returns 0 (default for missing file)
+        let generation = read_generation(dir.path()).unwrap();
+        assert_eq!(generation, 0);
+
+        // Document the risk: list_generation_files shows snapshots exist at gen 3
+        let files = list_generation_files(dir.path()).unwrap();
+        assert!(files.iter().any(|(g, _)| *g == 3));
+
+        // This mismatch (gen=0, but files at gen=3) could cause data loss
+        // if cleanup_stale_generations is called - it would delete gen 3 files
+    }
+
+    #[test]
+    fn corrupt_generation_file_with_existing_snapshots_returns_error() {
+        // Scenario: generation file contains garbage, but valid snapshots exist
+        // Behavior: Returns error, preventing any operations until manually fixed
+        let dir = tempdir().unwrap();
+
+        // Create valid snapshots at generation 2
+        File::create(snapshot_path(dir.path(), 2)).unwrap();
+        File::create(events_path(dir.path(), 2)).unwrap();
+
+        // Write corrupt generation file
+        std::fs::write(dir.path().join("generation"), "not_a_number\n").unwrap();
+
+        // read_generation returns an error
+        let result = read_generation(dir.path());
+        assert!(
+            matches!(result, Err(GenerationError::InvalidNumber(_))),
+            "Expected InvalidNumber error for corrupt generation file"
+        );
+
+        // The snapshots still exist and could be recovered manually
+        let files = list_generation_files(dir.path()).unwrap();
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().any(|(g, _)| *g == 2));
+    }
+
+    #[test]
+    fn list_generation_files_can_find_max_generation_when_file_missing() {
+        // This test demonstrates how to recover from a missing generation file:
+        // scan for highest generation number among existing snapshots
+        let dir = tempdir().unwrap();
+
+        // Create snapshots at multiple generations
+        File::create(snapshot_path(dir.path(), 1)).unwrap();
+        File::create(snapshot_path(dir.path(), 3)).unwrap();
+        File::create(snapshot_path(dir.path(), 5)).unwrap();
+        File::create(events_path(dir.path(), 5)).unwrap();
+
+        // No generation file
+        assert!(!dir.path().join("generation").exists());
+
+        // Recovery strategy: find max generation from existing files
+        let files = list_generation_files(dir.path()).unwrap();
+        let max_gen = files.iter().map(|(g, _)| *g).max().unwrap_or(0);
+
+        assert_eq!(max_gen, 5);
+
+        // Could then write_generation(dir.path(), max_gen) to restore consistency
+    }
 }

@@ -72,7 +72,10 @@ pub struct PersistedRepoSnapshot {
     /// On replay, seek to this offset and read forward.
     pub log_position: u64,
 
-    /// Next sequence number to assign (monotonically increasing).
+    /// Next sequence number to assign (globally monotonic).
+    /// This value is preserved across generations during compaction.
+    /// Events written to any generation's log file use this as their
+    /// starting sequence number, ensuring global uniqueness.
     pub next_seq: u64,
 
     /// Cached default branch name.

@@ -15,7 +15,7 @@ use crate::types::{CascadePhase, PrNumber, Sha, TrainError};
 ///
 /// Example JSON:
 /// ```json
-/// {"seq":1,"ts":"2024-01-15T10:00:00Z","type":"train_started","root_pr":123,"current_pr":123}
+/// {"seq":0,"ts":"2024-01-15T10:00:00Z","type":"train_started","root_pr":123,"current_pr":123}
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateEvent {
@@ -279,205 +279,47 @@ pub enum StateEventPayload {
 impl StateEventPayload {
     /// Returns true if this event type requires immediate fsync.
     pub fn is_critical(&self) -> bool {
-        matches!(
-            self,
+        // Exhaustive match ensures new variants force explicit classification.
+        match self {
             // Train lifecycle
             StateEventPayload::TrainStarted { .. }
-                | StateEventPayload::TrainStopped { .. }
-                | StateEventPayload::TrainCompleted { .. }
-                | StateEventPayload::TrainAborted { .. }
-                // Phase transitions
-                | StateEventPayload::PhaseTransition { .. }
-                | StateEventPayload::SquashCommitted { .. }
-                // Intent events (must be durable before performing operation)
-                | StateEventPayload::IntentPushPrep { .. }
-                | StateEventPayload::IntentSquash { .. }
-                | StateEventPayload::IntentPushReconcile { .. }
-                | StateEventPayload::IntentPushCatchup { .. }
-                | StateEventPayload::IntentRetarget { .. }
-                // Done events (must be durable before considering operation complete)
-                | StateEventPayload::DonePushPrep { .. }
-                | StateEventPayload::DonePushReconcile { .. }
-                | StateEventPayload::DonePushCatchup { .. }
-                | StateEventPayload::DoneRetarget { .. }
-                // Fan-out (atomic train record updates)
-                | StateEventPayload::FanOutCompleted { .. }
-        )
+            | StateEventPayload::TrainStopped { .. }
+            | StateEventPayload::TrainCompleted { .. }
+            | StateEventPayload::TrainAborted { .. } => true,
+
+            // Phase transitions
+            StateEventPayload::PhaseTransition { .. }
+            | StateEventPayload::SquashCommitted { .. } => true,
+
+            // Intent events (must be durable before performing operation)
+            StateEventPayload::IntentPushPrep { .. }
+            | StateEventPayload::IntentSquash { .. }
+            | StateEventPayload::IntentPushReconcile { .. }
+            | StateEventPayload::IntentPushCatchup { .. }
+            | StateEventPayload::IntentRetarget { .. } => true,
+
+            // Done events (must be durable before considering operation complete)
+            StateEventPayload::DonePushPrep { .. }
+            | StateEventPayload::DonePushReconcile { .. }
+            | StateEventPayload::DonePushCatchup { .. }
+            | StateEventPayload::DoneRetarget { .. } => true,
+
+            // Fan-out (atomic train record updates)
+            StateEventPayload::FanOutCompleted { .. } => true,
+
+            // Observational events (not critical for recovery)
+            StateEventPayload::PrMerged { .. }
+            | StateEventPayload::PrStateChanged { .. }
+            | StateEventPayload::PredecessorDeclared { .. } => false,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::DescendantProgress;
+    use crate::test_utils::{arb_state_event, arb_state_event_payload};
     use proptest::prelude::*;
-
-    // ─── Arbitrary implementations for property testing ───
-
-    fn arb_pr_number() -> impl Strategy<Value = PrNumber> {
-        any::<u64>().prop_map(PrNumber)
-    }
-
-    fn arb_sha() -> impl Strategy<Value = Sha> {
-        "[0-9a-f]{40}".prop_map(|s| Sha::parse(s).unwrap())
-    }
-
-    fn arb_train_error() -> impl Strategy<Value = TrainError> {
-        ("[a-z_]{1,20}", "[a-zA-Z0-9 ]{1,100}").prop_map(|(t, m)| TrainError::new(t, m))
-    }
-
-    fn arb_descendant_progress() -> impl Strategy<Value = DescendantProgress> {
-        prop::collection::vec(arb_pr_number(), 0..5).prop_map(DescendantProgress::new)
-    }
-
-    fn arb_cascade_phase() -> impl Strategy<Value = CascadePhase> {
-        prop_oneof![
-            Just(CascadePhase::Idle),
-            arb_descendant_progress().prop_map(|p| CascadePhase::Preparing { progress: p }),
-            arb_descendant_progress().prop_map(|p| CascadePhase::SquashPending { progress: p }),
-            (arb_descendant_progress(), arb_sha()).prop_map(|(p, s)| CascadePhase::Reconciling {
-                progress: p,
-                squash_sha: s
-            }),
-            (arb_descendant_progress(), arb_sha()).prop_map(|(p, s)| CascadePhase::CatchingUp {
-                progress: p,
-                squash_sha: s
-            }),
-            (arb_descendant_progress(), arb_sha()).prop_map(|(p, s)| CascadePhase::Retargeting {
-                progress: p,
-                squash_sha: s
-            }),
-        ]
-    }
-
-    fn arb_branch_name() -> impl Strategy<Value = String> {
-        "[a-z][a-z0-9/-]{0,50}".prop_map(String::from)
-    }
-
-    fn arb_state_event_payload() -> impl Strategy<Value = StateEventPayload> {
-        prop_oneof![
-            // Train lifecycle
-            (arb_pr_number(), arb_pr_number()).prop_map(|(r, c)| StateEventPayload::TrainStarted {
-                root_pr: r,
-                current_pr: c
-            }),
-            arb_pr_number().prop_map(|r| StateEventPayload::TrainStopped { root_pr: r }),
-            arb_pr_number().prop_map(|r| StateEventPayload::TrainCompleted { root_pr: r }),
-            (arb_pr_number(), arb_train_error()).prop_map(|(r, e)| {
-                StateEventPayload::TrainAborted {
-                    root_pr: r,
-                    error: e,
-                }
-            }),
-            // Phase transitions
-            (
-                arb_pr_number(),
-                arb_pr_number(),
-                prop::option::of(arb_pr_number()),
-                prop::option::of(arb_sha()),
-                arb_cascade_phase()
-            )
-                .prop_map(|(tr, cp, pp, ls, ph)| StateEventPayload::PhaseTransition {
-                    train_root: tr,
-                    current_pr: cp,
-                    predecessor_pr: pp,
-                    last_squash_sha: ls,
-                    phase: ph
-                }),
-            (arb_pr_number(), arb_pr_number(), arb_sha()).prop_map(|(tr, pr, sh)| {
-                StateEventPayload::SquashCommitted {
-                    train_root: tr,
-                    pr,
-                    sha: sh,
-                }
-            }),
-            // Intent/done - prep
-            (arb_pr_number(), arb_branch_name(), arb_sha(), arb_sha()).prop_map(
-                |(tr, br, pre, exp)| StateEventPayload::IntentPushPrep {
-                    train_root: tr,
-                    branch: br,
-                    pre_push_sha: pre,
-                    expected_tree: exp
-                }
-            ),
-            (arb_pr_number(), arb_branch_name()).prop_map(|(tr, br)| {
-                StateEventPayload::DonePushPrep {
-                    train_root: tr,
-                    branch: br,
-                }
-            }),
-            // Intent squash
-            (arb_pr_number(), arb_pr_number())
-                .prop_map(|(tr, pr)| StateEventPayload::IntentSquash { train_root: tr, pr }),
-            // Intent/done - reconcile
-            (arb_pr_number(), arb_branch_name(), arb_sha(), arb_sha()).prop_map(
-                |(tr, br, pre, exp)| StateEventPayload::IntentPushReconcile {
-                    train_root: tr,
-                    branch: br,
-                    pre_push_sha: pre,
-                    expected_tree: exp
-                }
-            ),
-            (arb_pr_number(), arb_branch_name()).prop_map(|(tr, br)| {
-                StateEventPayload::DonePushReconcile {
-                    train_root: tr,
-                    branch: br,
-                }
-            }),
-            // Intent/done - catchup
-            (arb_pr_number(), arb_branch_name(), arb_sha(), arb_sha()).prop_map(
-                |(tr, br, pre, exp)| StateEventPayload::IntentPushCatchup {
-                    train_root: tr,
-                    branch: br,
-                    pre_push_sha: pre,
-                    expected_tree: exp
-                }
-            ),
-            (arb_pr_number(), arb_branch_name()).prop_map(|(tr, br)| {
-                StateEventPayload::DonePushCatchup {
-                    train_root: tr,
-                    branch: br,
-                }
-            }),
-            // Intent/done - retarget
-            (arb_pr_number(), arb_pr_number(), arb_branch_name()).prop_map(|(tr, pr, nb)| {
-                StateEventPayload::IntentRetarget {
-                    train_root: tr,
-                    pr,
-                    new_base: nb,
-                }
-            }),
-            (arb_pr_number(), arb_pr_number())
-                .prop_map(|(tr, pr)| StateEventPayload::DoneRetarget { train_root: tr, pr }),
-            // Fan-out
-            (
-                arb_pr_number(),
-                prop::collection::vec(arb_pr_number(), 1..5),
-                arb_pr_number()
-            )
-                .prop_map(|(old, new, orig)| StateEventPayload::FanOutCompleted {
-                    old_root: old,
-                    new_roots: new,
-                    original_root_pr: orig
-                }),
-            // Non-critical
-            (arb_pr_number(), arb_sha())
-                .prop_map(|(pr, sha)| StateEventPayload::PrMerged { pr, sha }),
-            (arb_pr_number(), "[a-z]{1,10}".prop_map(String::from))
-                .prop_map(|(pr, st)| StateEventPayload::PrStateChanged { pr, state: st }),
-            (arb_pr_number(), arb_pr_number()).prop_map(|(pr, pred)| {
-                StateEventPayload::PredecessorDeclared {
-                    pr,
-                    predecessor: pred,
-                }
-            }),
-        ]
-    }
-
-    fn arb_state_event() -> impl Strategy<Value = StateEvent> {
-        (any::<u64>(), arb_state_event_payload())
-            .prop_map(|(seq, payload)| StateEvent::new(seq, payload))
-    }
 
     // ─── Property tests ───
 
@@ -487,9 +329,7 @@ mod tests {
         fn state_event_serde_roundtrip(event in arb_state_event()) {
             let json = serde_json::to_string(&event).unwrap();
             let parsed: StateEvent = serde_json::from_str(&json).unwrap();
-            // Compare everything except timestamp (which is set at creation time)
-            prop_assert_eq!(event.seq, parsed.seq);
-            prop_assert_eq!(event.payload, parsed.payload);
+            prop_assert_eq!(event, parsed);
         }
 
         /// StateEventPayload serialization roundtrip.
