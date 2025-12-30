@@ -100,14 +100,49 @@ pub fn compact(state_dir: &Path, snapshot: &mut PersistedRepoSnapshot) -> Result
 ///
 /// # Logic
 ///
-/// 1. Read current generation N
-/// 2. Delete any files from generations other than N
-/// 3. Delete any orphaned .tmp files
+/// 1. Scan for existing snapshot files to find the highest generation
+/// 2. Read the generation file value
+/// 3. Use the highest snapshot generation (if any exist), updating the generation
+///    file if it's stale or missing
+/// 4. Delete files from other generations
+/// 5. Delete any orphaned .tmp files
+///
+/// # Recovery from stale/missing generation file
+///
+/// If the generation file is missing or points to a lower generation than the
+/// highest existing snapshot, this function uses the snapshot's generation and
+/// restores the generation file. This prevents data loss when the generation
+/// file is corrupted or lost.
 pub fn cleanup_stale_generations(state_dir: &Path) -> Result<()> {
-    let current_gen = read_generation(state_dir)?;
+    let file_gen = read_generation(state_dir)?;
     let files = list_generation_files(state_dir)?;
 
-    // Delete files from generations other than current (both old and orphaned future generations)
+    // Find the highest generation among existing snapshot files.
+    // Snapshots are written atomically, so if a snapshot file exists, it's complete.
+    let max_snapshot_gen = files
+        .iter()
+        .filter(|(_, file_type)| *file_type == "snapshot")
+        .map(|(generation, _)| *generation)
+        .max();
+
+    // Determine the actual current generation:
+    // - If snapshots exist, use the highest snapshot generation. This handles:
+    //   - Stale generation file (points to older gen than exists)
+    //   - Missing generation file (returns 0, but snapshots exist)
+    //   - Crash after snapshot write but before gen file update
+    // - If no snapshots exist, trust the generation file (fresh state)
+    let current_gen = match max_snapshot_gen {
+        Some(max_gen) => {
+            // If there's a mismatch, update the generation file to be consistent
+            if max_gen != file_gen {
+                write_generation(state_dir, max_gen)?;
+            }
+            max_gen
+        }
+        None => file_gen, // No snapshots - trust the file (fresh state or generation 0)
+    };
+
+    // Delete files from generations other than current
     for (generation, _file_type) in files {
         if generation != current_gen {
             delete_old_generation(state_dir, generation)?;
@@ -553,20 +588,11 @@ mod tests {
             );
 
             // === Validate log_position correctness ===
-            if crash_point == 0 || crash_point == 1 {
-                // Recovery uses old generation - log_position should be at start (0)
-                // since we created snapshot with log_position = 0
-                prop_assert_eq!(
-                    loaded.log_position, 0,
-                    "After crash at point {}, recovered snapshot should have log_position=0 (original)", crash_point
-                );
-            } else {
-                // Recovery uses new generation - log_position should be 0 (fresh log)
-                prop_assert_eq!(
-                    loaded.log_position, 0,
-                    "After crash at point {}, new generation should have log_position=0", crash_point
-                );
-            }
+            // All cases: log_position should be 0 (either original snapshot or new snapshot)
+            prop_assert_eq!(
+                loaded.log_position, 0,
+                "After crash at point {}, snapshot should have log_position=0", crash_point
+            );
 
             // === Validate event log replay works ===
             let current_events_path = events_path(dir.path(), current_gen);
@@ -575,20 +601,22 @@ mod tests {
             // Replay should succeed (file might not exist for new generation, which is OK)
             let (replayed_events, next_seq) = replay_result.unwrap();
 
-            if crash_point == 0 || crash_point == 1 {
-                // Old generation: should replay all events from log_position (0)
+            if crash_point == 0 {
+                // Crash before anything: still at initial_gen, replay its events
                 prop_assert_eq!(
                     replayed_events.len(), num_events,
-                    "After crash at point {}, should replay {} events, got {}",
-                    crash_point, num_events, replayed_events.len()
+                    "After crash at point 0, should replay {} events, got {}",
+                    num_events, replayed_events.len()
                 );
                 prop_assert_eq!(
                     next_seq, num_events as u64,
-                    "After crash at point {}, next_seq should be {}, got {}",
-                    crash_point, num_events, next_seq
+                    "After crash at point 0, next_seq should be {}, got {}",
+                    num_events, next_seq
                 );
             } else {
-                // New generation: empty event log (no events yet)
+                // crash_point 1, 2, 3: Recovery uses the higher generation (new_gen)
+                // The new snapshot already has next_seq = num_events incorporated,
+                // and there's no event log at the new generation yet.
                 prop_assert_eq!(
                     replayed_events.len(), 0,
                     "After crash at point {}, new generation should have 0 events, got {}",
@@ -598,18 +626,6 @@ mod tests {
                     next_seq, 0,
                     "After crash at point {}, new generation next_seq should be 0, got {}",
                     crash_point, next_seq
-                );
-            }
-
-            // === Validate next_seq in snapshot allows correct continuation ===
-            // After recovery, next_seq should match what replay returns
-            // (For old gen: events exist, for new gen: 0)
-            if crash_point == 0 || crash_point == 1 {
-                // Old generation was recovered, but snapshot.next_seq was 0 initially
-                // The recovery process should use replay to determine correct next_seq
-                prop_assert_eq!(
-                    next_seq, num_events as u64,
-                    "Replay should return next_seq={} for continuing writes", num_events
                 );
             }
 
@@ -625,56 +641,63 @@ mod tests {
 
         // ─── Generation file consistency properties ───
 
-        /// Cleanup preserves exactly the files at the generation file's value.
+        /// Cleanup preserves exactly the files at the highest snapshot generation.
         ///
-        /// For any generation file value G and any set of existing snapshot generations,
-        /// after cleanup only files at generation G remain.
+        /// For any set of existing snapshot generations, after cleanup only files
+        /// at the highest generation remain, and the generation file is updated
+        /// to match.
         #[test]
-        fn cleanup_preserves_only_current_generation(
-            current_gen in 0u64..10,
-            other_gens in prop::collection::vec(0u64..10, 0..5)
+        fn cleanup_preserves_only_highest_snapshot_generation(
+            gen_file_value in 0u64..10,
+            snapshot_gens in prop::collection::hash_set(0u64..10, 1..5)
         ) {
             let dir = tempdir().unwrap();
 
-            // Set up generation file
-            write_generation(dir.path(), current_gen).unwrap();
+            // Set up generation file (may not match actual snapshots)
+            write_generation(dir.path(), gen_file_value).unwrap();
 
-            // Create files at current generation
-            File::create(snapshot_path(dir.path(), current_gen)).unwrap();
-            File::create(events_path(dir.path(), current_gen)).unwrap();
-
-            // Create files at other generations (may overlap with current_gen)
-            for g in &other_gens {
-                let _ = File::create(snapshot_path(dir.path(), *g));
-                let _ = File::create(events_path(dir.path(), *g));
+            // Create snapshot and event files at various generations
+            for g in &snapshot_gens {
+                File::create(snapshot_path(dir.path(), *g)).unwrap();
+                File::create(events_path(dir.path(), *g)).unwrap();
             }
+
+            // Determine expected: highest snapshot generation
+            let expected_gen = *snapshot_gens.iter().max().unwrap();
 
             // Run cleanup
             cleanup_stale_generations(dir.path()).unwrap();
 
-            // Property: only files at current_gen remain
+            // Property: only files at highest snapshot generation remain
             let remaining = list_generation_files(dir.path()).unwrap();
             for (g, _) in &remaining {
                 prop_assert_eq!(
-                    *g, current_gen,
-                    "After cleanup, only generation {} should remain, found {}", current_gen, g
+                    *g, expected_gen,
+                    "After cleanup, only generation {} should remain, found {}", expected_gen, g
                 );
             }
 
-            // And current_gen files should still exist
+            // Highest generation files should still exist
             prop_assert!(
-                snapshot_path(dir.path(), current_gen).exists(),
-                "Snapshot at current generation {} should exist", current_gen
+                snapshot_path(dir.path(), expected_gen).exists(),
+                "Snapshot at highest generation {} should exist", expected_gen
+            );
+
+            // Generation file should be updated to match
+            let updated_gen = read_generation(dir.path()).unwrap();
+            prop_assert_eq!(
+                updated_gen, expected_gen,
+                "Generation file should be updated to {}, got {}", expected_gen, updated_gen
             );
         }
 
-        /// Stale generation file causes data loss: cleanup deletes snapshots newer than
-        /// the generation file value.
+        /// When generation file is stale/missing, cleanup should preserve newer snapshots.
         ///
-        /// This property documents dangerous behavior: if the generation file points to
-        /// an older generation than actually exists, cleanup will delete the newer data.
+        /// If the generation file points to an older generation than actually exists,
+        /// cleanup should detect this (e.g., by scanning existing files) and NOT delete
+        /// the newer data. Currently this bug exists and this test fails.
         #[test]
-        fn stale_generation_file_causes_data_loss(
+        fn stale_generation_file_preserves_newer_snapshots(
             stale_gen in 0u64..5,
             newer_gen in 5u64..10
         ) {
@@ -683,7 +706,7 @@ mod tests {
 
             let dir = tempdir().unwrap();
 
-            // Generation file points to old value
+            // Generation file points to old value (simulating corruption/loss)
             write_generation(dir.path(), stale_gen).unwrap();
 
             // But valid snapshot exists at newer generation
@@ -696,20 +719,14 @@ mod tests {
             File::create(snapshot_path(dir.path(), stale_gen)).unwrap();
             File::create(events_path(dir.path(), stale_gen)).unwrap();
 
-            // Cleanup uses generation file value, not actual snapshot content
+            // Cleanup should detect the mismatch and preserve newer data
             cleanup_stale_generations(dir.path()).unwrap();
 
-            // DATA LOSS: newer snapshot is deleted
+            // CORRECT BEHAVIOR: newer snapshot should be preserved
             prop_assert!(
-                !snapshot_path(dir.path(), newer_gen).exists(),
-                "Newer snapshot at gen {} was deleted due to stale generation file pointing to {}",
+                snapshot_path(dir.path(), newer_gen).exists(),
+                "Newer snapshot at gen {} should be preserved even when generation file points to {}",
                 newer_gen, stale_gen
-            );
-
-            // Stale files remain
-            prop_assert!(
-                snapshot_path(dir.path(), stale_gen).exists(),
-                "Stale snapshot at gen {} remains", stale_gen
             );
         }
 
@@ -753,74 +770,88 @@ mod tests {
         let dir = tempdir().unwrap();
 
         // Simulate state after writing new snapshot but before updating generation
-        // Generation file says 0, but snapshot.1.json exists
+        // Generation file says 0, but snapshot.1.json exists (with newer data)
 
-        // Create initial state
+        // Create initial state at generation 0
         let mut snapshot = create_snapshot_with_train(100);
         save_snapshot_atomic(&snapshot_path(dir.path(), 0), &snapshot).unwrap();
         write_generation(dir.path(), 0).unwrap();
 
-        // Create event log with some events
+        // Create event log with some events at generation 0
         let events = events_path(dir.path(), 0);
         let mut f = File::create(&events).unwrap();
         writeln!(f, r#"{{"seq":0,"ts":"2024-01-01T00:00:00Z","type":"train_started","root_pr":101,"current_pr":101}}"#).unwrap();
 
         // Simulate crash after writing snapshot.1 but before updating generation
+        // This snapshot has MORE data (train 200 in addition to train 100)
         snapshot
             .active_trains
             .insert(PrNumber(200), TrainRecord::new(PrNumber(200)));
         save_snapshot_atomic(&snapshot_path(dir.path(), 1), &snapshot).unwrap();
-        // Generation still says 0!
+        // Generation file still says 0!
 
-        // Recovery should use generation 0 (ignoring orphaned snapshot.1)
-        let current_gen = read_generation(dir.path()).unwrap();
-        assert_eq!(current_gen, 0);
+        // Before cleanup, gen file says 0
+        assert_eq!(read_generation(dir.path()).unwrap(), 0);
 
-        // The old snapshot should be the one we load
-        let loaded =
-            crate::persistence::snapshot::load_snapshot(&snapshot_path(dir.path(), 0)).unwrap();
-        assert!(loaded.active_trains.contains_key(&PrNumber(100)));
-        // The train added to snapshot.1 should NOT be visible
-        assert!(!loaded.active_trains.contains_key(&PrNumber(200)));
+        // Both snapshots exist before cleanup
+        assert!(snapshot_path(dir.path(), 0).exists());
+        assert!(snapshot_path(dir.path(), 1).exists());
 
-        // Cleanup removes the orphaned snapshot.1
-        assert!(
-            snapshot_path(dir.path(), 1).exists(),
-            "Orphaned snapshot.1 should exist before cleanup"
-        );
+        // Cleanup should use the HIGHEST snapshot (generation 1) to preserve data
         cleanup_stale_generations(dir.path()).unwrap();
 
-        // Generation 0 files still exist
-        assert!(snapshot_path(dir.path(), 0).exists());
-        assert!(events_path(dir.path(), 0).exists());
+        // Generation file should be updated to 1
+        assert_eq!(
+            read_generation(dir.path()).unwrap(),
+            1,
+            "Generation file should be updated to match highest snapshot"
+        );
 
-        // Orphaned snapshot.1 is removed
+        // Generation 1 files should exist (the newer, more complete snapshot)
         assert!(
-            !snapshot_path(dir.path(), 1).exists(),
-            "Orphaned snapshot.1 should be removed by cleanup"
+            snapshot_path(dir.path(), 1).exists(),
+            "Snapshot.1 (highest) should be preserved"
+        );
+
+        // Generation 0 files should be removed
+        assert!(
+            !snapshot_path(dir.path(), 0).exists(),
+            "Snapshot.0 (older) should be removed"
+        );
+
+        // The preserved snapshot should contain ALL data (both trains)
+        let loaded =
+            crate::persistence::snapshot::load_snapshot(&snapshot_path(dir.path(), 1)).unwrap();
+        assert!(
+            loaded.active_trains.contains_key(&PrNumber(100)),
+            "Train 100 should be in preserved snapshot"
+        );
+        assert!(
+            loaded.active_trains.contains_key(&PrNumber(200)),
+            "Train 200 should be in preserved snapshot"
         );
     }
 
     #[test]
-    fn cleanup_removes_orphaned_future_generations() {
-        // This test specifically verifies that cleanup handles generation > current,
-        // which can happen if a crash occurs after writing a new snapshot but before
-        // updating the generation file.
+    fn cleanup_preserves_highest_snapshot_generation() {
+        // When multiple snapshot generations exist, cleanup keeps the highest one
+        // and removes all others. This handles the crash scenario where a new
+        // snapshot was written but the generation file wasn't updated.
         let dir = tempdir().unwrap();
 
-        // Set up current generation as 2
+        // Generation file says 2 (simulating stale state)
         write_generation(dir.path(), 2).unwrap();
         File::create(snapshot_path(dir.path(), 2)).unwrap();
         File::create(events_path(dir.path(), 2)).unwrap();
 
-        // Create orphaned files from both past AND future generations
-        // Past: generation 0 and 1 (didn't get cleaned up from prior compaction)
+        // Old generations (didn't get cleaned up from prior compaction)
         File::create(snapshot_path(dir.path(), 0)).unwrap();
         File::create(events_path(dir.path(), 0)).unwrap();
         File::create(snapshot_path(dir.path(), 1)).unwrap();
         File::create(events_path(dir.path(), 1)).unwrap();
 
-        // Future: generation 3 (crash during compaction before gen file update)
+        // Newer generation 3 (crash during compaction before gen file update)
+        // This is the HIGHEST snapshot, so it should be preserved
         File::create(snapshot_path(dir.path(), 3)).unwrap();
         // Note: events.3.log might not exist if crash was early in compaction
 
@@ -833,7 +864,7 @@ mod tests {
         // Run cleanup
         cleanup_stale_generations(dir.path()).unwrap();
 
-        // Only current generation (2) should remain
+        // Only the HIGHEST snapshot generation (3) should remain
         assert!(
             !snapshot_path(dir.path(), 0).exists(),
             "Old generation 0 should be removed"
@@ -851,16 +882,23 @@ mod tests {
             "Old generation 1 events should be removed"
         );
         assert!(
-            snapshot_path(dir.path(), 2).exists(),
-            "Current generation 2 should remain"
+            !snapshot_path(dir.path(), 2).exists(),
+            "Generation 2 should be removed (not highest)"
         );
         assert!(
-            events_path(dir.path(), 2).exists(),
-            "Current generation 2 events should remain"
+            !events_path(dir.path(), 2).exists(),
+            "Generation 2 events should be removed"
         );
         assert!(
-            !snapshot_path(dir.path(), 3).exists(),
-            "Orphaned future generation 3 should be removed"
+            snapshot_path(dir.path(), 3).exists(),
+            "Highest generation 3 should be preserved"
+        );
+
+        // Generation file should be updated to 3
+        assert_eq!(
+            read_generation(dir.path()).unwrap(),
+            3,
+            "Generation file should be updated to match highest snapshot"
         );
     }
 
@@ -897,12 +935,13 @@ mod tests {
     // but snapshot files exist. This is critical for understanding data loss risks.
 
     #[test]
-    fn cleanup_with_missing_generation_file_deletes_all_snapshots() {
-        // CRITICAL: This test documents a data loss scenario!
+    fn cleanup_with_missing_generation_file_preserves_snapshots() {
+        // When the generation file is missing but snapshots exist at higher generations,
+        // cleanup_stale_generations should detect this by scanning existing files and
+        // preserve the newest snapshot rather than deleting it.
         //
-        // If the generation file is missing but snapshots exist at higher generations,
-        // cleanup_stale_generations will delete those snapshots because read_generation
-        // returns 0 (default), and all files with generation != 0 are considered stale.
+        // Currently this test FAILS because read_generation returns 0 for missing file,
+        // and cleanup deletes all files with generation != 0.
         let dir = tempdir().unwrap();
 
         // Create valid snapshot at generation 3 (simulating prior successful compactions)
@@ -917,24 +956,27 @@ mod tests {
             crate::persistence::snapshot::load_snapshot(&snapshot_path(dir.path(), 3)).unwrap();
         assert!(loaded.active_trains.contains_key(&PrNumber(999)));
 
-        // Delete the generation file (simulating corruption/loss)
-        // Note: generation file doesn't exist yet in this test setup
+        // Generation file is missing (simulating corruption/loss)
         assert!(!dir.path().join("generation").exists());
 
-        // read_generation returns 0 for missing file
-        assert_eq!(read_generation(dir.path()).unwrap(), 0);
-
-        // THIS IS THE DATA LOSS: cleanup thinks gen 0 is current, deletes gen 3
+        // Cleanup should detect existing snapshots and preserve them
         cleanup_stale_generations(dir.path()).unwrap();
 
-        // The snapshot is gone!
+        // CORRECT BEHAVIOR: snapshot should be preserved
         assert!(
-            !snapshot_path(dir.path(), 3).exists(),
-            "Snapshot at gen 3 was deleted because generation file was missing"
+            snapshot_path(dir.path(), 3).exists(),
+            "Snapshot at gen 3 should be preserved even when generation file is missing"
         );
         assert!(
-            !events_path(dir.path(), 3).exists(),
-            "Events at gen 3 were deleted because generation file was missing"
+            events_path(dir.path(), 3).exists(),
+            "Events at gen 3 should be preserved even when generation file is missing"
+        );
+
+        // After cleanup, the generation file should be restored to match existing snapshots
+        assert_eq!(
+            read_generation(dir.path()).unwrap(),
+            3,
+            "Generation file should be restored to match the highest existing snapshot"
         );
     }
 
