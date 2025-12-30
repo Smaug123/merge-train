@@ -89,10 +89,18 @@ fn prune_prs(snapshot: &mut PersistedRepoSnapshot, config: &PruneConfig) {
         }
     }
 
-    // Keep all PRs in active trains
+    // Keep all PRs in active trains (including frozen descendants)
     for train in snapshot.active_trains.values() {
         keep.insert(train.current_pr);
         keep.insert(train.original_root_pr);
+
+        // Keep all frozen descendants - they're part of the active cascade
+        // and needed for the operation to complete correctly
+        if let Some(progress) = train.cascade_phase.progress() {
+            for pr in &progress.frozen_descendants {
+                keep.insert(*pr);
+            }
+        }
     }
 
     // Transitive closure: keep predecessors of kept PRs
@@ -176,7 +184,9 @@ fn prune_dedupe_keys(snapshot: &mut PersistedRepoSnapshot, config: &PruneConfig)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{CachedPr, MergeStateStatus, PrState, Sha, TrainRecord};
+    use crate::types::{
+        CachedPr, CascadePhase, DescendantProgress, MergeStateStatus, PrState, Sha, TrainRecord,
+    };
     use chrono::{Duration, Utc};
     use proptest::prelude::*;
 
@@ -470,6 +480,10 @@ mod tests {
         (1u64..10000).prop_map(PrNumber)
     }
 
+    fn arb_sha() -> impl Strategy<Value = Sha> {
+        "[0-9a-f]{40}".prop_map(|s| Sha::parse(s).unwrap())
+    }
+
     proptest! {
         /// Open PRs are never pruned.
         #[test]
@@ -601,6 +615,51 @@ mod tests {
             let after_second = snapshot.prs.len();
 
             prop_assert_eq!(after_first, after_second, "Pruning should be idempotent");
+        }
+
+        /// PRs in frozen_descendants of active train cascade phases are never pruned.
+        ///
+        /// When a train is mid-cascade (not Idle), its frozen_descendants list contains
+        /// PRs that are part of the active operation. These PRs might be closed/merged
+        /// (e.g., a descendant that failed during preparation), but they must be preserved
+        /// for the cascade to complete correctly and for recovery to work.
+        #[test]
+        fn frozen_descendants_in_active_trains_never_pruned(
+            train_pr in 1u64..1000,
+            // Use distinct range for descendants to avoid overlap with train_pr
+            frozen_descendants in prop::collection::hash_set(1000u64..2000, 1..5)
+                .prop_map(|set| set.into_iter().map(PrNumber).collect::<Vec<_>>()),
+            sha in arb_sha(),
+        ) {
+            let mut snapshot = PersistedRepoSnapshot::new("main");
+            let old_date = Utc::now() - Duration::days(60);
+
+            // Add old merged PRs for the frozen descendants - these would normally be pruned
+            for pr_num in &frozen_descendants {
+                snapshot.prs.insert(*pr_num, create_merged_pr(pr_num.0, old_date));
+            }
+
+            // Add the train PR itself
+            snapshot.prs.insert(PrNumber(train_pr), create_merged_pr(train_pr, old_date));
+
+            // Create train with non-Idle phase containing frozen_descendants
+            let progress = DescendantProgress::new(frozen_descendants.clone());
+            let mut train = TrainRecord::new(PrNumber(train_pr));
+            train.cascade_phase = CascadePhase::Reconciling {
+                progress,
+                squash_sha: sha,
+            };
+            snapshot.active_trains.insert(PrNumber(train_pr), train);
+
+            prune_snapshot(&mut snapshot, &default_config());
+
+            // All frozen descendants should survive pruning
+            for pr_num in &frozen_descendants {
+                prop_assert!(
+                    snapshot.prs.contains_key(pr_num),
+                    "Frozen descendant {} in active train should not be pruned", pr_num
+                );
+            }
         }
     }
 }
