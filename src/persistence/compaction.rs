@@ -62,6 +62,13 @@ pub type Result<T> = std::result::Result<T, CompactionError>;
 /// * `state_dir` - The state directory containing snapshot and event files
 /// * `snapshot` - The current state to persist as the new generation's snapshot
 ///
+/// # Prerequisites
+///
+/// `cleanup_stale_generations` MUST be called before `compact` to ensure
+/// the generation file is consistent with existing snapshots. Failure to do
+/// so may result in creating a new generation that conflicts with existing
+/// (higher-numbered) snapshots.
+///
 /// # Crash Safety
 ///
 /// At any crash point during compaction:
@@ -69,19 +76,25 @@ pub type Result<T> = std::result::Result<T, CompactionError>;
 /// - The new generation is either complete or can be detected as incomplete
 ///
 /// Recovery will use whichever generation is complete.
+///
+/// # Error Handling
+///
+/// If any I/O operation fails, the in-memory `snapshot` is left unchanged.
+/// The caller can safely retry or continue with the original generation.
 pub fn compact(state_dir: &Path, snapshot: &mut PersistedRepoSnapshot) -> Result<()> {
     // 1. Read current generation
     let old_gen = read_generation(state_dir)?;
     let new_gen = old_gen + 1;
 
-    // 2. Update snapshot metadata for new generation
-    snapshot.log_generation = new_gen;
-    snapshot.log_position = 0; // Start of new event log
-    snapshot.touch(); // Update snapshot_at timestamp
+    // 2. Stage changes in a clone (don't mutate original until disk writes succeed)
+    let mut staged = snapshot.clone();
+    staged.log_generation = new_gen;
+    staged.log_position = 0; // Start of new event log
+    staged.touch(); // Update snapshot_at timestamp
 
     // 3. Write new snapshot (atomic)
     let new_snapshot_path = snapshot_path(state_dir, new_gen);
-    save_snapshot_atomic(&new_snapshot_path, snapshot)?;
+    save_snapshot_atomic(&new_snapshot_path, &staged)?;
 
     // 4. Update generation file (atomic)
     // This is the commit point - once this completes, the new generation is active
@@ -90,6 +103,9 @@ pub fn compact(state_dir: &Path, snapshot: &mut PersistedRepoSnapshot) -> Result
     // 5. Clean up old generation files
     // Only do this after the new generation is fully durable
     delete_old_generation(state_dir, old_gen)?;
+
+    // 6. Commit to in-memory state only after all disk writes succeed
+    *snapshot = staged;
 
     Ok(())
 }
@@ -760,6 +776,90 @@ mod tests {
                 after_first, after_second,
                 "Cleanup should be idempotent"
             );
+        }
+
+        // ─── Error handling properties ───
+
+        /// Property: If compact returns Err, the in-memory snapshot is unchanged.
+        ///
+        /// This is critical for callers that may retry or continue after a failure.
+        /// They need to know the snapshot still reflects the pre-compaction state.
+        #[test]
+        fn compact_failure_preserves_snapshot_state(
+            train_pr in arb_pr_number(),
+            initial_gen in 0u64..5,
+        ) {
+            use std::os::unix::fs::PermissionsExt;
+
+            let dir = tempdir().unwrap();
+
+            let mut snapshot = create_test_snapshot();
+            snapshot.active_trains.insert(train_pr, TrainRecord::new(train_pr));
+            snapshot.log_generation = initial_gen;
+            snapshot.log_position = 42; // Non-zero to detect mutation
+
+            // Set up initial state
+            write_generation(dir.path(), initial_gen).unwrap();
+            save_snapshot_atomic(&snapshot_path(dir.path(), initial_gen), &snapshot).unwrap();
+
+            // Make the state directory read-only to force write failures
+            let permissions = std::fs::Permissions::from_mode(0o555);
+            std::fs::set_permissions(dir.path(), permissions).unwrap();
+
+            let original_gen = snapshot.log_generation;
+            let original_pos = snapshot.log_position;
+            let original_trains = snapshot.active_trains.clone();
+
+            let result = compact(dir.path(), &mut snapshot);
+
+            // Restore permissions for cleanup
+            let permissions = std::fs::Permissions::from_mode(0o755);
+            std::fs::set_permissions(dir.path(), permissions).unwrap();
+
+            // PROPERTY: On failure, snapshot should be unchanged
+            prop_assert!(result.is_err(), "compact should fail with read-only directory");
+            prop_assert_eq!(snapshot.log_generation, original_gen,
+                "log_generation should be unchanged on error");
+            prop_assert_eq!(snapshot.log_position, original_pos,
+                "log_position should be unchanged on error");
+            prop_assert_eq!(snapshot.active_trains, original_trains,
+                "active_trains should be unchanged on error");
+        }
+
+        /// Property: compact should work correctly even if snapshots exist at higher generations.
+        ///
+        /// This tests the scenario where cleanup_stale_generations was called first
+        /// (as documented in Prerequisites), ensuring the generation file is consistent.
+        #[test]
+        fn compact_after_cleanup_is_consistent(
+            existing_gen in 2u64..10,
+        ) {
+            let dir = tempdir().unwrap();
+
+            // Set up: snapshot exists at high generation but NO generation file
+            let mut existing_snapshot = create_test_snapshot();
+            existing_snapshot.log_generation = existing_gen;
+            existing_snapshot.active_trains.insert(PrNumber(999), TrainRecord::new(PrNumber(999)));
+            save_snapshot_atomic(&snapshot_path(dir.path(), existing_gen), &existing_snapshot).unwrap();
+            File::create(events_path(dir.path(), existing_gen)).unwrap();
+            // Note: generation file intentionally NOT written
+
+            // Run cleanup first (as documented in Prerequisites)
+            cleanup_stale_generations(dir.path()).unwrap();
+
+            // Verify cleanup detected the snapshot and restored generation file
+            let gen_after_cleanup = read_generation(dir.path()).unwrap();
+            prop_assert_eq!(gen_after_cleanup, existing_gen,
+                "cleanup should restore generation file to match highest snapshot");
+
+            // Now compact should advance from the correct generation
+            let mut snapshot_to_compact = existing_snapshot.clone();
+            compact(dir.path(), &mut snapshot_to_compact).unwrap();
+
+            prop_assert_eq!(snapshot_to_compact.log_generation, existing_gen + 1,
+                "compact should advance from the restored generation");
+            prop_assert_eq!(read_generation(dir.path()).unwrap(), existing_gen + 1,
+                "generation file should be updated after compact");
         }
     }
 
