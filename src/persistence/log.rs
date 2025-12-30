@@ -413,9 +413,11 @@ mod tests {
             let offset = positions[split];
 
             // Replay from offset
-            let (replayed, _) = EventLog::replay_from(&path, offset).unwrap();
+            let (replayed, next_seq) = EventLog::replay_from(&path, offset).unwrap();
 
             prop_assert_eq!(replayed.len(), payloads.len() - split);
+            // next_seq should be max_seq + 1, which equals total event count
+            prop_assert_eq!(next_seq, payloads.len() as u64);
             for (i, event) in replayed.iter().enumerate() {
                 prop_assert_eq!(event.seq, (split + i) as u64);
             }
@@ -489,10 +491,13 @@ mod tests {
             // Should have recovered some events (maybe 0 if truncated very early)
             prop_assert!(replayed.len() <= payloads.len());
 
-            // Sequence numbers should be valid
+            // Sequence numbers should be valid and payloads should match originals
+            // (i.e., recovered events are a true prefix of what was written)
             if !replayed.is_empty() {
                 for (i, event) in replayed.iter().enumerate() {
                     prop_assert_eq!(event.seq, i as u64);
+                    prop_assert_eq!(&event.payload, &payloads[i],
+                        "Recovered event {} has wrong payload", i);
                 }
                 prop_assert_eq!(next_seq, replayed.len() as u64);
             } else {
@@ -621,6 +626,57 @@ mod tests {
         let (events, next_seq) = EventLog::replay_from(&path, 0).unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(next_seq, 2);
+    }
+
+    #[test]
+    fn non_monotonic_sequence_treated_as_corruption() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.log");
+
+        // Write two valid events with seq 0 and 1
+        let mut log = EventLog::open(&path).unwrap();
+        log.append(StateEventPayload::TrainStarted {
+            root_pr: PrNumber(1),
+            current_pr: PrNumber(1),
+        })
+        .unwrap();
+        log.append(StateEventPayload::TrainStopped {
+            root_pr: PrNumber(1),
+        })
+        .unwrap();
+        drop(log);
+
+        // Manually append an event with a duplicate sequence number (seq=1 again)
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(
+            file,
+            r#"{{"seq":1,"ts":"2024-01-01T00:00:00Z","type":"train_completed","root_pr":1}}"#
+        )
+        .unwrap();
+        // Also add a valid event after to show we stop at corruption
+        writeln!(
+            file,
+            r#"{{"seq":2,"ts":"2024-01-01T00:00:01Z","type":"train_completed","root_pr":2}}"#
+        )
+        .unwrap();
+        drop(file);
+
+        // Replay should stop at the non-monotonic event and truncate
+        let (events, next_seq) = EventLog::replay_from(&path, 0).unwrap();
+        assert_eq!(events.len(), 2, "Should recover only the valid prefix");
+        assert_eq!(next_seq, 2);
+        assert!(matches!(
+            events[0].payload,
+            StateEventPayload::TrainStarted { .. }
+        ));
+        assert!(matches!(
+            events[1].payload,
+            StateEventPayload::TrainStopped { .. }
+        ));
+
+        // File should be truncated to remove corruption
+        let (events_after, _) = EventLog::replay_from(&path, 0).unwrap();
+        assert_eq!(events_after.len(), 2, "File should be truncated");
     }
 
     #[test]
