@@ -94,17 +94,17 @@ pub fn compact(state_dir: &Path, snapshot: &mut PersistedRepoSnapshot) -> Result
         .map(|(g, _)| *g)
         .max();
 
-    if let Some(max_gen) = max_snapshot_gen {
-        if max_gen > old_gen {
-            return Err(CompactionError::Io(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "snapshot exists at generation {} but generation file says {}; \
+    if let Some(max_gen) = max_snapshot_gen
+        && max_gen > old_gen
+    {
+        return Err(CompactionError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "snapshot exists at generation {} but generation file says {}; \
                      call cleanup_stale_generations first",
-                    max_gen, old_gen
-                ),
-            )));
-        }
+                max_gen, old_gen
+            ),
+        )));
     }
 
     let new_gen = old_gen + 1;
