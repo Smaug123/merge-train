@@ -122,6 +122,7 @@ pub fn events_path(state_dir: &Path, generation: u64) -> std::path::PathBuf {
 /// Deletes old generation files (snapshot and events log).
 ///
 /// This should only be called after the new generation is fully durable.
+/// Missing files or a missing directory are tolerated (nothing to delete).
 pub fn delete_old_generation(state_dir: &Path, generation: u64) -> Result<()> {
     let snapshot = snapshot_path(state_dir, generation);
     let events = events_path(state_dir, generation);
@@ -130,10 +131,13 @@ pub fn delete_old_generation(state_dir: &Path, generation: u64) -> Result<()> {
     let _ = std::fs::remove_file(&snapshot);
     let _ = std::fs::remove_file(&events);
 
-    // fsync directory to ensure deletions are durable
-    fsync_dir(state_dir)?;
-
-    Ok(())
+    // fsync directory to ensure deletions are durable.
+    // If directory doesn't exist, there's nothing to sync.
+    match fsync_dir(state_dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Lists all generation files in the state directory.
@@ -269,6 +273,14 @@ mod tests {
         let dir = tempdir().unwrap();
         // Should not error even if files don't exist
         delete_old_generation(dir.path(), 0).unwrap();
+    }
+
+    #[test]
+    fn delete_old_generation_handles_missing_directory() {
+        let dir = tempdir().unwrap();
+        let nonexistent = dir.path().join("nonexistent");
+        // Should not error even if directory doesn't exist
+        delete_old_generation(&nonexistent, 0).unwrap();
     }
 
     #[test]
