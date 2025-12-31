@@ -79,8 +79,15 @@ pub type Result<T> = std::result::Result<T, CompactionError>;
 ///
 /// # Error Handling
 ///
-/// If any I/O operation fails, the in-memory `snapshot` is left unchanged.
-/// The caller can safely retry or continue with the original generation.
+/// If the snapshot write or generation file update fails, the in-memory `snapshot`
+/// is left unchanged and the caller can safely retry or continue with the original
+/// generation.
+///
+/// If cleanup of old generation files fails (after the new generation is committed),
+/// the in-memory `snapshot` will already reflect the new generation. This is
+/// intentional: once the generation file is updated, events must be written to
+/// the new generation's log. The old files can be cleaned up on the next startup
+/// via `cleanup_stale_generations`.
 pub fn compact(state_dir: &Path, snapshot: &mut PersistedRepoSnapshot) -> Result<()> {
     // 1. Read current generation
     let old_gen = read_generation(state_dir)?;
@@ -155,11 +162,11 @@ pub fn compact(state_dir: &Path, snapshot: &mut PersistedRepoSnapshot) -> Result
 /// and restores the generation file. This prevents data loss when the generation
 /// file is corrupted or lost.
 pub fn cleanup_stale_generations(state_dir: &Path) -> Result<()> {
-    let file_gen = match read_generation(state_dir) {
-        Ok(g) => g,
+    let (file_gen, gen_file_corrupt) = match read_generation(state_dir) {
+        Ok(g) => (g, false),
         Err(super::generation::GenerationError::InvalidNumber(_)) => {
             // Treat corrupt generation file like missing - scan snapshots to recover
-            0
+            (0, true)
         }
         Err(e) => return Err(e.into()),
     };
@@ -181,13 +188,19 @@ pub fn cleanup_stale_generations(state_dir: &Path) -> Result<()> {
     // - If no snapshots exist, trust the generation file (fresh state)
     let current_gen = match max_snapshot_gen {
         Some(max_gen) => {
-            // If there's a mismatch, update the generation file to be consistent
-            if max_gen != file_gen {
+            // If there's a mismatch or corruption, update the generation file to be consistent
+            if max_gen != file_gen || gen_file_corrupt {
                 write_generation(state_dir, max_gen)?;
             }
             max_gen
         }
-        None => file_gen, // No snapshots - trust the file (fresh state or generation 0)
+        None => {
+            // No snapshots - use generation 0, but fix corrupt file if needed
+            if gen_file_corrupt {
+                write_generation(state_dir, 0)?;
+            }
+            file_gen
+        }
     };
 
     // Delete files from generations other than current

@@ -167,7 +167,8 @@ pub fn list_generation_files(state_dir: &Path) -> io::Result<Vec<(u64, &'static 
         }
     }
 
-    files.sort_by_key(|(generation, _)| *generation);
+    // Sort by generation, then by file type for deterministic ordering
+    files.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     Ok(files)
 }
 
@@ -352,12 +353,12 @@ mod tests {
         let generation = read_generation(dir.path()).unwrap();
         assert_eq!(generation, 0);
 
-        // Document the risk: list_generation_files shows snapshots exist at gen 3
+        // list_generation_files shows snapshots exist at gen 3
         let files = list_generation_files(dir.path()).unwrap();
         assert!(files.iter().any(|(g, _)| *g == 3));
 
-        // This mismatch (gen=0, but files at gen=3) could cause data loss
-        // if cleanup_stale_generations is called - it would delete gen 3 files
+        // Note: cleanup_stale_generations handles this case correctly by scanning
+        // for existing snapshots and using the highest generation, preserving gen 3.
     }
 
     #[test]
