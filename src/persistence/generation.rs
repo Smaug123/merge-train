@@ -11,11 +11,12 @@
 //!
 //! # Recovery
 //!
-//! On startup:
-//! 1. Read the generation file to find current generation N
-//! 2. Load `snapshot.<N>.json` (fallback to `snapshot.<N-1>.json` if crash during compaction)
-//! 3. Replay `events.<N>.log` from the snapshot's `log_position`
-//! 4. Clean up any stale files from older generations
+//! On startup (via `cleanup_stale_generations` in compaction module):
+//! 1. Scan for the highest existing snapshot generation (handles crash during compaction)
+//! 2. If the generation file is stale, missing, or corrupt, restore it to match the highest snapshot
+//! 3. Load the snapshot for the current generation
+//! 4. Replay events for the current generation from the snapshot's `log_position`
+//! 5. Clean up files from other generations
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
@@ -123,13 +124,22 @@ pub fn events_path(state_dir: &Path, generation: u64) -> std::path::PathBuf {
 ///
 /// This should only be called after the new generation is fully durable.
 /// Missing files or a missing directory are tolerated (nothing to delete).
+/// Other errors (permissions, I/O) are propagated.
 pub fn delete_old_generation(state_dir: &Path, generation: u64) -> Result<()> {
     let snapshot = snapshot_path(state_dir, generation);
     let events = events_path(state_dir, generation);
 
-    // Ignore errors if files don't exist
-    let _ = std::fs::remove_file(&snapshot);
-    let _ = std::fs::remove_file(&events);
+    // Only ignore NotFound errors - propagate other errors
+    match std::fs::remove_file(&snapshot) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    match std::fs::remove_file(&events) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
 
     // fsync directory to ensure deletions are durable.
     // If directory doesn't exist, there's nothing to sync.

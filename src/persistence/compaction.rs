@@ -17,10 +17,12 @@
 //!
 //! # Recovery
 //!
-//! 1. Read `generation` file to find current generation N
-//! 2. Load `snapshot.<N>.json` (or `snapshot.<N-1>.json` if crash during compaction)
-//! 3. Replay `events.<N>.log` from snapshot's `log_position`
-//! 4. Clean up stale files from older generations
+//! On startup (via `cleanup_stale_generations`):
+//! 1. Scan for the highest existing snapshot generation (handles crash during compaction)
+//! 2. If the generation file is stale, missing, or corrupt, restore it to match the highest snapshot
+//! 3. Load the snapshot for the current generation
+//! 4. Replay events for the current generation from the snapshot's `log_position`
+//! 5. Clean up files from other generations
 
 use std::io;
 use std::path::Path;
@@ -1293,101 +1295,76 @@ mod tests {
         );
     }
 
-    /// Documents the data loss scenario that occurs when an orphaned snapshot exists
-    /// and the process continues appending events to the old generation's log.
+    /// Tests that compact() properly rolls back when write_generation() fails.
     ///
-    /// This test simulates the failure mode where:
-    /// 1. compact() writes snapshot.N+1
-    /// 2. write_generation() fails
-    /// 3. Process continues, appending events to events.N.log
-    /// 4. On restart, cleanup_stale_generations() promotes to N+1
-    /// 5. events.N.log is deleted, losing the post-failure events
+    /// Uses fault injection: replacing the generation file with a directory causes
+    /// write_generation() to fail at the rename step (IsADirectory error), while
+    /// save_snapshot_atomic() succeeds (writes to a different file).
     ///
-    /// The fix in compact() (rollback on write_generation failure) prevents step 3
-    /// from occurring with an orphaned snapshot. This test documents what happens
-    /// WITHOUT the fix, serving as a regression test.
+    /// This verifies the rollback code at lines 135-138 of compact():
+    /// - On write_generation failure, the orphaned snapshot is deleted
+    /// - The in-memory snapshot remains unchanged
+    /// - The original generation's files remain intact
+    #[cfg(unix)]
     #[test]
-    fn orphaned_snapshot_with_new_events_causes_data_loss() {
-        use crate::persistence::event::StateEventPayload;
-        use crate::persistence::log::EventLog;
-
+    fn compact_rollback_on_write_generation_failure() {
         let dir = tempdir().unwrap();
-        let initial_gen = 1u64;
 
-        // Set up initial state at generation 1
-        let mut snapshot = create_test_snapshot();
-        snapshot.log_generation = initial_gen;
+        // 1. Set up initial state at generation 1
+        let mut snapshot = create_snapshot_with_train(100);
+        snapshot.log_generation = 1;
         snapshot.log_position = 0;
-        snapshot.next_seq = 0;
-        snapshot
-            .active_trains
-            .insert(PrNumber(100), TrainRecord::new(PrNumber(100)));
+        write_generation(dir.path(), 1).unwrap();
+        save_snapshot_atomic(&snapshot_path(dir.path(), 1), &snapshot).unwrap();
+        File::create(events_path(dir.path(), 1)).unwrap();
 
-        write_generation(dir.path(), initial_gen).unwrap();
-        save_snapshot_atomic(&snapshot_path(dir.path(), initial_gen), &snapshot).unwrap();
+        // Capture original state for comparison
+        let original_gen = snapshot.log_generation;
+        let original_pos = snapshot.log_position;
+        let original_trains = snapshot.active_trains.clone();
 
-        // Simulate: compact() wrote snapshot.2 but write_generation() failed
-        // (WITHOUT the rollback fix, the orphaned snapshot would remain)
-        let mut orphaned_snapshot = snapshot.clone();
-        orphaned_snapshot.log_generation = 2;
-        orphaned_snapshot.log_position = 0;
-        save_snapshot_atomic(&snapshot_path(dir.path(), 2), &orphaned_snapshot).unwrap();
-        // Generation file still says 1!
+        // 2. Replace generation file with a directory to break write_generation
+        // This causes rename() to fail with IsADirectory, but only AFTER
+        // save_snapshot_atomic() has already written the new snapshot
+        std::fs::remove_file(dir.path().join("generation")).unwrap();
+        std::fs::create_dir(dir.path().join("generation")).unwrap();
 
-        // Simulate: process continues, appending NEW events to events.1.log
-        // These events are NOT in snapshot.2 (which was written before them)
-        {
-            let events_file = events_path(dir.path(), initial_gen);
-            let mut log = EventLog::open(&events_file).unwrap();
-            log.append(StateEventPayload::TrainStarted {
-                root_pr: PrNumber(999),
-                current_pr: PrNumber(999),
-            })
-            .unwrap();
-        }
+        // 3. Call compact() - should fail but rollback the orphaned snapshot
+        let result = compact(dir.path(), &mut snapshot);
+        assert!(
+            result.is_err(),
+            "compact should fail when generation is a directory"
+        );
 
-        // Verify the event was written
-        let events_file = events_path(dir.path(), initial_gen);
-        let (events_before, _) = EventLog::replay_from(&events_file, 0).unwrap();
-        assert_eq!(events_before.len(), 1, "Event should exist before cleanup");
+        // 4. Verify rollback: snapshot.2.json should NOT exist
+        assert!(
+            !snapshot_path(dir.path(), 2).exists(),
+            "Orphaned snapshot should be deleted by rollback"
+        );
 
-        // Simulate restart: cleanup_stale_generations() runs
-        cleanup_stale_generations(dir.path()).unwrap();
+        // 5. Verify original generation files are intact
+        assert!(
+            snapshot_path(dir.path(), 1).exists(),
+            "Original snapshot should still exist"
+        );
+        assert!(
+            events_path(dir.path(), 1).exists(),
+            "Original events should still exist"
+        );
 
-        // DOCUMENT THE BUG: cleanup promoted to generation 2 and deleted events.1.log
-        let current_gen = read_generation(dir.path()).unwrap();
+        // 6. Verify in-memory snapshot is unchanged
         assert_eq!(
-            current_gen, 2,
-            "Cleanup promoted to orphaned snapshot's generation"
+            snapshot.log_generation, original_gen,
+            "In-memory log_generation should be unchanged"
         );
-        assert!(
-            !events_path(dir.path(), 1).exists(),
-            "events.1.log was deleted by cleanup"
+        assert_eq!(
+            snapshot.log_position, original_pos,
+            "In-memory log_position should be unchanged"
         );
-
-        // The new event (TrainStarted for PR 999) is LOST:
-        // - It's not in snapshot.2 (written before the event)
-        // - It's not in events.2.log (doesn't exist or is empty)
-        let loaded =
-            crate::persistence::snapshot::load_snapshot(&snapshot_path(dir.path(), 2)).unwrap();
-        assert!(
-            !loaded.active_trains.contains_key(&PrNumber(999)),
-            "PR 999 is NOT in snapshot.2 (it was written after)"
+        assert_eq!(
+            snapshot.active_trains, original_trains,
+            "In-memory active_trains should be unchanged"
         );
-
-        let events_2_path = events_path(dir.path(), 2);
-        let events_2_exist = events_2_path.exists();
-        let events_2_empty = events_2_exist
-            && std::fs::metadata(&events_2_path)
-                .map(|m| m.len() == 0)
-                .unwrap_or(true);
-        assert!(
-            !events_2_exist || events_2_empty,
-            "events.2.log doesn't exist or is empty"
-        );
-
-        // DATA LOSS: The event for PR 999 is gone.
-        // This test documents the failure mode that the rollback fix prevents.
     }
 
     proptest! {
