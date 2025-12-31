@@ -17,10 +17,12 @@
 //!
 //! # Recovery
 //!
-//! 1. Read `generation` file to find current generation N
-//! 2. Load `snapshot.<N>.json` (or `snapshot.<N-1>.json` if crash during compaction)
-//! 3. Replay `events.<N>.log` from snapshot's `log_position`
-//! 4. Clean up stale files from older generations
+//! On startup (via `cleanup_stale_generations`):
+//! 1. Scan for the highest existing snapshot generation (handles crash during compaction)
+//! 2. If the generation file is stale, missing, or corrupt, restore it to match the highest snapshot
+//! 3. Load the snapshot for the current generation
+//! 4. Replay events for the current generation from the snapshot's `log_position`
+//! 5. Clean up files from other generations
 
 use std::io;
 use std::path::Path;
@@ -79,8 +81,15 @@ pub type Result<T> = std::result::Result<T, CompactionError>;
 ///
 /// # Error Handling
 ///
-/// If any I/O operation fails, the in-memory `snapshot` is left unchanged.
-/// The caller can safely retry or continue with the original generation.
+/// If the snapshot write or generation file update fails, the in-memory `snapshot`
+/// is left unchanged and the caller can safely retry or continue with the original
+/// generation.
+///
+/// If cleanup of old generation files fails (after the new generation is committed),
+/// the in-memory `snapshot` will already reflect the new generation. This is
+/// intentional: once the generation file is updated, events must be written to
+/// the new generation's log. The old files can be cleaned up on the next startup
+/// via `cleanup_stale_generations`.
 pub fn compact(state_dir: &Path, snapshot: &mut PersistedRepoSnapshot) -> Result<()> {
     // 1. Read current generation
     let old_gen = read_generation(state_dir)?;
@@ -120,8 +129,16 @@ pub fn compact(state_dir: &Path, snapshot: &mut PersistedRepoSnapshot) -> Result
     save_snapshot_atomic(&new_snapshot_path, &staged)?;
 
     // 4. Update generation file (atomic)
-    // This is the commit point - once this completes, the new generation is active
-    write_generation(state_dir, new_gen)?;
+    // This is the commit point - once this completes, the new generation is active.
+    // If this fails, we must clean up the orphaned snapshot to prevent data loss:
+    // without cleanup, the process could continue appending to events.<N>.log,
+    // then on restart cleanup_stale_generations() would promote to N+1 and delete
+    // those new events.
+    if let Err(e) = write_generation(state_dir, new_gen) {
+        // Best-effort rollback: delete the orphaned snapshot
+        let _ = std::fs::remove_file(&new_snapshot_path);
+        return Err(e.into());
+    }
 
     // 5. Commit to in-memory state BEFORE deleting old files.
     // This ensures snapshot.log_generation points to a valid generation if
@@ -155,11 +172,11 @@ pub fn compact(state_dir: &Path, snapshot: &mut PersistedRepoSnapshot) -> Result
 /// and restores the generation file. This prevents data loss when the generation
 /// file is corrupted or lost.
 pub fn cleanup_stale_generations(state_dir: &Path) -> Result<()> {
-    let file_gen = match read_generation(state_dir) {
-        Ok(g) => g,
+    let (file_gen, gen_file_corrupt) = match read_generation(state_dir) {
+        Ok(g) => (g, false),
         Err(super::generation::GenerationError::InvalidNumber(_)) => {
             // Treat corrupt generation file like missing - scan snapshots to recover
-            0
+            (0, true)
         }
         Err(e) => return Err(e.into()),
     };
@@ -181,13 +198,19 @@ pub fn cleanup_stale_generations(state_dir: &Path) -> Result<()> {
     // - If no snapshots exist, trust the generation file (fresh state)
     let current_gen = match max_snapshot_gen {
         Some(max_gen) => {
-            // If there's a mismatch, update the generation file to be consistent
-            if max_gen != file_gen {
+            // If there's a mismatch or corruption, update the generation file to be consistent
+            if max_gen != file_gen || gen_file_corrupt {
                 write_generation(state_dir, max_gen)?;
             }
             max_gen
         }
-        None => file_gen, // No snapshots - trust the file (fresh state or generation 0)
+        None => {
+            // No snapshots - use generation 0, but fix corrupt file if needed
+            if gen_file_corrupt {
+                write_generation(state_dir, 0)?;
+            }
+            file_gen
+        }
     };
 
     // Delete files from generations other than current
@@ -1269,6 +1292,114 @@ mod tests {
             err.contains("generation 5") && err.contains("generation file says 2"),
             "Error should explain the conflict: {}",
             err
+        );
+    }
+
+    /// Documents the Unix filesystem behavior that `compact_rollback_on_write_generation_failure`
+    /// relies on: opening a directory for writing fails with EISDIR.
+    #[cfg(unix)]
+    #[test]
+    fn unix_open_directory_for_write_fails() {
+        use std::fs::OpenOptions;
+        use std::io::ErrorKind;
+
+        let dir = tempdir().unwrap();
+        let subdir = dir.path().join("subdir");
+        std::fs::create_dir(&subdir).unwrap();
+
+        // Opening a directory for writing fails with "Is a directory"
+        let result = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&subdir);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        // EISDIR (21 on most Unix) maps to ErrorKind::Other or ErrorKind::IsADirectory
+        assert!(
+            err.kind() == ErrorKind::Other
+                || err.kind() == ErrorKind::IsADirectory
+                || err.raw_os_error() == Some(21), // EISDIR on Linux/macOS
+            "Expected EISDIR error, got: {:?}",
+            err
+        );
+    }
+
+    /// Tests that compact() properly rolls back when write_generation() fails.
+    ///
+    /// Uses fault injection: creating generation.tmp as a directory causes
+    /// write_generation() to fail when opening the temp file for writing,
+    /// while save_snapshot_atomic() succeeds (writes to a different file).
+    ///
+    /// This verifies the rollback code at lines 137-141 of compact():
+    /// - On write_generation failure, the orphaned snapshot is deleted
+    /// - The in-memory snapshot remains unchanged
+    /// - The original generation's files remain intact
+    #[cfg(unix)]
+    #[test]
+    fn compact_rollback_on_write_generation_failure() {
+        let dir = tempdir().unwrap();
+
+        // 1. Set up initial state at generation 1
+        let mut snapshot = create_snapshot_with_train(100);
+        snapshot.log_generation = 1;
+        snapshot.log_position = 0;
+        write_generation(dir.path(), 1).unwrap();
+        save_snapshot_atomic(&snapshot_path(dir.path(), 1), &snapshot).unwrap();
+        File::create(events_path(dir.path(), 1)).unwrap();
+
+        // Capture original state for comparison
+        let original_gen = snapshot.log_generation;
+        let original_pos = snapshot.log_position;
+        let original_trains = snapshot.active_trains.clone();
+
+        // 2. Create generation.tmp as a directory to break write_generation
+        // write_generation() tries to open generation.tmp for writing, which fails
+        // with EISDIR when it's a directory. This happens AFTER save_snapshot_atomic()
+        // has already written the new snapshot.
+        std::fs::create_dir(dir.path().join("generation.tmp")).unwrap();
+
+        // 3. Call compact() - should fail but rollback the orphaned snapshot
+        let result = compact(dir.path(), &mut snapshot);
+        assert!(
+            result.is_err(),
+            "compact should fail when generation.tmp is a directory"
+        );
+
+        // 4. Verify rollback: snapshot.2.json should NOT exist
+        assert!(
+            !snapshot_path(dir.path(), 2).exists(),
+            "Orphaned snapshot should be deleted by rollback"
+        );
+
+        // 5. Verify original generation files are intact
+        assert!(
+            snapshot_path(dir.path(), 1).exists(),
+            "Original snapshot should still exist"
+        );
+        assert!(
+            events_path(dir.path(), 1).exists(),
+            "Original events should still exist"
+        );
+        assert_eq!(
+            read_generation(dir.path()).unwrap(),
+            1,
+            "Generation file should still be 1"
+        );
+
+        // 6. Verify in-memory snapshot is unchanged
+        assert_eq!(
+            snapshot.log_generation, original_gen,
+            "In-memory log_generation should be unchanged"
+        );
+        assert_eq!(
+            snapshot.log_position, original_pos,
+            "In-memory log_position should be unchanged"
+        );
+        assert_eq!(
+            snapshot.active_trains, original_trains,
+            "In-memory active_trains should be unchanged"
         );
     }
 
