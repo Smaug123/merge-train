@@ -1295,13 +1295,44 @@ mod tests {
         );
     }
 
+    /// Documents the Unix filesystem behavior that `compact_rollback_on_write_generation_failure`
+    /// relies on: opening a directory for writing fails with EISDIR.
+    #[cfg(unix)]
+    #[test]
+    fn unix_open_directory_for_write_fails() {
+        use std::fs::OpenOptions;
+        use std::io::ErrorKind;
+
+        let dir = tempdir().unwrap();
+        let subdir = dir.path().join("subdir");
+        std::fs::create_dir(&subdir).unwrap();
+
+        // Opening a directory for writing fails with "Is a directory"
+        let result = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&subdir);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        // EISDIR (21 on most Unix) maps to ErrorKind::Other or ErrorKind::IsADirectory
+        assert!(
+            err.kind() == ErrorKind::Other
+                || err.kind() == ErrorKind::IsADirectory
+                || err.raw_os_error() == Some(21), // EISDIR on Linux/macOS
+            "Expected EISDIR error, got: {:?}",
+            err
+        );
+    }
+
     /// Tests that compact() properly rolls back when write_generation() fails.
     ///
-    /// Uses fault injection: replacing the generation file with a directory causes
-    /// write_generation() to fail at the rename step (IsADirectory error), while
-    /// save_snapshot_atomic() succeeds (writes to a different file).
+    /// Uses fault injection: creating generation.tmp as a directory causes
+    /// write_generation() to fail when opening the temp file for writing,
+    /// while save_snapshot_atomic() succeeds (writes to a different file).
     ///
-    /// This verifies the rollback code at lines 135-138 of compact():
+    /// This verifies the rollback code at lines 137-141 of compact():
     /// - On write_generation failure, the orphaned snapshot is deleted
     /// - The in-memory snapshot remains unchanged
     /// - The original generation's files remain intact
@@ -1323,17 +1354,17 @@ mod tests {
         let original_pos = snapshot.log_position;
         let original_trains = snapshot.active_trains.clone();
 
-        // 2. Replace generation file with a directory to break write_generation
-        // This causes rename() to fail with IsADirectory, but only AFTER
-        // save_snapshot_atomic() has already written the new snapshot
-        std::fs::remove_file(dir.path().join("generation")).unwrap();
-        std::fs::create_dir(dir.path().join("generation")).unwrap();
+        // 2. Create generation.tmp as a directory to break write_generation
+        // write_generation() tries to open generation.tmp for writing, which fails
+        // with EISDIR when it's a directory. This happens AFTER save_snapshot_atomic()
+        // has already written the new snapshot.
+        std::fs::create_dir(dir.path().join("generation.tmp")).unwrap();
 
         // 3. Call compact() - should fail but rollback the orphaned snapshot
         let result = compact(dir.path(), &mut snapshot);
         assert!(
             result.is_err(),
-            "compact should fail when generation is a directory"
+            "compact should fail when generation.tmp is a directory"
         );
 
         // 4. Verify rollback: snapshot.2.json should NOT exist
@@ -1350,6 +1381,11 @@ mod tests {
         assert!(
             events_path(dir.path(), 1).exists(),
             "Original events should still exist"
+        );
+        assert_eq!(
+            read_generation(dir.path()).unwrap(),
+            1,
+            "Generation file should still be 1"
         );
 
         // 6. Verify in-memory snapshot is unchanged
