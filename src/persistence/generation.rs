@@ -172,7 +172,7 @@ pub fn list_generation_files(state_dir: &Path) -> io::Result<Vec<(u64, &'static 
     }
 
     // Sort by generation, then by file type for deterministic ordering
-    files.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    files.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
     Ok(files)
 }
 
