@@ -610,21 +610,20 @@ mod tests {
 
         /// Contexts with colons in different positions produce different keys.
         ///
-        /// This specifically tests the case the review comment mentioned:
-        /// "a:b" + "c" vs "a" + "b:c" should not collide.
+        /// Tests that "a:b" and "a" always produce different keys, even though
+        /// they share a common prefix. The escaping ensures the key format is
+        /// unambiguous.
         #[test]
         fn status_colon_position_matters(
             sha in arb_sha(),
             a in "[a-zA-Z0-9]{1,10}",
             b in "[a-zA-Z0-9]{1,10}",
-            c in "[a-zA-Z0-9]{1,10}",
             state in arb_state(),
         ) {
-            // "a:b" with suffix c vs "a" with suffix "b:c"
-            let ctx1 = format!("{}:{}", a, b);
-            let ctx2 = a.clone();
+            let ctx1 = format!("{}:{}", a, b); // "a:b"
+            let ctx2 = a.clone();              // "a"
 
-            // These contexts are different, so keys must be different
+            // These contexts are always different (ctx1 has colon, ctx2 doesn't)
             prop_assume!(ctx1 != ctx2);
 
             let key1 = DedupeKey::status(&sha, &ctx1, &state);
@@ -710,28 +709,53 @@ mod tests {
     }
 
     #[test]
-    fn status_key_escaping_prevents_collisions() {
+    fn status_key_different_contexts_produce_different_keys() {
         let sha = Sha::parse("a".repeat(40)).unwrap();
 
-        // These two contexts should produce different keys
-        // Context "a:b" with state "c" vs context "a" with state "b:c" would collide
-        // without escaping, but states don't contain colons so this specific case
-        // can't happen. However, we test the escaping works correctly.
-
+        // Basic test: different contexts produce different keys
         let key1 = DedupeKey::status(&sha, "ci:build", "success");
         let key2 = DedupeKey::status(&sha, "ci", "success");
-
-        // Keys should be different
         assert_ne!(key1, key2);
 
-        // More importantly, even complex contexts don't collide
+        // Multiple levels of colons still produce distinct keys
         let key3 = DedupeKey::status(&sha, "a:b:c", "pending");
         let key4 = DedupeKey::status(&sha, "a:b", "pending");
         let key5 = DedupeKey::status(&sha, "a", "pending");
-
         assert_ne!(key3, key4);
         assert_ne!(key3, key5);
         assert_ne!(key4, key5);
+    }
+
+    #[test]
+    fn status_key_escaping_distinguishes_colon_vs_escaped_colon() {
+        let sha = Sha::parse("a".repeat(40)).unwrap();
+
+        // This is the key collision case that escaping prevents:
+        // Without escaping, "a\:b" (literal backslash-colon in context) could produce
+        // the same key as "a:b" (just colon). With proper escaping:
+        // - "a:b"  → "a\:b" in key (colon escaped)
+        // - "a\:b" → "a\\\:b" in key (backslash escaped to \\, then colon escaped to \:)
+        let key_colon = DedupeKey::status(&sha, "a:b", "success");
+        let key_backslash_colon = DedupeKey::status(&sha, r"a\:b", "success");
+
+        assert_ne!(
+            key_colon, key_backslash_colon,
+            "literal backslash-colon must differ from plain colon"
+        );
+
+        // Verify the actual escaped forms
+        // "a:b" escapes to "a\:b" (colon becomes backslash-colon)
+        assert!(
+            key_colon.as_str().contains(r"a\:b"),
+            "key_colon should contain escaped colon: {}",
+            key_colon.as_str()
+        );
+        // "a\:b" escapes to "a\\\:b" (backslash becomes \\, colon becomes \:)
+        assert!(
+            key_backslash_colon.as_str().contains(r"a\\\:b"),
+            "key_backslash_colon should contain double-escaped form: {}",
+            key_backslash_colon.as_str()
+        );
     }
 
     #[test]

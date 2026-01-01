@@ -148,7 +148,12 @@ pub fn cleanup_done_deliveries(
         return Ok(0);
     }
 
-    let cutoff = std::time::SystemTime::now() - grace_period;
+    // Use checked_sub to handle potential underflow with very large grace periods
+    // or extreme clock skew. If underflow would occur, use UNIX_EPOCH as cutoff
+    // (effectively: nothing is old enough to clean up).
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(grace_period)
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
     let mut removed = 0;
 
     for entry in std::fs::read_dir(spool_dir)? {

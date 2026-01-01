@@ -5,12 +5,28 @@
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Deserialize;
 use thiserror::Error;
 
 use crate::persistence::fsync::{fsync_dir, fsync_file};
 use crate::types::DeliveryId;
+
+/// Counter for generating unique temp file names within a process.
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Generates a unique temp file path for atomic writes.
+///
+/// Uses PID + monotonic counter to ensure uniqueness across concurrent operations.
+/// This prevents the race condition where concurrent spool_delivery calls for the
+/// same delivery ID could clobber each other's temp files.
+fn unique_temp_path(base_path: &Path) -> PathBuf {
+    let pid = std::process::id();
+    let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let extension = format!("tmp.{}.{}", pid, counter);
+    base_path.with_extension(extension)
+}
 
 /// Errors that can occur during spool operations.
 #[derive(Debug, Error)]
@@ -171,8 +187,16 @@ pub fn spool_delivery(
     // Validate delivery ID to prevent path traversal attacks
     validate_delivery_id(delivery_id)?;
 
-    // Ensure spool directory exists
+    // Ensure spool directory exists, with durable creation.
+    // We must fsync the parent directory after creating spool_dir to ensure
+    // the directory entry is durable. Without this, a crash after create_dir_all
+    // but before the parent fsync could lose the directory.
+    let spool_dir_existed = spool_dir.exists();
     std::fs::create_dir_all(spool_dir)?;
+    if !spool_dir_existed && let Some(parent) = spool_dir.parent() {
+        // Parent must exist after create_dir_all succeeds
+        fsync_dir(parent)?;
+    }
 
     let delivery = SpooledDelivery::new(spool_dir, delivery_id.clone());
 
@@ -182,8 +206,11 @@ pub fn spool_delivery(
         return Err(SpoolError::DuplicateDelivery(delivery_id.clone()));
     }
 
-    // Write to temp file
-    let temp_path = delivery.temp_path();
+    // Write to temp file with unique name to prevent concurrent clobbering.
+    // Without unique names, concurrent spool_delivery calls for the same ID
+    // could overwrite each other's temp files before hard_link, leading to
+    // nondeterministic payload contents.
+    let temp_path = unique_temp_path(&delivery.payload_path);
     {
         let mut file = OpenOptions::new()
             .write(true)
@@ -300,7 +327,24 @@ pub fn remove_delivery(delivery: &SpooledDelivery) -> Result<()> {
     let _ = std::fs::remove_file(delivery.done_marker_path());
     let _ = std::fs::remove_file(delivery.proc_marker_path());
     let _ = std::fs::remove_file(&delivery.payload_path);
+
+    // Clean up any orphaned temp files from interrupted spool operations.
+    // These have the pattern <id>.json.tmp.<pid>.<counter> or the legacy <id>.json.tmp
     let _ = std::fs::remove_file(delivery.temp_path());
+    // Also try to clean any unique temp files by pattern matching
+    if let Some(parent) = delivery.payload_path.parent()
+        && let Some(stem) = delivery.payload_path.file_name().and_then(|n| n.to_str())
+        && let Ok(entries) = std::fs::read_dir(parent)
+    {
+        let pattern = format!("{}.tmp.", stem);
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str()
+                && name.starts_with(&pattern)
+            {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
 
     // Also clean up any orphaned temp marker files from interrupted marker creation
     let done_temp = delivery.done_marker_path().with_extension("done.tmp");
@@ -378,8 +422,18 @@ mod tests {
             let read_payload = delivery.read_payload_bytes().unwrap();
             prop_assert_eq!(payload1, read_payload, "First payload must be preserved");
 
-            // Temp file from second attempt should be cleaned up
-            prop_assert!(!delivery.temp_path().exists());
+            // Temp files from second attempt should be cleaned up
+            // (we use unique temp paths like <id>.json.tmp.<pid>.<counter>)
+            let temp_files: Vec<_> = std::fs::read_dir(spool_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(|n| n.contains(".tmp"))
+                })
+                .collect();
+            prop_assert!(temp_files.is_empty(), "temp files should be cleaned up");
         }
 
         /// Processing marker is idempotent.
@@ -567,15 +621,16 @@ mod tests {
             prop_assert!(!delivery.done_marker_path().exists());
 
             // Recovery state (before cleanup_interrupted_processing):
-            // is_pending is FALSE (has proc marker = in-progress, prevents double-processing)
-            // is_processing is true (has proc, no done)
-            prop_assert!(!delivery.is_pending()); // NOT pending while in-progress
+            // - is_pending is FALSE (has proc marker, prevents double-processing)
+            // - is_processing is TRUE (has proc, no done)
+            // - is_done is FALSE
+            //
+            // The delivery remains in this state until cleanup_interrupted_processing()
+            // is called at startup, which removes the proc marker and returns the
+            // delivery to pending state. That behavior is tested in drain.rs tests.
+            prop_assert!(!delivery.is_pending());
             prop_assert!(delivery.is_processing());
             prop_assert!(!delivery.is_done());
-
-            // After cleanup_interrupted_processing (which should be called at startup),
-            // the proc marker is removed and the delivery becomes pending again.
-            // The drain module's cleanup_interrupted_processing handles this.
         }
 
         /// Crash after processing complete: all markers exist.
@@ -649,6 +704,9 @@ mod tests {
         /// This is an edge case that shouldn't happen in practice (proc marker
         /// is only created after payload exists), but if files are manually
         /// deleted or corrupted, the system should handle it gracefully.
+        ///
+        /// The key property is that the delivery is NOT pending, so it won't
+        /// be picked up by drain_pending and cause errors.
         #[test]
         fn orphaned_proc_marker_no_payload(
             delivery_id in arb_delivery_id(),
@@ -661,11 +719,13 @@ mod tests {
             let delivery = SpooledDelivery::new(spool_dir, delivery_id);
             std::fs::write(delivery.proc_marker_path(), b"").unwrap();
 
-            // Should not be pending (no payload)
+            // Key property: NOT pending (no payload), so won't be queued for processing
             prop_assert!(!delivery.is_pending());
-            // Should not be processing (no payload, even though proc exists)
-            // Note: is_processing checks proc_marker_path().exists() && !done_marker_path().exists()
-            // So technically it would return true. But is_pending returns false, so it won't be queued.
+
+            // Note: is_processing() returns TRUE here (proc exists, no done).
+            // This is technically "correct" per its definition, but doesn't matter
+            // because is_pending() is false and drain_pending() won't return it.
+            prop_assert!(delivery.is_processing());
             prop_assert!(!delivery.is_done());
         }
 
@@ -740,8 +800,14 @@ mod tests {
 
         let delivery = spool_delivery(spool_dir, &delivery_id, payload).unwrap();
 
-        // Temp file should not exist after successful spool
-        assert!(!delivery.temp_path().exists());
+        // No temp files should exist after successful spool
+        // (we use unique temp paths like <id>.json.tmp.<pid>.<counter>)
+        let temp_files: Vec<_> = std::fs::read_dir(spool_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_str().is_some_and(|n| n.contains(".tmp")))
+            .collect();
+        assert!(temp_files.is_empty(), "temp files should be cleaned up");
         // But payload should exist
         assert!(delivery.payload_path.exists());
     }
