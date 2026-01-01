@@ -99,10 +99,24 @@ pub fn cleanup_interrupted_processing(spool_dir: &Path) -> Result<()> {
             // Check if there's a corresponding .done marker
             let done_path = path.with_extension("done");
             if !done_path.exists() {
-                // No .done marker means processing was interrupted
-                // Remove the .proc marker so it can be reprocessed
-                if std::fs::remove_file(&path).is_ok() {
-                    removed_any = true;
+                // No .done marker means processing was interrupted.
+                // Remove the .proc marker so it can be reprocessed.
+                //
+                // We propagate errors here because a failed removal leaves the
+                // .proc marker stuck, preventing the delivery from ever becoming
+                // pending again. This is a critical failure that should not be
+                // silently ignored.
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {
+                        removed_any = true;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        // File was already removed (race with another cleanup),
+                        // this is fine - the goal is achieved.
+                    }
+                    Err(e) => {
+                        return Err(e.into());
+                    }
                 }
             }
         }

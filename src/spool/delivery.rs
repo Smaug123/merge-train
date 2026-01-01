@@ -38,9 +38,11 @@ fn unique_temp_path(base_path: &Path) -> PathBuf {
 
 /// A structured webhook envelope for crash-safe spooling.
 ///
-/// This ensures that the event type is always stored alongside the body,
-/// which is required for replay: on recovery, we need to know the event
-/// type (from `X-GitHub-Event` header) to correctly parse the body.
+/// This stores the complete webhook delivery: headers + body, as specified
+/// in DESIGN.md. The headers are required for:
+/// 1. **Replay**: The `X-GitHub-Event` header determines how to parse the body
+/// 2. **Debugging**: Headers like `X-Hub-Signature-256` aid in troubleshooting
+/// 3. **Audit**: The full request context is preserved for analysis
 ///
 /// # Why Not Just Store Raw Bytes?
 ///
@@ -55,8 +57,15 @@ fn unique_temp_path(base_path: &Path) -> PathBuf {
 /// # Example
 ///
 /// ```ignore
+/// use std::collections::HashMap;
+///
+/// let mut headers = HashMap::new();
+/// headers.insert("X-GitHub-Event".to_string(), "pull_request".to_string());
+/// headers.insert("X-Hub-Signature-256".to_string(), "sha256=...".to_string());
+///
 /// let envelope = WebhookEnvelope {
 ///     event_type: "pull_request".to_string(),
+///     headers,
 ///     body: serde_json::from_slice(&request_body)?,
 /// };
 /// spool_webhook(&spool_dir, &delivery_id, &envelope)?;
@@ -74,7 +83,14 @@ fn unique_temp_path(base_path: &Path) -> PathBuf {
 pub struct WebhookEnvelope {
     /// The GitHub event type from the `X-GitHub-Event` header.
     /// This is required for determining how to parse the body on replay.
+    /// Stored separately for efficient access without parsing all headers.
     pub event_type: String,
+
+    /// All HTTP headers from the webhook request.
+    /// Stored for replay/debug purposes. Keys are header names (case-preserved),
+    /// values are the header values as strings.
+    #[serde(default)]
+    pub headers: std::collections::HashMap<String, String>,
 
     /// The webhook body as a JSON value.
     /// This is the parsed JSON payload from GitHub. Using `serde_json::Value`
@@ -100,6 +116,10 @@ pub enum SpoolError {
     /// Invalid delivery ID (contains path separators or other unsafe characters).
     #[error("invalid delivery ID: contains unsafe characters: {0}")]
     InvalidDeliveryId(DeliveryId),
+
+    /// Invalid webhook envelope (empty event_type).
+    #[error("invalid webhook envelope: event_type is empty")]
+    EmptyEventType,
 }
 
 /// Result type for spool operations.
@@ -262,14 +282,50 @@ pub(crate) fn spool_delivery(
     validate_delivery_id(delivery_id)?;
 
     // Ensure spool directory exists, with durable creation.
-    // We must fsync the parent directory after creating spool_dir to ensure
-    // the directory entry is durable. Without this, a crash after create_dir_all
-    // but before the parent fsync could lose the directory.
-    let spool_dir_existed = spool_dir.exists();
+    //
+    // When create_dir_all creates intermediate directories, each parent must be
+    // fsynced to make its child's directory entry durable. For example, if
+    // creating /a/b/c/d where only /a exists, we must fsync /a (for b), /a/b
+    // (for c), and /a/b/c (for d). Without this, a crash could drop any of the
+    // intermediate directories even after create_dir_all returns successfully.
+    //
+    // Algorithm:
+    // 1. Find the first existing ancestor before create_dir_all
+    // 2. After create_dir_all, fsync all directories from that ancestor down
+    //    to (but not including) spool_dir
+    let first_existing_ancestor = {
+        let mut path = spool_dir.to_path_buf();
+        while !path.exists() {
+            if let Some(parent) = path.parent() {
+                path = parent.to_path_buf();
+            } else {
+                break;
+            }
+        }
+        if path.exists() { Some(path) } else { None }
+    };
+
     std::fs::create_dir_all(spool_dir)?;
-    if !spool_dir_existed && let Some(parent) = spool_dir.parent() {
-        // Parent must exist after create_dir_all succeeds
-        fsync_dir(parent)?;
+
+    // Fsync all directories from first_existing_ancestor to spool_dir's parent
+    if let Some(ancestor) = first_existing_ancestor {
+        // Collect directories that need fsyncing: from ancestor to spool_dir.parent()
+        // We need to fsync each directory to make its child's entry durable.
+        let mut dirs_to_fsync = Vec::new();
+        let mut current = spool_dir.to_path_buf();
+        while current != ancestor {
+            if let Some(parent) = current.parent() {
+                dirs_to_fsync.push(parent.to_path_buf());
+                current = parent.to_path_buf();
+            } else {
+                break;
+            }
+        }
+        // Fsync from ancestor down to immediate parent of spool_dir
+        // (the list is in reverse order: [parent, grandparent, ...])
+        for dir in dirs_to_fsync.into_iter().rev() {
+            fsync_dir(&dir)?;
+        }
     }
 
     let delivery = SpooledDelivery::new(spool_dir, delivery_id.clone());
@@ -332,8 +388,11 @@ pub(crate) fn spool_delivery(
 /// # Example
 ///
 /// ```ignore
+/// use std::collections::HashMap;
+///
 /// let envelope = WebhookEnvelope {
 ///     event_type: "pull_request".to_string(),
+///     headers: HashMap::new(), // or populate with actual headers
 ///     body: request_body,
 /// };
 /// let delivery = spool_webhook(&spool_dir, &delivery_id, &envelope)?;
@@ -349,6 +408,12 @@ pub fn spool_webhook(
     delivery_id: &DeliveryId,
     envelope: &WebhookEnvelope,
 ) -> Result<SpooledDelivery> {
+    // Validate event_type is non-empty (required for crash-replay).
+    // This is enforced at the boundary to ensure the invariant holds.
+    if envelope.event_type.is_empty() {
+        return Err(SpoolError::EmptyEventType);
+    }
+
     let payload = serde_json::to_vec(envelope)?;
     spool_delivery(spool_dir, delivery_id, &payload)
 }
@@ -561,17 +626,31 @@ mod tests {
             })
     }
 
+    /// Generate arbitrary HTTP headers for webhook envelopes.
+    fn arb_headers() -> impl Strategy<Value = std::collections::HashMap<String, String>> {
+        prop::collection::hash_map(
+            "[A-Za-z][A-Za-z0-9-]{2,20}", // Header names like X-GitHub-Event
+            "[a-zA-Z0-9/_=.-]{1,50}",     // Header values
+            0..5,
+        )
+    }
+
     /// Generate arbitrary webhook envelopes.
     fn arb_webhook_envelope() -> impl Strategy<Value = WebhookEnvelope> {
-        (arb_event_type(), arb_json_value())
-            .prop_map(|(event_type, body)| WebhookEnvelope { event_type, body })
+        (arb_event_type(), arb_headers(), arb_json_value()).prop_map(
+            |(event_type, headers, body)| WebhookEnvelope {
+                event_type,
+                headers,
+                body,
+            },
+        )
     }
 
     proptest! {
         /// Webhook envelope roundtrip: spool_webhook + read_webhook preserves data.
         ///
         /// This test verifies the structured envelope API correctly preserves
-        /// both the event type and body through serialization/deserialization.
+        /// event type, headers, and body through serialization/deserialization.
         #[test]
         fn webhook_envelope_roundtrip(
             delivery_id in arb_delivery_id(),
@@ -586,31 +665,61 @@ mod tests {
             // Read back using structured envelope API
             let read_envelope = delivery.read_webhook().unwrap();
 
-            // Both event_type and body must be preserved exactly
+            // Event type, headers, and body must be preserved exactly
             prop_assert_eq!(envelope.event_type, read_envelope.event_type,
                 "Event type must survive roundtrip");
+            prop_assert_eq!(envelope.headers, read_envelope.headers,
+                "Headers must survive roundtrip");
             prop_assert_eq!(envelope.body, read_envelope.body,
                 "Body must survive roundtrip");
         }
 
-        /// Event type is required for crash-replay: verify it's always present.
+        /// Event type is required for crash-replay: spool_webhook rejects empty event types.
         ///
-        /// This test documents the invariant that spool_webhook enforces:
-        /// the event_type is always stored and can always be recovered.
+        /// This test verifies that spool_webhook enforces the invariant at the boundary:
+        /// empty event_type is rejected with EmptyEventType error. This ensures that
+        /// any successfully spooled webhook can be correctly replayed on recovery.
         #[test]
-        fn webhook_envelope_always_has_event_type(
+        fn webhook_envelope_rejects_empty_event_type(
+            delivery_id in arb_delivery_id(),
+            body in arb_json_value(),
+        ) {
+            let dir = tempdir().unwrap();
+            let spool_dir = dir.path();
+
+            // Empty event_type must be rejected
+            let envelope = WebhookEnvelope {
+                event_type: String::new(),
+                headers: std::collections::HashMap::new(),
+                body: body.clone(),
+            };
+            let result = spool_webhook(spool_dir, &delivery_id, &envelope);
+            prop_assert!(matches!(result, Err(SpoolError::EmptyEventType)),
+                "Empty event_type must be rejected at boundary");
+
+            // Whitespace-only would NOT be caught by is_empty() - document this.
+            // If stricter validation is needed, use .trim().is_empty() instead.
+        }
+
+        /// Non-empty event types are preserved through roundtrip.
+        ///
+        /// This complements webhook_envelope_rejects_empty_event_type by verifying
+        /// that valid event types survive the roundtrip.
+        #[test]
+        fn webhook_envelope_preserves_event_type(
             delivery_id in arb_delivery_id(),
             envelope in arb_webhook_envelope(),
         ) {
             let dir = tempdir().unwrap();
             let spool_dir = dir.path();
 
+            // The generator produces non-empty event types, so this should succeed
             let delivery = spool_webhook(spool_dir, &delivery_id, &envelope).unwrap();
             let read_envelope = delivery.read_webhook().unwrap();
 
-            // The event type must be non-empty (GitHub always provides it)
-            prop_assert!(!read_envelope.event_type.is_empty(),
-                "Event type must be present for crash-replay");
+            // Event type must be preserved exactly
+            prop_assert_eq!(envelope.event_type, read_envelope.event_type,
+                "Event type must be preserved through roundtrip");
         }
     }
 
