@@ -11,11 +11,12 @@
 //!
 //! # Recovery
 //!
-//! On startup:
-//! 1. Read the generation file to find current generation N
-//! 2. Load `snapshot.<N>.json` (fallback to `snapshot.<N-1>.json` if crash during compaction)
-//! 3. Replay `events.<N>.log` from the snapshot's `log_position`
-//! 4. Clean up any stale files from older generations
+//! On startup (via `cleanup_stale_generations` in compaction module):
+//! 1. Scan for the highest existing snapshot generation (handles crash during compaction)
+//! 2. If the generation file is stale, missing, or corrupt, restore it to match the highest snapshot
+//! 3. Load the snapshot for the current generation
+//! 4. Replay events for the current generation from the snapshot's `log_position`
+//! 5. Clean up files from other generations
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
@@ -122,18 +123,31 @@ pub fn events_path(state_dir: &Path, generation: u64) -> std::path::PathBuf {
 /// Deletes old generation files (snapshot and events log).
 ///
 /// This should only be called after the new generation is fully durable.
+/// Missing files or a missing directory are tolerated (nothing to delete).
+/// Other errors (permissions, I/O) are propagated.
 pub fn delete_old_generation(state_dir: &Path, generation: u64) -> Result<()> {
     let snapshot = snapshot_path(state_dir, generation);
     let events = events_path(state_dir, generation);
 
-    // Ignore errors if files don't exist
-    let _ = std::fs::remove_file(&snapshot);
-    let _ = std::fs::remove_file(&events);
+    // Only ignore NotFound errors - propagate other errors
+    match std::fs::remove_file(&snapshot) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    match std::fs::remove_file(&events) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
 
-    // fsync directory to ensure deletions are durable
-    fsync_dir(state_dir)?;
-
-    Ok(())
+    // fsync directory to ensure deletions are durable.
+    // If directory doesn't exist, there's nothing to sync.
+    match fsync_dir(state_dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Lists all generation files in the state directory.
@@ -167,7 +181,8 @@ pub fn list_generation_files(state_dir: &Path) -> io::Result<Vec<(u64, &'static 
         }
     }
 
-    files.sort_by_key(|(generation, _)| *generation);
+    // Sort by generation, then by file type for deterministic ordering
+    files.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
     Ok(files)
 }
 
@@ -271,6 +286,14 @@ mod tests {
     }
 
     #[test]
+    fn delete_old_generation_handles_missing_directory() {
+        let dir = tempdir().unwrap();
+        let nonexistent = dir.path().join("nonexistent");
+        // Should not error even if directory doesn't exist
+        delete_old_generation(&nonexistent, 0).unwrap();
+    }
+
+    #[test]
     fn delete_old_generation_removes_files() {
         let dir = tempdir().unwrap();
         let snapshot = snapshot_path(dir.path(), 0);
@@ -352,12 +375,12 @@ mod tests {
         let generation = read_generation(dir.path()).unwrap();
         assert_eq!(generation, 0);
 
-        // Document the risk: list_generation_files shows snapshots exist at gen 3
+        // list_generation_files shows snapshots exist at gen 3
         let files = list_generation_files(dir.path()).unwrap();
         assert!(files.iter().any(|(g, _)| *g == 3));
 
-        // This mismatch (gen=0, but files at gen=3) could cause data loss
-        // if cleanup_stale_generations is called - it would delete gen 3 files
+        // Note: cleanup_stale_generations handles this case correctly by scanning
+        // for existing snapshots and using the highest generation, preserving gen 3.
     }
 
     #[test]

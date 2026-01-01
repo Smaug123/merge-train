@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 6c4d40f296468ada528ff53234e7ef7f10c4423083fb5707eed58ed0d5f1156f # shrinks to delivery_id = DeliveryId("00a0aaa0-aa0a-0aa0-aaaa-0aaaaa0a0aaa"), payload = []

@@ -21,11 +21,12 @@
 //!
 //! # Recovery
 //!
-//! On startup:
-//! 1. Read the `generation` file to find current generation N
-//! 2. Load `snapshot.<N>.json` (fallback to `snapshot.<N-1>.json` if crash during compaction)
-//! 3. Replay `events.<N>.log` from the snapshot's `log_position`
-//! 4. Clean up stale files from older generations
+//! On startup (via `cleanup_stale_generations`):
+//! 1. Scan for the highest existing snapshot generation (handles crash during compaction)
+//! 2. If the generation file is stale, missing, or corrupt, restore it to match the highest snapshot
+//! 3. Load the snapshot for the current generation
+//! 4. Replay events for the current generation from the snapshot's `log_position`
+//! 5. Clean up files from other generations
 //!
 //! # Crash Safety
 //!
