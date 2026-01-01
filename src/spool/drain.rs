@@ -260,6 +260,55 @@ mod tests {
             }
         }
 
+        /// In-progress deliveries (with .proc marker) are never returned by drain.
+        ///
+        /// This is a critical safety property: without this, workers would double-process
+        /// deliveries when drain_pending is called during normal operation.
+        #[test]
+        fn drain_never_returns_in_progress_deliveries(
+            pending_ids in prop::collection::vec(arb_delivery_id(), 1..5),
+            processing_ids in prop::collection::vec(arb_delivery_id(), 1..5),
+            payload in arb_payload(),
+        ) {
+            use std::collections::HashSet;
+
+            // Ensure no overlap between pending and processing IDs
+            let pending_set: HashSet<_> = pending_ids.iter().map(|id| id.as_str()).collect();
+            let processing_set: HashSet<_> = processing_ids.iter().map(|id| id.as_str()).collect();
+            let overlap = pending_set.intersection(&processing_set).count();
+            prop_assume!(overlap == 0);
+
+            let dir = tempdir().unwrap();
+            let spool_dir = dir.path();
+
+            // Create pending deliveries (no .proc marker)
+            for id in &pending_ids {
+                let _ = spool_delivery(spool_dir, id, &payload);
+            }
+
+            // Create in-progress deliveries (with .proc marker)
+            for id in &processing_ids {
+                let delivery = spool_delivery(spool_dir, id, &payload).unwrap();
+                mark_processing(&delivery).unwrap();
+            }
+
+            // Drain pending - should ONLY return pending, never in-progress
+            let pending = drain_pending(spool_dir).unwrap();
+            let returned_ids: HashSet<_> = pending.iter().map(|d| d.delivery_id.as_str()).collect();
+
+            // All pending IDs should be returned
+            for id in &pending_ids {
+                prop_assert!(returned_ids.contains(id.as_str()),
+                    "Pending delivery {} was not returned", id.as_str());
+            }
+
+            // NO in-progress IDs should be returned
+            for id in &processing_ids {
+                prop_assert!(!returned_ids.contains(id.as_str()),
+                    "In-progress delivery {} was incorrectly returned", id.as_str());
+            }
+        }
+
         /// Done deliveries are not returned by drain.
         #[test]
         fn drain_excludes_done(
@@ -594,12 +643,14 @@ mod tests {
         assert!(!spool_dir.join("orphan.json.proc").exists());
     }
 
-    /// Drain does NOT clean up proc markers (that's cleanup_interrupted_processing's job).
+    /// Drain does NOT return deliveries with proc markers (they're in-progress).
     ///
     /// This is important because drain may be called while workers are processing.
-    /// If drain cleaned up proc markers, it would cause double-processing.
+    /// If drain returned items with proc markers, it would cause double-processing.
+    /// The proc markers are cleaned up by `cleanup_interrupted_processing()` at
+    /// startup only, which makes those deliveries pending again.
     #[test]
-    fn drain_does_not_touch_proc_markers() {
+    fn drain_excludes_in_progress_deliveries() {
         let dir = tempdir().unwrap();
         let spool_dir = dir.path();
 
@@ -611,10 +662,16 @@ mod tests {
         // Drain WITHOUT calling cleanup_interrupted_processing
         let pending = drain_pending(spool_dir).unwrap();
 
-        // Delivery should still be pending (it has .json, no .done)
-        assert_eq!(pending.len(), 1);
+        // Delivery should NOT be returned (it has .proc marker = in-progress)
+        assert_eq!(pending.len(), 0);
 
-        // But the proc marker should still exist (not cleaned up)
+        // The proc marker should still exist (drain doesn't clean it up)
         assert!(delivery.proc_marker_path().exists());
+
+        // After cleanup_interrupted_processing, it becomes pending again
+        cleanup_interrupted_processing(spool_dir).unwrap();
+        let pending = drain_pending(spool_dir).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].delivery_id.as_str(), "in-progress-delivery");
     }
 }

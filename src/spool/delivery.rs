@@ -105,9 +105,21 @@ impl SpooledDelivery {
         self.payload_path.with_extension("json.tmp")
     }
 
-    /// Checks if the delivery is pending (payload exists, no done marker).
+    /// Checks if the delivery is pending (payload exists, not processing, not done).
+    ///
+    /// A delivery is pending if:
+    /// - The payload file exists
+    /// - No `.proc` marker exists (not currently being processed)
+    /// - No `.done` marker exists (not already completed)
+    ///
+    /// This ensures `drain_pending` won't return items that are actively being
+    /// processed by a worker. At startup, `cleanup_interrupted_processing()` removes
+    /// stale `.proc` markers from crashed runs, allowing those deliveries to become
+    /// pending again.
     pub fn is_pending(&self) -> bool {
-        self.payload_path.exists() && !self.done_marker_path().exists()
+        self.payload_path.exists()
+            && !self.proc_marker_path().exists()
+            && !self.done_marker_path().exists()
     }
 
     /// Checks if the delivery is being processed (proc marker exists, no done marker).
@@ -135,11 +147,17 @@ impl SpooledDelivery {
 
 /// Spools a webhook delivery to disk atomically.
 ///
-/// The delivery is written using the write-to-temp-then-rename pattern:
+/// The delivery is written using the write-to-temp-then-link pattern:
 /// 1. Write to `<delivery-id>.json.tmp`
 /// 2. fsync the temp file
-/// 3. Rename to `<delivery-id>.json`
-/// 4. fsync the directory
+/// 3. hard_link to `<delivery-id>.json` (fails atomically if exists)
+/// 4. Remove the temp file
+/// 5. fsync the directory
+///
+/// Using hard_link instead of rename provides atomic duplicate detection:
+/// on Unix, link() fails with EEXIST if the target already exists, preventing
+/// the race condition where two concurrent spool_delivery calls could both
+/// pass exists() checks and the later rename would overwrite the first.
 ///
 /// # Errors
 ///
@@ -158,12 +176,8 @@ pub fn spool_delivery(
 
     let delivery = SpooledDelivery::new(spool_dir, delivery_id.clone());
 
-    // Check for duplicate - reject if payload file already exists
-    if delivery.payload_path.exists() {
-        return Err(SpoolError::DuplicateDelivery(delivery_id.clone()));
-    }
-
-    // Also check for done marker (processed but not yet cleaned up)
+    // Early check for done marker (processed but not yet cleaned up)
+    // This is an optimization to fail fast; the atomic check below is authoritative.
     if delivery.done_marker_path().exists() {
         return Err(SpoolError::DuplicateDelivery(delivery_id.clone()));
     }
@@ -180,10 +194,26 @@ pub fn spool_delivery(
         fsync_file(&file)?;
     }
 
-    // Atomic rename
-    std::fs::rename(&temp_path, &delivery.payload_path)?;
+    // Atomic link - fails with EEXIST if target already exists
+    // This is the authoritative duplicate check that prevents race conditions.
+    match std::fs::hard_link(&temp_path, &delivery.payload_path) {
+        Ok(()) => {
+            // Link succeeded, remove the temp file
+            let _ = std::fs::remove_file(&temp_path);
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            // Target already exists - this is a duplicate
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(SpoolError::DuplicateDelivery(delivery_id.clone()));
+        }
+        Err(e) => {
+            // Some other error - clean up temp file and propagate
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(e.into());
+        }
+    }
 
-    // fsync directory to ensure the rename is durable
+    // fsync directory to ensure the link is durable
     fsync_dir(spool_dir)?;
 
     Ok(delivery)
@@ -214,28 +244,48 @@ pub fn mark_done(delivery: &SpooledDelivery) -> Result<()> {
     create_marker_file(&delivery.done_marker_path(), &delivery.spool_dir)
 }
 
-/// Creates an empty marker file atomically.
+/// Creates an empty marker file atomically using temp-file + fsync + rename.
 ///
-/// The marker is created by opening with O_CREAT | O_EXCL semantics where possible,
-/// then fsyncing the directory to ensure durability.
+/// The marker is created with the following crash-safe sequence:
+/// 1. Create a temp file with `.tmp` suffix
+/// 2. fsync the temp file (even though empty, this ensures metadata is durable)
+/// 3. Atomic rename to the final path
+/// 4. fsync the directory to ensure the rename is durable
+///
+/// This ensures that if we crash at any point:
+/// - Before rename: no marker exists (temp file is ignored on recovery)
+/// - After rename but before dir fsync: marker may or may not exist (but if it
+///   exists, it's complete)
 fn create_marker_file(path: &Path, spool_dir: &Path) -> Result<()> {
     // If marker already exists, this is a no-op (idempotent)
     if path.exists() {
         return Ok(());
     }
 
-    // Create empty marker file
-    // Note: This isn't strictly atomic in the "exclusive create" sense,
-    // but the marker being empty means any partial state is equivalent to complete.
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)?;
-    // Empty file, no content to write
-    drop(file);
+    // Create temp file path by appending .tmp to the marker path
+    // e.g., "delivery.json.done" -> "delivery.json.done.tmp"
+    let temp_path = path.with_extension(
+        path.extension()
+            .map(|e| format!("{}.tmp", e.to_string_lossy()))
+            .unwrap_or_else(|| "tmp".to_string()),
+    );
 
-    // fsync directory to ensure the marker is durable
+    // Create and fsync the temp file
+    {
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temp_path)?;
+        // fsync the file itself to ensure it's durable before rename
+        fsync_file(&file)?;
+    }
+
+    // Atomic rename - if this succeeds, the marker is created
+    // If we crash before this, the temp file is ignored on recovery
+    std::fs::rename(&temp_path, path)?;
+
+    // fsync directory to ensure the rename is durable
     fsync_dir(spool_dir)?;
 
     Ok(())
@@ -251,6 +301,12 @@ pub fn remove_delivery(delivery: &SpooledDelivery) -> Result<()> {
     let _ = std::fs::remove_file(delivery.proc_marker_path());
     let _ = std::fs::remove_file(&delivery.payload_path);
     let _ = std::fs::remove_file(delivery.temp_path());
+
+    // Also clean up any orphaned temp marker files from interrupted marker creation
+    let done_temp = delivery.done_marker_path().with_extension("done.tmp");
+    let proc_temp = delivery.proc_marker_path().with_extension("proc.tmp");
+    let _ = std::fs::remove_file(done_temp);
+    let _ = std::fs::remove_file(proc_temp);
 
     Ok(())
 }
@@ -293,7 +349,15 @@ mod tests {
             prop_assert!(!delivery.is_done());
         }
 
-        /// Duplicate delivery IDs are rejected.
+        /// Duplicate delivery IDs are rejected atomically.
+        ///
+        /// This test verifies that:
+        /// 1. The first spool succeeds
+        /// 2. The second spool with the same ID fails with DuplicateDelivery
+        /// 3. The first payload is NOT overwritten by the second attempt
+        ///
+        /// The atomic rejection uses hard_link() which fails with EEXIST if the
+        /// target already exists, preventing race conditions in concurrent scenarios.
         #[test]
         fn duplicate_delivery_rejected(
             delivery_id in arb_delivery_id(),
@@ -304,11 +368,18 @@ mod tests {
             let spool_dir = dir.path();
 
             // First spool succeeds
-            let _delivery = spool_delivery(spool_dir, &delivery_id, &payload1).unwrap();
+            let delivery = spool_delivery(spool_dir, &delivery_id, &payload1).unwrap();
 
             // Second spool with same ID fails
             let result = spool_delivery(spool_dir, &delivery_id, &payload2);
             prop_assert!(matches!(result, Err(SpoolError::DuplicateDelivery(_))));
+
+            // CRITICAL: First payload is preserved, not overwritten
+            let read_payload = delivery.read_payload_bytes().unwrap();
+            prop_assert_eq!(payload1, read_payload, "First payload must be preserved");
+
+            // Temp file from second attempt should be cleaned up
+            prop_assert!(!delivery.temp_path().exists());
         }
 
         /// Processing marker is idempotent.
@@ -370,7 +441,7 @@ mod tests {
 
             // Mark processing
             mark_processing(&delivery).unwrap();
-            prop_assert!(delivery.is_pending()); // Still pending (not done)
+            prop_assert!(!delivery.is_pending()); // NOT pending while processing (prevents double-processing)
             prop_assert!(delivery.is_processing());
             prop_assert!(!delivery.is_done());
 
@@ -496,14 +567,14 @@ mod tests {
             prop_assert!(!delivery.done_marker_path().exists());
 
             // Recovery state (before cleanup_interrupted_processing):
-            // is_pending is true (has payload, no done)
+            // is_pending is FALSE (has proc marker = in-progress, prevents double-processing)
             // is_processing is true (has proc, no done)
-            prop_assert!(delivery.is_pending());
+            prop_assert!(!delivery.is_pending()); // NOT pending while in-progress
             prop_assert!(delivery.is_processing());
             prop_assert!(!delivery.is_done());
 
             // After cleanup_interrupted_processing (which should be called at startup),
-            // the proc marker is removed and the delivery can be reprocessed.
+            // the proc marker is removed and the delivery becomes pending again.
             // The drain module's cleanup_interrupted_processing handles this.
         }
 
@@ -533,6 +604,44 @@ mod tests {
             prop_assert!(!delivery.is_pending());
             prop_assert!(!delivery.is_processing());
             prop_assert!(delivery.is_done());
+        }
+
+        /// Crash during marker creation: temp marker file exists.
+        ///
+        /// If a crash occurs during marker creation (after writing temp file but
+        /// before the atomic rename), only the .done.tmp or .proc.tmp file exists.
+        /// On recovery, the temp marker file is NOT treated as a valid marker.
+        #[test]
+        fn crash_during_marker_creation_temp_only(
+            delivery_id in arb_delivery_id(),
+            payload in arb_payload(),
+        ) {
+            let dir = tempdir().unwrap();
+            let spool_dir = dir.path();
+
+            // Spool a delivery
+            let delivery = spool_delivery(spool_dir, &delivery_id, &payload).unwrap();
+
+            // Simulate crash during mark_done: temp marker exists but not final marker
+            let done_temp = delivery.done_marker_path().with_extension("done.tmp");
+            std::fs::write(&done_temp, b"").unwrap();
+
+            // The temp file should exist
+            prop_assert!(done_temp.exists());
+            // But the final marker should NOT exist
+            prop_assert!(!delivery.done_marker_path().exists());
+
+            // Delivery should still be pending (no done marker)
+            prop_assert!(delivery.is_pending());
+            prop_assert!(!delivery.is_done());
+
+            // Now complete the marker creation normally
+            mark_done(&delivery).unwrap();
+
+            // Now done marker should exist
+            prop_assert!(delivery.done_marker_path().exists());
+            prop_assert!(delivery.is_done());
+            prop_assert!(!delivery.is_pending());
         }
 
         /// Partial state: proc marker exists without payload.

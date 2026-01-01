@@ -141,6 +141,45 @@ impl From<String> for DedupeKey {
     }
 }
 
+// ─── Dedupe tracking and TTL-based pruning ───
+
+use std::collections::HashMap;
+
+/// Default TTL for dedupe keys (24 hours).
+pub const DEFAULT_DEDUPE_TTL_HOURS: i64 = 24;
+
+/// Checks if a dedupe key has been seen.
+///
+/// Returns `true` if the key exists in the seen set, meaning this event
+/// is a duplicate and should be skipped.
+pub fn is_duplicate(seen_keys: &HashMap<String, DateTime<Utc>>, key: &DedupeKey) -> bool {
+    seen_keys.contains_key(key.as_str())
+}
+
+/// Records a dedupe key as seen with the current timestamp.
+///
+/// This should be called after successfully processing an event.
+pub fn mark_seen(seen_keys: &mut HashMap<String, DateTime<Utc>>, key: &DedupeKey) {
+    seen_keys.insert(key.as_str().to_string(), Utc::now());
+}
+
+/// Prunes dedupe keys older than the specified TTL.
+///
+/// Returns the number of keys pruned.
+pub fn prune_expired_keys(seen_keys: &mut HashMap<String, DateTime<Utc>>, ttl_hours: i64) -> usize {
+    let cutoff = Utc::now() - chrono::Duration::hours(ttl_hours);
+    let before_len = seen_keys.len();
+    seen_keys.retain(|_, timestamp| *timestamp > cutoff);
+    before_len - seen_keys.len()
+}
+
+/// Prunes dedupe keys using the default TTL (24 hours).
+///
+/// Returns the number of keys pruned.
+pub fn prune_expired_keys_default(seen_keys: &mut HashMap<String, DateTime<Utc>>) -> usize {
+    prune_expired_keys(seen_keys, DEFAULT_DEDUPE_TTL_HOURS)
+}
+
 /// Raw webhook payload data for dedupe key extraction.
 ///
 /// This is a minimal representation of webhook fields needed for deduplication.
@@ -705,5 +744,114 @@ mod tests {
             key.as_str(),
             format!("status:{}:continuous-integration:success", "a".repeat(40))
         );
+    }
+
+    // ─── Dedupe tracking tests ───
+
+    proptest! {
+        /// Once a key is marked as seen, is_duplicate returns true.
+        #[test]
+        fn marked_key_is_duplicate(
+            pr in arb_pr_number(),
+            comment_id in arb_comment_id(),
+        ) {
+            let mut seen = HashMap::new();
+            let key = DedupeKey::issue_comment_created(pr, comment_id);
+
+            // Initially not a duplicate
+            prop_assert!(!is_duplicate(&seen, &key));
+
+            // Mark as seen
+            mark_seen(&mut seen, &key);
+
+            // Now it's a duplicate
+            prop_assert!(is_duplicate(&seen, &key));
+        }
+
+        /// Different keys are not duplicates of each other.
+        #[test]
+        fn different_keys_not_duplicate(
+            pr1 in arb_pr_number(),
+            pr2 in arb_pr_number(),
+            comment_id in arb_comment_id(),
+        ) {
+            prop_assume!(pr1 != pr2);
+
+            let mut seen = HashMap::new();
+            let key1 = DedupeKey::issue_comment_created(pr1, comment_id);
+            let key2 = DedupeKey::issue_comment_created(pr2, comment_id);
+
+            // Mark key1 as seen
+            mark_seen(&mut seen, &key1);
+
+            // key1 is duplicate, key2 is not
+            prop_assert!(is_duplicate(&seen, &key1));
+            prop_assert!(!is_duplicate(&seen, &key2));
+        }
+
+        /// Pruning removes only keys older than TTL.
+        #[test]
+        fn pruning_respects_ttl(
+            pr in arb_pr_number(),
+            comment_id in arb_comment_id(),
+        ) {
+            let mut seen = HashMap::new();
+            let key = DedupeKey::issue_comment_created(pr, comment_id);
+
+            // Add a key with current timestamp
+            mark_seen(&mut seen, &key);
+            prop_assert_eq!(seen.len(), 1);
+
+            // Pruning with 24 hour TTL should not remove it
+            let pruned = prune_expired_keys(&mut seen, 24);
+            prop_assert_eq!(pruned, 0);
+            prop_assert_eq!(seen.len(), 1);
+
+            // Manually set timestamp to 25 hours ago
+            let old_timestamp = Utc::now() - chrono::Duration::hours(25);
+            seen.insert(key.as_str().to_string(), old_timestamp);
+
+            // Now pruning should remove it
+            let pruned = prune_expired_keys(&mut seen, 24);
+            prop_assert_eq!(pruned, 1);
+            prop_assert_eq!(seen.len(), 0);
+        }
+    }
+
+    #[test]
+    fn prune_mixed_ages() {
+        let mut seen = HashMap::new();
+
+        // Add some fresh keys
+        let fresh_key = DedupeKey::issue_comment_created(PrNumber(1), CommentId(1));
+        mark_seen(&mut seen, &fresh_key);
+
+        // Add some old keys (manually set timestamp)
+        let old_key = DedupeKey::issue_comment_created(PrNumber(2), CommentId(2));
+        let old_timestamp = Utc::now() - chrono::Duration::hours(25);
+        seen.insert(old_key.as_str().to_string(), old_timestamp);
+
+        // Add another old key
+        let old_key2 = DedupeKey::issue_comment_created(PrNumber(3), CommentId(3));
+        seen.insert(old_key2.as_str().to_string(), old_timestamp);
+
+        assert_eq!(seen.len(), 3);
+
+        // Prune with 24 hour TTL
+        let pruned = prune_expired_keys_default(&mut seen);
+
+        // Should remove 2 old keys, keep 1 fresh
+        assert_eq!(pruned, 2);
+        assert_eq!(seen.len(), 1);
+        assert!(is_duplicate(&seen, &fresh_key));
+        assert!(!is_duplicate(&seen, &old_key));
+        assert!(!is_duplicate(&seen, &old_key2));
+    }
+
+    #[test]
+    fn empty_seen_set_not_duplicate() {
+        let seen = HashMap::new();
+        let key = DedupeKey::issue_comment_created(PrNumber(123), CommentId(456));
+        assert!(!is_duplicate(&seen, &key));
     }
 }

@@ -24,6 +24,9 @@ pub mod dedupe;
 pub mod delivery;
 pub mod drain;
 
-pub use dedupe::{DedupeKey, extract_dedupe_key};
+pub use dedupe::{
+    DEFAULT_DEDUPE_TTL_HOURS, DedupeKey, extract_dedupe_key, is_duplicate, mark_seen,
+    prune_expired_keys, prune_expired_keys_default,
+};
 pub use delivery::{SpoolError, SpooledDelivery, mark_done, mark_processing, spool_delivery};
 pub use drain::{cleanup_interrupted_processing, drain_pending};
