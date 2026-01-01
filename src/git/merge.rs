@@ -71,10 +71,12 @@ pub fn prepare_descendant(
     let local_ref = format!("refs/remotes/origin/pr/{}", predecessor_pr);
 
     // Fetch the descendant branch and predecessor via PR ref.
-    // Format: "refs/pull/<n>/head:refs/remotes/origin/pr/<n>" creates a local
+    // Format: "+refs/pull/<n>/head:refs/remotes/origin/pr/<n>" creates a local
     // tracking ref that we can merge from.
+    // The "+" prefix forces the update even if the PR was force-pushed (rebased).
+    // Without "+", a force-pushed PR would cause fetch to fail with "non-fast-forward".
     // Use "--" to prevent branch names starting with "-" from being interpreted as flags.
-    let fetch_refspec = format!("{}:{}", pr_ref, local_ref);
+    let fetch_refspec = format!("+{}:{}", pr_ref, local_ref);
     run_git_sync(
         worktree,
         &["fetch", "origin", "--", descendant_branch, &fetch_refspec],
