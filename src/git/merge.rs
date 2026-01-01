@@ -184,11 +184,27 @@ pub fn reconcile_descendant(
 
     let squash_parent = &parents[0];
 
+    // Validate: the squash commit must be on the default branch.
+    // This catches cases where a wrong SHA (off-main) is passed.
+    let default_head = rev_parse(worktree, &format!("origin/{}", default_branch))?;
+    let commit_on_default =
+        super::is_ancestor(worktree, squash_sha, &default_head)? || squash_sha == &default_head;
+
+    if !commit_on_default {
+        return Err(GitError::CommandFailed {
+            command: "validate squash commit".to_string(),
+            stderr: format!(
+                "Commit {} is not on the {} branch history. \
+                 The squash SHA must be a commit on the default branch.",
+                squash_sha, default_branch
+            ),
+        });
+    }
+
     // Validate: the parent must be on the default branch history.
     // For a valid squash merge: parent is the prior main HEAD, which is on main.
     // For a multi-commit rebase: parent is the previous rebased commit,
     // which is NOT on the main branch history.
-    let default_head = rev_parse(worktree, &format!("origin/{}", default_branch))?;
     let parent_on_default = super::is_ancestor(worktree, squash_parent, &default_head)?
         || squash_parent == &default_head;
 
@@ -450,12 +466,20 @@ pub fn is_valid_squash_merge(
 
     let parent = &parents[0];
 
+    let default_head = rev_parse(worktree, &format!("origin/{}", default_branch))?;
+
+    // The COMMIT must be on the default branch.
+    // This catches cases where a wrong SHA (off-main) is passed.
+    let commit_on_default =
+        super::is_ancestor(worktree, commit, &default_head)? || commit == &default_head;
+    if !commit_on_default {
+        return Ok(false);
+    }
+
     // The PARENT must be on the default branch.
     // For a valid squash: the parent is the prior main HEAD, which is on main.
     // For a multi-commit rebase: the parent is the previous rebased commit,
     // which is NOT on the main branch history.
-    let default_head = rev_parse(worktree, &format!("origin/{}", default_branch))?;
-
     // Check if the parent is an ancestor of (or equal to) the default branch HEAD
     // This catches rebase merges where the parent is not on main's history
     let parent_on_default =

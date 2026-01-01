@@ -399,155 +399,113 @@ proptest! {
     }
 }
 
-/// Property 3 extension: Verify that the naive approach (merging main during preparation)
-/// would lose commits, while the correct approach preserves them.
+/// Property 3 extension: Verify that the correct approach (using $SQUASH_SHA^ during
+/// reconciliation) properly incorporates late commits that land on main.
 ///
 /// This is a deterministic test rather than property-based because it's testing
 /// a specific scenario from the design doc.
 ///
-/// The test demonstrates BOTH paths:
-/// 1. NAIVE (WRONG): Merge main during preparation -> loses intervening commits
-/// 2. CORRECT: Use $SQUASH_SHA^ during reconciliation -> preserves all commits
+/// The test demonstrates:
+/// 1. A late commit lands on main between preparation and squash
+/// 2. The $SQUASH_SHA^ includes this late commit
+/// 3. Reconciliation properly incorporates the late commit's content
+///
+/// The naive approach (merging main during preparation) would create a more
+/// complex merge topology that could cause issues, but git's 3-way merge
+/// is robust enough to handle most cases. The correct approach avoids this
+/// complexity by not pre-merging main.
 #[test]
-fn squash_parent_ordering_prevents_lost_commits() {
-    // =========================================================================
-    // PART 1: Demonstrate the NAIVE path can lose commits
-    // =========================================================================
-    // The naive approach merges main during preparation. This can cause issues
-    // when a late commit lands on main between preparation and squash.
-    //
-    // While git's 3-way merge often handles this correctly, the naive approach
-    // creates a more complex merge history that can lead to:
-    // 1. Merge conflicts that wouldn't occur with the correct approach
-    // 2. Confusion about which version of a file is canonical
-    // 3. Potential for lost commits in edge cases with file renames/moves
-    //
-    // The correct approach (not merging main during preparation) ensures a
-    // clean, predictable merge history where $SQUASH_SHA^ is always merged
-    // fresh, incorporating all intervening commits reliably.
-    {
-        let (_temp_dir, config) = create_test_repo();
+fn squash_parent_ordering_incorporates_late_commits() {
+    let (_temp_dir, config) = create_test_repo();
 
-        // Create predecessor and descendant
-        let pred_sha =
-            create_branch_with_file(&config, "pr-123", "pred.txt", "predecessor", "main");
-        create_pr_ref(&config, 123, &pred_sha);
-        let _desc_sha =
-            create_branch_with_file(&config, "pr-124", "desc.txt", "descendant", "pr-123");
+    // Create predecessor PR
+    let pred_sha = create_branch_with_file(&config, "pr-123", "pred.txt", "predecessor", "main");
+    create_pr_ref(&config, 123, &pred_sha);
 
-        // NAIVE APPROACH: Merge main during preparation
-        let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
-        prepare_descendant(&worktree, "pr-124", 123, false).unwrap();
-        run_git_sync(&worktree, &["fetch", "origin", "main"]).unwrap();
-        run_git_sync(
-            &worktree,
-            &["merge", "origin/main", "-m", "Merge main (naive)"],
-        )
-        .unwrap();
+    // Create descendant PR from predecessor
+    let _desc_sha = create_branch_with_file(&config, "pr-124", "desc.txt", "descendant", "pr-123");
 
-        // At this point, descendant has main@T1 merged
-        // Record what main looked like at preparation time
-        let main_at_prep = super::rev_parse(&worktree, "origin/main").unwrap();
+    // CORRECT APPROACH: Prepare WITHOUT merging main
+    let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
+    prepare_descendant(&worktree, "pr-124", 123, false).unwrap();
+    run_git_sync(
+        &worktree,
+        &["push", "origin", "HEAD:refs/heads/pr-124", "--force"],
+    )
+    .unwrap();
 
-        run_git_sync(
-            &worktree,
-            &["push", "origin", "HEAD:refs/heads/pr-124", "--force"],
-        )
-        .unwrap();
+    // Verify: after preparation, the descendant does NOT have late.txt
+    // (because we didn't merge main during preparation)
+    assert!(
+        !worktree.join("late.txt").exists(),
+        "Before late commit, late.txt should NOT exist"
+    );
 
-        // Late commit lands on main AFTER preparation
-        let _late_sha = add_commit_to_main(&config, "late.txt", "late commit");
+    // A late commit lands on main AFTER preparation
+    let _late_sha = add_commit_to_main(&config, "late.txt", "late commit content");
 
-        // Squash merge the predecessor
-        let squash_sha = squash_merge_to_main(&config, &pred_sha);
+    // Get main state before squash (includes late commit)
+    let clone_dir = config.clone_dir();
+    let main_before = run_git_stdout(&clone_dir, &["rev-parse", "refs/heads/main"]).unwrap();
+    let main_before = Sha::parse(&main_before).unwrap();
 
-        // Verify: the squash parent (main before squash) includes late.txt
-        let clone_dir = config.clone_dir();
-        let squash_parent = super::get_parents(&clone_dir, squash_sha.as_str()).unwrap()[0].clone();
+    // Squash merge the predecessor
+    let squash_sha = squash_merge_to_main(&config, &pred_sha);
 
-        // The squash parent should be NEWER than main_at_prep
-        assert_ne!(
-            squash_parent, main_at_prep,
-            "Squash parent should include commits after preparation"
-        );
+    // Verify the squash parent is main_before (which includes the late commit)
+    let parents = super::get_parents(&clone_dir, squash_sha.as_str()).unwrap();
+    assert_eq!(
+        parents.len(),
+        1,
+        "Squash commit should have exactly one parent"
+    );
+    assert_eq!(
+        parents[0], main_before,
+        "Squash parent should be main before squash (includes late commit)"
+    );
 
-        // The naive approach created extra complexity: the descendant already
-        // has main@T1 merged, so the reconciliation merge is a 3-way merge
-        // with a different base than the correct approach would use.
-        // This is documented in DESIGN.md as potentially problematic.
-    }
+    // Verify: before reconciliation, the descendant still doesn't have late.txt
+    assert!(
+        !worktree.join("late.txt").exists(),
+        "Before reconciliation, late.txt should NOT exist"
+    );
 
-    // =========================================================================
-    // PART 2: Demonstrate the CORRECT path preserves all commits
-    // =========================================================================
-    {
-        let (_temp_dir, config) = create_test_repo();
+    // Reconcile with $SQUASH_SHA^ (correct approach)
+    // This merges the squash parent (which includes late.txt) into the descendant
+    reconcile_descendant(&worktree, "pr-124", &squash_sha, "main", false).unwrap();
 
-        // Create predecessor PR
-        let pred_sha =
-            create_branch_with_file(&config, "pr-123", "pred.txt", "predecessor", "main");
-        create_pr_ref(&config, 123, &pred_sha);
+    // Verify: after reconciliation, late.txt exists
+    // The reconciliation merged $SQUASH_SHA^ which includes the late commit
+    assert!(
+        worktree.join("late.txt").exists(),
+        "After reconciliation, late.txt MUST exist - the late commit was incorporated via $SQUASH_SHA^"
+    );
+    assert_eq!(
+        read_file(&worktree, "late.txt"),
+        Some("late commit content".to_string()),
+        "late.txt should have the correct content"
+    );
 
-        // Create descendant PR from predecessor
-        let _desc_sha =
-            create_branch_with_file(&config, "pr-124", "desc.txt", "descendant", "pr-123");
+    // Catch up with main
+    catch_up_descendant(&worktree, "pr-124", "main", false).unwrap();
 
-        // An independent commit lands on main BEFORE we squash
-        let _intervening = add_commit_to_main(&config, "late.txt", "late commit");
-
-        // Get main state before squash
-        let clone_dir = config.clone_dir();
-        let main_before = run_git_stdout(&clone_dir, &["rev-parse", "refs/heads/main"]).unwrap();
-        let main_before = Sha::parse(&main_before).unwrap();
-
-        // Squash merge the predecessor
-        let squash_sha = squash_merge_to_main(&config, &pred_sha);
-
-        // Verify the squash parent is main_before (which includes the late commit)
-        let parents = super::get_parents(&clone_dir, squash_sha.as_str()).unwrap();
-        assert_eq!(parents.len(), 1);
-        assert_eq!(
-            parents[0], main_before,
-            "Squash parent should be the main before squash"
-        );
-
-        // CORRECT APPROACH: Prepare WITHOUT merging main
-        let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
-        prepare_descendant(&worktree, "pr-124", 123, false).unwrap();
-        run_git_sync(
-            &worktree,
-            &["push", "origin", "HEAD:refs/heads/pr-124", "--force"],
-        )
-        .unwrap();
-
-        // Verify: after preparation, the descendant does NOT have late.txt
-        // (because we didn't merge main during preparation)
-        assert!(
-            !worktree.join("late.txt").exists(),
-            "Before reconciliation, late.txt should NOT exist (correct approach)"
-        );
-
-        // Reconcile with $SQUASH_SHA^ (correct approach)
-        reconcile_descendant(&worktree, "pr-124", &squash_sha, "main", false).unwrap();
-
-        // Catch up with main
-        catch_up_descendant(&worktree, "pr-124", "main", false).unwrap();
-
-        // Verify the late commit's content is preserved
-        assert!(
-            worktree.join("late.txt").exists(),
-            "After correct reconciliation, late.txt MUST exist - the late commit is preserved"
-        );
-        assert_eq!(
-            read_file(&worktree, "late.txt"),
-            Some("late commit".to_string())
-        );
-
-        // Verify all content is present
-        assert!(worktree.join("pred.txt").exists());
-        assert!(worktree.join("desc.txt").exists());
-        assert!(worktree.join("README.md").exists());
-    }
+    // Verify all content is preserved after catch-up
+    assert!(
+        worktree.join("late.txt").exists(),
+        "late.txt should still exist after catch-up"
+    );
+    assert!(
+        worktree.join("pred.txt").exists(),
+        "pred.txt should exist (from predecessor)"
+    );
+    assert!(
+        worktree.join("desc.txt").exists(),
+        "desc.txt should exist (from descendant)"
+    );
+    assert!(
+        worktree.join("README.md").exists(),
+        "README.md should exist (from initial commit)"
+    );
 }
 
 /// Conflicts during catch-up are detected and reported.
