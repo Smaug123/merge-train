@@ -11,7 +11,7 @@ use std::path::Path;
 
 use crate::types::Sha;
 
-use super::{GitError, GitResult, get_tree_sha, rev_parse, run_git_sync};
+use super::{GitError, GitResult, get_parents, get_tree_sha, rev_parse, run_git_sync};
 
 /// Result of a push operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,13 +178,19 @@ pub fn is_push_completed(
     }
 
     // Check for ours merge scenario: if the expected tree equals the pre-push tree,
-    // the tree didn't change (e.g., `-s ours` reconciliation). In this case, we can't
-    // reliably distinguish "our merge commit made it" from "someone else pushed a
-    // commit with the same tree". Be conservative and say not completed.
+    // the tree didn't change (e.g., `-s ours` reconciliation). In this case, tree
+    // comparison alone can't distinguish "our merge commit made it" from "someone
+    // else pushed a commit with the same tree". However, we can check if the remote's
+    // first parent is pre_push_sha - this confirms our merge commit is there.
     let pre_push_tree = get_tree_sha(worktree, pre_push_sha.as_str())?;
     if *expected_tree == pre_push_tree {
-        // Tree didn't change. We can't rely on tree comparison alone.
-        // Return false to trigger a retry push, which will determine the real state.
+        // Tree didn't change. Check if remote's first parent is pre_push_sha.
+        let parents = get_parents(worktree, remote_sha.as_str())?;
+        if parents.first() == Some(pre_push_sha) {
+            // Remote's first parent matches - our merge commit made it
+            return Ok(true);
+        }
+        // Can't confirm our merge made it - be conservative
         return Ok(false);
     }
 
@@ -477,5 +483,64 @@ mod tests {
 
         // Now completed
         assert!(intent.is_completed(&worktree).unwrap());
+    }
+
+    #[test]
+    fn is_push_completed_detects_ours_merge() {
+        // Test that is_push_completed correctly detects a completed ours-merge push.
+        // In an ours-merge, the tree doesn't change (expected_tree == pre_push_tree).
+        // The fix checks if remote's first parent is pre_push_sha to confirm our merge made it.
+        let (_temp_dir, config) = create_test_repo();
+        let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
+        run_git_sync(&worktree, &["config", "user.email", "test@test.com"]).unwrap();
+        run_git_sync(&worktree, &["config", "user.name", "Test"]).unwrap();
+
+        // Get pre-push state
+        let pre_push_sha = get_remote_ref(&worktree, "main").unwrap().unwrap();
+        let pre_push_tree = get_tree_sha(&worktree, pre_push_sha.as_str()).unwrap();
+
+        // Create a temporary commit with different content (simulates a feature branch)
+        std::fs::write(worktree.join("feature.txt"), "feature content").unwrap();
+        run_git_sync(&worktree, &["add", "."]).unwrap();
+        run_git_sync(&worktree, &["commit", "-m", "Feature commit"]).unwrap();
+        let feature_sha = rev_parse(&worktree, "HEAD").unwrap();
+
+        // Go back to main (detached) and create an ours merge
+        // This simulates reconciliation after a squash where we keep main's tree
+        run_git_sync(&worktree, &["checkout", "--detach", pre_push_sha.as_str()]).unwrap();
+        run_git_sync(
+            &worktree,
+            &[
+                "merge",
+                "-s",
+                "ours",
+                feature_sha.as_str(),
+                "-m",
+                "Ours merge",
+            ],
+        )
+        .unwrap();
+
+        // The tree should be unchanged (ours merge keeps main's tree)
+        let expected_tree = get_tree_sha(&worktree, "HEAD").unwrap();
+        assert_eq!(
+            expected_tree, pre_push_tree,
+            "Ours merge should preserve main's tree"
+        );
+
+        // Push hasn't happened yet - remote still has pre_push_sha
+        assert!(
+            !is_push_completed(&worktree, "main", &expected_tree, &pre_push_sha).unwrap(),
+            "Should not detect completion before push"
+        );
+
+        // Do the push
+        push_head_to_branch(&worktree, "main").unwrap();
+
+        // Now it should be detected as completed (the fix makes this work)
+        assert!(
+            is_push_completed(&worktree, "main", &expected_tree, &pre_push_sha).unwrap(),
+            "Should detect ours-merge push as completed"
+        );
     }
 }
