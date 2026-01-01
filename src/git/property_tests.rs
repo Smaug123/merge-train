@@ -1104,3 +1104,116 @@ fn worktree_cleanup_leaves_no_orphans() {
         orphans
     );
 }
+
+/// Regression test: Naive approach (merging main during preparation) loses late commits.
+///
+/// This test demonstrates WHY we use `$SQUASH_SHA^` during reconciliation rather than
+/// merging main during preparation. The naive approach would:
+/// 1. During preparation: merge current main into descendant
+/// 2. Late commit lands on main
+/// 3. Predecessor is squashed
+/// 4. Reconciliation doesn't incorporate the late commit
+///
+/// The correct approach (using `$SQUASH_SHA^`) ensures the late commit is incorporated
+/// because `$SQUASH_SHA^` IS main at the time of the squash, which includes the late commit.
+#[test]
+fn naive_ordering_loses_late_commits() {
+    let (_temp_dir, config) = create_test_repo();
+
+    // Create predecessor and descendant
+    let pred_sha = create_branch_with_file(&config, "pr-123", "pred.txt", "predecessor", "main");
+    create_pr_ref(&config, 123, &pred_sha);
+    let _desc_sha = create_branch_with_file(
+        &config,
+        "pr-124",
+        "desc.txt",
+        "descendant content",
+        "pr-123",
+    );
+
+    // Get worktree
+    let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
+
+    // === NAIVE APPROACH ===
+    // The naive approach would prepare by merging main into the descendant.
+    // Simulate this by explicitly merging main during preparation phase.
+    run_git_sync(&worktree, &["checkout", "--detach", "refs/heads/pr-124"]).unwrap();
+    run_git_sync(&worktree, &["fetch", "origin", "main"]).unwrap();
+    run_git_sync(
+        &worktree,
+        &[
+            "merge",
+            "origin/main",
+            "-m",
+            "Naive: merge main during prep",
+        ],
+    )
+    .unwrap();
+
+    // Save the "naively prepared" state
+    let naive_prep_sha = super::rev_parse(&worktree, "HEAD").unwrap();
+
+    // Push naive prep (this would be what the naive approach would do)
+    run_git_sync(
+        &worktree,
+        &[
+            "push",
+            "origin",
+            &format!("{}:refs/heads/pr-124-naive", naive_prep_sha),
+            "--force",
+        ],
+    )
+    .unwrap();
+
+    // Late commit lands on main AFTER the naive preparation
+    let late_content = "LATE COMMIT - this must not be lost!";
+    let _late_sha = add_commit_to_main(&config, "late.txt", late_content);
+
+    // Squash merge predecessor (main now includes late commit)
+    let squash_sha = squash_merge_to_main(&config, &pred_sha);
+
+    // === NAIVE RECONCILIATION ===
+    // A naive reconciliation would just rebase onto the squash or merge squash^
+    // without considering late commits. Let's see if the naive prep has late.txt.
+    run_git_sync(
+        &worktree,
+        &["checkout", "--detach", "refs/heads/pr-124-naive"],
+    )
+    .unwrap();
+
+    // The naive preparation does NOT have the late commit!
+    assert!(
+        !worktree.join("late.txt").exists(),
+        "NAIVE APPROACH BUG: The naive preparation (merging main during prep) \
+         does not have the late commit that landed after preparation"
+    );
+
+    // === CORRECT APPROACH ===
+    // Now let's do it correctly: prepare without merging main, then reconcile with $SQUASH_SHA^
+
+    // Start fresh from the original descendant
+    run_git_sync(&worktree, &["checkout", "--detach", "refs/heads/pr-124"]).unwrap();
+
+    // Correct preparation: just merge predecessor, NOT main
+    prepare_descendant(&worktree, "pr-124", 123, &test_identity()).unwrap();
+
+    // At this point, we still don't have late.txt (correct - it hasn't landed on our branch)
+    assert!(
+        !worktree.join("late.txt").exists(),
+        "Before reconciliation, late.txt should not exist (expected behavior)"
+    );
+
+    // Correct reconciliation: uses $SQUASH_SHA^ which IS main at squash time (includes late commit)
+    reconcile_descendant(&worktree, "pr-124", &squash_sha, "main", &test_identity()).unwrap();
+
+    // The correct approach DOES have the late commit!
+    assert!(
+        worktree.join("late.txt").exists(),
+        "CORRECT APPROACH: Reconciliation with $SQUASH_SHA^ incorporates the late commit"
+    );
+    assert_eq!(
+        read_file(&worktree, "late.txt"),
+        Some(late_content.to_string()),
+        "late.txt should have correct content"
+    );
+}

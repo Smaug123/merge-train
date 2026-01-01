@@ -494,4 +494,25 @@ mod tests {
         assert!(!status_100.1); // PR 100 is clean
         assert!(status_200.1); // PR 200 is dirty
     }
+
+    #[test]
+    fn cleanup_worktree_on_restart_deletes_corrupted() {
+        let (_temp_dir, config) = create_test_repo();
+
+        // Create a worktree
+        let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
+        assert!(worktree.exists());
+
+        // Corrupt the worktree by replacing .git (which points to the real gitdir)
+        // with invalid content. This will cause git commands to fail.
+        let git_file = worktree.join(".git");
+        std::fs::write(&git_file, "gitdir: /nonexistent/path/that/does/not/exist").unwrap();
+
+        // Clean on restart - should detect corruption and delete
+        let result = cleanup_worktree_on_restart(&config, PrNumber(123)).unwrap();
+        assert_eq!(result, CleanupResult::Deleted);
+
+        // Worktree should be gone
+        assert!(!worktree.exists());
+    }
 }

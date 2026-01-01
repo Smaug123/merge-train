@@ -178,6 +178,9 @@ pub fn parse_stack_dir_name(path: &Path) -> Option<PrNumber> {
 ///
 /// This ensures consistent behavior across different machines by ignoring
 /// system and user git configuration (e.g., rerere, hooks, aliases).
+///
+/// Security: Disables local hooks via `-c core.hooksPath=/dev/null` to prevent
+/// untrusted repos from executing code during merge/commit operations.
 pub(crate) fn git_command(workdir: &Path) -> std::process::Command {
     use std::process::Command;
 
@@ -190,6 +193,9 @@ pub(crate) fn git_command(workdir: &Path) -> std::process::Command {
 
     // Disable terminal prompts
     cmd.env("GIT_TERMINAL_PROMPT", "0");
+
+    // Security: disable all hooks to prevent untrusted repos from executing code
+    cmd.args(["-c", "core.hooksPath=/dev/null"]);
 
     cmd
 }

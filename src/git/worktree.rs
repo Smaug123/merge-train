@@ -10,7 +10,7 @@
 //! throughout the cascade.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::types::PrNumber;
@@ -21,7 +21,7 @@ use super::{GitConfig, GitResult, parse_stack_dir_name, run_git_sync};
 ///
 /// A valid worktree has a `.git` file (not directory) that points to the main repo.
 /// Partial deletions or corruption may leave a directory without this file.
-fn is_valid_worktree(path: &PathBuf) -> bool {
+fn is_valid_worktree(path: &Path) -> bool {
     // A worktree has a .git *file* (not directory) containing "gitdir: ..."
     let git_path = path.join(".git");
     git_path.is_file()
