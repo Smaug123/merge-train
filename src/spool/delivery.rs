@@ -21,11 +21,19 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Uses PID + monotonic counter to ensure uniqueness across concurrent operations.
 /// This prevents the race condition where concurrent spool_delivery calls for the
 /// same delivery ID could clobber each other's temp files.
+///
+/// For a base path like `<id>.json`, produces `<id>.json.tmp.<pid>.<counter>`.
+/// This preserves the original extension so cleanup can find orphaned temp files
+/// by pattern matching on `<id>.json.tmp.*`.
 fn unique_temp_path(base_path: &Path) -> PathBuf {
     let pid = std::process::id();
     let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let extension = format!("tmp.{}.{}", pid, counter);
-    base_path.with_extension(extension)
+    // Append .tmp.<pid>.<counter> to existing extension to produce <id>.json.tmp.<pid>.<counter>
+    let new_extension = match base_path.extension().and_then(|e| e.to_str()) {
+        Some(ext) => format!("{}.tmp.{}.{}", ext, pid, counter),
+        None => format!("tmp.{}.{}", pid, counter),
+    };
+    base_path.with_extension(new_extension)
 }
 
 /// Errors that can occur during spool operations.
@@ -541,7 +549,8 @@ mod tests {
         /// Crash during spool: only temp file exists.
         ///
         /// If a crash occurs after writing the temp file but before the atomic
-        /// rename, only the .json.tmp file exists. On recovery:
+        /// hard_link, only the temp file exists (pattern: <id>.json.tmp.<pid>.<counter>).
+        /// On recovery:
         /// - The orphaned temp file is NOT picked up as a pending delivery
         /// - The delivery can be re-spooled (no duplicate error)
         #[test]
@@ -553,12 +562,15 @@ mod tests {
             let spool_dir = dir.path();
             std::fs::create_dir_all(spool_dir).unwrap();
 
-            // Simulate crash: temp file exists but not payload
+            // Simulate crash: temp file exists but not payload.
+            // Use unique_temp_path to create the actual temp file pattern that
+            // spool_delivery would create during a real crash.
             let delivery = SpooledDelivery::new(spool_dir, delivery_id.clone());
-            std::fs::write(delivery.temp_path(), &payload).unwrap();
+            let orphaned_temp = unique_temp_path(&delivery.payload_path);
+            std::fs::write(&orphaned_temp, &payload).unwrap();
 
             // Verify: temp file exists, payload doesn't
-            prop_assert!(delivery.temp_path().exists());
+            prop_assert!(orphaned_temp.exists());
             prop_assert!(!delivery.payload_path.exists());
 
             // Recovery: delivery should NOT be pending (temp files are ignored)
@@ -727,6 +739,37 @@ mod tests {
             // because is_pending() is false and drain_pending() won't return it.
             prop_assert!(delivery.is_processing());
             prop_assert!(!delivery.is_done());
+        }
+
+        /// remove_delivery cleans up orphaned temp files from unique_temp_path.
+        ///
+        /// Property: If a crash occurred after unique_temp_path created a temp file
+        /// but before hard_link completed, that orphaned temp file should be cleaned
+        /// up when remove_delivery is called for that delivery ID.
+        #[test]
+        fn remove_delivery_cleans_orphaned_unique_temp_files(
+            delivery_id in arb_delivery_id(),
+            payload in arb_payload(),
+        ) {
+            let dir = tempdir().unwrap();
+            let spool_dir = dir.path();
+
+            // Successfully spool a delivery first
+            let delivery = spool_delivery(spool_dir, &delivery_id, &payload).unwrap();
+
+            // Simulate an orphaned temp file from a concurrent/crashed spool attempt.
+            // This mimics what unique_temp_path actually produces.
+            let orphaned_temp = unique_temp_path(&delivery.payload_path);
+            std::fs::write(&orphaned_temp, b"orphaned temp data").unwrap();
+            prop_assert!(orphaned_temp.exists(), "orphaned temp file should exist before cleanup");
+
+            // remove_delivery should clean up the orphaned temp file
+            remove_delivery(&delivery).unwrap();
+
+            // The orphaned temp file should be gone
+            prop_assert!(!orphaned_temp.exists(),
+                "orphaned temp file at {:?} should be cleaned up by remove_delivery",
+                orphaned_temp);
         }
 
         /// Partial state: done marker exists without payload.
