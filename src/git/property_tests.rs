@@ -156,9 +156,21 @@ fn create_pr_ref(config: &GitConfig, pr_number: u64, sha: &Sha) {
     .unwrap();
 }
 
+/// Result of a squash merge: the squash commit SHA and the prior main HEAD.
+struct SquashResult {
+    squash_sha: Sha,
+    prior_main_head: Sha,
+}
+
 /// Perform a squash merge of a branch into main.
-fn squash_merge_to_main(config: &GitConfig, branch_sha: &Sha) -> Sha {
+/// Returns both the squash commit SHA and the main HEAD before the squash.
+fn squash_merge_to_main(config: &GitConfig, branch_sha: &Sha) -> SquashResult {
     let clone_dir = config.clone_dir();
+
+    // Capture main HEAD before the squash - this is the expected squash parent
+    let prior_main_head = run_git_stdout(&clone_dir, &["rev-parse", "refs/heads/main"]).unwrap();
+    let prior_main_head = Sha::parse(&prior_main_head).unwrap();
+
     let temp_work = clone_dir.parent().unwrap().join("temp_squash");
     std::fs::create_dir_all(&temp_work).unwrap();
     run_git_sync(
@@ -188,7 +200,10 @@ fn squash_merge_to_main(config: &GitConfig, branch_sha: &Sha) -> Sha {
     )
     .unwrap();
 
-    Sha::parse(&squash_sha).unwrap()
+    SquashResult {
+        squash_sha: Sha::parse(&squash_sha).unwrap(),
+        prior_main_head,
+    }
 }
 
 /// Add a commit to main (simulating an independent PR landing).
@@ -233,10 +248,10 @@ proptest! {
         run_git_sync(&worktree, &["push", "origin", "HEAD:refs/heads/pr-124", "--force"]).unwrap();
 
         // Squash merge predecessor to main
-        let squash_sha = squash_merge_to_main(&config, &pred_sha);
+        let squash = squash_merge_to_main(&config, &pred_sha);
 
         // Reconcile descendant
-        let reconcile_result = reconcile_descendant(&worktree, "pr-124", &squash_sha, "main", &test_identity()).unwrap();
+        let reconcile_result = reconcile_descendant(&worktree, "pr-124", &squash.squash_sha, &squash.prior_main_head, "main", &test_identity()).unwrap();
         prop_assert!(reconcile_result.is_ok());
 
         // Catch up with main (if needed)
@@ -275,13 +290,13 @@ proptest! {
         run_git_sync(&worktree, &["push", "origin", "HEAD:refs/heads/pr-124", "--force"]).unwrap();
 
         // Squash merge predecessor
-        let squash_sha = squash_merge_to_main(&config, &pred_sha);
+        let squash = squash_merge_to_main(&config, &pred_sha);
 
         // An independent commit lands on main AFTER the squash
         let _intervening_sha = add_commit_to_main(&config, "intervening.txt", &intervening_content);
 
         // Reconcile and catch up
-        reconcile_descendant(&worktree, "pr-124", &squash_sha, "main", &test_identity()).unwrap();
+        reconcile_descendant(&worktree, "pr-124", &squash.squash_sha, &squash.prior_main_head, "main", &test_identity()).unwrap();
         catch_up_descendant(&worktree, "pr-124", "main", &test_identity()).unwrap();
 
         // The intervening commit should be incorporated
@@ -359,8 +374,8 @@ proptest! {
         prepare_descendant(&worktree, "pr-124", 123, &test_identity()).unwrap();
         run_git_sync(&worktree, &["push", "origin", "HEAD:refs/heads/pr-124", "--force"]).unwrap();
 
-        let squash_sha = squash_merge_to_main(&config, &pred_sha);
-        reconcile_descendant(&worktree, "pr-124", &squash_sha, "main", &test_identity()).unwrap();
+        let squash = squash_merge_to_main(&config, &pred_sha);
+        reconcile_descendant(&worktree, "pr-124", &squash.squash_sha, &squash.prior_main_head, "main", &test_identity()).unwrap();
         catch_up_descendant(&worktree, "pr-124", "main", &test_identity()).unwrap();
 
         // Verify ALL predecessor files preserved
@@ -410,14 +425,14 @@ proptest! {
         let _before2 = add_commit_to_main(&config, "before2.txt", &before_squash_content2);
 
         // Squash merge predecessor
-        let squash_sha = squash_merge_to_main(&config, &pred_sha);
+        let squash = squash_merge_to_main(&config, &pred_sha);
 
         // === One commit lands on main AFTER the squash ===
         // This gets incorporated via catch-up
         let _after = add_commit_to_main(&config, "after.txt", &after_squash_content);
 
         // Reconcile and catch up
-        reconcile_descendant(&worktree, "pr-124", &squash_sha, "main", &test_identity()).unwrap();
+        reconcile_descendant(&worktree, "pr-124", &squash.squash_sha, &squash.prior_main_head, "main", &test_identity()).unwrap();
         catch_up_descendant(&worktree, "pr-124", "main", &test_identity()).unwrap();
 
         // Verify BEFORE-squash commits are preserved (via $SQUASH_SHA^)
@@ -452,14 +467,14 @@ proptest! {
 
         // Create and squash a branch
         let branch_sha = create_branch_with_file(&config, "pr-123", "file.txt", &content, "main");
-        let squash_sha = squash_merge_to_main(&config, &branch_sha);
+        let squash = squash_merge_to_main(&config, &branch_sha);
 
         // Get a worktree to verify
         let worktree = worktree_for_stack(&config, PrNumber(999)).unwrap();
         run_git_sync(&worktree, &["fetch", "origin", "main"]).unwrap();
 
         // Verify squash has exactly one parent
-        let parents = super::get_parents(&worktree, squash_sha.as_str()).unwrap();
+        let parents = super::get_parents(&worktree, squash.squash_sha.as_str()).unwrap();
         prop_assert_eq!(parents.len(), 1, "Squash commit should have exactly one parent");
 
         // The parent should be on the default branch.
@@ -601,23 +616,19 @@ fn squash_parent_ordering_incorporates_late_commits() {
     // A late commit lands on main AFTER preparation
     let _late_sha = add_commit_to_main(&config, "late.txt", "late commit content");
 
-    // Get main state before squash (includes late commit)
-    let clone_dir = config.clone_dir();
-    let main_before = run_git_stdout(&clone_dir, &["rev-parse", "refs/heads/main"]).unwrap();
-    let main_before = Sha::parse(&main_before).unwrap();
-
     // Squash merge the predecessor
-    let squash_sha = squash_merge_to_main(&config, &pred_sha);
+    let clone_dir = config.clone_dir();
+    let squash = squash_merge_to_main(&config, &pred_sha);
 
     // Verify the squash parent is main_before (which includes the late commit)
-    let parents = super::get_parents(&clone_dir, squash_sha.as_str()).unwrap();
+    let parents = super::get_parents(&clone_dir, squash.squash_sha.as_str()).unwrap();
     assert_eq!(
         parents.len(),
         1,
         "Squash commit should have exactly one parent"
     );
     assert_eq!(
-        parents[0], main_before,
+        parents[0], squash.prior_main_head,
         "Squash parent should be main before squash (includes late commit)"
     );
 
@@ -629,7 +640,15 @@ fn squash_parent_ordering_incorporates_late_commits() {
 
     // Reconcile with $SQUASH_SHA^ (correct approach)
     // This merges the squash parent (which includes late.txt) into the descendant
-    reconcile_descendant(&worktree, "pr-124", &squash_sha, "main", &test_identity()).unwrap();
+    reconcile_descendant(
+        &worktree,
+        "pr-124",
+        &squash.squash_sha,
+        &squash.prior_main_head,
+        "main",
+        &test_identity(),
+    )
+    .unwrap();
 
     // Verify: after reconciliation, late.txt exists
     // The reconciliation merged $SQUASH_SHA^ which includes the late commit
@@ -690,7 +709,7 @@ fn catch_up_detects_conflicts_with_main() {
     run_git_sync(&worktree, &["push", "origin", "HEAD:refs/heads/pr-124"]).unwrap();
 
     // Squash predecessor
-    let squash_sha = squash_merge_to_main(&config, &pred_sha);
+    let squash = squash_merge_to_main(&config, &pred_sha);
 
     // Main gets a conflicting change
     let main_worktree = config.clone_dir().parent().unwrap().join("main_work");
@@ -726,7 +745,15 @@ fn catch_up_detects_conflicts_with_main() {
     // Prepare and reconcile the descendant (should work) using PR number
     run_git_sync(&worktree, &["checkout", "--detach", "refs/heads/pr-124"]).unwrap();
     prepare_descendant(&worktree, "pr-124", 123, &test_identity()).unwrap();
-    reconcile_descendant(&worktree, "pr-124", &squash_sha, "main", &test_identity()).unwrap();
+    reconcile_descendant(
+        &worktree,
+        "pr-124",
+        &squash.squash_sha,
+        &squash.prior_main_head,
+        "main",
+        &test_identity(),
+    )
+    .unwrap();
 
     // Catch-up should detect the conflict
     let result = catch_up_descendant(&worktree, "pr-124", "main", &test_identity()).unwrap();
@@ -848,7 +875,7 @@ fn recovery_uses_frozen_descendants() {
     let _late_sha = create_branch_with_file(&config, "pr-103", "late.txt", "late", "pr-100");
 
     // Squash the predecessor
-    let squash_sha = squash_merge_to_main(&config, &pred_sha);
+    let squash = squash_merge_to_main(&config, &pred_sha);
 
     // Recovery: use remaining_descendants to get what to process
     let to_reconcile = remaining_descendants(&phase);
@@ -860,7 +887,15 @@ fn recovery_uses_frozen_descendants() {
     // Reconcile only the frozen descendants
     for &pr in &to_reconcile {
         let branch = format!("pr-{}", pr.0);
-        reconcile_descendant(&worktree, &branch, &squash_sha, "main", &test_identity()).unwrap();
+        reconcile_descendant(
+            &worktree,
+            &branch,
+            &squash.squash_sha,
+            &squash.prior_main_head,
+            "main",
+            &test_identity(),
+        )
+        .unwrap();
     }
 
     // Verify late descendant was NOT processed
@@ -869,7 +904,8 @@ fn recovery_uses_frozen_descendants() {
     run_git_sync(&worktree2, &["checkout", "--detach", "origin/pr-103"]).unwrap();
 
     let head_sha = super::rev_parse(&worktree2, "HEAD").unwrap();
-    let squash_is_ancestor = is_ancestor(&worktree2, &squash_sha, &head_sha).unwrap_or(false);
+    let squash_is_ancestor =
+        is_ancestor(&worktree2, &squash.squash_sha, &head_sha).unwrap_or(false);
     assert!(
         !squash_is_ancestor,
         "Late descendant must NOT have squash as ancestor (it was never reconciled)"
@@ -925,7 +961,7 @@ fn fanout_worktree_ordering() {
     }
 
     // Squash merge the root
-    let squash_sha = squash_merge_to_main(&config, &root_sha);
+    let squash = squash_merge_to_main(&config, &root_sha);
 
     // Reconcile all descendants
     for pr in [101, 102, 103] {
@@ -933,7 +969,8 @@ fn fanout_worktree_ordering() {
         reconcile_descendant(
             &root_worktree,
             &branch,
-            &squash_sha,
+            &squash.squash_sha,
+            &squash.prior_main_head,
             "main",
             &test_identity(),
         )
@@ -1170,7 +1207,7 @@ fn naive_ordering_loses_late_commits() {
     let _late_sha = add_commit_to_main(&config, "late.txt", late_content);
 
     // Squash merge predecessor (main now includes late commit)
-    let squash_sha = squash_merge_to_main(&config, &pred_sha);
+    let squash = squash_merge_to_main(&config, &pred_sha);
 
     // === NAIVE RECONCILIATION ===
     // A naive reconciliation would just rebase onto the squash or merge squash^
@@ -1204,7 +1241,15 @@ fn naive_ordering_loses_late_commits() {
     );
 
     // Correct reconciliation: uses $SQUASH_SHA^ which IS main at squash time (includes late commit)
-    reconcile_descendant(&worktree, "pr-124", &squash_sha, "main", &test_identity()).unwrap();
+    reconcile_descendant(
+        &worktree,
+        "pr-124",
+        &squash.squash_sha,
+        &squash.prior_main_head,
+        "main",
+        &test_identity(),
+    )
+    .unwrap();
 
     // The correct approach DOES have the late commit!
     assert!(

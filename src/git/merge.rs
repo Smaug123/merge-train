@@ -153,10 +153,12 @@ pub fn prepare_descendant(
 /// - Either merge results in a conflict
 /// - The squash commit has multiple parents (not a squash merge)
 /// - The squash parent is not on the default branch (rebase/fast-forward merge detected)
+/// - The squash parent does not match the expected parent (multi-commit rebase/FF detected)
 pub fn reconcile_descendant(
     worktree: &Path,
     descendant_branch: &str,
     squash_sha: &Sha,
+    expected_squash_parent: &Sha,
     default_branch: &str,
     identity: &CommitIdentity,
 ) -> GitResult<MergeResult> {
@@ -225,6 +227,22 @@ pub fn reconcile_descendant(
                  This indicates a rebase or fast-forward merge was used instead of squash. \
                  The merge train only supports squash merges.",
                 squash_sha, squash_parent, default_branch
+            ),
+        });
+    }
+
+    // Validate: the parent must be exactly the expected parent (prior main HEAD).
+    // This catches multi-commit rebase/FF merges that land on main:
+    // After a multi-commit FF, both commits are on main, so the ancestor check passes.
+    // But the parent is NOT the prior main HEAD - it's another FF'd commit.
+    if squash_parent != expected_squash_parent {
+        return Err(GitError::CommandFailed {
+            command: "validate squash parent".to_string(),
+            stderr: format!(
+                "Commit {} has parent {} but expected {}. \
+                 This indicates a multi-commit rebase or fast-forward merge was used \
+                 instead of squash. The merge train only supports squash merges.",
+                squash_sha, squash_parent, expected_squash_parent
             ),
         });
     }
@@ -748,6 +766,12 @@ mod tests {
         // Simulate squash-merge of predecessor to main
         // (In real code, GitHub API does this; here we do it manually)
         let clone_dir = config.clone_dir();
+
+        // Capture main HEAD before squash - this is what the squash parent should be
+        let main_before_squash =
+            run_git_stdout(&clone_dir, &["rev-parse", "refs/heads/main"]).unwrap();
+        let main_before_squash = Sha::parse(&main_before_squash).unwrap();
+
         let temp_work = clone_dir.parent().unwrap().join("temp_squash");
         std::fs::create_dir_all(&temp_work).unwrap();
         run_git_sync(
@@ -794,8 +818,15 @@ mod tests {
         .unwrap();
 
         // Now reconcile the descendant
-        let result =
-            reconcile_descendant(&worktree, "pr-124", &squash_sha, "main", &identity).unwrap();
+        let result = reconcile_descendant(
+            &worktree,
+            "pr-124",
+            &squash_sha,
+            &main_before_squash,
+            "main",
+            &identity,
+        )
+        .unwrap();
 
         assert!(
             result.is_ok(),
@@ -831,6 +862,12 @@ mod tests {
 
         // Create a merge commit (not a squash) on main
         let clone_dir = config.clone_dir();
+
+        // Capture main HEAD before merge
+        let main_before_merge =
+            run_git_stdout(&clone_dir, &["rev-parse", "refs/heads/main"]).unwrap();
+        let main_before_merge = Sha::parse(&main_before_merge).unwrap();
+
         let temp_work = clone_dir.parent().unwrap().join("temp_merge");
         std::fs::create_dir_all(&temp_work).unwrap();
         run_git_sync(
@@ -880,7 +917,14 @@ mod tests {
         )
         .unwrap();
 
-        let result = reconcile_descendant(&worktree, "pr-124", &merge_sha, "main", &identity);
+        let result = reconcile_descendant(
+            &worktree,
+            "pr-124",
+            &merge_sha,
+            &main_before_merge,
+            "main",
+            &identity,
+        );
 
         // Should fail because it's not a squash merge
         assert!(result.is_err());
@@ -970,8 +1014,14 @@ mod tests {
         let prepared_sha = run_git_stdout(&worktree1, &["rev-parse", "HEAD"]).unwrap();
 
         // Squash merge predecessor to main
+        let clone_dir = config.clone_dir();
+
+        // Capture main HEAD before squash
+        let main_before_squash =
+            run_git_stdout(&clone_dir, &["rev-parse", "refs/heads/main"]).unwrap();
+        let main_before_squash = Sha::parse(&main_before_squash).unwrap();
+
         let squash_sha = {
-            let clone_dir = config.clone_dir();
             let temp_work = clone_dir.parent().unwrap().join("temp_squash_test");
             std::fs::create_dir_all(&temp_work).unwrap();
             run_git_sync(
@@ -1004,8 +1054,15 @@ mod tests {
         let worktree2 = worktree_for_stack(&config, PrNumber(200)).unwrap();
 
         // Reconcile should fetch pr-124 and use the PREPARED state, not the old state
-        let result =
-            reconcile_descendant(&worktree2, "pr-124", &squash_sha, "main", &identity).unwrap();
+        let result = reconcile_descendant(
+            &worktree2,
+            "pr-124",
+            &squash_sha,
+            &main_before_squash,
+            "main",
+            &identity,
+        )
+        .unwrap();
         assert!(result.is_ok(), "Reconcile should succeed, got {:?}", result);
 
         // Verify we reconciled from the prepared state (prepared SHA should be an ancestor)
@@ -1665,6 +1722,10 @@ mod tests {
         )
         .unwrap();
 
+        // Capture main HEAD - this would be the expected squash parent
+        let main_head = run_git_stdout(&clone_dir, &["rev-parse", "refs/heads/main"]).unwrap();
+        let main_head = Sha::parse(&main_head).unwrap();
+
         // Create a multi-commit branch (simulating a rebase scenario)
         // The KEY is: the second commit's parent is NOT on main
         let multi_work = clone_dir.parent().unwrap().join("temp_multi");
@@ -1716,7 +1777,14 @@ mod tests {
 
         // Try to reconcile with the second commit (whose parent is NOT on main)
         // This simulates trying to use a rebased commit as if it were a squash
-        let result = reconcile_descendant(&worktree, "pr-124", &second_sha, "main", &identity);
+        let result = reconcile_descendant(
+            &worktree,
+            "pr-124",
+            &second_sha,
+            &main_head,
+            "main",
+            &identity,
+        );
 
         // Should fail because second_sha's parent (first commit) is not on main
         assert!(
@@ -1731,5 +1799,131 @@ mod tests {
             "Error should mention 'not on the main branch', got: {}",
             err_str
         );
+    }
+
+    /// Regression test for the multi-commit FF-to-main bug.
+    ///
+    /// This test demonstrates the gap identified in the review:
+    /// After a multi-commit rebase/FF merge lands on main, the parent check
+    /// incorrectly passes because both the "squash" and its parent are now
+    /// ancestors of main HEAD.
+    ///
+    /// The fix requires passing `expected_squash_parent` to verify the parent
+    /// is exactly what we expect (the prior main HEAD), not just any ancestor.
+    #[test]
+    fn reconcile_descendant_rejects_multi_commit_ff_on_main() {
+        let (_temp_dir, config, initial_sha) = create_test_repo();
+        let clone_dir = config.clone_dir();
+
+        // Create predecessor
+        let pred_sha =
+            create_branch_with_file(&config, "pr-123", "pred.txt", "predecessor", "main");
+        create_pr_ref(&config, 123, &pred_sha);
+
+        // Create descendant from predecessor
+        let _desc_sha = create_branch_with_file(
+            &config,
+            "pr-124",
+            "desc.txt",
+            "descendant content",
+            "pr-123",
+        );
+
+        // Prepare the descendant
+        let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
+        let identity = test_identity();
+        prepare_descendant(&worktree, "pr-124", 123, &identity).unwrap();
+        run_git_sync(
+            &worktree,
+            &["push", "origin", "HEAD:refs/heads/pr-124", "--force"],
+        )
+        .unwrap();
+
+        // Record main HEAD BEFORE the FF merge - this is what the squash parent should be
+        let main_before_ff = run_git_stdout(&clone_dir, &["rev-parse", "refs/heads/main"]).unwrap();
+        let main_before_ff = Sha::parse(&main_before_ff).unwrap();
+
+        // Create a multi-commit branch and FF merge it to main
+        // This simulates someone doing a rebase-merge or direct FF push
+        let multi_work = clone_dir.parent().unwrap().join("temp_multi_ff");
+        std::fs::create_dir_all(&multi_work).unwrap();
+        run_git_sync(
+            &clone_dir,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                multi_work.to_str().unwrap(),
+                "refs/heads/main",
+            ],
+        )
+        .unwrap();
+        run_git_sync(&multi_work, &["config", "user.email", "test@test.com"]).unwrap();
+        run_git_sync(&multi_work, &["config", "user.name", "Test"]).unwrap();
+
+        // First commit
+        std::fs::write(multi_work.join("first.txt"), "first commit").unwrap();
+        run_git_sync(&multi_work, &["add", "."]).unwrap();
+        run_git_sync(&multi_work, &["commit", "-m", "First commit"]).unwrap();
+        let first_sha = run_git_stdout(&multi_work, &["rev-parse", "HEAD"]).unwrap();
+        let first_sha = Sha::parse(&first_sha).unwrap();
+
+        // Second commit (parent is first commit)
+        std::fs::write(multi_work.join("second.txt"), "second commit").unwrap();
+        run_git_sync(&multi_work, &["add", "."]).unwrap();
+        run_git_sync(&multi_work, &["commit", "-m", "Second commit"]).unwrap();
+        let second_sha = run_git_stdout(&multi_work, &["rev-parse", "HEAD"]).unwrap();
+        let second_sha = Sha::parse(&second_sha).unwrap();
+
+        // KEY DIFFERENCE: Push directly to main (fast-forward merge)
+        // This makes BOTH commits ancestors of main HEAD
+        run_git_sync(&multi_work, &["push", "origin", "HEAD:refs/heads/main"]).unwrap();
+
+        run_git_sync(
+            &clone_dir,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                multi_work.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+
+        // Now try to reconcile with the second commit as if it were a squash
+        // The parent of second_sha is first_sha, which is NOW on main (after the FF)
+        // But first_sha is NOT the "prior main HEAD" - main_before_ff was!
+        //
+        // With the new expected_squash_parent parameter, this should fail because
+        // first_sha != main_before_ff
+        let result = reconcile_descendant(
+            &worktree,
+            "pr-124",
+            &second_sha,
+            &main_before_ff, // Expected parent: what main was BEFORE the FF
+            "main",
+            &identity,
+        );
+
+        // Should fail because second_sha's parent (first_sha) != expected (main_before_ff)
+        assert!(
+            result.is_err(),
+            "reconcile_descendant should reject multi-commit FF where parent != expected. \
+             second_sha={}, parent={}, expected={}, result={:?}",
+            second_sha,
+            first_sha,
+            main_before_ff,
+            result
+        );
+        let err = result.unwrap_err();
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("expected") || err_str.contains("rebase"),
+            "Error should mention expected parent mismatch, got: {}",
+            err_str
+        );
+
+        // Verify initial_sha is not used (silence warning)
+        let _ = initial_sha;
     }
 }
