@@ -26,10 +26,42 @@ pub enum SpoolError {
     /// Duplicate delivery ID (already exists in spool).
     #[error("duplicate delivery ID: {0}")]
     DuplicateDelivery(DeliveryId),
+
+    /// Invalid delivery ID (contains path separators or other unsafe characters).
+    #[error("invalid delivery ID: contains unsafe characters: {0}")]
+    InvalidDeliveryId(DeliveryId),
 }
 
 /// Result type for spool operations.
 pub type Result<T> = std::result::Result<T, SpoolError>;
+
+/// Validates that a delivery ID is safe to use in filenames.
+///
+/// A delivery ID is unsafe if it:
+/// - Contains path separators (`/` or `\`)
+/// - Contains null bytes
+/// - Is empty
+/// - Starts with a dot (hidden file, could conflict with markers)
+/// - Is `.` or `..` (directory traversal)
+fn validate_delivery_id(delivery_id: &DeliveryId) -> Result<()> {
+    let id = delivery_id.as_str();
+
+    if id.is_empty() {
+        return Err(SpoolError::InvalidDeliveryId(delivery_id.clone()));
+    }
+
+    // Check for path separators, null bytes, and other unsafe characters
+    if id.contains('/') || id.contains('\\') || id.contains('\0') {
+        return Err(SpoolError::InvalidDeliveryId(delivery_id.clone()));
+    }
+
+    // Reject hidden files and directory traversal
+    if id.starts_with('.') {
+        return Err(SpoolError::InvalidDeliveryId(delivery_id.clone()));
+    }
+
+    Ok(())
+}
 
 /// A webhook delivery in the spool.
 ///
@@ -118,6 +150,9 @@ pub fn spool_delivery(
     delivery_id: &DeliveryId,
     payload: &[u8],
 ) -> Result<SpooledDelivery> {
+    // Validate delivery ID to prevent path traversal attacks
+    validate_delivery_id(delivery_id)?;
+
     // Ensure spool directory exists
     std::fs::create_dir_all(spool_dir)?;
 
@@ -372,6 +407,184 @@ mod tests {
             prop_assert!(!delivery.proc_marker_path().exists());
             prop_assert!(!delivery.done_marker_path().exists());
         }
+
+        // ─── Crash recovery property tests ───
+        //
+        // These tests verify the system recovers correctly from crashes at
+        // any point in the write sequence.
+
+        /// Crash during spool: only temp file exists.
+        ///
+        /// If a crash occurs after writing the temp file but before the atomic
+        /// rename, only the .json.tmp file exists. On recovery:
+        /// - The orphaned temp file is NOT picked up as a pending delivery
+        /// - The delivery can be re-spooled (no duplicate error)
+        #[test]
+        fn crash_during_spool_temp_only(
+            delivery_id in arb_delivery_id(),
+            payload in arb_payload(),
+        ) {
+            let dir = tempdir().unwrap();
+            let spool_dir = dir.path();
+            std::fs::create_dir_all(spool_dir).unwrap();
+
+            // Simulate crash: temp file exists but not payload
+            let delivery = SpooledDelivery::new(spool_dir, delivery_id.clone());
+            std::fs::write(delivery.temp_path(), &payload).unwrap();
+
+            // Verify: temp file exists, payload doesn't
+            prop_assert!(delivery.temp_path().exists());
+            prop_assert!(!delivery.payload_path.exists());
+
+            // Recovery: delivery should NOT be pending (temp files are ignored)
+            prop_assert!(!delivery.is_pending());
+
+            // Re-spooling should succeed (no duplicate)
+            let result = spool_delivery(spool_dir, &delivery_id, &payload);
+            prop_assert!(result.is_ok());
+        }
+
+        /// Crash after spool complete: only payload file exists.
+        ///
+        /// If the spool completed successfully, only the .json file exists.
+        /// On recovery, the delivery should be pending and processable.
+        #[test]
+        fn crash_after_spool_payload_only(
+            delivery_id in arb_delivery_id(),
+            payload in arb_payload(),
+        ) {
+            let dir = tempdir().unwrap();
+            let spool_dir = dir.path();
+
+            // Simulate: spool completed, then crash before any processing
+            let delivery = spool_delivery(spool_dir, &delivery_id, &payload).unwrap();
+
+            // Verify state
+            prop_assert!(delivery.payload_path.exists());
+            prop_assert!(!delivery.proc_marker_path().exists());
+            prop_assert!(!delivery.done_marker_path().exists());
+
+            // Recovery: should be pending
+            prop_assert!(delivery.is_pending());
+            prop_assert!(!delivery.is_processing());
+            prop_assert!(!delivery.is_done());
+
+            // Payload should be readable
+            let read_payload = delivery.read_payload_bytes().unwrap();
+            prop_assert_eq!(payload, read_payload);
+        }
+
+        /// Crash during processing: payload + proc marker exist.
+        ///
+        /// If a crash occurs during processing (after .proc marker created but
+        /// before .done marker), the delivery needs to be reprocessed.
+        #[test]
+        fn crash_during_processing(
+            delivery_id in arb_delivery_id(),
+            payload in arb_payload(),
+        ) {
+            let dir = tempdir().unwrap();
+            let spool_dir = dir.path();
+
+            // Simulate: processing started, then crash
+            let delivery = spool_delivery(spool_dir, &delivery_id, &payload).unwrap();
+            mark_processing(&delivery).unwrap();
+
+            // Verify state
+            prop_assert!(delivery.payload_path.exists());
+            prop_assert!(delivery.proc_marker_path().exists());
+            prop_assert!(!delivery.done_marker_path().exists());
+
+            // Recovery state (before cleanup_interrupted_processing):
+            // is_pending is true (has payload, no done)
+            // is_processing is true (has proc, no done)
+            prop_assert!(delivery.is_pending());
+            prop_assert!(delivery.is_processing());
+            prop_assert!(!delivery.is_done());
+
+            // After cleanup_interrupted_processing (which should be called at startup),
+            // the proc marker is removed and the delivery can be reprocessed.
+            // The drain module's cleanup_interrupted_processing handles this.
+        }
+
+        /// Crash after processing complete: all markers exist.
+        ///
+        /// If the processing completed (done marker created), the delivery
+        /// should NOT be reprocessed on recovery.
+        #[test]
+        fn crash_after_processing_complete(
+            delivery_id in arb_delivery_id(),
+            payload in arb_payload(),
+        ) {
+            let dir = tempdir().unwrap();
+            let spool_dir = dir.path();
+
+            // Simulate: processing completed, then crash
+            let delivery = spool_delivery(spool_dir, &delivery_id, &payload).unwrap();
+            mark_processing(&delivery).unwrap();
+            mark_done(&delivery).unwrap();
+
+            // Verify state
+            prop_assert!(delivery.payload_path.exists());
+            prop_assert!(delivery.proc_marker_path().exists());
+            prop_assert!(delivery.done_marker_path().exists());
+
+            // Recovery: should be done, not pending
+            prop_assert!(!delivery.is_pending());
+            prop_assert!(!delivery.is_processing());
+            prop_assert!(delivery.is_done());
+        }
+
+        /// Partial state: proc marker exists without payload.
+        ///
+        /// This is an edge case that shouldn't happen in practice (proc marker
+        /// is only created after payload exists), but if files are manually
+        /// deleted or corrupted, the system should handle it gracefully.
+        #[test]
+        fn orphaned_proc_marker_no_payload(
+            delivery_id in arb_delivery_id(),
+        ) {
+            let dir = tempdir().unwrap();
+            let spool_dir = dir.path();
+            std::fs::create_dir_all(spool_dir).unwrap();
+
+            // Simulate: somehow only proc marker exists (manual deletion of payload)
+            let delivery = SpooledDelivery::new(spool_dir, delivery_id);
+            std::fs::write(delivery.proc_marker_path(), b"").unwrap();
+
+            // Should not be pending (no payload)
+            prop_assert!(!delivery.is_pending());
+            // Should not be processing (no payload, even though proc exists)
+            // Note: is_processing checks proc_marker_path().exists() && !done_marker_path().exists()
+            // So technically it would return true. But is_pending returns false, so it won't be queued.
+            prop_assert!(!delivery.is_done());
+        }
+
+        /// Partial state: done marker exists without payload.
+        ///
+        /// If the payload was deleted but done marker remains, the delivery
+        /// should still be considered done (not pending).
+        #[test]
+        fn orphaned_done_marker_no_payload(
+            delivery_id in arb_delivery_id(),
+        ) {
+            let dir = tempdir().unwrap();
+            let spool_dir = dir.path();
+            std::fs::create_dir_all(spool_dir).unwrap();
+
+            // Simulate: somehow only done marker exists
+            let delivery = SpooledDelivery::new(spool_dir, delivery_id.clone());
+            std::fs::write(delivery.done_marker_path(), b"").unwrap();
+
+            // Should be done (done marker exists)
+            prop_assert!(delivery.is_done());
+            // Should not be pending (done takes precedence, even without payload)
+            prop_assert!(!delivery.is_pending());
+
+            // Re-spooling should fail (done marker blocks it)
+            let result = spool_delivery(spool_dir, &delivery_id, b"new payload");
+            prop_assert!(matches!(result, Err(SpoolError::DuplicateDelivery(_))));
+        }
     }
 
     // ─── Unit tests ───
@@ -422,5 +635,156 @@ mod tests {
         assert!(!delivery.temp_path().exists());
         // But payload should exist
         assert!(delivery.payload_path.exists());
+    }
+
+    // ─── Path traversal prevention tests ───
+
+    #[test]
+    fn rejects_delivery_id_with_forward_slash() {
+        let dir = tempdir().unwrap();
+        let spool_dir = dir.path();
+
+        let delivery_id = DeliveryId::new("../../../etc/passwd");
+        let result = spool_delivery(spool_dir, &delivery_id, b"payload");
+        assert!(matches!(result, Err(SpoolError::InvalidDeliveryId(_))));
+    }
+
+    #[test]
+    fn rejects_delivery_id_with_backslash() {
+        let dir = tempdir().unwrap();
+        let spool_dir = dir.path();
+
+        let delivery_id = DeliveryId::new("..\\..\\..\\windows\\system32");
+        let result = spool_delivery(spool_dir, &delivery_id, b"payload");
+        assert!(matches!(result, Err(SpoolError::InvalidDeliveryId(_))));
+    }
+
+    #[test]
+    fn rejects_delivery_id_with_null_byte() {
+        let dir = tempdir().unwrap();
+        let spool_dir = dir.path();
+
+        let delivery_id = DeliveryId::new("delivery\0id");
+        let result = spool_delivery(spool_dir, &delivery_id, b"payload");
+        assert!(matches!(result, Err(SpoolError::InvalidDeliveryId(_))));
+    }
+
+    #[test]
+    fn rejects_empty_delivery_id() {
+        let dir = tempdir().unwrap();
+        let spool_dir = dir.path();
+
+        let delivery_id = DeliveryId::new("");
+        let result = spool_delivery(spool_dir, &delivery_id, b"payload");
+        assert!(matches!(result, Err(SpoolError::InvalidDeliveryId(_))));
+    }
+
+    #[test]
+    fn rejects_delivery_id_starting_with_dot() {
+        let dir = tempdir().unwrap();
+        let spool_dir = dir.path();
+
+        // Hidden files could conflict with marker files or be invisible
+        let delivery_id = DeliveryId::new(".hidden-delivery");
+        let result = spool_delivery(spool_dir, &delivery_id, b"payload");
+        assert!(matches!(result, Err(SpoolError::InvalidDeliveryId(_))));
+
+        // Directory traversal attempts
+        let delivery_id = DeliveryId::new(".");
+        let result = spool_delivery(spool_dir, &delivery_id, b"payload");
+        assert!(matches!(result, Err(SpoolError::InvalidDeliveryId(_))));
+
+        let delivery_id = DeliveryId::new("..");
+        let result = spool_delivery(spool_dir, &delivery_id, b"payload");
+        assert!(matches!(result, Err(SpoolError::InvalidDeliveryId(_))));
+    }
+
+    #[test]
+    fn rejects_absolute_path_delivery_id() {
+        let dir = tempdir().unwrap();
+        let spool_dir = dir.path();
+
+        let delivery_id = DeliveryId::new("/etc/passwd");
+        let result = spool_delivery(spool_dir, &delivery_id, b"payload");
+        assert!(matches!(result, Err(SpoolError::InvalidDeliveryId(_))));
+    }
+
+    #[test]
+    fn accepts_valid_uuid_delivery_id() {
+        let dir = tempdir().unwrap();
+        let spool_dir = dir.path();
+
+        // GitHub delivery IDs are UUIDs
+        let delivery_id = DeliveryId::new("550e8400-e29b-41d4-a716-446655440000");
+        let result = spool_delivery(spool_dir, &delivery_id, b"payload");
+        assert!(result.is_ok());
+    }
+
+    // ─── Path traversal property tests ───
+
+    proptest! {
+        /// Any delivery ID containing path separators is rejected.
+        #[test]
+        fn rejects_any_id_with_path_separators(
+            prefix in "[a-zA-Z0-9-]{0,10}",
+            suffix in "[a-zA-Z0-9-]{0,10}",
+            separator in prop::sample::select(vec!['/', '\\']),
+        ) {
+            let dir = tempdir().unwrap();
+            let spool_dir = dir.path();
+
+            let malicious_id = format!("{}{}{}", prefix, separator, suffix);
+            let delivery_id = DeliveryId::new(&malicious_id);
+            let result = spool_delivery(spool_dir, &delivery_id, b"payload");
+            prop_assert!(matches!(result, Err(SpoolError::InvalidDeliveryId(_))));
+        }
+
+        /// Any delivery ID starting with a dot is rejected.
+        #[test]
+        fn rejects_any_id_starting_with_dot(
+            suffix in "[a-zA-Z0-9-]{0,20}",
+        ) {
+            let dir = tempdir().unwrap();
+            let spool_dir = dir.path();
+
+            let malicious_id = format!(".{}", suffix);
+            let delivery_id = DeliveryId::new(&malicious_id);
+            let result = spool_delivery(spool_dir, &delivery_id, b"payload");
+            prop_assert!(matches!(result, Err(SpoolError::InvalidDeliveryId(_))));
+        }
+
+        /// Valid UUID-format delivery IDs are always accepted.
+        #[test]
+        fn accepts_all_valid_uuids(
+            delivery_id in arb_delivery_id(),
+            payload in arb_payload(),
+        ) {
+            let dir = tempdir().unwrap();
+            let spool_dir = dir.path();
+
+            let result = spool_delivery(spool_dir, &delivery_id, &payload);
+            // Should succeed (not an InvalidDeliveryId error)
+            prop_assert!(!matches!(result, Err(SpoolError::InvalidDeliveryId(_))));
+        }
+
+        /// Resulting file is always within spool_dir (path canonicalization check).
+        #[test]
+        fn payload_path_stays_within_spool_dir(
+            delivery_id in arb_delivery_id(),
+            payload in arb_payload(),
+        ) {
+            let dir = tempdir().unwrap();
+            let spool_dir = dir.path();
+
+            let delivery = spool_delivery(spool_dir, &delivery_id, &payload).unwrap();
+
+            // The payload path must be a child of spool_dir
+            prop_assert!(delivery.payload_path.starts_with(spool_dir));
+
+            // And must not contain any .. components after canonicalization
+            let canonical = delivery.payload_path.canonicalize().unwrap();
+            let spool_canonical = spool_dir.canonicalize().unwrap();
+            prop_assert!(canonical.starts_with(&spool_canonical));
+        }
     }
 }

@@ -26,4 +26,4 @@ pub mod drain;
 
 pub use dedupe::{DedupeKey, extract_dedupe_key};
 pub use delivery::{SpoolError, SpooledDelivery, mark_done, mark_processing, spool_delivery};
-pub use drain::drain_pending;
+pub use drain::{cleanup_interrupted_processing, drain_pending};

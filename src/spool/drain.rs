@@ -11,12 +11,14 @@ use super::delivery::{Result, SpooledDelivery};
 
 /// Drains the spool directory, returning all pending deliveries.
 ///
-/// This function:
-/// 1. Cleans up interrupted processing (`.proc` markers without `.done`)
-/// 2. Returns all pending deliveries (`.json` files without `.done` markers)
+/// Returns all pending deliveries (`.json` files without `.done` markers)
+/// in deterministic order (sorted by delivery ID) for reproducible behavior.
 ///
-/// Deliveries are returned in deterministic order (sorted by delivery ID)
-/// for reproducible behavior.
+/// **Important**: This function does NOT clean up interrupted processing markers.
+/// Call [`cleanup_interrupted_processing`] once at startup before starting any
+/// workers, then use this function for subsequent drains during normal operation.
+/// Calling cleanup while workers are active would delete their in-progress markers,
+/// causing double-processing.
 ///
 /// # Errors
 ///
@@ -27,11 +29,7 @@ pub fn drain_pending(spool_dir: &Path) -> Result<Vec<SpooledDelivery>> {
         return Ok(Vec::new());
     }
 
-    // Step 1: Clean up interrupted processing
-    // Delete .proc markers that don't have corresponding .done markers
-    cleanup_interrupted_processing(spool_dir)?;
-
-    // Step 2: Find all pending deliveries
+    // Find all pending deliveries
     let mut pending = Vec::new();
 
     for entry in std::fs::read_dir(spool_dir)? {
@@ -63,7 +61,24 @@ pub fn drain_pending(spool_dir: &Path) -> Result<Vec<SpooledDelivery>> {
 /// If a crash occurred during processing, we'll have a `.proc` marker
 /// but no `.done` marker. The delivery needs to be reprocessed, so we
 /// remove the `.proc` marker to put it back in the pending state.
-fn cleanup_interrupted_processing(spool_dir: &Path) -> Result<()> {
+///
+/// **Critical**: This function MUST only be called at startup, before any
+/// workers begin processing deliveries. Calling it while workers are active
+/// would delete their in-progress markers, causing the same delivery to be
+/// picked up and processed again (double-processing).
+///
+/// # Safety Guarantee
+///
+/// If this function is called exactly once at startup before workers start:
+/// - Any `.proc` without `.done` is from a previous crashed run
+/// - Removing these `.proc` markers allows the deliveries to be reprocessed
+/// - No race condition is possible because no workers are running yet
+pub fn cleanup_interrupted_processing(spool_dir: &Path) -> Result<()> {
+    // If spool directory doesn't exist, nothing to clean up
+    if !spool_dir.exists() {
+        return Ok(());
+    }
+
     for entry in std::fs::read_dir(spool_dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -270,9 +285,9 @@ mod tests {
             prop_assert_eq!(pending[0].delivery_id.as_str(), id2.as_str());
         }
 
-        /// Interrupted processing is cleaned up.
+        /// Interrupted processing is cleaned up by cleanup_interrupted_processing.
         #[test]
-        fn drain_cleans_up_interrupted(
+        fn cleanup_removes_interrupted_proc_markers(
             id in arb_delivery_id(),
             payload in arb_payload(),
         ) {
@@ -287,15 +302,139 @@ mod tests {
             prop_assert!(delivery.proc_marker_path().exists());
             prop_assert!(!delivery.done_marker_path().exists());
 
-            // Drain should clean up the proc marker
-            let pending = drain_pending(spool_dir).unwrap();
-
-            // Delivery should be in pending list (ready for reprocessing)
-            prop_assert_eq!(pending.len(), 1);
-            prop_assert_eq!(pending[0].delivery_id.as_str(), id.as_str());
+            // Call cleanup (simulating startup recovery)
+            cleanup_interrupted_processing(spool_dir).unwrap();
 
             // Proc marker should be removed
             prop_assert!(!delivery.proc_marker_path().exists());
+
+            // Now drain should return the delivery as pending
+            let pending = drain_pending(spool_dir).unwrap();
+            prop_assert_eq!(pending.len(), 1);
+            prop_assert_eq!(pending[0].delivery_id.as_str(), id.as_str());
+        }
+
+        // ─── Integrated crash recovery tests ───
+        //
+        // These tests verify the full startup recovery sequence:
+        // cleanup_interrupted_processing() followed by drain_pending()
+
+        /// Startup recovery with mixed states.
+        ///
+        /// Simulates a crash leaving the spool in a mixed state with:
+        /// - Orphaned temp files (crash during spool)
+        /// - Pending deliveries (crash after spool)
+        /// - Interrupted processing (crash during processing)
+        /// - Completed deliveries (crash after done marker)
+        #[test]
+        fn startup_recovery_mixed_states(
+            pending_ids in prop::collection::vec(arb_delivery_id(), 1..3),
+            interrupted_ids in prop::collection::vec(arb_delivery_id(), 1..3),
+            done_ids in prop::collection::vec(arb_delivery_id(), 1..3),
+            temp_ids in prop::collection::vec(arb_delivery_id(), 1..3),
+            payload in arb_payload(),
+        ) {
+            let dir = tempdir().unwrap();
+            let spool_dir = dir.path();
+            std::fs::create_dir_all(spool_dir).unwrap();
+
+            // Dedupe all IDs
+            use std::collections::HashSet;
+            let all_ids: HashSet<_> = pending_ids.iter()
+                .chain(interrupted_ids.iter())
+                .chain(done_ids.iter())
+                .chain(temp_ids.iter())
+                .map(|id| id.as_str())
+                .collect();
+
+            // Skip if any duplicates (simplifies test logic)
+            let total = pending_ids.len() + interrupted_ids.len() + done_ids.len() + temp_ids.len();
+            prop_assume!(all_ids.len() == total);
+
+            // Set up each state
+            for id in &pending_ids {
+                spool_delivery(spool_dir, id, &payload).unwrap();
+            }
+
+            for id in &interrupted_ids {
+                let d = spool_delivery(spool_dir, id, &payload).unwrap();
+                mark_processing(&d).unwrap();
+            }
+
+            for id in &done_ids {
+                let d = spool_delivery(spool_dir, id, &payload).unwrap();
+                mark_processing(&d).unwrap();
+                mark_done(&d).unwrap();
+            }
+
+            for id in &temp_ids {
+                use crate::spool::delivery::SpooledDelivery;
+                let d = SpooledDelivery::new(spool_dir, id.clone());
+                std::fs::write(d.temp_path(), &payload).unwrap();
+            }
+
+            // Run startup recovery
+            cleanup_interrupted_processing(spool_dir).unwrap();
+            let pending = drain_pending(spool_dir).unwrap();
+
+            // Should return pending + interrupted (now cleared) deliveries
+            let expected_count = pending_ids.len() + interrupted_ids.len();
+            prop_assert_eq!(pending.len(), expected_count);
+
+            // Verify correct IDs are pending
+            let pending_set: HashSet<_> = pending.iter().map(|d| d.delivery_id.as_str()).collect();
+            for id in &pending_ids {
+                prop_assert!(pending_set.contains(id.as_str()));
+            }
+            for id in &interrupted_ids {
+                prop_assert!(pending_set.contains(id.as_str()));
+            }
+            for id in &done_ids {
+                prop_assert!(!pending_set.contains(id.as_str()));
+            }
+            for id in &temp_ids {
+                prop_assert!(!pending_set.contains(id.as_str()));
+            }
+        }
+
+        /// Repeated drain calls return consistent results.
+        ///
+        /// After startup recovery, subsequent drain calls should return the same
+        /// pending deliveries (idempotent) until they are processed.
+        #[test]
+        fn drain_is_idempotent(
+            ids in prop::collection::vec(arb_delivery_id(), 2..5),
+            payloads in prop::collection::vec(arb_payload(), 2..5),
+        ) {
+            let dir = tempdir().unwrap();
+            let spool_dir = dir.path();
+
+            let count = ids.len().min(payloads.len());
+            let ids = &ids[..count];
+            let payloads = &payloads[..count];
+
+            // Dedupe IDs
+            let mut unique_ids: Vec<_> = ids.to_vec();
+            unique_ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+            unique_ids.dedup_by(|a, b| a.as_str() == b.as_str());
+
+            for (id, payload) in unique_ids.iter().zip(payloads.iter()) {
+                let _ = spool_delivery(spool_dir, id, payload);
+            }
+
+            // Drain multiple times
+            let drain1 = drain_pending(spool_dir).unwrap();
+            let drain2 = drain_pending(spool_dir).unwrap();
+            let drain3 = drain_pending(spool_dir).unwrap();
+
+            // All should return the same IDs
+            prop_assert_eq!(drain1.len(), drain2.len());
+            prop_assert_eq!(drain2.len(), drain3.len());
+
+            for ((d1, d2), d3) in drain1.iter().zip(drain2.iter()).zip(drain3.iter()) {
+                prop_assert_eq!(d1.delivery_id.as_str(), d2.delivery_id.as_str());
+                prop_assert_eq!(d2.delivery_id.as_str(), d3.delivery_id.as_str());
+            }
         }
     }
 
@@ -442,6 +581,9 @@ mod tests {
         let id = DeliveryId::new("valid-delivery");
         spool_delivery(spool_dir, &id, b"payload").unwrap();
 
+        // Call cleanup first (simulating startup)
+        cleanup_interrupted_processing(spool_dir).unwrap();
+
         let pending = drain_pending(spool_dir).unwrap();
 
         // Only the valid delivery should be returned
@@ -450,5 +592,29 @@ mod tests {
 
         // The orphaned .proc marker should be cleaned up (no .done, so it's "interrupted")
         assert!(!spool_dir.join("orphan.json.proc").exists());
+    }
+
+    /// Drain does NOT clean up proc markers (that's cleanup_interrupted_processing's job).
+    ///
+    /// This is important because drain may be called while workers are processing.
+    /// If drain cleaned up proc markers, it would cause double-processing.
+    #[test]
+    fn drain_does_not_touch_proc_markers() {
+        let dir = tempdir().unwrap();
+        let spool_dir = dir.path();
+
+        // Spool and mark processing (simulating an active worker)
+        let id = DeliveryId::new("in-progress-delivery");
+        let delivery = spool_delivery(spool_dir, &id, b"payload").unwrap();
+        mark_processing(&delivery).unwrap();
+
+        // Drain WITHOUT calling cleanup_interrupted_processing
+        let pending = drain_pending(spool_dir).unwrap();
+
+        // Delivery should still be pending (it has .json, no .done)
+        assert_eq!(pending.len(), 1);
+
+        // But the proc marker should still exist (not cleaned up)
+        assert!(delivery.proc_marker_path().exists());
     }
 }

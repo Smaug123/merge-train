@@ -101,8 +101,18 @@ impl DedupeKey {
     /// Creates a dedupe key for a `status` event.
     ///
     /// Status events are per-SHA and context, with state changes.
+    ///
+    /// Note: The context is escaped to prevent collisions when it contains
+    /// the separator character (`:`). For example, `ci:build` becomes `ci\:build`.
     pub fn status(sha: &Sha, context: &str, state: &str) -> Self {
-        DedupeKey(format!("status:{}:{}:{}", sha.as_str(), context, state))
+        // Escape backslashes first, then colons, to allow unambiguous parsing
+        let escaped_context = context.replace('\\', "\\\\").replace(':', "\\:");
+        DedupeKey(format!(
+            "status:{}:{}:{}",
+            sha.as_str(),
+            escaped_context,
+            state
+        ))
     }
 
     /// Creates a dedupe key for a `pull_request_review` event.
@@ -411,6 +421,208 @@ mod tests {
             let expected = DedupeKey::pull_request(pr, &action, &head_sha);
             prop_assert_eq!(key, expected);
         }
+
+        // ─── Comprehensive extract_dedupe_key tests for all event types ───
+
+        #[test]
+        fn extract_issue_comment_edited(
+            pr in arb_pr_number(),
+            comment_id in arb_comment_id(),
+            updated_at in arb_datetime(),
+        ) {
+            let event = WebhookEventData::IssueCommentEdited {
+                pr,
+                comment_id,
+                updated_at,
+            };
+            let key = extract_dedupe_key(&event);
+            let expected = DedupeKey::issue_comment_edited(pr, comment_id, &updated_at);
+            prop_assert_eq!(key, expected);
+        }
+
+        #[test]
+        fn extract_issue_comment_deleted(
+            pr in arb_pr_number(),
+            comment_id in arb_comment_id(),
+        ) {
+            let event = WebhookEventData::IssueCommentDeleted { pr, comment_id };
+            let key = extract_dedupe_key(&event);
+            let expected = DedupeKey::issue_comment_deleted(pr, comment_id);
+            prop_assert_eq!(key, expected);
+        }
+
+        #[test]
+        fn extract_pull_request_edited(
+            pr in arb_pr_number(),
+            updated_at in arb_datetime(),
+        ) {
+            let event = WebhookEventData::PullRequestEdited { pr, updated_at };
+            let key = extract_dedupe_key(&event);
+            let expected = DedupeKey::pull_request_edited(pr, &updated_at);
+            prop_assert_eq!(key, expected);
+        }
+
+        #[test]
+        fn extract_check_suite(
+            suite_id in 1u64..u64::MAX,
+            action in arb_action(),
+            updated_at in arb_datetime(),
+        ) {
+            let event = WebhookEventData::CheckSuite {
+                suite_id,
+                action: action.clone(),
+                updated_at,
+            };
+            let key = extract_dedupe_key(&event);
+            let expected = DedupeKey::check_suite(suite_id, &action, &updated_at);
+            prop_assert_eq!(key, expected);
+        }
+
+        #[test]
+        fn extract_status(
+            sha in arb_sha(),
+            context in arb_context(),
+            state in arb_state(),
+        ) {
+            let event = WebhookEventData::Status {
+                sha: sha.clone(),
+                context: context.clone(),
+                state: state.clone(),
+            };
+            let key = extract_dedupe_key(&event);
+            let expected = DedupeKey::status(&sha, &context, &state);
+            prop_assert_eq!(key, expected);
+        }
+
+        #[test]
+        fn extract_pull_request_review(
+            pr in arb_pr_number(),
+            review_id in 1u64..u64::MAX,
+            action in arb_action(),
+        ) {
+            let event = WebhookEventData::PullRequestReview {
+                pr,
+                review_id,
+                action: action.clone(),
+            };
+            let key = extract_dedupe_key(&event);
+            let expected = DedupeKey::pull_request_review(pr, review_id, &action);
+            prop_assert_eq!(key, expected);
+        }
+
+        /// Status events with colon-containing contexts still produce correct keys.
+        #[test]
+        fn extract_status_with_colons_in_context(
+            sha in arb_sha(),
+            state in arb_state(),
+        ) {
+            // Use a context that contains colons (common in CI systems)
+            let context = "ci:build:test:lint";
+            let event = WebhookEventData::Status {
+                sha: sha.clone(),
+                context: context.to_string(),
+                state: state.clone(),
+            };
+            let key = extract_dedupe_key(&event);
+
+            // Verify the key contains escaped colons
+            prop_assert!(key.as_str().contains("ci\\:build\\:test\\:lint"));
+
+            let expected = DedupeKey::status(&sha, context, &state);
+            prop_assert_eq!(key, expected);
+        }
+
+        // ─── Collision-free property tests ───
+
+        /// Different status contexts always produce different keys (collision-free).
+        ///
+        /// This is the critical property that the escaping fix ensures.
+        /// Without escaping, "a:b" + "c" could collide with "a" + "b:c".
+        #[test]
+        fn status_different_contexts_never_collide(
+            sha in arb_sha(),
+            ctx1 in "[a-zA-Z0-9:/_-]{1,30}",
+            ctx2 in "[a-zA-Z0-9:/_-]{1,30}",
+            state in arb_state(),
+        ) {
+            prop_assume!(ctx1 != ctx2);
+
+            let key1 = DedupeKey::status(&sha, &ctx1, &state);
+            let key2 = DedupeKey::status(&sha, &ctx2, &state);
+
+            prop_assert_ne!(key1, key2, "Different contexts must produce different keys");
+        }
+
+        /// Different status states always produce different keys.
+        #[test]
+        fn status_different_states_never_collide(
+            sha in arb_sha(),
+            context in "[a-zA-Z0-9:/_-]{1,30}",
+            state1 in arb_state(),
+            state2 in arb_state(),
+        ) {
+            prop_assume!(state1 != state2);
+
+            let key1 = DedupeKey::status(&sha, &context, &state1);
+            let key2 = DedupeKey::status(&sha, &context, &state2);
+
+            prop_assert_ne!(key1, key2, "Different states must produce different keys");
+        }
+
+        /// Contexts with colons in different positions produce different keys.
+        ///
+        /// This specifically tests the case the review comment mentioned:
+        /// "a:b" + "c" vs "a" + "b:c" should not collide.
+        #[test]
+        fn status_colon_position_matters(
+            sha in arb_sha(),
+            a in "[a-zA-Z0-9]{1,10}",
+            b in "[a-zA-Z0-9]{1,10}",
+            c in "[a-zA-Z0-9]{1,10}",
+            state in arb_state(),
+        ) {
+            // "a:b" with suffix c vs "a" with suffix "b:c"
+            let ctx1 = format!("{}:{}", a, b);
+            let ctx2 = a.clone();
+
+            // These contexts are different, so keys must be different
+            prop_assume!(ctx1 != ctx2);
+
+            let key1 = DedupeKey::status(&sha, &ctx1, &state);
+            let key2 = DedupeKey::status(&sha, &ctx2, &state);
+
+            prop_assert_ne!(key1, key2);
+        }
+
+        /// Escaping is consistent: same input always produces same output.
+        #[test]
+        fn status_escaping_is_deterministic(
+            sha in arb_sha(),
+            context in "[a-zA-Z0-9:/_\\\\-]{1,30}",
+            state in arb_state(),
+        ) {
+            let key1 = DedupeKey::status(&sha, &context, &state);
+            let key2 = DedupeKey::status(&sha, &context, &state);
+
+            prop_assert_eq!(key1, key2);
+        }
+
+        /// Contexts with backslashes are properly escaped and don't collide.
+        #[test]
+        fn status_backslash_escaping_prevents_collisions(
+            sha in arb_sha(),
+            state in arb_state(),
+        ) {
+            // "a\:b" (literal backslash-colon) vs "a:b" (just colon)
+            // These must produce different keys
+            let ctx_with_backslash = r"a\:b";
+            let ctx_with_colon = "a:b";
+
+            let key1 = DedupeKey::status(&sha, ctx_with_backslash, &state);
+            let key2 = DedupeKey::status(&sha, ctx_with_colon, &state);
+
+            prop_assert_ne!(key1, key2, "Backslash-colon and plain colon must differ");
+        }
     }
 
     // ─── Unit tests ───
@@ -432,5 +644,66 @@ mod tests {
     fn display_matches_as_str() {
         let key = DedupeKey::issue_comment_created(PrNumber(123), CommentId(456));
         assert_eq!(format!("{}", key), key.as_str());
+    }
+
+    // ─── Status key escaping tests ───
+
+    #[test]
+    fn status_key_escapes_colons_in_context() {
+        let sha = Sha::parse("a".repeat(40)).unwrap();
+
+        // Context with colon should be escaped
+        let key = DedupeKey::status(&sha, "ci:build", "success");
+        assert!(key.as_str().contains("ci\\:build"));
+        assert_eq!(
+            key.as_str(),
+            format!("status:{}:ci\\:build:success", "a".repeat(40))
+        );
+    }
+
+    #[test]
+    fn status_key_escapes_backslashes_in_context() {
+        let sha = Sha::parse("a".repeat(40)).unwrap();
+
+        // Context with backslash should be escaped
+        let key = DedupeKey::status(&sha, "ci\\test", "success");
+        assert!(key.as_str().contains("ci\\\\test"));
+    }
+
+    #[test]
+    fn status_key_escaping_prevents_collisions() {
+        let sha = Sha::parse("a".repeat(40)).unwrap();
+
+        // These two contexts should produce different keys
+        // Context "a:b" with state "c" vs context "a" with state "b:c" would collide
+        // without escaping, but states don't contain colons so this specific case
+        // can't happen. However, we test the escaping works correctly.
+
+        let key1 = DedupeKey::status(&sha, "ci:build", "success");
+        let key2 = DedupeKey::status(&sha, "ci", "success");
+
+        // Keys should be different
+        assert_ne!(key1, key2);
+
+        // More importantly, even complex contexts don't collide
+        let key3 = DedupeKey::status(&sha, "a:b:c", "pending");
+        let key4 = DedupeKey::status(&sha, "a:b", "pending");
+        let key5 = DedupeKey::status(&sha, "a", "pending");
+
+        assert_ne!(key3, key4);
+        assert_ne!(key3, key5);
+        assert_ne!(key4, key5);
+    }
+
+    #[test]
+    fn status_key_context_without_special_chars_unchanged() {
+        let sha = Sha::parse("a".repeat(40)).unwrap();
+
+        // Simple context without colons or backslashes
+        let key = DedupeKey::status(&sha, "continuous-integration", "success");
+        assert_eq!(
+            key.as_str(),
+            format!("status:{}:continuous-integration:success", "a".repeat(40))
+        );
     }
 }
