@@ -130,6 +130,7 @@ pub fn prepare_descendant(
 /// * `worktree` - Path to the stack's worktree
 /// * `descendant_branch` - The descendant's branch name
 /// * `squash_sha` - The SHA of the squash commit on main
+/// * `default_branch` - The default branch name (e.g., "main")
 /// * `sign` - Whether to sign the merge commits
 ///
 /// # Returns
@@ -142,17 +143,22 @@ pub fn prepare_descendant(
 /// - The squash commit has no parent (shouldn't happen for a valid squash)
 /// - Either merge results in a conflict
 /// - The squash commit has multiple parents (not a squash merge)
+/// - The squash parent is not on the default branch (rebase/fast-forward merge detected)
 pub fn reconcile_descendant(
     worktree: &Path,
     descendant_branch: &str,
     squash_sha: &Sha,
+    default_branch: &str,
     sign: bool,
 ) -> GitResult<MergeResult> {
-    // Fetch the squash commit AND the descendant branch.
+    // Fetch the default branch AND the descendant branch.
+    // We fetch the default branch (not the squash SHA) because:
+    // 1. The squash commit is on the default branch, so fetching main gets it
+    // 2. Some servers disallow fetching by raw SHA (uploadpack.allowReachableSHA1InWant)
     // The descendant branch must be fetched because after a push, our local
     // remote-tracking ref (origin/<branch>) may be stale. Without fetching,
     // we'd check out an old commit and lose the prepared merge state.
-    fetch(worktree, &[squash_sha.as_str(), descendant_branch])?;
+    fetch(worktree, &[default_branch, descendant_branch])?;
 
     // Get the parent of the squash commit (main state just before squash)
     let parents = get_parents(worktree, squash_sha.as_str())?;
@@ -177,6 +183,26 @@ pub fn reconcile_descendant(
     }
 
     let squash_parent = &parents[0];
+
+    // Validate: the parent must be on the default branch history.
+    // For a valid squash merge: parent is the prior main HEAD, which is on main.
+    // For a multi-commit rebase: parent is the previous rebased commit,
+    // which is NOT on the main branch history.
+    let default_head = rev_parse(worktree, &format!("origin/{}", default_branch))?;
+    let parent_on_default = super::is_ancestor(worktree, squash_parent, &default_head)?
+        || squash_parent == &default_head;
+
+    if !parent_on_default {
+        return Err(GitError::CommandFailed {
+            command: "validate squash parent".to_string(),
+            stderr: format!(
+                "Commit {} has parent {} which is not on the {} branch history. \
+                 This indicates a rebase or fast-forward merge was used instead of squash. \
+                 The merge train only supports squash merges.",
+                squash_sha, squash_parent, default_branch
+            ),
+        });
+    }
 
     // Checkout the descendant branch in detached HEAD mode
     let remote_branch = format!("origin/{}", descendant_branch);
@@ -361,8 +387,11 @@ pub fn update_root_for_behind(
     default_branch: &str,
     sign: bool,
 ) -> GitResult<MergeResult> {
-    // Fetch the latest default branch
-    fetch(worktree, &[default_branch])?;
+    // Fetch both the default branch AND the branch we're updating.
+    // The branch must be fetched because after a push, our local
+    // remote-tracking ref (origin/<branch>) may be stale. Without fetching,
+    // we'd check out an old commit and lose newer commits when we later push.
+    fetch(worktree, &[default_branch, branch])?;
 
     // Checkout the branch in detached HEAD mode
     let remote_branch = format!("origin/{}", branch);
@@ -715,7 +744,7 @@ mod tests {
         .unwrap();
 
         // Now reconcile the descendant
-        let result = reconcile_descendant(&worktree, "pr-124", &squash_sha, false).unwrap();
+        let result = reconcile_descendant(&worktree, "pr-124", &squash_sha, "main", false).unwrap();
 
         assert!(
             result.is_ok(),
@@ -799,7 +828,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = reconcile_descendant(&worktree, "pr-124", &merge_sha, false);
+        let result = reconcile_descendant(&worktree, "pr-124", &merge_sha, "main", false);
 
         // Should fail because it's not a squash merge
         assert!(result.is_err());
@@ -920,7 +949,8 @@ mod tests {
         let worktree2 = worktree_for_stack(&config, PrNumber(200)).unwrap();
 
         // Reconcile should fetch pr-124 and use the PREPARED state, not the old state
-        let result = reconcile_descendant(&worktree2, "pr-124", &squash_sha, false).unwrap();
+        let result =
+            reconcile_descendant(&worktree2, "pr-124", &squash_sha, "main", false).unwrap();
         assert!(result.is_ok(), "Reconcile should succeed, got {:?}", result);
 
         // Verify we reconciled from the prepared state (prepared SHA should be an ancestor)
@@ -1168,6 +1198,243 @@ mod tests {
         assert!(
             !is_valid,
             "Multi-commit rebase (parent not on main) should be rejected"
+        );
+    }
+
+    /// Helper to add a commit to a branch WITHOUT updating remote-tracking refs.
+    /// This simulates the scenario where someone else pushes to the remote.
+    fn add_commit_without_fetch(
+        config: &GitConfig,
+        branch: &str,
+        filename: &str,
+        content: &str,
+    ) -> Sha {
+        let clone_dir = config.clone_dir();
+
+        // Create a temporary worktree
+        let temp_work = clone_dir.parent().unwrap().join("temp_remote_push");
+        let _ = std::fs::remove_dir_all(&temp_work);
+        std::fs::create_dir_all(&temp_work).unwrap();
+        run_git_sync(
+            &clone_dir,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                temp_work.to_str().unwrap(),
+                &format!("refs/heads/{}", branch),
+            ],
+        )
+        .unwrap();
+
+        run_git_sync(&temp_work, &["config", "user.email", "test@test.com"]).unwrap();
+        run_git_sync(&temp_work, &["config", "user.name", "Test"]).unwrap();
+
+        // Create the file and commit
+        std::fs::write(temp_work.join(filename), content).unwrap();
+        run_git_sync(&temp_work, &["add", filename]).unwrap();
+        run_git_sync(&temp_work, &["commit", "-m", &format!("Add {}", filename)]).unwrap();
+
+        let sha = run_git_stdout(&temp_work, &["rev-parse", "HEAD"]).unwrap();
+
+        // Update the branch ref DIRECTLY in the bare repo without using push
+        // This avoids the opportunistic remote-tracking ref update
+        run_git_sync(
+            &clone_dir,
+            &["update-ref", &format!("refs/heads/{}", branch), &sha],
+        )
+        .unwrap();
+
+        // Cleanup
+        run_git_sync(
+            &clone_dir,
+            &["worktree", "remove", "--force", temp_work.to_str().unwrap()],
+        )
+        .unwrap();
+
+        Sha::parse(&sha).unwrap()
+    }
+
+    /// Test that update_root_for_behind fetches the branch, not just the default branch.
+    ///
+    /// BUG: update_root_for_behind only fetches the default branch, so origin/<branch> can
+    /// be stale. This can cause us to merge main into an outdated root head, potentially
+    /// dropping newer commits when we later push.
+    #[test]
+    fn update_root_for_behind_fetches_branch() {
+        let (_temp_dir, config, _initial_sha) = create_test_repo();
+
+        // Create a branch
+        let _branch_sha = create_branch_with_file(
+            &config,
+            "pr-123",
+            "original.txt",
+            "original content",
+            "main",
+        );
+
+        // Get worktree and fetch pr-123 to establish initial state
+        let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
+        run_git_sync(&worktree, &["fetch", "origin", "pr-123"]).unwrap();
+        let original_head = rev_parse(&worktree, "origin/pr-123").unwrap();
+
+        // Simulate someone else pushing a new commit to pr-123 (remote update)
+        // Use add_commit_without_fetch to avoid updating remote-tracking refs
+        let updated_sha =
+            add_commit_without_fetch(&config, "pr-123", "updated.txt", "updated content");
+
+        // Also add a commit to main (to make BEHIND status meaningful)
+        let _main_update =
+            add_commit_without_fetch(&config, "main", "main_new.txt", "main new content");
+
+        // Verify the remote ref was actually updated
+        let clone_dir = config.clone_dir();
+        let remote_head = run_git_stdout(&clone_dir, &["rev-parse", "refs/heads/pr-123"]).unwrap();
+        let remote_head = Sha::parse(&remote_head).unwrap();
+        assert_eq!(
+            remote_head, updated_sha,
+            "Remote refs/heads/pr-123 should be updated"
+        );
+
+        // Now our worktree has stale origin/pr-123 (pointing to original_head)
+        // Verify staleness before calling update_root_for_behind
+        let stale_head = rev_parse(&worktree, "origin/pr-123").unwrap();
+        assert_eq!(
+            stale_head, original_head,
+            "origin/pr-123 should still point to original_head (stale)"
+        );
+        assert_ne!(
+            stale_head, remote_head,
+            "origin/pr-123 should NOT point to remote_head yet (should be stale)"
+        );
+
+        // Call update_root_for_behind - it should fetch the branch to get the latest state
+        let result = update_root_for_behind(&worktree, "pr-123", "main", false).unwrap();
+        assert!(
+            result.is_ok(),
+            "update_root_for_behind should succeed, got {:?}",
+            result
+        );
+
+        // The result should include the updated file (updated.txt)
+        // If the branch wasn't fetched, this file won't exist because we started
+        // from the stale origin/pr-123
+        assert!(
+            worktree.join("updated.txt").exists(),
+            "updated.txt should exist - update_root_for_behind should fetch the branch \
+             to get the latest state, not use a stale origin/<branch>"
+        );
+
+        // Also verify original file and main_new file exist
+        assert!(worktree.join("original.txt").exists());
+        assert!(worktree.join("main_new.txt").exists());
+    }
+
+    /// Test that reconcile_descendant validates the squash parent is on the default branch.
+    ///
+    /// This verifies that reconcile_descendant rejects commits whose parent is NOT
+    /// reachable from the default branch. This catches cases like:
+    /// - Multi-commit rebase where the "squash SHA" is actually the last rebased commit
+    /// - Invalid SHA provided by mistake
+    ///
+    /// Note: The validation only works when the commits are NOT yet on main. Once a
+    /// rebase-and-merge is pushed to main, the rebased commits ARE on main, so we
+    /// can't distinguish them from a squash at the git level. The merge train relies
+    /// on the GitHub API to verify the merge method (squash vs rebase) before calling
+    /// reconcile_descendant.
+    #[test]
+    fn reconcile_descendant_rejects_commit_with_parent_not_on_main() {
+        let (_temp_dir, config, _initial_sha) = create_test_repo();
+        let clone_dir = config.clone_dir();
+
+        // Create predecessor
+        let pred_sha =
+            create_branch_with_file(&config, "pr-123", "pred.txt", "predecessor", "main");
+        create_pr_ref(&config, 123, &pred_sha);
+
+        // Create descendant from predecessor
+        let _desc_sha = create_branch_with_file(
+            &config,
+            "pr-124",
+            "desc.txt",
+            "descendant content",
+            "pr-123",
+        );
+
+        // Prepare the descendant
+        let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
+        prepare_descendant(&worktree, "pr-124", 123, false).unwrap();
+        run_git_sync(
+            &worktree,
+            &["push", "origin", "HEAD:refs/heads/pr-124", "--force"],
+        )
+        .unwrap();
+
+        // Create a multi-commit branch (simulating a rebase scenario)
+        // The KEY is: the second commit's parent is NOT on main
+        let multi_work = clone_dir.parent().unwrap().join("temp_multi");
+        std::fs::create_dir_all(&multi_work).unwrap();
+        run_git_sync(
+            &clone_dir,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                multi_work.to_str().unwrap(),
+                "refs/heads/main",
+            ],
+        )
+        .unwrap();
+        run_git_sync(&multi_work, &["config", "user.email", "test@test.com"]).unwrap();
+        run_git_sync(&multi_work, &["config", "user.name", "Test"]).unwrap();
+
+        // First commit (parent IS on main)
+        std::fs::write(multi_work.join("first.txt"), "first commit").unwrap();
+        run_git_sync(&multi_work, &["add", "."]).unwrap();
+        run_git_sync(&multi_work, &["commit", "-m", "First commit"]).unwrap();
+
+        // Second commit (parent is first commit, NOT on main)
+        std::fs::write(multi_work.join("second.txt"), "second commit").unwrap();
+        run_git_sync(&multi_work, &["add", "."]).unwrap();
+        run_git_sync(&multi_work, &["commit", "-m", "Second commit"]).unwrap();
+
+        let second_sha = run_git_stdout(&multi_work, &["rev-parse", "HEAD"]).unwrap();
+        let second_sha = Sha::parse(&second_sha).unwrap();
+
+        // Push to a feature branch, NOT main
+        // This simulates a rebase scenario where commits are on a branch but not yet merged
+        run_git_sync(
+            &multi_work,
+            &["push", "origin", "HEAD:refs/heads/feature-multi"],
+        )
+        .unwrap();
+        run_git_sync(
+            &clone_dir,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                multi_work.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+
+        // Try to reconcile with the second commit (whose parent is NOT on main)
+        // This simulates trying to use a rebased commit as if it were a squash
+        let result = reconcile_descendant(&worktree, "pr-124", &second_sha, "main", false);
+
+        // Should fail because second_sha's parent (first commit) is not on main
+        assert!(
+            result.is_err(),
+            "reconcile_descendant should reject commit whose parent is not on main. Result: {:?}",
+            result
+        );
+        let err = result.unwrap_err();
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("not on the main branch"),
+            "Error should mention 'not on the main branch', got: {}",
+            err_str
         );
     }
 }

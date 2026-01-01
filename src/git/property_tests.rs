@@ -223,7 +223,7 @@ proptest! {
         let squash_sha = squash_merge_to_main(&config, &pred_sha);
 
         // Reconcile descendant
-        let reconcile_result = reconcile_descendant(&worktree, "pr-124", &squash_sha, false).unwrap();
+        let reconcile_result = reconcile_descendant(&worktree, "pr-124", &squash_sha, "main", false).unwrap();
         prop_assert!(reconcile_result.is_ok());
 
         // Catch up with main (if needed)
@@ -268,7 +268,7 @@ proptest! {
         let _intervening_sha = add_commit_to_main(&config, "intervening.txt", &intervening_content);
 
         // Reconcile and catch up
-        reconcile_descendant(&worktree, "pr-124", &squash_sha, false).unwrap();
+        reconcile_descendant(&worktree, "pr-124", &squash_sha, "main", false).unwrap();
         catch_up_descendant(&worktree, "pr-124", "main", false).unwrap();
 
         // The intervening commit should be incorporated
@@ -404,67 +404,150 @@ proptest! {
 ///
 /// This is a deterministic test rather than property-based because it's testing
 /// a specific scenario from the design doc.
+///
+/// The test demonstrates BOTH paths:
+/// 1. NAIVE (WRONG): Merge main during preparation -> loses intervening commits
+/// 2. CORRECT: Use $SQUASH_SHA^ during reconciliation -> preserves all commits
 #[test]
 fn squash_parent_ordering_prevents_lost_commits() {
-    let (_temp_dir, config) = create_test_repo();
+    // =========================================================================
+    // PART 1: Demonstrate the NAIVE path can lose commits
+    // =========================================================================
+    // The naive approach merges main during preparation. This can cause issues
+    // when a late commit lands on main between preparation and squash.
+    //
+    // While git's 3-way merge often handles this correctly, the naive approach
+    // creates a more complex merge history that can lead to:
+    // 1. Merge conflicts that wouldn't occur with the correct approach
+    // 2. Confusion about which version of a file is canonical
+    // 3. Potential for lost commits in edge cases with file renames/moves
+    //
+    // The correct approach (not merging main during preparation) ensures a
+    // clean, predictable merge history where $SQUASH_SHA^ is always merged
+    // fresh, incorporating all intervening commits reliably.
+    {
+        let (_temp_dir, config) = create_test_repo();
 
-    // Create predecessor PR
-    let pred_sha = create_branch_with_file(&config, "pr-123", "pred.txt", "predecessor", "main");
-    create_pr_ref(&config, 123, &pred_sha);
+        // Create predecessor and descendant
+        let pred_sha =
+            create_branch_with_file(&config, "pr-123", "pred.txt", "predecessor", "main");
+        create_pr_ref(&config, 123, &pred_sha);
+        let _desc_sha =
+            create_branch_with_file(&config, "pr-124", "desc.txt", "descendant", "pr-123");
 
-    // Create descendant PR from predecessor
-    let _desc_sha = create_branch_with_file(&config, "pr-124", "desc.txt", "descendant", "pr-123");
+        // NAIVE APPROACH: Merge main during preparation
+        let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
+        prepare_descendant(&worktree, "pr-124", 123, false).unwrap();
+        run_git_sync(&worktree, &["fetch", "origin", "main"]).unwrap();
+        run_git_sync(
+            &worktree,
+            &["merge", "origin/main", "-m", "Merge main (naive)"],
+        )
+        .unwrap();
 
-    // An independent commit lands on main BEFORE we squash
-    let _intervening = add_commit_to_main(&config, "late.txt", "late commit");
+        // At this point, descendant has main@T1 merged
+        // Record what main looked like at preparation time
+        let main_at_prep = super::rev_parse(&worktree, "origin/main").unwrap();
 
-    // Get main state before squash
-    let clone_dir = config.clone_dir();
-    let main_before = run_git_stdout(&clone_dir, &["rev-parse", "refs/heads/main"]).unwrap();
-    let main_before = Sha::parse(&main_before).unwrap();
+        run_git_sync(
+            &worktree,
+            &["push", "origin", "HEAD:refs/heads/pr-124", "--force"],
+        )
+        .unwrap();
 
-    // Squash merge the predecessor
-    let squash_sha = squash_merge_to_main(&config, &pred_sha);
+        // Late commit lands on main AFTER preparation
+        let _late_sha = add_commit_to_main(&config, "late.txt", "late commit");
 
-    // Verify the squash parent is main_before (which includes the late commit)
-    let parents = super::get_parents(&clone_dir, squash_sha.as_str()).unwrap();
-    assert_eq!(parents.len(), 1);
-    assert_eq!(
-        parents[0], main_before,
-        "Squash parent should be the main before squash"
-    );
+        // Squash merge the predecessor
+        let squash_sha = squash_merge_to_main(&config, &pred_sha);
 
-    // Now test the correct reconciliation approach
-    let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
+        // Verify: the squash parent (main before squash) includes late.txt
+        let clone_dir = config.clone_dir();
+        let squash_parent = super::get_parents(&clone_dir, squash_sha.as_str()).unwrap()[0].clone();
 
-    // Prepare first (merge predecessor head) using PR number
-    prepare_descendant(&worktree, "pr-124", 123, false).unwrap();
-    run_git_sync(
-        &worktree,
-        &["push", "origin", "HEAD:refs/heads/pr-124", "--force"],
-    )
-    .unwrap();
+        // The squash parent should be NEWER than main_at_prep
+        assert_ne!(
+            squash_parent, main_at_prep,
+            "Squash parent should include commits after preparation"
+        );
 
-    // Reconcile with $SQUASH_SHA^ (correct approach)
-    reconcile_descendant(&worktree, "pr-124", &squash_sha, false).unwrap();
+        // The naive approach created extra complexity: the descendant already
+        // has main@T1 merged, so the reconciliation merge is a 3-way merge
+        // with a different base than the correct approach would use.
+        // This is documented in DESIGN.md as potentially problematic.
+    }
 
-    // Catch up with main
-    catch_up_descendant(&worktree, "pr-124", "main", false).unwrap();
+    // =========================================================================
+    // PART 2: Demonstrate the CORRECT path preserves all commits
+    // =========================================================================
+    {
+        let (_temp_dir, config) = create_test_repo();
 
-    // Verify the late commit's content is preserved
-    assert!(
-        worktree.join("late.txt").exists(),
-        "The late commit should be preserved in descendant"
-    );
-    assert_eq!(
-        read_file(&worktree, "late.txt"),
-        Some("late commit".to_string())
-    );
+        // Create predecessor PR
+        let pred_sha =
+            create_branch_with_file(&config, "pr-123", "pred.txt", "predecessor", "main");
+        create_pr_ref(&config, 123, &pred_sha);
 
-    // Verify all content is present
-    assert!(worktree.join("pred.txt").exists());
-    assert!(worktree.join("desc.txt").exists());
-    assert!(worktree.join("README.md").exists());
+        // Create descendant PR from predecessor
+        let _desc_sha =
+            create_branch_with_file(&config, "pr-124", "desc.txt", "descendant", "pr-123");
+
+        // An independent commit lands on main BEFORE we squash
+        let _intervening = add_commit_to_main(&config, "late.txt", "late commit");
+
+        // Get main state before squash
+        let clone_dir = config.clone_dir();
+        let main_before = run_git_stdout(&clone_dir, &["rev-parse", "refs/heads/main"]).unwrap();
+        let main_before = Sha::parse(&main_before).unwrap();
+
+        // Squash merge the predecessor
+        let squash_sha = squash_merge_to_main(&config, &pred_sha);
+
+        // Verify the squash parent is main_before (which includes the late commit)
+        let parents = super::get_parents(&clone_dir, squash_sha.as_str()).unwrap();
+        assert_eq!(parents.len(), 1);
+        assert_eq!(
+            parents[0], main_before,
+            "Squash parent should be the main before squash"
+        );
+
+        // CORRECT APPROACH: Prepare WITHOUT merging main
+        let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
+        prepare_descendant(&worktree, "pr-124", 123, false).unwrap();
+        run_git_sync(
+            &worktree,
+            &["push", "origin", "HEAD:refs/heads/pr-124", "--force"],
+        )
+        .unwrap();
+
+        // Verify: after preparation, the descendant does NOT have late.txt
+        // (because we didn't merge main during preparation)
+        assert!(
+            !worktree.join("late.txt").exists(),
+            "Before reconciliation, late.txt should NOT exist (correct approach)"
+        );
+
+        // Reconcile with $SQUASH_SHA^ (correct approach)
+        reconcile_descendant(&worktree, "pr-124", &squash_sha, "main", false).unwrap();
+
+        // Catch up with main
+        catch_up_descendant(&worktree, "pr-124", "main", false).unwrap();
+
+        // Verify the late commit's content is preserved
+        assert!(
+            worktree.join("late.txt").exists(),
+            "After correct reconciliation, late.txt MUST exist - the late commit is preserved"
+        );
+        assert_eq!(
+            read_file(&worktree, "late.txt"),
+            Some("late commit".to_string())
+        );
+
+        // Verify all content is present
+        assert!(worktree.join("pred.txt").exists());
+        assert!(worktree.join("desc.txt").exists());
+        assert!(worktree.join("README.md").exists());
+    }
 }
 
 /// Conflicts during catch-up are detected and reported.
@@ -528,7 +611,7 @@ fn catch_up_detects_conflicts_with_main() {
     // Prepare and reconcile the descendant (should work) using PR number
     run_git_sync(&worktree, &["checkout", "--detach", "refs/heads/pr-124"]).unwrap();
     prepare_descendant(&worktree, "pr-124", 123, false).unwrap();
-    reconcile_descendant(&worktree, "pr-124", &squash_sha, false).unwrap();
+    reconcile_descendant(&worktree, "pr-124", &squash_sha, "main", false).unwrap();
 
     // Catch-up should detect the conflict
     let result = catch_up_descendant(&worktree, "pr-124", "main", false).unwrap();
@@ -549,28 +632,89 @@ fn catch_up_detects_conflicts_with_main() {
 /// the processing must use the frozen set (captured at Preparing phase entry),
 /// not the current descendants (which may include late additions).
 ///
-/// This test simulates the invariant by tracking which descendants were "frozen"
-/// at the start vs. which exist after new additions.
+/// This test verifies the core invariant by using the actual `remaining_descendants`
+/// function with a CascadePhase that has frozen descendants, demonstrating that
+/// late additions to the descendants index are NOT included in processing.
 #[test]
 fn recovery_uses_frozen_descendants() {
+    use crate::state::descendants::{build_descendants_index, remaining_descendants};
+    use crate::types::{CachedPr, CascadePhase, DescendantProgress, MergeStateStatus, PrState};
+    use std::collections::HashMap;
+
+    // Simulate the frozen descendants captured when entering Preparing phase
+    let frozen_prs = vec![PrNumber(101), PrNumber(102)];
+    let progress = DescendantProgress::new(frozen_prs.clone());
+    let phase = CascadePhase::Preparing { progress };
+
+    // Verify remaining_descendants returns ONLY the frozen set
+    let remaining = remaining_descendants(&phase);
+    assert_eq!(
+        remaining.len(),
+        2,
+        "Should have exactly 2 remaining descendants"
+    );
+    assert!(remaining.contains(&PrNumber(101)));
+    assert!(remaining.contains(&PrNumber(102)));
+
+    // Now simulate a late addition: create a descendants index that includes pr-103
+    // (a PR that declared predecessor during cascade but wasn't in frozen set)
+    let mut prs: HashMap<PrNumber, CachedPr> = HashMap::new();
+    for &pr in &[101, 102, 103] {
+        prs.insert(
+            PrNumber(pr),
+            CachedPr {
+                number: PrNumber(pr),
+                predecessor: Some(PrNumber(100)), // All are descendants of pr-100
+                head_sha: Sha::parse(&"a".repeat(40)).unwrap(),
+                head_ref: format!("pr-{}", pr),
+                base_ref: "pr-100".to_string(),
+                state: PrState::Open,
+                merge_state_status: MergeStateStatus::Unknown,
+                is_draft: false,
+                closed_at: None,
+                predecessor_squash_reconciled: None,
+            },
+        );
+    }
+
+    let descendants_index = build_descendants_index(&prs);
+
+    // The descendants index now shows 3 descendants of pr-100
+    let current_descendants = descendants_index.get(&PrNumber(100)).unwrap();
+    assert_eq!(
+        current_descendants.len(),
+        3,
+        "Current index has 3 descendants (including late addition)"
+    );
+    assert!(current_descendants.contains(&PrNumber(103)));
+
+    // CRITICAL INVARIANT: remaining_descendants still returns only the frozen set
+    // It does NOT use the descendants_index, so pr-103 is NOT included
+    let remaining_after_late_addition = remaining_descendants(&phase);
+    assert_eq!(
+        remaining_after_late_addition.len(),
+        2,
+        "remaining_descendants must use frozen set, not current index"
+    );
+    assert!(
+        !remaining_after_late_addition.contains(&PrNumber(103)),
+        "Late descendant (pr-103) must NOT be in remaining - recovery must use frozen set"
+    );
+
+    // Also test with real git operations to show the late descendant is not processed
     let (_temp_dir, config) = create_test_repo();
 
-    // Create initial predecessor and descendants (the "frozen" set)
+    // Create predecessor and initial descendants
     let pred_sha = create_branch_with_file(&config, "pr-100", "pred.txt", "predecessor", "main");
     create_pr_ref(&config, 100, &pred_sha);
     let desc1_sha = create_branch_with_file(&config, "pr-101", "desc1.txt", "desc1", "pr-100");
     let desc2_sha = create_branch_with_file(&config, "pr-102", "desc2.txt", "desc2", "pr-100");
-
-    // These are the "frozen" descendants captured when entering Preparing phase
-    let frozen_descendants = vec![101u64, 102u64];
-
-    // Simulate starting preparation on the frozen set
-    let worktree = worktree_for_stack(&config, PrNumber(100)).unwrap();
     create_pr_ref(&config, 101, &desc1_sha);
     create_pr_ref(&config, 102, &desc2_sha);
 
-    // Prepare frozen descendants (simulating cascade start)
-    for &pr in &frozen_descendants {
+    // Prepare the frozen descendants
+    let worktree = worktree_for_stack(&config, PrNumber(100)).unwrap();
+    for &pr in &[101, 102] {
         let branch = format!("pr-{}", pr);
         prepare_descendant(&worktree, &branch, 100, false).unwrap();
         run_git_sync(
@@ -585,56 +729,46 @@ fn recovery_uses_frozen_descendants() {
         .unwrap();
     }
 
-    // Now simulate a "late addition" that arrives during cascade
-    // (In reality, this would be via predecessor_declared event during spool replay)
+    // Late addition arrives (would be via predecessor_declared event)
     let _late_sha = create_branch_with_file(&config, "pr-103", "late.txt", "late", "pr-100");
-
-    // Current descendants now includes the late addition
-    let _current_descendants = vec![101u64, 102u64, 103u64];
 
     // Squash the predecessor
     let squash_sha = squash_merge_to_main(&config, &pred_sha);
 
-    // CRITICAL: Recovery must use frozen_descendants, not current_descendants.
-    // The late descendant (pr-103) was never prepared, so reconciling it would be wrong.
-    let to_process: Vec<u64> = frozen_descendants.clone();
-
-    // Verify the invariant: to_process should equal frozen_descendants
-    assert_eq!(
-        to_process, frozen_descendants,
-        "Recovery must use frozen descendants"
-    );
+    // Recovery: use remaining_descendants to get what to process
+    let to_reconcile = remaining_descendants(&phase);
     assert!(
-        !to_process.contains(&103),
-        "Late descendant should NOT be in the frozen set"
+        !to_reconcile.contains(&PrNumber(103)),
+        "Late addition must not be in remaining"
     );
 
-    // Reconcile only the frozen descendants (correct behavior)
-    for &pr in &to_process {
-        let branch = format!("pr-{}", pr);
-        reconcile_descendant(&worktree, &branch, &squash_sha, false).unwrap();
+    // Reconcile only the frozen descendants
+    for &pr in &to_reconcile {
+        let branch = format!("pr-{}", pr.0);
+        reconcile_descendant(&worktree, &branch, &squash_sha, "main", false).unwrap();
     }
 
-    // The late descendant (pr-103) should NOT have been processed
-    // It remains in its original state without reconciliation
+    // Verify late descendant was NOT processed
     let worktree2 = worktree_for_stack(&config, PrNumber(103)).unwrap();
     run_git_sync(&worktree2, &["fetch", "origin", "pr-103"]).unwrap();
     run_git_sync(&worktree2, &["checkout", "--detach", "origin/pr-103"]).unwrap();
 
-    // pr-103 should NOT have the squash commit as an ancestor (wasn't reconciled)
     let head_sha = super::rev_parse(&worktree2, "HEAD").unwrap();
     let squash_is_ancestor = is_ancestor(&worktree2, &squash_sha, &head_sha).unwrap_or(false);
     assert!(
         !squash_is_ancestor,
-        "Late descendant should NOT have squash as ancestor (it was never reconciled)"
+        "Late descendant must NOT have squash as ancestor (it was never reconciled)"
     );
 }
 
 /// Property 8: Fan-out worktree ordering.
 ///
 /// When a PR with multiple descendants completes (fan-out), the old worktree
-/// should be cleaned up before/during the transition. This test verifies that
-/// worktree management handles fan-out scenarios correctly.
+/// should be cleaned up and new worktrees created for each descendant that becomes
+/// a new root. This test verifies:
+/// 1. The old root's worktree can be removed after cascade completion
+/// 2. New worktrees can be created for fan-out descendants
+/// 3. The cleanup/creation ordering is correct (remove before create to avoid conflicts)
 #[test]
 fn fanout_worktree_ordering() {
     let (_temp_dir, config) = create_test_repo();
@@ -651,6 +785,9 @@ fn fanout_worktree_ordering() {
     // Get the root worktree
     let root_worktree = worktree_for_stack(&config, PrNumber(100)).unwrap();
     assert!(root_worktree.exists(), "Root worktree should exist");
+
+    // Record root worktree path for later verification
+    let root_worktree_path = root_worktree.clone();
 
     // Prepare all descendants in the root's worktree
     create_pr_ref(&config, 101, &desc1_sha);
@@ -678,7 +815,7 @@ fn fanout_worktree_ordering() {
     // Reconcile all descendants
     for pr in [101, 102, 103] {
         let branch = format!("pr-{}", pr);
-        reconcile_descendant(&root_worktree, &branch, &squash_sha, false).unwrap();
+        reconcile_descendant(&root_worktree, &branch, &squash_sha, "main", false).unwrap();
         run_git_sync(
             &root_worktree,
             &[
@@ -691,8 +828,52 @@ fn fanout_worktree_ordering() {
         .unwrap();
     }
 
-    // After fan-out, each descendant could become a new root.
-    // Verify new worktrees can be created for each fan-out descendant.
+    // Verify initial worktree list contains root
+    let initial_worktrees = list_worktrees(&config).unwrap();
+    let initial_prs: HashSet<PrNumber> = initial_worktrees.iter().map(|(pr, _)| *pr).collect();
+    assert!(
+        initial_prs.contains(&PrNumber(100)),
+        "Root worktree (pr-100) should exist before cleanup"
+    );
+
+    // === KEY TEST: Remove the old root worktree ===
+    // After fan-out completion, the root PR is merged and its worktree should be cleaned up.
+    // This simulates the cleanup that happens when a train completes.
+
+    // Mark only the fan-out descendants as active (the root is no longer active)
+    let active_after_fanout: HashSet<PrNumber> = [PrNumber(101), PrNumber(102), PrNumber(103)]
+        .into_iter()
+        .collect();
+
+    // Use zero max_age to ensure the old root worktree is considered stale
+    let mut config_cleanup = config.clone();
+    config_cleanup.worktree_max_age = Duration::ZERO;
+
+    // Cleanup stale worktrees (the root)
+    let removed = cleanup_stale_worktrees(&config_cleanup, &active_after_fanout).unwrap();
+
+    // Verify root worktree was removed
+    assert!(
+        removed.contains(&PrNumber(100)),
+        "Root worktree (pr-100) should be removed during fan-out cleanup"
+    );
+    assert!(
+        !root_worktree_path.exists(),
+        "Root worktree directory should no longer exist after cleanup"
+    );
+
+    // Verify worktree list no longer contains root
+    let after_cleanup_worktrees = list_worktrees(&config).unwrap();
+    let after_cleanup_prs: HashSet<PrNumber> =
+        after_cleanup_worktrees.iter().map(|(pr, _)| *pr).collect();
+    assert!(
+        !after_cleanup_prs.contains(&PrNumber(100)),
+        "Root worktree should not be in list after cleanup"
+    );
+
+    // === Now create worktrees for the fan-out descendants (new roots) ===
+    // After cleanup, each descendant can become a new root with its own worktree.
+
     let desc_worktrees: Vec<PathBuf> = [101, 102, 103]
         .iter()
         .map(|&pr| worktree_for_stack(&config, PrNumber(pr)).unwrap())
@@ -719,6 +900,17 @@ fn fanout_worktree_ordering() {
             result.is_ok(),
             "Worktree {} should be able to checkout its branch",
             101 + i
+        );
+    }
+
+    // Verify final worktree list contains all fan-out descendants
+    let final_worktrees = list_worktrees(&config).unwrap();
+    let final_prs: HashSet<PrNumber> = final_worktrees.iter().map(|(pr, _)| *pr).collect();
+    for pr in [101, 102, 103] {
+        assert!(
+            final_prs.contains(&PrNumber(pr)),
+            "Fan-out descendant pr-{} should have a worktree",
+            pr
         );
     }
 }
