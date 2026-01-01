@@ -73,10 +73,11 @@ pub fn prepare_descendant(
     // Fetch the descendant branch and predecessor via PR ref.
     // Format: "refs/pull/<n>/head:refs/remotes/origin/pr/<n>" creates a local
     // tracking ref that we can merge from.
+    // Use "--" to prevent branch names starting with "-" from being interpreted as flags.
     let fetch_refspec = format!("{}:{}", pr_ref, local_ref);
     run_git_sync(
         worktree,
-        &["fetch", "origin", descendant_branch, &fetch_refspec],
+        &["fetch", "origin", "--", descendant_branch, &fetch_refspec],
     )
     .map_err(|e| {
         if let GitError::CommandFailed { stderr, .. } = &e

@@ -301,14 +301,21 @@ pub fn get_parents(workdir: &Path, commit: &str) -> GitResult<Vec<Sha>> {
 }
 
 /// Fetch refs from origin.
+///
+/// Uses `--` to separate options from refspecs, preventing branch names
+/// starting with `-` from being interpreted as flags.
 pub fn fetch(workdir: &Path, refspecs: &[&str]) -> GitResult<()> {
-    let mut args = vec!["fetch", "origin"];
+    let mut args = vec!["fetch", "origin", "--"];
     args.extend(refspecs);
     run_git_sync(workdir, &args)?;
     Ok(())
 }
 
 /// Checkout a target in detached HEAD mode.
+///
+/// Note: Unlike `git fetch`, `git checkout --detach` does not need a `--`
+/// separator because the target ref always follows `--detach`. Additionally,
+/// all callers use `origin/<branch>` format which is safe from flag injection.
 pub fn checkout_detached(workdir: &Path, target: &str) -> GitResult<()> {
     run_git_sync(workdir, &["checkout", "--detach", target])?;
     Ok(())

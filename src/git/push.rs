@@ -143,6 +143,14 @@ pub fn get_remote_ref(worktree: &Path, branch: &str) -> GitResult<Option<Sha>> {
 /// # Returns
 ///
 /// `true` if the push was already completed (remote has our content).
+///
+/// # Note on ours merges
+///
+/// For `-s ours` reconciliation merges, the tree doesn't change. In this case,
+/// tree comparison alone cannot distinguish "our commit made it" from "someone
+/// else pushed a commit with the same tree". We detect this case (expected_tree
+/// == pre_push tree) and conservatively return `false`, allowing the caller to
+/// retry the push. The retry will either succeed or provide concrete feedback.
 pub fn is_push_completed(
     worktree: &Path,
     branch: &str,
@@ -155,7 +163,7 @@ pub fn is_push_completed(
     };
 
     // Fetch the remote ref to ensure we have it locally
-    run_git_sync(worktree, &["fetch", "origin", branch])?;
+    run_git_sync(worktree, &["fetch", "origin", "--", branch])?;
 
     // Compare tree SHAs
     let remote_tree = get_tree_sha(worktree, remote_sha.as_str())?;
@@ -165,8 +173,22 @@ pub fn is_push_completed(
 
     // Verify the parent chain includes pre_push_sha
     let is_ancestor = super::is_ancestor(worktree, pre_push_sha, &remote_sha)?;
+    if !is_ancestor {
+        return Ok(false);
+    }
 
-    Ok(is_ancestor)
+    // Check for ours merge scenario: if the expected tree equals the pre-push tree,
+    // the tree didn't change (e.g., `-s ours` reconciliation). In this case, we can't
+    // reliably distinguish "our merge commit made it" from "someone else pushed a
+    // commit with the same tree". Be conservative and say not completed.
+    let pre_push_tree = get_tree_sha(worktree, pre_push_sha.as_str())?;
+    if *expected_tree == pre_push_tree {
+        // Tree didn't change. We can't rely on tree comparison alone.
+        // Return false to trigger a retry push, which will determine the real state.
+        return Ok(false);
+    }
+
+    Ok(true)
 }
 
 /// Information needed to verify push completion during recovery.
