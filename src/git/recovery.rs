@@ -213,12 +213,10 @@ pub fn has_merge_conflict(worktree_path: &Path) -> GitResult<bool> {
         return Ok(false);
     }
 
-    use std::process::Command;
-
-    // Check for unmerged paths in the index
-    let output = Command::new("git")
+    // Use git_command for consistent, non-interactive, config-isolated environment.
+    // This prevents hangs on auth prompts and ensures reproducible behavior.
+    let output = super::git_command(worktree_path)
         .args(["diff", "--name-only", "--diff-filter=U"])
-        .current_dir(worktree_path)
         .output()?;
 
     if !output.status.success() {

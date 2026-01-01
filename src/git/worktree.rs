@@ -142,7 +142,9 @@ pub fn cleanup_stale_worktrees(
             .duration_since(modified)
             .unwrap_or(Duration::MAX);
 
-        if age > config.worktree_max_age {
+        // Use >= to avoid flakiness with coarse timestamp resolution.
+        // When max_age is zero, we want to clean up immediately.
+        if age >= config.worktree_max_age {
             tracing::info!(
                 path = %path.display(),
                 age_hours = age.as_secs() / 3600,

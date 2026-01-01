@@ -57,14 +57,13 @@ impl PushResult {
 ///
 /// The result of the push operation.
 pub fn push_head_to_branch(worktree: &Path, branch: &str) -> GitResult<PushResult> {
-    use std::process::Command;
-
     let refspec = format!("HEAD:refs/heads/{}", branch);
     let head_sha = rev_parse(worktree, "HEAD")?;
 
-    let output = Command::new("git")
+    // Use git_command for consistent, non-interactive, config-isolated environment.
+    // This prevents hangs on auth prompts and ensures reproducible behavior.
+    let output = super::git_command(worktree)
         .args(["push", "origin", &refspec])
-        .current_dir(worktree)
         .output()?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -101,11 +100,10 @@ pub fn push_head_to_branch(worktree: &Path, branch: &str) -> GitResult<PushResul
 ///
 /// Returns `None` if the branch doesn't exist on the remote.
 pub fn get_remote_ref(worktree: &Path, branch: &str) -> GitResult<Option<Sha>> {
-    use std::process::Command;
-
-    let output = Command::new("git")
+    // Use git_command for consistent, non-interactive, config-isolated environment.
+    // This prevents hangs on auth prompts and ensures reproducible behavior.
+    let output = super::git_command(worktree)
         .args(["ls-remote", "origin", &format!("refs/heads/{}", branch)])
-        .current_dir(worktree)
         .output()?;
 
     if !output.status.success() {

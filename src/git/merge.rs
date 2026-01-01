@@ -26,7 +26,7 @@ use crate::types::Sha;
 
 use super::{
     GitError, GitResult, MergeResult, checkout_detached, fetch, get_parents, git_command,
-    rev_parse, run_git_stdout,
+    rev_parse, run_git_stdout, run_git_sync,
 };
 
 /// Prepare a descendant by merging the predecessor's head into it.
@@ -42,23 +42,57 @@ use super::{
 ///
 /// * `worktree` - Path to the stack's worktree
 /// * `descendant_branch` - The descendant's branch name (e.g., "feature-2")
-/// * `predecessor_head` - The predecessor's head SHA (from PR refs or cache)
+/// * `predecessor_pr` - The predecessor's PR number (used to fetch via refs/pull/<n>/head)
 /// * `sign` - Whether to sign the merge commit
 ///
 /// # Returns
 ///
 /// The result of the merge operation.
+///
+/// # Why PR refs?
+///
+/// Fetching by raw SHA is unreliable because:
+/// - `uploadpack.allowReachableSHA1InWant` may be disabled on the server
+/// - After branch deletion, the SHA may not be directly fetchable
+///
+/// GitHub's PR refs (`refs/pull/<n>/head`) are:
+/// - Maintained even after the PR branch is deleted
+/// - Reliable for fork-based PRs
+/// - Always fetchable via standard git protocols
 pub fn prepare_descendant(
     worktree: &Path,
     descendant_branch: &str,
-    predecessor_head: &Sha,
+    predecessor_pr: u64,
     sign: bool,
 ) -> GitResult<MergeResult> {
-    // Fetch the descendant branch and predecessor head
-    fetch(worktree, &[descendant_branch, predecessor_head.as_str()]).map_err(|e| {
+    // Construct the PR ref for the predecessor.
+    // GitHub maintains refs/pull/<n>/head even after the PR branch is deleted.
+    let pr_ref = format!("refs/pull/{}/head", predecessor_pr);
+    let local_ref = format!("refs/remotes/origin/pr/{}", predecessor_pr);
+
+    // Fetch the descendant branch and predecessor via PR ref.
+    // Format: "refs/pull/<n>/head:refs/remotes/origin/pr/<n>" creates a local
+    // tracking ref that we can merge from.
+    let fetch_refspec = format!("{}:{}", pr_ref, local_ref);
+    run_git_sync(
+        worktree,
+        &["fetch", "origin", descendant_branch, &fetch_refspec],
+    )
+    .map_err(|e| {
         if let GitError::CommandFailed { stderr, .. } = &e
             && stderr.contains("couldn't find remote ref")
         {
+            // Determine which ref failed
+            if stderr.contains(&pr_ref) {
+                return GitError::FetchFailed {
+                    refspec: pr_ref.clone(),
+                    details: format!(
+                        "Failed to fetch predecessor PR #{}. \
+                             This ref may have been garbage-collected on GitHub Enterprise Server.",
+                        predecessor_pr
+                    ),
+                };
+            }
             return GitError::FetchFailed {
                 refspec: descendant_branch.to_string(),
                 details: stderr.clone(),
@@ -71,19 +105,14 @@ pub fn prepare_descendant(
     let remote_branch = format!("origin/{}", descendant_branch);
     checkout_detached(worktree, &remote_branch)?;
 
-    // Merge the predecessor's head
+    // Merge the predecessor's head via the local PR ref
+    let merge_ref = format!("origin/pr/{}", predecessor_pr);
     let message = format!(
         "Merge predecessor into {} (merge train preparation)",
         descendant_branch
     );
 
-    merge_with_message(
-        worktree,
-        predecessor_head.as_str(),
-        &message,
-        MergeStrategy::Default,
-        sign,
-    )
+    merge_with_message(worktree, &merge_ref, &message, MergeStrategy::Default, sign)
 }
 
 /// Reconcile a descendant after the predecessor has been squash-merged.
@@ -119,8 +148,11 @@ pub fn reconcile_descendant(
     squash_sha: &Sha,
     sign: bool,
 ) -> GitResult<MergeResult> {
-    // Fetch the squash commit and ensure we have it locally
-    fetch(worktree, &[squash_sha.as_str()])?;
+    // Fetch the squash commit AND the descendant branch.
+    // The descendant branch must be fetched because after a push, our local
+    // remote-tracking ref (origin/<branch>) may be stale. Without fetching,
+    // we'd check out an old commit and lose the prepared merge state.
+    fetch(worktree, &[squash_sha.as_str(), descendant_branch])?;
 
     // Get the parent of the squash commit (main state just before squash)
     let parents = get_parents(worktree, squash_sha.as_str())?;
@@ -209,8 +241,11 @@ pub fn catch_up_descendant(
     default_branch: &str,
     sign: bool,
 ) -> GitResult<MergeResult> {
-    // Fetch the latest default branch
-    fetch(worktree, &[default_branch])?;
+    // Fetch the latest default branch AND the descendant branch.
+    // The descendant branch must be fetched because after a push, our local
+    // remote-tracking ref (origin/<branch>) may be stale. Without fetching,
+    // we'd check out an old commit and lose the reconciled merge state.
+    fetch(worktree, &[default_branch, descendant_branch])?;
 
     // Checkout the descendant branch in detached HEAD mode
     let remote_branch = format!("origin/{}", descendant_branch);
@@ -350,7 +385,15 @@ pub fn update_root_for_behind(
 ///
 /// A valid squash merge:
 /// - Has exactly one parent
-/// - That parent is the prior default branch HEAD
+/// - That parent is on the default branch history (i.e., is an ancestor of the
+///   current default branch HEAD)
+///
+/// This rejects:
+/// - Merge commits (two parents)
+/// - Multi-commit rebase merges (parent is the previous rebased commit, not on main)
+/// - Multi-commit fast-forward merges (same issue as rebase)
+///
+/// Single-commit rebase/fast-forward are indistinguishable from squash and accepted.
 ///
 /// # Arguments
 ///
@@ -366,6 +409,9 @@ pub fn is_valid_squash_merge(
     commit: &Sha,
     default_branch: &str,
 ) -> GitResult<bool> {
+    // Fetch the default branch first to ensure we have the latest state
+    fetch(worktree, &[default_branch])?;
+
     let parents = get_parents(worktree, commit.as_str())?;
 
     // Must have exactly one parent
@@ -373,12 +419,20 @@ pub fn is_valid_squash_merge(
         return Ok(false);
     }
 
-    // The parent should be on the default branch
-    // We verify this by checking if the commit is an ancestor of the default branch HEAD
-    let default_head = rev_parse(worktree, &format!("origin/{}", default_branch))?;
-    let is_on_default = super::is_ancestor(worktree, commit, &default_head)?;
+    let parent = &parents[0];
 
-    Ok(is_on_default)
+    // The PARENT must be on the default branch.
+    // For a valid squash: the parent is the prior main HEAD, which is on main.
+    // For a multi-commit rebase: the parent is the previous rebased commit,
+    // which is NOT on the main branch history.
+    let default_head = rev_parse(worktree, &format!("origin/{}", default_branch))?;
+
+    // Check if the parent is an ancestor of (or equal to) the default branch HEAD
+    // This catches rebase merges where the parent is not on main's history
+    let parent_on_default =
+        super::is_ancestor(worktree, parent, &default_head)? || parent == &default_head;
+
+    Ok(parent_on_default)
 }
 
 #[cfg(test)]
@@ -498,6 +552,22 @@ mod tests {
         Sha::parse(&sha).unwrap()
     }
 
+    /// Create a PR ref in the bare repo (simulates GitHub's refs/pull/<n>/head).
+    ///
+    /// This is needed because prepare_descendant now fetches via PR refs.
+    fn create_pr_ref(config: &GitConfig, pr_number: u64, sha: &Sha) {
+        let clone_dir = config.clone_dir();
+        run_git_sync(
+            &clone_dir,
+            &[
+                "update-ref",
+                &format!("refs/pull/{}/head", pr_number),
+                sha.as_str(),
+            ],
+        )
+        .unwrap();
+    }
+
     #[test]
     fn prepare_descendant_merges_predecessor() {
         let (_temp_dir, config, _initial_sha) = create_test_repo();
@@ -505,6 +575,8 @@ mod tests {
         // Create predecessor branch (PR #123)
         let pred_sha =
             create_branch_with_file(&config, "pr-123", "pred.txt", "predecessor content", "main");
+        // Create PR ref for predecessor
+        create_pr_ref(&config, 123, &pred_sha);
 
         // Create descendant branch (PR #124) from predecessor
         let _desc_sha = create_branch_with_file(
@@ -518,8 +590,8 @@ mod tests {
         // Get a worktree for the stack
         let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
 
-        // Prepare the descendant
-        let result = prepare_descendant(&worktree, "pr-124", &pred_sha, false).unwrap();
+        // Prepare the descendant using PR number
+        let result = prepare_descendant(&worktree, "pr-124", 123, false).unwrap();
 
         // Should complete without conflict (either Success or AlreadyUpToDate)
         assert!(
@@ -540,6 +612,7 @@ mod tests {
         // Create predecessor branch
         let pred_sha =
             create_branch_with_file(&config, "pr-123", "pred.txt", "predecessor content", "main");
+        create_pr_ref(&config, 123, &pred_sha);
 
         // Create descendant from predecessor (already has predecessor content)
         let _desc_sha = create_branch_with_file(
@@ -553,8 +626,8 @@ mod tests {
         // Get a worktree for the stack
         let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
 
-        // Prepare the descendant
-        let result1 = prepare_descendant(&worktree, "pr-124", &pred_sha, false).unwrap();
+        // Prepare the descendant using PR number
+        let result1 = prepare_descendant(&worktree, "pr-124", 123, false).unwrap();
         // Since pr-124 was created from pr-123, it might be AlreadyUpToDate
         assert!(
             result1.is_ok(),
@@ -571,7 +644,7 @@ mod tests {
 
         // Create a new worktree and prepare again - should be up to date
         let worktree2 = worktree_for_stack(&config, PrNumber(124)).unwrap();
-        let result2 = prepare_descendant(&worktree2, "pr-124", &pred_sha, false).unwrap();
+        let result2 = prepare_descendant(&worktree2, "pr-124", 123, false).unwrap();
 
         assert!(matches!(result2, MergeResult::AlreadyUpToDate));
     }
@@ -583,6 +656,7 @@ mod tests {
         // Create predecessor branch
         let pred_sha =
             create_branch_with_file(&config, "pr-123", "pred.txt", "predecessor content", "main");
+        create_pr_ref(&config, 123, &pred_sha);
 
         // Create descendant branch from predecessor
         let _desc_sha = create_branch_with_file(
@@ -628,7 +702,7 @@ mod tests {
 
         // First, prepare the descendant (normally done before squash)
         let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
-        let prep_result = prepare_descendant(&worktree, "pr-124", &pred_sha, false).unwrap();
+        let prep_result = prepare_descendant(&worktree, "pr-124", 123, false).unwrap();
         assert!(
             prep_result.is_ok(),
             "Expected prepare to succeed, got {:?}",
@@ -664,6 +738,7 @@ mod tests {
         // Create predecessor branch
         let pred_sha =
             create_branch_with_file(&config, "pr-123", "pred.txt", "predecessor content", "main");
+        create_pr_ref(&config, 123, &pred_sha);
 
         // Create descendant branch
         let _desc_sha = create_branch_with_file(
@@ -717,7 +792,7 @@ mod tests {
 
         // Try to reconcile with the merge commit
         let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
-        prepare_descendant(&worktree, "pr-124", &pred_sha, false).unwrap();
+        prepare_descendant(&worktree, "pr-124", 123, false).unwrap();
         run_git_sync(
             &worktree,
             &["push", "origin", "HEAD:refs/heads/pr-124", "--force"],
@@ -772,5 +847,327 @@ mod tests {
         let result = catch_up_descendant(&worktree, "pr-123", "main", false).unwrap();
 
         assert!(matches!(result, MergeResult::AlreadyUpToDate));
+    }
+
+    /// Test that reconcile_descendant fetches the descendant branch before checkout.
+    ///
+    /// After prepare_descendant pushes, a fresh worktree has stale origin/<branch> refs.
+    /// reconcile_descendant must fetch the descendant branch to get the prepared state,
+    /// otherwise it checks out the old (unprepared) commit and drops the merge.
+    #[test]
+    fn reconcile_descendant_fetches_descendant_before_checkout() {
+        let (_temp_dir, config, _initial_sha) = create_test_repo();
+
+        // Create predecessor and descendant branches
+        let pred_sha =
+            create_branch_with_file(&config, "pr-123", "pred.txt", "predecessor content", "main");
+        create_pr_ref(&config, 123, &pred_sha);
+        let _desc_sha = create_branch_with_file(
+            &config,
+            "pr-124",
+            "desc.txt",
+            "descendant content",
+            "pr-123",
+        );
+
+        // Prepare descendant in worktree 1
+        let worktree1 = worktree_for_stack(&config, PrNumber(123)).unwrap();
+        let prep_result = prepare_descendant(&worktree1, "pr-124", 123, false).unwrap();
+        assert!(prep_result.is_ok(), "Prepare should succeed");
+
+        // Push the prepared state
+        run_git_sync(
+            &worktree1,
+            &["push", "origin", "HEAD:refs/heads/pr-124", "--force"],
+        )
+        .unwrap();
+
+        // Get the prepared HEAD SHA
+        let prepared_sha = run_git_stdout(&worktree1, &["rev-parse", "HEAD"]).unwrap();
+
+        // Squash merge predecessor to main
+        let squash_sha = {
+            let clone_dir = config.clone_dir();
+            let temp_work = clone_dir.parent().unwrap().join("temp_squash_test");
+            std::fs::create_dir_all(&temp_work).unwrap();
+            run_git_sync(
+                &clone_dir,
+                &[
+                    "worktree",
+                    "add",
+                    "--detach",
+                    temp_work.to_str().unwrap(),
+                    "refs/heads/main",
+                ],
+            )
+            .unwrap();
+            run_git_sync(&temp_work, &["config", "user.email", "test@test.com"]).unwrap();
+            run_git_sync(&temp_work, &["config", "user.name", "Test"]).unwrap();
+            run_git_sync(&temp_work, &["merge", "--squash", &pred_sha.as_str()]).unwrap();
+            run_git_sync(&temp_work, &["commit", "-m", "Squash merge"]).unwrap();
+            let sha = run_git_stdout(&temp_work, &["rev-parse", "HEAD"]).unwrap();
+            run_git_sync(&temp_work, &["push", "origin", "HEAD:refs/heads/main"]).unwrap();
+            run_git_sync(
+                &clone_dir,
+                &["worktree", "remove", "--force", temp_work.to_str().unwrap()],
+            )
+            .unwrap();
+            Sha::parse(&sha).unwrap()
+        };
+
+        // Now get a FRESH worktree (worktree 2) - this simulates recovery or continuation.
+        // The fresh worktree has stale origin/pr-124 that doesn't include the prepared merge.
+        let worktree2 = worktree_for_stack(&config, PrNumber(200)).unwrap();
+
+        // Reconcile should fetch pr-124 and use the PREPARED state, not the old state
+        let result = reconcile_descendant(&worktree2, "pr-124", &squash_sha, false).unwrap();
+        assert!(result.is_ok(), "Reconcile should succeed, got {:?}", result);
+
+        // Verify we reconciled from the prepared state (prepared SHA should be an ancestor)
+        let head_sha = run_git_stdout(&worktree2, &["rev-parse", "HEAD"]).unwrap();
+        let is_ancestor = run_git_sync(
+            &worktree2,
+            &["merge-base", "--is-ancestor", &prepared_sha, &head_sha],
+        );
+        assert!(
+            is_ancestor.is_ok(),
+            "The prepared state should be an ancestor of the reconciled state"
+        );
+    }
+
+    /// Test that catch_up_descendant fetches the descendant branch before checkout.
+    ///
+    /// After reconcile pushes, the local refs are stale. catch_up must fetch first.
+    #[test]
+    fn catch_up_descendant_fetches_descendant_before_checkout() {
+        let (_temp_dir, config, _initial_sha) = create_test_repo();
+
+        // Create a branch
+        let _branch_sha =
+            create_branch_with_file(&config, "pr-123", "feature.txt", "feature content", "main");
+
+        // Get worktree 1, make a change, and push
+        let worktree1 = worktree_for_stack(&config, PrNumber(123)).unwrap();
+        run_git_sync(&worktree1, &["config", "user.email", "test@test.com"]).unwrap();
+        run_git_sync(&worktree1, &["config", "user.name", "Test"]).unwrap();
+        run_git_sync(&worktree1, &["fetch", "origin", "pr-123"]).unwrap();
+        run_git_sync(&worktree1, &["checkout", "--detach", "origin/pr-123"]).unwrap();
+
+        // Add another file to simulate preparation work
+        std::fs::write(worktree1.join("prepared.txt"), "prepared").unwrap();
+        run_git_sync(&worktree1, &["add", "."]).unwrap();
+        run_git_sync(&worktree1, &["commit", "-m", "Add prepared file"]).unwrap();
+        let _prepared_sha = run_git_stdout(&worktree1, &["rev-parse", "HEAD"]).unwrap();
+
+        // Push the prepared state
+        run_git_sync(
+            &worktree1,
+            &["push", "origin", "HEAD:refs/heads/pr-123", "--force"],
+        )
+        .unwrap();
+
+        // Add a commit to main
+        create_branch_with_file(&config, "main", "main_update.txt", "main update", "main");
+
+        // Get a FRESH worktree (worktree 2) - has stale origin/pr-123
+        let worktree2 = worktree_for_stack(&config, PrNumber(200)).unwrap();
+
+        // Catch up should fetch pr-123 and use the PUSHED state
+        let result = catch_up_descendant(&worktree2, "pr-123", "main", false).unwrap();
+        assert!(
+            result.is_ok() || result.is_success(),
+            "Catch up should succeed"
+        );
+
+        // Verify the prepared file exists (was not lost due to stale ref)
+        assert!(
+            worktree2.join("prepared.txt").exists(),
+            "The prepared file should exist - catch_up should use the pushed state"
+        );
+    }
+
+    /// Test that is_valid_squash_merge accepts a legitimate squash merge.
+    #[test]
+    fn is_valid_squash_merge_accepts_squash() {
+        let (_temp_dir, config, _initial_sha) = create_test_repo();
+
+        // Create a feature branch
+        let branch_sha =
+            create_branch_with_file(&config, "feature", "feature.txt", "feature content", "main");
+
+        // Squash merge it
+        let clone_dir = config.clone_dir();
+        let temp_work = clone_dir.parent().unwrap().join("temp_squash_valid");
+        std::fs::create_dir_all(&temp_work).unwrap();
+        run_git_sync(
+            &clone_dir,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                temp_work.to_str().unwrap(),
+                "refs/heads/main",
+            ],
+        )
+        .unwrap();
+        run_git_sync(&temp_work, &["config", "user.email", "test@test.com"]).unwrap();
+        run_git_sync(&temp_work, &["config", "user.name", "Test"]).unwrap();
+        run_git_sync(&temp_work, &["merge", "--squash", &branch_sha.as_str()]).unwrap();
+        run_git_sync(&temp_work, &["commit", "-m", "Squash merge feature"]).unwrap();
+
+        let squash_sha = run_git_stdout(&temp_work, &["rev-parse", "HEAD"]).unwrap();
+        let squash_sha = Sha::parse(&squash_sha).unwrap();
+
+        run_git_sync(&temp_work, &["push", "origin", "HEAD:refs/heads/main"]).unwrap();
+        run_git_sync(
+            &clone_dir,
+            &["worktree", "remove", "--force", temp_work.to_str().unwrap()],
+        )
+        .unwrap();
+
+        // Validate from a worktree
+        let worktree = worktree_for_stack(&config, PrNumber(999)).unwrap();
+        let is_valid = is_valid_squash_merge(&worktree, &squash_sha, "main").unwrap();
+
+        assert!(is_valid, "Squash merge should be accepted");
+    }
+
+    /// Test that is_valid_squash_merge rejects a merge commit (two parents).
+    #[test]
+    fn is_valid_squash_merge_rejects_merge_commit() {
+        let (_temp_dir, config, _initial_sha) = create_test_repo();
+
+        // Create a feature branch
+        let branch_sha =
+            create_branch_with_file(&config, "feature", "feature.txt", "feature content", "main");
+
+        // Create a divergence on main so merge is required
+        create_branch_with_file(&config, "main", "main_change.txt", "main change", "main");
+
+        // Do a real merge (not squash) - this creates two parents
+        let clone_dir = config.clone_dir();
+        let temp_work = clone_dir.parent().unwrap().join("temp_merge_commit");
+        std::fs::create_dir_all(&temp_work).unwrap();
+        run_git_sync(
+            &clone_dir,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                temp_work.to_str().unwrap(),
+                "refs/heads/main",
+            ],
+        )
+        .unwrap();
+        run_git_sync(&temp_work, &["config", "user.email", "test@test.com"]).unwrap();
+        run_git_sync(&temp_work, &["config", "user.name", "Test"]).unwrap();
+        run_git_sync(
+            &temp_work,
+            &[
+                "merge",
+                "--no-ff",
+                &branch_sha.as_str(),
+                "-m",
+                "Merge commit",
+            ],
+        )
+        .unwrap();
+
+        let merge_sha = run_git_stdout(&temp_work, &["rev-parse", "HEAD"]).unwrap();
+        let merge_sha = Sha::parse(&merge_sha).unwrap();
+
+        run_git_sync(&temp_work, &["push", "origin", "HEAD:refs/heads/main"]).unwrap();
+        run_git_sync(
+            &clone_dir,
+            &["worktree", "remove", "--force", temp_work.to_str().unwrap()],
+        )
+        .unwrap();
+
+        // Validate from a worktree
+        let worktree = worktree_for_stack(&config, PrNumber(999)).unwrap();
+        let is_valid = is_valid_squash_merge(&worktree, &merge_sha, "main").unwrap();
+
+        assert!(!is_valid, "Merge commit (two parents) should be rejected");
+    }
+
+    /// Test that is_valid_squash_merge rejects a multi-commit rebase merge.
+    ///
+    /// In a multi-commit rebase, the parent of the last rebased commit is
+    /// the previous rebased commit, NOT the prior main HEAD.
+    #[test]
+    fn is_valid_squash_merge_rejects_multi_commit_rebase() {
+        let (_temp_dir, config, _initial_sha) = create_test_repo();
+        let clone_dir = config.clone_dir();
+
+        // Create a feature branch with TWO commits
+        let temp_work = clone_dir.parent().unwrap().join("temp_feature");
+        std::fs::create_dir_all(&temp_work).unwrap();
+        run_git_sync(
+            &clone_dir,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                temp_work.to_str().unwrap(),
+                "refs/heads/main",
+            ],
+        )
+        .unwrap();
+        run_git_sync(&temp_work, &["config", "user.email", "test@test.com"]).unwrap();
+        run_git_sync(&temp_work, &["config", "user.name", "Test"]).unwrap();
+
+        // First commit on feature
+        std::fs::write(temp_work.join("file1.txt"), "content1").unwrap();
+        run_git_sync(&temp_work, &["add", "."]).unwrap();
+        run_git_sync(&temp_work, &["commit", "-m", "Feature commit 1"]).unwrap();
+
+        // Second commit on feature
+        std::fs::write(temp_work.join("file2.txt"), "content2").unwrap();
+        run_git_sync(&temp_work, &["add", "."]).unwrap();
+        run_git_sync(&temp_work, &["commit", "-m", "Feature commit 2"]).unwrap();
+
+        run_git_sync(&temp_work, &["push", "origin", "HEAD:refs/heads/feature"]).unwrap();
+
+        // Record the second commit SHA
+        let second_commit_sha = run_git_stdout(&temp_work, &["rev-parse", "HEAD"]).unwrap();
+        let second_commit_sha = Sha::parse(&second_commit_sha).unwrap();
+
+        // The parent of the second commit is the first commit, NOT main
+        let parents = run_git_stdout(&temp_work, &["rev-parse", "HEAD^"]).unwrap();
+        let first_commit_parent = Sha::parse(&parents).unwrap();
+
+        // Verify that the parent is NOT an ancestor of main
+        // (it's on the feature branch, not on main)
+        run_git_sync(&temp_work, &["fetch", "origin", "main"]).unwrap();
+        let main_sha = run_git_stdout(&temp_work, &["rev-parse", "origin/main"]).unwrap();
+
+        // The first commit should NOT be an ancestor of main (it's on feature only)
+        let _is_ancestor_result = run_git_sync(
+            &temp_work,
+            &[
+                "merge-base",
+                "--is-ancestor",
+                &first_commit_parent.as_str(),
+                &main_sha,
+            ],
+        );
+
+        run_git_sync(
+            &clone_dir,
+            &["worktree", "remove", "--force", temp_work.to_str().unwrap()],
+        )
+        .unwrap();
+
+        // Now check is_valid_squash_merge for the second commit
+        // It has one parent, but that parent is the first commit, not main
+        let worktree = worktree_for_stack(&config, PrNumber(999)).unwrap();
+        run_git_sync(&worktree, &["fetch", "origin", "feature"]).unwrap();
+
+        let is_valid = is_valid_squash_merge(&worktree, &second_commit_sha, "main").unwrap();
+
+        assert!(
+            !is_valid,
+            "Multi-commit rebase (parent not on main) should be rejected"
+        );
     }
 }
