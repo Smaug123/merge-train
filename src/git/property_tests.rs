@@ -20,8 +20,17 @@ use tempfile::TempDir;
 use crate::git::merge::{catch_up_descendant, prepare_descendant, reconcile_descendant};
 use crate::git::recovery::{cleanup_worktree_on_abort, is_worktree_dirty};
 use crate::git::worktree::{cleanup_stale_worktrees, list_worktrees, worktree_for_stack};
-use crate::git::{GitConfig, is_ancestor, run_git_stdout, run_git_sync};
+use crate::git::{CommitIdentity, GitConfig, is_ancestor, run_git_stdout, run_git_sync};
 use crate::types::{PrNumber, Sha};
+
+/// Test identity for merge commits (no signing).
+fn test_identity() -> CommitIdentity {
+    CommitIdentity {
+        name: "Test".to_string(),
+        email: "test@test.com".to_string(),
+        signing_key: None,
+    }
+}
 
 /// Create a test repository with the given configuration.
 fn create_test_repo() -> (TempDir, GitConfig) {
@@ -34,7 +43,11 @@ fn create_test_repo() -> (TempDir, GitConfig) {
         repo: "repo".to_string(),
         default_branch: "main".to_string(),
         worktree_max_age: Duration::from_secs(24 * 3600),
-        sign_commits: false,
+        commit_identity: CommitIdentity {
+            name: "Test".to_string(),
+            email: "test@test.com".to_string(),
+            signing_key: None,
+        },
     };
 
     // Create the clone directory and initialize a bare repo
@@ -215,7 +228,7 @@ proptest! {
 
         // Get worktree and prepare descendant using PR number
         let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
-        let prep_result = prepare_descendant(&worktree, "pr-124", 123, false).unwrap();
+        let prep_result = prepare_descendant(&worktree, "pr-124", 123, &test_identity()).unwrap();
         prop_assert!(prep_result.is_ok());
         run_git_sync(&worktree, &["push", "origin", "HEAD:refs/heads/pr-124", "--force"]).unwrap();
 
@@ -223,11 +236,11 @@ proptest! {
         let squash_sha = squash_merge_to_main(&config, &pred_sha);
 
         // Reconcile descendant
-        let reconcile_result = reconcile_descendant(&worktree, "pr-124", &squash_sha, "main", false).unwrap();
+        let reconcile_result = reconcile_descendant(&worktree, "pr-124", &squash_sha, "main", &test_identity()).unwrap();
         prop_assert!(reconcile_result.is_ok());
 
         // Catch up with main (if needed)
-        let _ = catch_up_descendant(&worktree, "pr-124", "main", false).unwrap();
+        let _ = catch_up_descendant(&worktree, "pr-124", "main", &test_identity()).unwrap();
 
         // Verify all content is present
         prop_assert!(worktree.join("pred.txt").exists(), "pred.txt should exist");
@@ -258,7 +271,7 @@ proptest! {
 
         // Prepare descendant using PR number
         let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
-        prepare_descendant(&worktree, "pr-124", 123, false).unwrap();
+        prepare_descendant(&worktree, "pr-124", 123, &test_identity()).unwrap();
         run_git_sync(&worktree, &["push", "origin", "HEAD:refs/heads/pr-124", "--force"]).unwrap();
 
         // Squash merge predecessor
@@ -268,8 +281,8 @@ proptest! {
         let _intervening_sha = add_commit_to_main(&config, "intervening.txt", &intervening_content);
 
         // Reconcile and catch up
-        reconcile_descendant(&worktree, "pr-124", &squash_sha, "main", false).unwrap();
-        catch_up_descendant(&worktree, "pr-124", "main", false).unwrap();
+        reconcile_descendant(&worktree, "pr-124", &squash_sha, "main", &test_identity()).unwrap();
+        catch_up_descendant(&worktree, "pr-124", "main", &test_identity()).unwrap();
 
         // The intervening commit should be incorporated
         prop_assert!(worktree.join("intervening.txt").exists(), "intervening.txt should exist");
@@ -343,12 +356,12 @@ proptest! {
 
         // Prepare, squash, reconcile, catch-up
         let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
-        prepare_descendant(&worktree, "pr-124", 123, false).unwrap();
+        prepare_descendant(&worktree, "pr-124", 123, &test_identity()).unwrap();
         run_git_sync(&worktree, &["push", "origin", "HEAD:refs/heads/pr-124", "--force"]).unwrap();
 
         let squash_sha = squash_merge_to_main(&config, &pred_sha);
-        reconcile_descendant(&worktree, "pr-124", &squash_sha, "main", false).unwrap();
-        catch_up_descendant(&worktree, "pr-124", "main", false).unwrap();
+        reconcile_descendant(&worktree, "pr-124", &squash_sha, "main", &test_identity()).unwrap();
+        catch_up_descendant(&worktree, "pr-124", "main", &test_identity()).unwrap();
 
         // Verify ALL predecessor files preserved
         prop_assert!(worktree.join("pred1.txt").exists(), "pred1.txt should exist");
@@ -388,7 +401,7 @@ proptest! {
 
         // Prepare descendant
         let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
-        prepare_descendant(&worktree, "pr-124", 123, false).unwrap();
+        prepare_descendant(&worktree, "pr-124", 123, &test_identity()).unwrap();
         run_git_sync(&worktree, &["push", "origin", "HEAD:refs/heads/pr-124", "--force"]).unwrap();
 
         // === Two commits land on main BEFORE the squash ===
@@ -404,8 +417,8 @@ proptest! {
         let _after = add_commit_to_main(&config, "after.txt", &after_squash_content);
 
         // Reconcile and catch up
-        reconcile_descendant(&worktree, "pr-124", &squash_sha, "main", false).unwrap();
-        catch_up_descendant(&worktree, "pr-124", "main", false).unwrap();
+        reconcile_descendant(&worktree, "pr-124", &squash_sha, "main", &test_identity()).unwrap();
+        catch_up_descendant(&worktree, "pr-124", "main", &test_identity()).unwrap();
 
         // Verify BEFORE-squash commits are preserved (via $SQUASH_SHA^)
         prop_assert!(worktree.join("before1.txt").exists(), "before1.txt should exist (pre-squash commit via $SQUASH_SHA^)");
@@ -571,7 +584,7 @@ fn squash_parent_ordering_incorporates_late_commits() {
 
     // CORRECT APPROACH: Prepare WITHOUT merging main
     let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
-    prepare_descendant(&worktree, "pr-124", 123, false).unwrap();
+    prepare_descendant(&worktree, "pr-124", 123, &test_identity()).unwrap();
     run_git_sync(
         &worktree,
         &["push", "origin", "HEAD:refs/heads/pr-124", "--force"],
@@ -616,7 +629,7 @@ fn squash_parent_ordering_incorporates_late_commits() {
 
     // Reconcile with $SQUASH_SHA^ (correct approach)
     // This merges the squash parent (which includes late.txt) into the descendant
-    reconcile_descendant(&worktree, "pr-124", &squash_sha, "main", false).unwrap();
+    reconcile_descendant(&worktree, "pr-124", &squash_sha, "main", &test_identity()).unwrap();
 
     // Verify: after reconciliation, late.txt exists
     // The reconciliation merged $SQUASH_SHA^ which includes the late commit
@@ -631,7 +644,7 @@ fn squash_parent_ordering_incorporates_late_commits() {
     );
 
     // Catch up with main
-    catch_up_descendant(&worktree, "pr-124", "main", false).unwrap();
+    catch_up_descendant(&worktree, "pr-124", "main", &test_identity()).unwrap();
 
     // Verify all content is preserved after catch-up
     assert!(
@@ -712,11 +725,11 @@ fn catch_up_detects_conflicts_with_main() {
 
     // Prepare and reconcile the descendant (should work) using PR number
     run_git_sync(&worktree, &["checkout", "--detach", "refs/heads/pr-124"]).unwrap();
-    prepare_descendant(&worktree, "pr-124", 123, false).unwrap();
-    reconcile_descendant(&worktree, "pr-124", &squash_sha, "main", false).unwrap();
+    prepare_descendant(&worktree, "pr-124", 123, &test_identity()).unwrap();
+    reconcile_descendant(&worktree, "pr-124", &squash_sha, "main", &test_identity()).unwrap();
 
     // Catch-up should detect the conflict
-    let result = catch_up_descendant(&worktree, "pr-124", "main", false).unwrap();
+    let result = catch_up_descendant(&worktree, "pr-124", "main", &test_identity()).unwrap();
     assert!(
         result.is_conflict(),
         "Expected conflict during catch-up, got {:?}",
@@ -818,7 +831,7 @@ fn recovery_uses_frozen_descendants() {
     let worktree = worktree_for_stack(&config, PrNumber(100)).unwrap();
     for &pr in &[101, 102] {
         let branch = format!("pr-{}", pr);
-        prepare_descendant(&worktree, &branch, 100, false).unwrap();
+        prepare_descendant(&worktree, &branch, 100, &test_identity()).unwrap();
         run_git_sync(
             &worktree,
             &[
@@ -847,7 +860,7 @@ fn recovery_uses_frozen_descendants() {
     // Reconcile only the frozen descendants
     for &pr in &to_reconcile {
         let branch = format!("pr-{}", pr.0);
-        reconcile_descendant(&worktree, &branch, &squash_sha, "main", false).unwrap();
+        reconcile_descendant(&worktree, &branch, &squash_sha, "main", &test_identity()).unwrap();
     }
 
     // Verify late descendant was NOT processed
@@ -898,7 +911,7 @@ fn fanout_worktree_ordering() {
 
     for pr in [101, 102, 103] {
         let branch = format!("pr-{}", pr);
-        prepare_descendant(&root_worktree, &branch, 100, false).unwrap();
+        prepare_descendant(&root_worktree, &branch, 100, &test_identity()).unwrap();
         run_git_sync(
             &root_worktree,
             &[
@@ -917,7 +930,14 @@ fn fanout_worktree_ordering() {
     // Reconcile all descendants
     for pr in [101, 102, 103] {
         let branch = format!("pr-{}", pr);
-        reconcile_descendant(&root_worktree, &branch, &squash_sha, "main", false).unwrap();
+        reconcile_descendant(
+            &root_worktree,
+            &branch,
+            &squash_sha,
+            "main",
+            &test_identity(),
+        )
+        .unwrap();
         run_git_sync(
             &root_worktree,
             &[

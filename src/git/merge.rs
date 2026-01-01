@@ -25,8 +25,8 @@ use crate::effects::git::MergeStrategy;
 use crate::types::Sha;
 
 use super::{
-    GitError, GitResult, MergeResult, checkout_detached, fetch, get_parents, git_command,
-    rev_parse, run_git_stdout, run_git_sync,
+    CommitIdentity, GitError, GitResult, MergeResult, checkout_detached, fetch, get_parents,
+    git_commit_command, rev_parse, run_git_stdout, run_git_sync,
 };
 
 /// Prepare a descendant by merging the predecessor's head into it.
@@ -43,7 +43,7 @@ use super::{
 /// * `worktree` - Path to the stack's worktree
 /// * `descendant_branch` - The descendant's branch name (e.g., "feature-2")
 /// * `predecessor_pr` - The predecessor's PR number (used to fetch via refs/pull/<n>/head)
-/// * `sign` - Whether to sign the merge commit
+/// * `identity` - Identity for the merge commit (author/committer, optional signing key)
 ///
 /// # Returns
 ///
@@ -63,7 +63,7 @@ pub fn prepare_descendant(
     worktree: &Path,
     descendant_branch: &str,
     predecessor_pr: u64,
-    sign: bool,
+    identity: &CommitIdentity,
 ) -> GitResult<MergeResult> {
     // Construct the PR ref for the predecessor.
     // GitHub maintains refs/pull/<n>/head even after the PR branch is deleted.
@@ -112,7 +112,13 @@ pub fn prepare_descendant(
         descendant_branch
     );
 
-    merge_with_message(worktree, &merge_ref, &message, MergeStrategy::Default, sign)
+    merge_with_message(
+        worktree,
+        &merge_ref,
+        &message,
+        MergeStrategy::Default,
+        identity,
+    )
 }
 
 /// Reconcile a descendant after the predecessor has been squash-merged.
@@ -131,7 +137,7 @@ pub fn prepare_descendant(
 /// * `descendant_branch` - The descendant's branch name
 /// * `squash_sha` - The SHA of the squash commit on main
 /// * `default_branch` - The default branch name (e.g., "main")
-/// * `sign` - Whether to sign the merge commits
+/// * `identity` - Identity for the merge commits (author/committer, optional signing key)
 ///
 /// # Returns
 ///
@@ -149,7 +155,7 @@ pub fn reconcile_descendant(
     descendant_branch: &str,
     squash_sha: &Sha,
     default_branch: &str,
-    sign: bool,
+    identity: &CommitIdentity,
 ) -> GitResult<MergeResult> {
     // Fetch the default branch AND the descendant branch.
     // We fetch the default branch (not the squash SHA) because:
@@ -236,7 +242,7 @@ pub fn reconcile_descendant(
         squash_parent.as_str(),
         &message1,
         MergeStrategy::Default,
-        sign,
+        identity,
     )?;
 
     if let MergeResult::Conflict { .. } = result1 {
@@ -255,7 +261,7 @@ pub fn reconcile_descendant(
         squash_sha.as_str(),
         &message2,
         MergeStrategy::Ours,
-        sign,
+        identity,
     )
 }
 
@@ -272,7 +278,7 @@ pub fn reconcile_descendant(
 /// * `worktree` - Path to the stack's worktree
 /// * `descendant_branch` - The descendant's branch name
 /// * `default_branch` - The default branch name (e.g., "main")
-/// * `sign` - Whether to sign the merge commit
+/// * `identity` - Identity for the merge commit (author/committer, optional signing key)
 ///
 /// # Returns
 ///
@@ -281,7 +287,7 @@ pub fn catch_up_descendant(
     worktree: &Path,
     descendant_branch: &str,
     default_branch: &str,
-    sign: bool,
+    identity: &CommitIdentity,
 ) -> GitResult<MergeResult> {
     // Fetch the latest default branch AND the descendant branch.
     // The descendant branch must be fetched because after a push, our local
@@ -305,17 +311,20 @@ pub fn catch_up_descendant(
         &remote_default,
         &message,
         MergeStrategy::Default,
-        sign,
+        identity,
     )
 }
 
 /// Perform a merge with a specific message and strategy.
+///
+/// Uses the provided identity for the commit author/committer. If
+/// `identity.signing_key` is set, the merge commit will be GPG signed.
 fn merge_with_message(
     worktree: &Path,
     target: &str,
     message: &str,
     strategy: MergeStrategy,
-    sign: bool,
+    identity: &CommitIdentity,
 ) -> GitResult<MergeResult> {
     let mut args = vec!["merge", "--no-edit", "-m", message];
 
@@ -324,13 +333,15 @@ fn merge_with_message(
         args.push(strategy_arg);
     }
 
-    if sign {
+    if identity.signing_key.is_some() {
         args.push("-S");
     }
 
     args.push(target);
 
-    let output = git_command(worktree).args(&args).output()?;
+    let output = git_commit_command(worktree, identity)
+        .args(&args)
+        .output()?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -392,7 +403,7 @@ fn get_conflicting_files(worktree: &Path) -> GitResult<Vec<String>> {
 /// * `worktree` - Path to the stack's worktree
 /// * `branch` - The branch name
 /// * `default_branch` - The default branch name (e.g., "main")
-/// * `sign` - Whether to sign the merge commit
+/// * `identity` - Identity for the merge commit (author/committer, optional signing key)
 ///
 /// # Returns
 ///
@@ -401,7 +412,7 @@ pub fn update_root_for_behind(
     worktree: &Path,
     branch: &str,
     default_branch: &str,
-    sign: bool,
+    identity: &CommitIdentity,
 ) -> GitResult<MergeResult> {
     // Fetch both the default branch AND the branch we're updating.
     // The branch must be fetched because after a push, our local
@@ -422,7 +433,7 @@ pub fn update_root_for_behind(
         &remote_default,
         &message,
         MergeStrategy::Default,
-        sign,
+        identity,
     )
 }
 
@@ -492,10 +503,19 @@ pub fn is_valid_squash_merge(
 mod tests {
     use super::*;
     use crate::git::worktree::worktree_for_stack;
-    use crate::git::{GitConfig, run_git_stdout, run_git_sync};
+    use crate::git::{CommitIdentity, GitConfig, run_git_stdout, run_git_sync};
     use crate::types::PrNumber;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    /// Test identity for merge commits (no signing).
+    fn test_identity() -> CommitIdentity {
+        CommitIdentity {
+            name: "Test".to_string(),
+            email: "test@test.com".to_string(),
+            signing_key: None,
+        }
+    }
 
     /// Create a minimal git repo with a main branch and initial commit.
     fn create_test_repo() -> (TempDir, GitConfig, Sha) {
@@ -508,7 +528,7 @@ mod tests {
             repo: "repo".to_string(),
             default_branch: "main".to_string(),
             worktree_max_age: Duration::from_secs(24 * 3600),
-            sign_commits: false,
+            commit_identity: test_identity(),
         };
 
         // Create the clone directory and initialize a bare repo
@@ -644,7 +664,8 @@ mod tests {
         let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
 
         // Prepare the descendant using PR number
-        let result = prepare_descendant(&worktree, "pr-124", 123, false).unwrap();
+        let identity = test_identity();
+        let result = prepare_descendant(&worktree, "pr-124", 123, &identity).unwrap();
 
         // Should complete without conflict (either Success or AlreadyUpToDate)
         assert!(
@@ -680,7 +701,8 @@ mod tests {
         let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
 
         // Prepare the descendant using PR number
-        let result1 = prepare_descendant(&worktree, "pr-124", 123, false).unwrap();
+        let identity = test_identity();
+        let result1 = prepare_descendant(&worktree, "pr-124", 123, &identity).unwrap();
         // Since pr-124 was created from pr-123, it might be AlreadyUpToDate
         assert!(
             result1.is_ok(),
@@ -697,7 +719,7 @@ mod tests {
 
         // Create a new worktree and prepare again - should be up to date
         let worktree2 = worktree_for_stack(&config, PrNumber(124)).unwrap();
-        let result2 = prepare_descendant(&worktree2, "pr-124", 123, false).unwrap();
+        let result2 = prepare_descendant(&worktree2, "pr-124", 123, &identity).unwrap();
 
         assert!(matches!(result2, MergeResult::AlreadyUpToDate));
     }
@@ -755,7 +777,8 @@ mod tests {
 
         // First, prepare the descendant (normally done before squash)
         let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
-        let prep_result = prepare_descendant(&worktree, "pr-124", 123, false).unwrap();
+        let identity = test_identity();
+        let prep_result = prepare_descendant(&worktree, "pr-124", 123, &identity).unwrap();
         assert!(
             prep_result.is_ok(),
             "Expected prepare to succeed, got {:?}",
@@ -768,7 +791,8 @@ mod tests {
         .unwrap();
 
         // Now reconcile the descendant
-        let result = reconcile_descendant(&worktree, "pr-124", &squash_sha, "main", false).unwrap();
+        let result =
+            reconcile_descendant(&worktree, "pr-124", &squash_sha, "main", &identity).unwrap();
 
         assert!(
             result.is_ok(),
@@ -845,14 +869,15 @@ mod tests {
 
         // Try to reconcile with the merge commit
         let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
-        prepare_descendant(&worktree, "pr-124", 123, false).unwrap();
+        let identity = test_identity();
+        prepare_descendant(&worktree, "pr-124", 123, &identity).unwrap();
         run_git_sync(
             &worktree,
             &["push", "origin", "HEAD:refs/heads/pr-124", "--force"],
         )
         .unwrap();
 
-        let result = reconcile_descendant(&worktree, "pr-124", &merge_sha, "main", false);
+        let result = reconcile_descendant(&worktree, "pr-124", &merge_sha, "main", &identity);
 
         // Should fail because it's not a squash merge
         assert!(result.is_err());
@@ -879,7 +904,8 @@ mod tests {
 
         // Get worktree and catch up
         let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
-        let result = catch_up_descendant(&worktree, "pr-123", "main", false).unwrap();
+        let identity = test_identity();
+        let result = catch_up_descendant(&worktree, "pr-123", "main", &identity).unwrap();
 
         assert!(result.is_success());
 
@@ -897,7 +923,8 @@ mod tests {
             create_branch_with_file(&config, "pr-123", "feature.txt", "feature content", "main");
 
         let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
-        let result = catch_up_descendant(&worktree, "pr-123", "main", false).unwrap();
+        let identity = test_identity();
+        let result = catch_up_descendant(&worktree, "pr-123", "main", &identity).unwrap();
 
         assert!(matches!(result, MergeResult::AlreadyUpToDate));
     }
@@ -925,7 +952,8 @@ mod tests {
 
         // Prepare descendant in worktree 1
         let worktree1 = worktree_for_stack(&config, PrNumber(123)).unwrap();
-        let prep_result = prepare_descendant(&worktree1, "pr-124", 123, false).unwrap();
+        let identity = test_identity();
+        let prep_result = prepare_descendant(&worktree1, "pr-124", 123, &identity).unwrap();
         assert!(prep_result.is_ok(), "Prepare should succeed");
 
         // Push the prepared state
@@ -974,7 +1002,7 @@ mod tests {
 
         // Reconcile should fetch pr-124 and use the PREPARED state, not the old state
         let result =
-            reconcile_descendant(&worktree2, "pr-124", &squash_sha, "main", false).unwrap();
+            reconcile_descendant(&worktree2, "pr-124", &squash_sha, "main", &identity).unwrap();
         assert!(result.is_ok(), "Reconcile should succeed, got {:?}", result);
 
         // Verify we reconciled from the prepared state (prepared SHA should be an ancestor)
@@ -1027,7 +1055,8 @@ mod tests {
         let worktree2 = worktree_for_stack(&config, PrNumber(200)).unwrap();
 
         // Catch up should fetch pr-123 and use the PUSHED state
-        let result = catch_up_descendant(&worktree2, "pr-123", "main", false).unwrap();
+        let identity = test_identity();
+        let result = catch_up_descendant(&worktree2, "pr-123", "main", &identity).unwrap();
         assert!(
             result.is_ok() || result.is_success(),
             "Catch up should succeed"
@@ -1570,7 +1599,8 @@ mod tests {
         );
 
         // Call update_root_for_behind - it should fetch the branch to get the latest state
-        let result = update_root_for_behind(&worktree, "pr-123", "main", false).unwrap();
+        let identity = test_identity();
+        let result = update_root_for_behind(&worktree, "pr-123", "main", &identity).unwrap();
         assert!(
             result.is_ok(),
             "update_root_for_behind should succeed, got {:?}",
@@ -1624,7 +1654,8 @@ mod tests {
 
         // Prepare the descendant
         let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
-        prepare_descendant(&worktree, "pr-124", 123, false).unwrap();
+        let identity = test_identity();
+        prepare_descendant(&worktree, "pr-124", 123, &identity).unwrap();
         run_git_sync(
             &worktree,
             &["push", "origin", "HEAD:refs/heads/pr-124", "--force"],
@@ -1682,7 +1713,7 @@ mod tests {
 
         // Try to reconcile with the second commit (whose parent is NOT on main)
         // This simulates trying to use a rebased commit as if it were a squash
-        let result = reconcile_descendant(&worktree, "pr-124", &second_sha, "main", false);
+        let result = reconcile_descendant(&worktree, "pr-124", &second_sha, "main", &identity);
 
         // Should fail because second_sha's parent (first commit) is not on main
         assert!(

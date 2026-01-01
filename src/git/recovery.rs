@@ -293,7 +293,11 @@ mod tests {
             repo: "repo".to_string(),
             default_branch: "main".to_string(),
             worktree_max_age: Duration::from_secs(24 * 3600),
-            sign_commits: false,
+            commit_identity: crate::git::CommitIdentity {
+                name: "Test".to_string(),
+                email: "test@test.com".to_string(),
+                signing_key: None,
+            },
         };
 
         // Create the clone directory and initialize a bare repo
