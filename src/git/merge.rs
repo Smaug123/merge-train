@@ -1225,6 +1225,243 @@ mod tests {
         );
     }
 
+    /// Test that is_valid_squash_merge accepts a single-commit rebase merge.
+    ///
+    /// For a single-commit branch, rebase and squash are indistinguishable:
+    /// both result in a single commit on main whose parent is the prior main HEAD.
+    /// This is expected behavior per DESIGN.md.
+    #[test]
+    fn is_valid_squash_merge_accepts_single_commit_rebase() {
+        let (_temp_dir, config, _initial_sha) = create_test_repo();
+        let clone_dir = config.clone_dir();
+
+        // Create a feature branch with ONE commit
+        let temp_work = clone_dir.parent().unwrap().join("temp_single_rebase");
+        std::fs::create_dir_all(&temp_work).unwrap();
+        run_git_sync(
+            &clone_dir,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                temp_work.to_str().unwrap(),
+                "refs/heads/main",
+            ],
+        )
+        .unwrap();
+        run_git_sync(&temp_work, &["config", "user.email", "test@test.com"]).unwrap();
+        run_git_sync(&temp_work, &["config", "user.name", "Test"]).unwrap();
+
+        // Single commit on feature
+        std::fs::write(temp_work.join("feature.txt"), "feature content").unwrap();
+        run_git_sync(&temp_work, &["add", "."]).unwrap();
+        run_git_sync(&temp_work, &["commit", "-m", "Feature commit"]).unwrap();
+        run_git_sync(&temp_work, &["push", "origin", "HEAD:refs/heads/feature"]).unwrap();
+
+        // Record the main HEAD before rebase
+        let main_head_before =
+            run_git_stdout(&clone_dir, &["rev-parse", "refs/heads/main"]).unwrap();
+        let main_head_before = Sha::parse(&main_head_before).unwrap();
+
+        // Rebase onto main (trivial since it's already based on main, but let's be explicit)
+        run_git_sync(&temp_work, &["rebase", "refs/heads/main"]).unwrap();
+
+        // Fast-forward main to the rebased commit
+        let rebased_sha = run_git_stdout(&temp_work, &["rev-parse", "HEAD"]).unwrap();
+        run_git_sync(&clone_dir, &["update-ref", "refs/heads/main", &rebased_sha]).unwrap();
+        let rebased_sha = Sha::parse(&rebased_sha).unwrap();
+
+        run_git_sync(
+            &clone_dir,
+            &["worktree", "remove", "--force", temp_work.to_str().unwrap()],
+        )
+        .unwrap();
+
+        // For a single-commit rebase, the parent is the prior main HEAD
+        let worktree = worktree_for_stack(&config, PrNumber(999)).unwrap();
+        run_git_sync(&worktree, &["fetch", "origin", "main"]).unwrap();
+
+        // Verify the parent is the prior main HEAD (same as squash behavior)
+        let parents = super::get_parents(&worktree, rebased_sha.as_str()).unwrap();
+        assert_eq!(
+            parents.len(),
+            1,
+            "Single-commit rebase should have one parent"
+        );
+        assert_eq!(
+            parents[0], main_head_before,
+            "Single-commit rebase parent should be prior main HEAD"
+        );
+
+        let is_valid = is_valid_squash_merge(&worktree, &rebased_sha, "main").unwrap();
+        assert!(
+            is_valid,
+            "Single-commit rebase should be ACCEPTED (indistinguishable from squash)"
+        );
+    }
+
+    /// Test that is_valid_squash_merge accepts a single-commit fast-forward merge.
+    ///
+    /// For a single-commit branch based directly on main, fast-forward merging
+    /// produces the same result as squash: a single commit whose parent is the
+    /// prior main HEAD. This is expected behavior per DESIGN.md.
+    #[test]
+    fn is_valid_squash_merge_accepts_single_commit_fast_forward() {
+        let (_temp_dir, config, _initial_sha) = create_test_repo();
+        let clone_dir = config.clone_dir();
+
+        // Record main HEAD before creating feature
+        let main_head_before =
+            run_git_stdout(&clone_dir, &["rev-parse", "refs/heads/main"]).unwrap();
+        let main_head_before = Sha::parse(&main_head_before).unwrap();
+
+        // Create a feature branch with ONE commit
+        let temp_work = clone_dir.parent().unwrap().join("temp_single_ff");
+        std::fs::create_dir_all(&temp_work).unwrap();
+        run_git_sync(
+            &clone_dir,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                temp_work.to_str().unwrap(),
+                "refs/heads/main",
+            ],
+        )
+        .unwrap();
+        run_git_sync(&temp_work, &["config", "user.email", "test@test.com"]).unwrap();
+        run_git_sync(&temp_work, &["config", "user.name", "Test"]).unwrap();
+
+        // Single commit on feature
+        std::fs::write(temp_work.join("feature.txt"), "feature content").unwrap();
+        run_git_sync(&temp_work, &["add", "."]).unwrap();
+        run_git_sync(&temp_work, &["commit", "-m", "Feature commit"]).unwrap();
+        let feature_sha = run_git_stdout(&temp_work, &["rev-parse", "HEAD"]).unwrap();
+        run_git_sync(&temp_work, &["push", "origin", "HEAD:refs/heads/feature"]).unwrap();
+
+        // Fast-forward main to feature (git merge --ff-only)
+        run_git_sync(&temp_work, &["checkout", "--detach", "refs/heads/main"]).unwrap();
+        run_git_sync(&temp_work, &["merge", "--ff-only", &feature_sha]).unwrap();
+        run_git_sync(&temp_work, &["push", "origin", "HEAD:refs/heads/main"]).unwrap();
+
+        let ff_sha = Sha::parse(&feature_sha).unwrap();
+
+        run_git_sync(
+            &clone_dir,
+            &["worktree", "remove", "--force", temp_work.to_str().unwrap()],
+        )
+        .unwrap();
+
+        // For a single-commit fast-forward, the parent is the prior main HEAD
+        let worktree = worktree_for_stack(&config, PrNumber(999)).unwrap();
+        run_git_sync(&worktree, &["fetch", "origin", "main"]).unwrap();
+
+        // Verify the parent is the prior main HEAD
+        let parents = super::get_parents(&worktree, ff_sha.as_str()).unwrap();
+        assert_eq!(
+            parents.len(),
+            1,
+            "Single-commit fast-forward should have one parent"
+        );
+        assert_eq!(
+            parents[0], main_head_before,
+            "Single-commit fast-forward parent should be prior main HEAD"
+        );
+
+        let is_valid = is_valid_squash_merge(&worktree, &ff_sha, "main").unwrap();
+        assert!(
+            is_valid,
+            "Single-commit fast-forward should be ACCEPTED (indistinguishable from squash)"
+        );
+    }
+
+    /// Test that is_valid_squash_merge rejects a multi-commit branch as invalid squash.
+    ///
+    /// This tests the same scenario as multi-commit rebase: a branch with multiple commits
+    /// where the tip commit's parent is NOT on main's history (it's the previous feature commit).
+    ///
+    /// Note: This tests the branch BEFORE it's merged. After a fast-forward merge, the
+    /// commits become part of main's history and this check would pass. The primary protection
+    /// against multi-commit fast-forward is the preflight check requiring squash-only merges.
+    ///
+    /// This is complementary to is_valid_squash_merge_rejects_multi_commit_rebase, testing
+    /// the same underlying property with a different branch structure.
+    #[test]
+    fn is_valid_squash_merge_rejects_multi_commit_branch() {
+        let (_temp_dir, config, _initial_sha) = create_test_repo();
+        let clone_dir = config.clone_dir();
+
+        // Record main HEAD before creating feature
+        let main_head_before =
+            run_git_stdout(&clone_dir, &["rev-parse", "refs/heads/main"]).unwrap();
+        let main_head_before = Sha::parse(&main_head_before).unwrap();
+
+        // Create a feature branch with TWO commits
+        let temp_work = clone_dir.parent().unwrap().join("temp_multi_branch");
+        std::fs::create_dir_all(&temp_work).unwrap();
+        run_git_sync(
+            &clone_dir,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                temp_work.to_str().unwrap(),
+                "refs/heads/main",
+            ],
+        )
+        .unwrap();
+        run_git_sync(&temp_work, &["config", "user.email", "test@test.com"]).unwrap();
+        run_git_sync(&temp_work, &["config", "user.name", "Test"]).unwrap();
+
+        // First commit on feature
+        std::fs::write(temp_work.join("file1.txt"), "content1").unwrap();
+        run_git_sync(&temp_work, &["add", "."]).unwrap();
+        run_git_sync(&temp_work, &["commit", "-m", "Feature commit 1"]).unwrap();
+        let first_sha = run_git_stdout(&temp_work, &["rev-parse", "HEAD"]).unwrap();
+        let first_sha = Sha::parse(&first_sha).unwrap();
+
+        // Second commit on feature
+        std::fs::write(temp_work.join("file2.txt"), "content2").unwrap();
+        run_git_sync(&temp_work, &["add", "."]).unwrap();
+        run_git_sync(&temp_work, &["commit", "-m", "Feature commit 2"]).unwrap();
+        let second_sha = run_git_stdout(&temp_work, &["rev-parse", "HEAD"]).unwrap();
+        let second_sha = Sha::parse(&second_sha).unwrap();
+
+        // Push feature branch (but DO NOT merge into main)
+        run_git_sync(&temp_work, &["push", "origin", "HEAD:refs/heads/feature"]).unwrap();
+
+        run_git_sync(
+            &clone_dir,
+            &["worktree", "remove", "--force", temp_work.to_str().unwrap()],
+        )
+        .unwrap();
+
+        // Check from a worktree - the second commit has first commit as parent
+        let worktree = worktree_for_stack(&config, PrNumber(999)).unwrap();
+        run_git_sync(&worktree, &["fetch", "origin", "feature"]).unwrap();
+
+        let parents = super::get_parents(&worktree, second_sha.as_str()).unwrap();
+        assert_eq!(parents.len(), 1, "Second commit should have one parent");
+        assert_eq!(
+            parents[0], first_sha,
+            "Second commit's parent should be the first commit"
+        );
+        assert_ne!(
+            parents[0], main_head_before,
+            "Second commit's parent should NOT be main HEAD"
+        );
+
+        // The second commit is NOT on main (feature branch only)
+        // This should be rejected because:
+        // 1. The commit is not on main's history
+        // 2. The parent (first commit) is also not on main's history
+        let is_valid = is_valid_squash_merge(&worktree, &second_sha, "main").unwrap();
+        assert!(
+            !is_valid,
+            "Multi-commit branch tip should be REJECTED (commit not on main)"
+        );
+    }
+
     /// Helper to add a commit to a branch WITHOUT updating remote-tracking refs.
     /// This simulates the scenario where someone else pushes to the remote.
     fn add_commit_without_fetch(

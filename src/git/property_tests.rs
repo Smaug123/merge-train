@@ -280,6 +280,150 @@ proptest! {
         prop_assert!(worktree.join("desc.txt").exists());
     }
 
+    /// Property 1b: Multi-file descendant content is preserved after cascade.
+    ///
+    /// This extends Property 1 to test multiple disjoint files across predecessor
+    /// and descendant branches. All files from both branches must be preserved.
+    #[test]
+    fn multi_file_content_preserved_after_cascade(
+        pred_content1 in "[a-z]{10,30}",
+        pred_content2 in "[a-z]{10,30}",
+        desc_content1 in "[a-z]{10,30}",
+        desc_content2 in "[a-z]{10,30}",
+        desc_content3 in "[a-z]{10,30}",
+    ) {
+        let (_temp_dir, config) = create_test_repo();
+        let clone_dir = config.clone_dir();
+
+        // Create predecessor with MULTIPLE files (simulates multi-commit)
+        let temp_work = clone_dir.parent().unwrap().join("temp_pred_multi");
+        std::fs::create_dir_all(&temp_work).unwrap();
+        run_git_sync(
+            &clone_dir,
+            &["worktree", "add", "--detach", temp_work.to_str().unwrap(), "refs/heads/main"],
+        ).unwrap();
+        run_git_sync(&temp_work, &["config", "user.email", "test@test.com"]).unwrap();
+        run_git_sync(&temp_work, &["config", "user.name", "Test"]).unwrap();
+
+        // Predecessor commit 1
+        std::fs::write(temp_work.join("pred1.txt"), &pred_content1).unwrap();
+        run_git_sync(&temp_work, &["add", "."]).unwrap();
+        run_git_sync(&temp_work, &["commit", "-m", "Pred file 1"]).unwrap();
+
+        // Predecessor commit 2
+        std::fs::write(temp_work.join("pred2.txt"), &pred_content2).unwrap();
+        run_git_sync(&temp_work, &["add", "."]).unwrap();
+        run_git_sync(&temp_work, &["commit", "-m", "Pred file 2"]).unwrap();
+
+        let pred_sha = run_git_stdout(&temp_work, &["rev-parse", "HEAD"]).unwrap();
+        run_git_sync(&temp_work, &["push", "origin", "HEAD:refs/heads/pr-123"]).unwrap();
+        let pred_sha = Sha::parse(&pred_sha).unwrap();
+        run_git_sync(&clone_dir, &["update-ref", "refs/pull/123/head", pred_sha.as_str()]).unwrap();
+
+        // Create descendant from predecessor with MULTIPLE files
+        run_git_sync(&temp_work, &["checkout", "--detach", &pred_sha.as_str()]).unwrap();
+
+        // Descendant commit 1
+        std::fs::write(temp_work.join("desc1.txt"), &desc_content1).unwrap();
+        run_git_sync(&temp_work, &["add", "."]).unwrap();
+        run_git_sync(&temp_work, &["commit", "-m", "Desc file 1"]).unwrap();
+
+        // Descendant commit 2
+        std::fs::write(temp_work.join("desc2.txt"), &desc_content2).unwrap();
+        run_git_sync(&temp_work, &["add", "."]).unwrap();
+        run_git_sync(&temp_work, &["commit", "-m", "Desc file 2"]).unwrap();
+
+        // Descendant commit 3
+        std::fs::write(temp_work.join("desc3.txt"), &desc_content3).unwrap();
+        run_git_sync(&temp_work, &["add", "."]).unwrap();
+        run_git_sync(&temp_work, &["commit", "-m", "Desc file 3"]).unwrap();
+
+        run_git_sync(&temp_work, &["push", "origin", "HEAD:refs/heads/pr-124"]).unwrap();
+        run_git_sync(&clone_dir, &["worktree", "remove", "--force", temp_work.to_str().unwrap()]).unwrap();
+
+        // Prepare, squash, reconcile, catch-up
+        let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
+        prepare_descendant(&worktree, "pr-124", 123, false).unwrap();
+        run_git_sync(&worktree, &["push", "origin", "HEAD:refs/heads/pr-124", "--force"]).unwrap();
+
+        let squash_sha = squash_merge_to_main(&config, &pred_sha);
+        reconcile_descendant(&worktree, "pr-124", &squash_sha, "main", false).unwrap();
+        catch_up_descendant(&worktree, "pr-124", "main", false).unwrap();
+
+        // Verify ALL predecessor files preserved
+        prop_assert!(worktree.join("pred1.txt").exists(), "pred1.txt should exist");
+        prop_assert!(worktree.join("pred2.txt").exists(), "pred2.txt should exist");
+        prop_assert_eq!(read_file(&worktree, "pred1.txt"), Some(pred_content1));
+        prop_assert_eq!(read_file(&worktree, "pred2.txt"), Some(pred_content2));
+
+        // Verify ALL descendant files preserved
+        prop_assert!(worktree.join("desc1.txt").exists(), "desc1.txt should exist");
+        prop_assert!(worktree.join("desc2.txt").exists(), "desc2.txt should exist");
+        prop_assert!(worktree.join("desc3.txt").exists(), "desc3.txt should exist");
+        prop_assert_eq!(read_file(&worktree, "desc1.txt"), Some(desc_content1));
+        prop_assert_eq!(read_file(&worktree, "desc2.txt"), Some(desc_content2));
+        prop_assert_eq!(read_file(&worktree, "desc3.txt"), Some(desc_content3));
+    }
+
+    /// Property 2b: Multiple intervening main commits are preserved.
+    ///
+    /// This extends Property 2 to test:
+    /// 1. Intervening commits that land BEFORE the squash (via $SQUASH_SHA^)
+    /// 2. Intervening commits that land AFTER the squash (via catch-up)
+    /// Both types must be preserved in the final state.
+    #[test]
+    fn multiple_intervening_commits_preserved(
+        pred_content in "[a-z]{10,30}",
+        desc_content in "[a-z]{10,30}",
+        before_squash_content1 in "[a-z]{10,30}",
+        before_squash_content2 in "[a-z]{10,30}",
+        after_squash_content in "[a-z]{10,30}",
+    ) {
+        let (_temp_dir, config) = create_test_repo();
+
+        // Create predecessor and descendant
+        let pred_sha = create_branch_with_file(&config, "pr-123", "pred.txt", &pred_content, "main");
+        create_pr_ref(&config, 123, &pred_sha);
+        let _desc_sha = create_branch_with_file(&config, "pr-124", "desc.txt", &desc_content, "pr-123");
+
+        // Prepare descendant
+        let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
+        prepare_descendant(&worktree, "pr-124", 123, false).unwrap();
+        run_git_sync(&worktree, &["push", "origin", "HEAD:refs/heads/pr-124", "--force"]).unwrap();
+
+        // === Two commits land on main BEFORE the squash ===
+        // These get incorporated via $SQUASH_SHA^ (parent of squash)
+        let _before1 = add_commit_to_main(&config, "before1.txt", &before_squash_content1);
+        let _before2 = add_commit_to_main(&config, "before2.txt", &before_squash_content2);
+
+        // Squash merge predecessor
+        let squash_sha = squash_merge_to_main(&config, &pred_sha);
+
+        // === One commit lands on main AFTER the squash ===
+        // This gets incorporated via catch-up
+        let _after = add_commit_to_main(&config, "after.txt", &after_squash_content);
+
+        // Reconcile and catch up
+        reconcile_descendant(&worktree, "pr-124", &squash_sha, "main", false).unwrap();
+        catch_up_descendant(&worktree, "pr-124", "main", false).unwrap();
+
+        // Verify BEFORE-squash commits are preserved (via $SQUASH_SHA^)
+        prop_assert!(worktree.join("before1.txt").exists(), "before1.txt should exist (pre-squash commit via $SQUASH_SHA^)");
+        prop_assert!(worktree.join("before2.txt").exists(), "before2.txt should exist (pre-squash commit via $SQUASH_SHA^)");
+        prop_assert_eq!(read_file(&worktree, "before1.txt"), Some(before_squash_content1));
+        prop_assert_eq!(read_file(&worktree, "before2.txt"), Some(before_squash_content2));
+
+        // Verify AFTER-squash commit is preserved (via catch-up)
+        prop_assert!(worktree.join("after.txt").exists(), "after.txt should exist (post-squash commit via catch-up)");
+        prop_assert_eq!(read_file(&worktree, "after.txt"), Some(after_squash_content));
+
+        // Verify original content still present
+        prop_assert!(worktree.join("pred.txt").exists());
+        prop_assert!(worktree.join("desc.txt").exists());
+        prop_assert_eq!(read_file(&worktree, "pred.txt"), Some(pred_content));
+        prop_assert_eq!(read_file(&worktree, "desc.txt"), Some(desc_content));
+    }
+
     /// Property 3: Squash parent ordering prevents lost commits.
     ///
     /// The reconciliation uses $SQUASH_SHA^ (parent of squash) to ensure that
