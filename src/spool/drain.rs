@@ -73,11 +73,22 @@ pub fn drain_pending(spool_dir: &Path) -> Result<Vec<SpooledDelivery>> {
 /// - Any `.proc` without `.done` is from a previous crashed run
 /// - Removing these `.proc` markers allows the deliveries to be reprocessed
 /// - No race condition is possible because no workers are running yet
+///
+/// # Durability
+///
+/// After removing all orphaned `.proc` markers, this function fsyncs the
+/// directory to ensure the deletions are durable. Without this, a power
+/// loss could "resurrect" the deleted markers (see DESIGN.md: "All directory
+/// fsyncs are mandatory, not best-effort").
 pub fn cleanup_interrupted_processing(spool_dir: &Path) -> Result<()> {
+    use crate::persistence::fsync::fsync_dir;
+
     // If spool directory doesn't exist, nothing to clean up
     if !spool_dir.exists() {
         return Ok(());
     }
+
+    let mut removed_any = false;
 
     for entry in std::fs::read_dir(spool_dir)? {
         let entry = entry?;
@@ -90,9 +101,17 @@ pub fn cleanup_interrupted_processing(spool_dir: &Path) -> Result<()> {
             if !done_path.exists() {
                 // No .done marker means processing was interrupted
                 // Remove the .proc marker so it can be reprocessed
-                let _ = std::fs::remove_file(&path);
+                if std::fs::remove_file(&path).is_ok() {
+                    removed_any = true;
+                }
             }
         }
+    }
+
+    // fsync the directory to ensure all deletions are durable.
+    // Only do this if we actually removed something to avoid unnecessary IO.
+    if removed_any {
+        fsync_dir(spool_dir)?;
     }
 
     Ok(())

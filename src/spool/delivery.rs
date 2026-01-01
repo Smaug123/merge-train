@@ -329,12 +329,31 @@ fn create_marker_file(path: &Path, spool_dir: &Path) -> Result<()> {
 /// Removes a spooled delivery and all its marker files.
 ///
 /// This should be called after the grace period has passed for done deliveries.
+///
+/// # Deletion Order (Crash Safety)
+///
+/// Files are deleted in this order to ensure crash safety:
+/// 1. **Payload first**: The payload is deleted before any markers. This ensures
+///    that if we crash mid-cleanup, the delivery cannot become "pending" again.
+///    (`is_pending()` requires `payload_path.exists()`, so deleting the payload
+///    first prevents reprocessing.)
+/// 2. **Markers second**: After the payload is gone, marker deletion order doesn't
+///    matter. Orphaned markers are harmless (they just consume disk space).
+/// 3. **Directory fsync last**: Ensures all deletions are durable. Without this,
+///    a power loss could "resurrect" deleted files.
+///
+/// The WRONG order (markers before payload) would be dangerous: a crash after
+/// deleting `.done` but before deleting the payload would leave a payload without
+/// a done marker, which `drain_pending()` would treat as pending → reprocessing!
 pub fn remove_delivery(delivery: &SpooledDelivery) -> Result<()> {
-    // Remove in reverse order: done marker, proc marker, payload
-    // Ignore "not found" errors since partial cleanup is fine
+    // CRITICAL: Delete payload FIRST to prevent reprocessing on crash.
+    // If we crash after this, the delivery cannot become pending again because
+    // is_pending() requires the payload file to exist.
+    let _ = std::fs::remove_file(&delivery.payload_path);
+
+    // Now safe to delete markers (orphaned markers are harmless)
     let _ = std::fs::remove_file(delivery.done_marker_path());
     let _ = std::fs::remove_file(delivery.proc_marker_path());
-    let _ = std::fs::remove_file(&delivery.payload_path);
 
     // Clean up any orphaned temp files from interrupted spool operations.
     // These have the pattern <id>.json.tmp.<pid>.<counter> or the legacy <id>.json.tmp
@@ -359,6 +378,11 @@ pub fn remove_delivery(delivery: &SpooledDelivery) -> Result<()> {
     let proc_temp = delivery.proc_marker_path().with_extension("proc.tmp");
     let _ = std::fs::remove_file(done_temp);
     let _ = std::fs::remove_file(proc_temp);
+
+    // fsync the directory to ensure all deletions are durable.
+    // Without this, a power loss could "resurrect" deleted files.
+    // See DESIGN.md: "All directory fsyncs are mandatory, not best-effort."
+    fsync_dir(&delivery.spool_dir)?;
 
     Ok(())
 }
@@ -796,6 +820,185 @@ mod tests {
             // Re-spooling should fail (done marker blocks it)
             let result = spool_delivery(spool_dir, &delivery_id, b"new payload");
             prop_assert!(matches!(result, Err(SpoolError::DuplicateDelivery(_))));
+        }
+
+        // ─── Crash-during-cleanup property tests ───
+        //
+        // These tests verify that a crash during remove_delivery does not
+        // cause already-processed deliveries to be reprocessed on recovery.
+        //
+        // The FIX (payload deleted before markers) ensures that any crash during
+        // remove_delivery leaves the system in a safe state:
+        // - Crash before payload deletion: .done marker still exists → is_done() = true
+        // - Crash after payload deletion: no payload → is_pending() = false
+        //   (is_pending requires payload_path.exists())
+
+        /// Crash during remove_delivery BEFORE payload deletion: delivery stays done.
+        ///
+        /// If remove_delivery crashes before deleting the payload, all files
+        /// including the .done marker still exist → delivery is still done.
+        #[test]
+        fn crash_before_payload_deletion_stays_done(
+            delivery_id in arb_delivery_id(),
+            payload in arb_payload(),
+        ) {
+            use crate::spool::drain::cleanup_interrupted_processing;
+
+            let dir = tempdir().unwrap();
+            let spool_dir = dir.path();
+
+            // Set up a completed delivery
+            let delivery = spool_delivery(spool_dir, &delivery_id, &payload).unwrap();
+            mark_processing(&delivery).unwrap();
+            mark_done(&delivery).unwrap();
+
+            // Simulate crash BEFORE remove_delivery does anything
+            // All files still exist: payload, .proc, .done
+
+            // Run recovery
+            cleanup_interrupted_processing(spool_dir).unwrap();
+
+            // Delivery is still done, not pending
+            prop_assert!(delivery.is_done(), "Delivery should still be done");
+            prop_assert!(!delivery.is_pending(), "Delivery should not be pending");
+        }
+
+        /// Crash during remove_delivery AFTER payload deletion: delivery not pending.
+        ///
+        /// The FIX ensures payload is deleted FIRST. If we crash after payload
+        /// deletion but before marker deletion, the delivery cannot be pending
+        /// because is_pending() requires payload_path.exists() to be true.
+        #[test]
+        fn crash_after_payload_deletion_not_pending(
+            delivery_id in arb_delivery_id(),
+            payload in arb_payload(),
+        ) {
+            use crate::spool::drain::cleanup_interrupted_processing;
+
+            let dir = tempdir().unwrap();
+            let spool_dir = dir.path();
+
+            // Set up a completed delivery
+            let delivery = spool_delivery(spool_dir, &delivery_id, &payload).unwrap();
+            mark_processing(&delivery).unwrap();
+            mark_done(&delivery).unwrap();
+
+            // Simulate crash AFTER payload deletion but BEFORE marker deletion.
+            // This is the state after step 1 of the FIXED remove_delivery:
+            // - Payload: DELETED
+            // - .done marker: still exists
+            // - .proc marker: still exists
+            std::fs::remove_file(&delivery.payload_path).ok();
+
+            // Run recovery
+            cleanup_interrupted_processing(spool_dir).unwrap();
+
+            // CRITICAL: Not pending because payload doesn't exist
+            prop_assert!(
+                !delivery.is_pending(),
+                "Delivery must not be pending after payload deletion. \
+                 payload exists: {}, proc exists: {}, done exists: {}",
+                delivery.payload_path.exists(),
+                delivery.proc_marker_path().exists(),
+                delivery.done_marker_path().exists()
+            );
+
+            // The .done marker still exists, so is_done() is true
+            prop_assert!(delivery.is_done(), ".done marker should still exist");
+        }
+
+        /// Crash after payload and .done marker deletion: still not pending.
+        ///
+        /// Tests the state after both payload and .done are deleted but .proc remains.
+        #[test]
+        fn crash_after_payload_and_done_deletion_not_pending(
+            delivery_id in arb_delivery_id(),
+            payload in arb_payload(),
+        ) {
+            use crate::spool::drain::cleanup_interrupted_processing;
+
+            let dir = tempdir().unwrap();
+            let spool_dir = dir.path();
+
+            // Set up a completed delivery
+            let delivery = spool_delivery(spool_dir, &delivery_id, &payload).unwrap();
+            mark_processing(&delivery).unwrap();
+            mark_done(&delivery).unwrap();
+
+            // Simulate crash after payload and .done deletion:
+            // - Payload: DELETED
+            // - .done marker: DELETED
+            // - .proc marker: still exists
+            std::fs::remove_file(&delivery.payload_path).ok();
+            std::fs::remove_file(delivery.done_marker_path()).ok();
+
+            // Run recovery
+            cleanup_interrupted_processing(spool_dir).unwrap();
+
+            // CRITICAL: Not pending because payload doesn't exist
+            prop_assert!(
+                !delivery.is_pending(),
+                "Delivery must not be pending - no payload. \
+                 payload exists: {}, proc exists: {}, done exists: {}",
+                delivery.payload_path.exists(),
+                delivery.proc_marker_path().exists(),
+                delivery.done_marker_path().exists()
+            );
+        }
+
+        /// Regression test: OLD buggy deletion order would cause reprocessing.
+        ///
+        /// This test documents the bug that existed before the fix: if markers
+        /// were deleted before the payload, a crash could leave the system in
+        /// a state where is_pending() returns true for an already-processed delivery.
+        ///
+        /// This scenario (markers gone, payload exists) should be impossible with
+        /// the FIXED code, but could occur with:
+        /// 1. Legacy data from before the fix
+        /// 2. External tampering (manual deletion of markers)
+        ///
+        /// We document this as a known limitation - the system cannot distinguish
+        /// between a legitimately pending delivery and one whose markers were
+        /// externally deleted.
+        #[test]
+        fn legacy_buggy_state_documented(
+            delivery_id in arb_delivery_id(),
+            payload in arb_payload(),
+        ) {
+            use crate::spool::drain::cleanup_interrupted_processing;
+
+            let dir = tempdir().unwrap();
+            let spool_dir = dir.path();
+
+            // Set up a completed delivery
+            let delivery = spool_delivery(spool_dir, &delivery_id, &payload).unwrap();
+            mark_processing(&delivery).unwrap();
+            mark_done(&delivery).unwrap();
+
+            // Simulate the LEGACY BUGGY state: markers deleted, payload remains.
+            // This can ONLY happen with:
+            // 1. Old code that deleted markers before payload
+            // 2. External tampering
+            std::fs::remove_file(delivery.done_marker_path()).ok();
+            std::fs::remove_file(delivery.proc_marker_path()).ok();
+            // payload still exists - this is the dangerous state
+
+            // Run recovery
+            cleanup_interrupted_processing(spool_dir).unwrap();
+
+            // KNOWN LIMITATION: In this corrupted state, is_pending() returns true.
+            // The system has no way to know this delivery was previously processed.
+            // This test documents the limitation rather than asserting it's fixed.
+            prop_assert!(
+                delivery.is_pending(),
+                "Expected: legacy corrupted state appears pending (known limitation). \
+                 The FIX prevents this state from occurring with new code."
+            );
+
+            // The FIX prevents this state from occurring during normal operation.
+            // For legacy data migration, operators should either:
+            // 1. Re-run with old state cleared
+            // 2. Accept potential reprocessing of in-flight deliveries during upgrade
         }
     }
 
