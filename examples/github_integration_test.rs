@@ -52,6 +52,13 @@ async fn main() -> anyhow::Result<()> {
         anyhow::anyhow!("TEST_REPO environment variable not set (e.g., owner/repo)")
     })?;
 
+    // Strip GitHub URL prefix if present (accept both "owner/repo" and "https://github.com/owner/repo")
+    let test_repo = test_repo
+        .strip_prefix("https://github.com/")
+        .or_else(|| test_repo.strip_prefix("http://github.com/"))
+        .or_else(|| test_repo.strip_prefix("github.com/"))
+        .unwrap_or(&test_repo);
+
     let (owner, repo) = test_repo
         .split_once('/')
         .ok_or_else(|| anyhow::anyhow!("TEST_REPO must be in owner/repo format"))?;

@@ -152,7 +152,9 @@ impl GitHubApiError {
     /// - Error message patterns for known GitHub API responses
     pub fn from_octocrab(err: octocrab::Error) -> Self {
         let status_code = Self::extract_status_code(&err);
-        let message = err.to_string();
+        // octocrab's Display just returns "GitHub", so we traverse the error source
+        // chain to find the actual error message
+        let message = Self::extract_message(&err);
 
         // Check for specific transient messages first
         if is_transient_message(&message) {
@@ -264,6 +266,34 @@ impl GitHubApiError {
         }
 
         None
+    }
+
+    /// Extracts a useful error message from an octocrab error.
+    ///
+    /// octocrab's Display impl just returns "GitHub", so we traverse the error
+    /// source chain to find the actual message from the underlying GitHubError.
+    pub fn extract_message(err: &octocrab::Error) -> String {
+        use std::error::Error;
+
+        // Walk the source chain to find useful messages
+        let mut messages = Vec::new();
+        let mut current: Option<&(dyn Error + 'static)> = Some(err);
+
+        while let Some(e) = current {
+            let msg = e.to_string();
+            // Skip the unhelpful "GitHub" message from octocrab's Display
+            if msg != "GitHub" && !msg.is_empty() {
+                messages.push(msg);
+            }
+            current = e.source();
+        }
+
+        if messages.is_empty() {
+            // Fallback to Debug if we couldn't find anything useful
+            format!("{:?}", err)
+        } else {
+            messages.join(": ")
+        }
     }
 }
 

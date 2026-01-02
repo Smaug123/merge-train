@@ -493,7 +493,7 @@ async fn squash_merge(
         }
         Err(e) => {
             // Check if this is a SHA mismatch (409 Conflict with specific message)
-            let err_str = e.to_string();
+            let err_str = GitHubApiError::extract_message(&e);
             if is_sha_mismatch_error(&err_str) {
                 Err(GitHubApiError::sha_mismatch(pr, &expected_sha, e))
             } else {
@@ -673,7 +673,8 @@ pub fn should_fallback_to_unknown(err_str: &str) -> bool {
     let err_lower = err_str.to_lowercase();
     let is_not_found = err_str.contains("404") || err_lower.contains("not found");
     let is_forbidden = err_str.contains("403") || err_lower.contains("forbidden");
-    is_not_found || is_forbidden
+    let is_not_protected = err_lower.contains("not protected");
+    is_not_found || is_forbidden || is_not_protected
 }
 
 async fn get_branch_protection(
@@ -722,7 +723,7 @@ async fn get_branch_protection(
             }))
         }
         Err(e) => {
-            let err_str = e.to_string();
+            let err_str = GitHubApiError::extract_message(&e);
             if should_fallback_to_unknown(&err_str) {
                 tracing::warn!(
                     branch = %branch,
@@ -813,7 +814,7 @@ async fn get_rulesets(client: &OctocrabClient) -> Result<GitHubResponse, GitHubA
             Ok(GitHubResponse::Rulesets(data))
         }
         Err(e) => {
-            let err_str = e.to_string();
+            let err_str = GitHubApiError::extract_message(&e);
             if should_fallback_to_unknown(&err_str) {
                 tracing::warn!(
                     error = %err_str,
