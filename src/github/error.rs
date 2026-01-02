@@ -165,12 +165,21 @@ impl GitHubApiError {
         }
 
         // Categorize by status code
+        //
+        // NOTE: HTTP 409 is NOT automatically treated as ShaMismatch here.
+        // A 409 can indicate:
+        // - SHA mismatch on merge (head branch was modified)
+        // - Merge conflicts (PR is not mergeable)
+        // - Other conflicts
+        //
+        // The distinction is made at the call site (e.g., squash_merge) where we can
+        // inspect the specific error message to determine if it's a retriable SHA
+        // mismatch or a permanent merge conflict.
         let kind = match status_code {
-            Some(409) => GitHubErrorKind::ShaMismatch,
             Some(429) => GitHubErrorKind::Transient, // Rate limited
             Some(403) if is_rate_limit_error(&message) => GitHubErrorKind::Transient,
             Some(code) if (500..600).contains(&code) => GitHubErrorKind::Transient,
-            Some(_) => GitHubErrorKind::Permanent, // Other 4xx
+            Some(_) => GitHubErrorKind::Permanent, // 4xx including 409
             None => {
                 // No status code - check if it's a network error
                 if is_network_error(&message) {

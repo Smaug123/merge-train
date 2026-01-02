@@ -30,6 +30,9 @@ fs2 = "0.4"
 thiserror = "2"
 anyhow = "1"
 
+# URL encoding
+urlencoding = "2"
+
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"

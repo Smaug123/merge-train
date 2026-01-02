@@ -144,9 +144,13 @@ async fn get_pr(client: &OctocrabClient, pr: PrNumber) -> Result<GitHubResponse,
             let state = match pull.merged_at {
                 Some(_) => {
                     // PR is merged - get merge commit SHA
+                    //
+                    // IMPORTANT: GitHub's API has eventual consistency. After a PR is merged,
+                    // merge_commit_sha may not be populated immediately. Per DESIGN.md, we
+                    // treat this as a transient error to allow retry with backoff.
                     let sha = pull.merge_commit_sha.as_ref().ok_or_else(|| {
-                        GitHubApiError::permanent_without_source(format!(
-                            "PR {} is merged but has no merge_commit_sha",
+                        GitHubApiError::transient_without_source(format!(
+                            "PR {} is merged but merge_commit_sha not yet available (eventual consistency)",
                             pr
                         ))
                     })?;
@@ -247,6 +251,9 @@ async fn list_recently_merged_prs(
     let mut page = 1u32;
     let mut all_prs = Vec::new();
 
+    // Safety limit to prevent runaway pagination on repos with many closed PRs
+    const MAX_PAGES: u32 = 10;
+
     loop {
         let result = client
             .inner()
@@ -264,27 +271,28 @@ async fn list_recently_merged_prs(
             Ok(page_result) => {
                 let items = page_result.items;
                 let is_last_page = items.len() < 100;
-                let mut found_old_pr = false;
+
+                // Track how many PRs on this page have merged_at within our window.
+                // We only stop early if the ENTIRE page has no recent merges,
+                // because sorting by `updated` doesn't guarantee merge order.
+                // An old PR with a recent comment appears early, but recent merges
+                // could still be on later pages.
+                let mut page_had_recent_merge = false;
 
                 for pull in items {
-                    // Check if this PR is too old
-                    if let Some(updated_at) = pull.updated_at
-                        && updated_at < since
-                    {
-                        found_old_pr = true;
-                        continue;
-                    }
-
-                    // Only include merged PRs
+                    // Only include merged PRs with merged_at within our window
                     let _merged_at = match pull.merged_at {
-                        Some(t) if t >= since => t,
-                        Some(_) => {
-                            found_old_pr = true;
-                            continue;
+                        Some(t) if t >= since => {
+                            page_had_recent_merge = true;
+                            t
                         }
-                        None => continue, // Closed but not merged
+                        Some(_) => continue, // Merged but too old
+                        None => continue,    // Closed but not merged
                     };
 
+                    // IMPORTANT: GitHub's API has eventual consistency. After a PR is merged,
+                    // merge_commit_sha may not be populated immediately. Per DESIGN.md, we
+                    // treat this as a transient error to allow retry with backoff.
                     let merge_commit_sha = match &pull.merge_commit_sha {
                         Some(sha) => match Sha::parse(sha) {
                             Ok(s) => s,
@@ -294,11 +302,10 @@ async fn list_recently_merged_prs(
                             }
                         },
                         None => {
-                            tracing::warn!(
-                                pr = pull.number,
-                                "Skipping merged PR without merge_commit_sha"
-                            );
-                            continue;
+                            return Err(GitHubApiError::transient_without_source(format!(
+                                "PR {} is merged but merge_commit_sha not yet available (eventual consistency)",
+                                pull.number
+                            )));
                         }
                     };
 
@@ -320,8 +327,14 @@ async fn list_recently_merged_prs(
                     });
                 }
 
-                // Stop if we've hit old PRs or last page
-                if found_old_pr || is_last_page {
+                // Stop if:
+                // 1. This is the last page (< 100 items)
+                // 2. This entire page had no recent merges (all were old or not merged)
+                // 3. We've hit the safety limit
+                //
+                // We do NOT stop just because we saw some old PRs, because the
+                // `updated` sort order doesn't correlate with `merged_at`.
+                if is_last_page || !page_had_recent_merge || page >= MAX_PAGES {
                     break;
                 }
                 page += 1;
@@ -450,12 +463,17 @@ async fn squash_merge(
             }
         }
         Err(e) => {
-            // Check if this is a SHA mismatch (409 Conflict)
-            let err_str = e.to_string();
-            if err_str.contains("409")
-                || err_str.to_lowercase().contains("head branch was modified")
-                || err_str.to_lowercase().contains("sha")
-            {
+            // Check if this is a SHA mismatch (409 Conflict with specific message)
+            //
+            // GitHub returns 409 for multiple reasons:
+            // - SHA mismatch: "Head branch was modified. Review and try the merge again."
+            // - Merge conflicts: "Merge conflict" or similar
+            //
+            // We only treat it as ShaMismatch (which triggers re-evaluation) if the
+            // message specifically indicates the head branch changed. Other 409 errors
+            // (like merge conflicts) are permanent failures.
+            let err_str = e.to_string().to_lowercase();
+            if err_str.contains("head branch was modified") {
                 Err(GitHubApiError::sha_mismatch(pr, &expected_sha, e))
             } else {
                 Err(GitHubApiError::from_octocrab(e))
@@ -622,11 +640,14 @@ async fn get_branch_protection(
     client: &OctocrabClient,
     branch: String,
 ) -> Result<GitHubResponse, GitHubApiError> {
+    // URL-encode the branch name to handle special characters like '/'
+    // e.g., "feature/foo" -> "feature%2Ffoo"
+    let encoded_branch = urlencoding::encode(&branch);
     let url = format!(
         "/repos/{}/{}/branches/{}/protection",
         client.owner(),
         client.repo_name(),
-        branch
+        encoded_branch
     );
 
     let result: Result<BranchProtectionResponse, _> = client.inner().get(&url, None::<&()>).await;
@@ -638,10 +659,22 @@ async fn get_branch_protection(
                 .map(|r| r.dismiss_stale_reviews)
                 .unwrap_or(false);
 
-            let required_status_checks = protection
-                .required_status_checks
-                .map(|r| r.contexts)
-                .unwrap_or_default();
+            // Combine legacy `contexts` with modern `checks` array.
+            // The modern format has: {"checks": [{"context": "ci/build", "app_id": 123}]}
+            // We extract just the context names for compatibility.
+            let mut required_status_checks = Vec::new();
+            if let Some(ref checks_config) = protection.required_status_checks {
+                // Add legacy contexts
+                required_status_checks.extend(checks_config.contexts.iter().cloned());
+
+                // Add modern checks (extract context names)
+                for check in &checks_config.checks {
+                    // Avoid duplicates if the same context appears in both
+                    if !required_status_checks.contains(&check.context) {
+                        required_status_checks.push(check.context.clone());
+                    }
+                }
+            }
 
             Ok(GitHubResponse::BranchProtection(BranchProtectionData {
                 dismiss_stale_reviews,
@@ -649,9 +682,21 @@ async fn get_branch_protection(
             }))
         }
         Err(e) => {
-            // 404 means no branch protection - return defaults
+            // 404 can mean:
+            // 1. Branch has no protection rules
+            // 2. User lacks permission to view protection rules
+            // 3. Branch doesn't exist
+            //
+            // We cannot distinguish these cases via the API. We log a warning
+            // and return empty protection, but callers should be aware this
+            // may under-detect protections if permissions are restricted.
             let err_str = e.to_string();
             if err_str.contains("404") || err_str.to_lowercase().contains("not found") {
+                tracing::warn!(
+                    branch = %branch,
+                    "Branch protection returned 404 - could be no protection, \
+                     insufficient permissions, or missing branch"
+                );
                 Ok(GitHubResponse::BranchProtection(BranchProtectionData {
                     dismiss_stale_reviews: false,
                     required_status_checks: vec![],
@@ -676,7 +721,21 @@ struct RequiredPullRequestReviews {
 
 #[derive(Debug, Deserialize)]
 struct RequiredStatusChecks {
+    /// Legacy status check contexts (array of strings)
+    #[serde(default)]
     contexts: Vec<String>,
+    /// Modern status checks with app_id (GitHub Apps)
+    #[serde(default)]
+    checks: Vec<RequiredStatusCheck>,
+}
+
+/// A modern required status check entry with optional app_id
+#[derive(Debug, Deserialize)]
+struct RequiredStatusCheck {
+    context: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    app_id: Option<i64>,
 }
 
 async fn get_rulesets(client: &OctocrabClient) -> Result<GitHubResponse, GitHubApiError> {
