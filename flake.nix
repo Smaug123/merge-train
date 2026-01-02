@@ -39,6 +39,7 @@
 
         nativeBuildInputs = with pkgs; [
           pkg-config
+          git # needed for property tests that create git repos
         ];
 
         buildInputs = with pkgs; [

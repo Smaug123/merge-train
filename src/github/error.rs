@@ -152,7 +152,9 @@ impl GitHubApiError {
     /// - Error message patterns for known GitHub API responses
     pub fn from_octocrab(err: octocrab::Error) -> Self {
         let status_code = Self::extract_status_code(&err);
-        let message = err.to_string();
+        // octocrab's Display just returns "GitHub", so we traverse the error source
+        // chain to find the actual error message
+        let message = Self::extract_message(&err);
 
         // Check for specific transient messages first
         if is_transient_message(&message) {
@@ -165,12 +167,21 @@ impl GitHubApiError {
         }
 
         // Categorize by status code
+        //
+        // NOTE: HTTP 409 is NOT automatically treated as ShaMismatch here.
+        // A 409 can indicate:
+        // - SHA mismatch on merge (head branch was modified)
+        // - Merge conflicts (PR is not mergeable)
+        // - Other conflicts
+        //
+        // The distinction is made at the call site (e.g., squash_merge) where we can
+        // inspect the specific error message to determine if it's a retriable SHA
+        // mismatch or a permanent merge conflict.
         let kind = match status_code {
-            Some(409) => GitHubErrorKind::ShaMismatch,
             Some(429) => GitHubErrorKind::Transient, // Rate limited
             Some(403) if is_rate_limit_error(&message) => GitHubErrorKind::Transient,
             Some(code) if (500..600).contains(&code) => GitHubErrorKind::Transient,
-            Some(_) => GitHubErrorKind::Permanent, // Other 4xx
+            Some(_) => GitHubErrorKind::Permanent, // 4xx including 409
             None => {
                 // No status code - check if it's a network error
                 if is_network_error(&message) {
@@ -256,6 +267,34 @@ impl GitHubApiError {
 
         None
     }
+
+    /// Extracts a useful error message from an octocrab error.
+    ///
+    /// octocrab's Display impl just returns "GitHub", so we traverse the error
+    /// source chain to find the actual message from the underlying GitHubError.
+    pub fn extract_message(err: &octocrab::Error) -> String {
+        use std::error::Error;
+
+        // Walk the source chain to find useful messages
+        let mut messages = Vec::new();
+        let mut current: Option<&(dyn Error + 'static)> = Some(err);
+
+        while let Some(e) = current {
+            let msg = e.to_string();
+            // Skip the unhelpful "GitHub" message from octocrab's Display
+            if msg != "GitHub" && !msg.is_empty() {
+                messages.push(msg);
+            }
+            current = e.source();
+        }
+
+        if messages.is_empty() {
+            // Fallback to Debug if we couldn't find anything useful
+            format!("{:?}", err)
+        } else {
+            messages.join(": ")
+        }
+    }
 }
 
 /// Checks if an error message indicates a transient condition.
@@ -263,7 +302,7 @@ impl GitHubApiError {
 /// These messages indicate GitHub API quirks that resolve with retries:
 /// - Status check propagation delays after a push
 /// - Concurrent modifications to the base branch
-fn is_transient_message(message: &str) -> bool {
+pub fn is_transient_message(message: &str) -> bool {
     let message_lower = message.to_lowercase();
 
     // Status check hasn't propagated yet
@@ -285,7 +324,7 @@ fn is_transient_message(message: &str) -> bool {
 }
 
 /// Checks if an error message indicates a rate limit.
-fn is_rate_limit_error(message: &str) -> bool {
+pub fn is_rate_limit_error(message: &str) -> bool {
     let message_lower = message.to_lowercase();
     message_lower.contains("rate limit")
         || message_lower.contains("api rate")
@@ -294,7 +333,7 @@ fn is_rate_limit_error(message: &str) -> bool {
 }
 
 /// Checks if an error message indicates a network-level error.
-fn is_network_error(message: &str) -> bool {
+pub fn is_network_error(message: &str) -> bool {
     let message_lower = message.to_lowercase();
     message_lower.contains("timeout")
         || message_lower.contains("connection")

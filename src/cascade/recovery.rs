@@ -329,6 +329,7 @@ pub fn verify_push_completed(
         &intent.branch,
         &intent.expected_tree,
         &intent.pre_push_sha,
+        intent.expected_second_parent.as_ref(),
     )
 }
 

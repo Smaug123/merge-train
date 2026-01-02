@@ -19,7 +19,7 @@ use crate::effects::{
 use crate::types::{CommentId, MergeStateStatus, PrNumber, PrState, Sha};
 
 use super::client::OctocrabClient;
-use super::error::GitHubApiError;
+use super::error::{GitHubApiError, is_rate_limit_error, is_transient_message};
 use super::retry::{RetryConfig, RetryPolicy, retry_with_backoff};
 
 // ─── GraphQL Types ────────────────────────────────────────────────────────────
@@ -39,7 +39,22 @@ query($owner: String!, $repo: String!, $number: Int!) {
 /// Response from the merge state GraphQL query.
 #[derive(Debug, Deserialize)]
 struct MergeStateQueryResponse {
+    data: Option<MergeStateData>,
+    errors: Option<Vec<GraphQLError>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MergeStateData {
     repository: Option<MergeStateRepository>,
+}
+
+/// GraphQL error from GitHub API.
+#[derive(Debug, Deserialize)]
+struct GraphQLError {
+    message: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    r#type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -144,9 +159,13 @@ async fn get_pr(client: &OctocrabClient, pr: PrNumber) -> Result<GitHubResponse,
             let state = match pull.merged_at {
                 Some(_) => {
                     // PR is merged - get merge commit SHA
+                    //
+                    // IMPORTANT: GitHub's API has eventual consistency. After a PR is merged,
+                    // merge_commit_sha may not be populated immediately. Per DESIGN.md, we
+                    // treat this as a transient error to allow retry with backoff.
                     let sha = pull.merge_commit_sha.as_ref().ok_or_else(|| {
-                        GitHubApiError::permanent_without_source(format!(
-                            "PR {} is merged but has no merge_commit_sha",
+                        GitHubApiError::transient_without_source(format!(
+                            "PR {} is merged but merge_commit_sha not yet available (eventual consistency)",
                             pr
                         ))
                     })?;
@@ -247,6 +266,9 @@ async fn list_recently_merged_prs(
     let mut page = 1u32;
     let mut all_prs = Vec::new();
 
+    // Safety limit to prevent runaway pagination on repos with many closed PRs
+    const MAX_PAGES: u32 = 10;
+
     loop {
         let result = client
             .inner()
@@ -264,27 +286,18 @@ async fn list_recently_merged_prs(
             Ok(page_result) => {
                 let items = page_result.items;
                 let is_last_page = items.len() < 100;
-                let mut found_old_pr = false;
 
                 for pull in items {
-                    // Check if this PR is too old
-                    if let Some(updated_at) = pull.updated_at
-                        && updated_at < since
-                    {
-                        found_old_pr = true;
-                        continue;
-                    }
-
-                    // Only include merged PRs
-                    let _merged_at = match pull.merged_at {
-                        Some(t) if t >= since => t,
-                        Some(_) => {
-                            found_old_pr = true;
-                            continue;
-                        }
-                        None => continue, // Closed but not merged
+                    // Only include merged PRs with merged_at within our window
+                    match pull.merged_at {
+                        Some(t) if t >= since => {} // Within window, continue processing
+                        Some(_) => continue,        // Merged but too old
+                        None => continue,           // Closed but not merged
                     };
 
+                    // IMPORTANT: GitHub's API has eventual consistency. After a PR is merged,
+                    // merge_commit_sha may not be populated immediately. Per DESIGN.md, we
+                    // treat this as a transient error to allow retry with backoff.
                     let merge_commit_sha = match &pull.merge_commit_sha {
                         Some(sha) => match Sha::parse(sha) {
                             Ok(s) => s,
@@ -294,11 +307,10 @@ async fn list_recently_merged_prs(
                             }
                         },
                         None => {
-                            tracing::warn!(
-                                pr = pull.number,
-                                "Skipping merged PR without merge_commit_sha"
-                            );
-                            continue;
+                            return Err(GitHubApiError::transient_without_source(format!(
+                                "PR {} is merged but merge_commit_sha not yet available (eventual consistency)",
+                                pull.number
+                            )));
                         }
                     };
 
@@ -320,17 +332,38 @@ async fn list_recently_merged_prs(
                     });
                 }
 
-                // Stop if we've hit old PRs or last page
-                if found_old_pr || is_last_page {
-                    break;
+                // Stop if:
+                // 1. This is the last page (< 100 items)
+                // 2. We've hit the safety limit
+                //
+                // IMPORTANT: We do NOT stop based on whether this page had recent merges.
+                // Results are sorted by `updated` (not `merged_at`), so a page could contain
+                // only old PRs with recent comments while recent merges appear on later pages.
+                // We must paginate through all pages (up to MAX_PAGES) to find all recent merges.
+                if is_last_page {
+                    // Naturally exhausted all pages - results are complete
+                    return Ok(GitHubResponse::RecentlyMergedPrList {
+                        prs: all_prs,
+                        may_be_incomplete: false,
+                    });
+                }
+                if page >= MAX_PAGES {
+                    // Hit the safety limit before exhausting pages - results may be incomplete
+                    tracing::warn!(
+                        pages = page,
+                        prs_found = all_prs.len(),
+                        "Hit pagination limit for recently merged PRs; results may be incomplete"
+                    );
+                    return Ok(GitHubResponse::RecentlyMergedPrList {
+                        prs: all_prs,
+                        may_be_incomplete: true,
+                    });
                 }
                 page += 1;
             }
             Err(e) => return Err(GitHubApiError::from_octocrab(e)),
         }
     }
-
-    Ok(GitHubResponse::PrList(all_prs))
 }
 
 // ─── Merge State (GraphQL) ────────────────────────────────────────────────────
@@ -362,20 +395,57 @@ async fn get_merge_state(
 
     match result {
         Ok(response) => {
-            let pr_data = response
-                .repository
-                .and_then(|r| r.pull_request)
-                .ok_or_else(|| {
-                    GitHubApiError::permanent_without_source(format!("PR {} not found", pr))
-                })?;
+            // Format GraphQL errors for use in error messages
+            let error_hint = response
+                .errors
+                .as_ref()
+                .filter(|e| !e.is_empty())
+                .map(|errors| {
+                    let msgs: Vec<_> = errors.iter().map(|e| e.message.as_str()).collect();
+                    msgs.join("; ")
+                });
 
-            // If PR is a draft, return Draft status regardless of merge_state_status
-            // (GitHub may report CLEAN for a draft PR if CI passes, but it's not mergeable)
-            if pr_data.is_draft {
-                return Ok(GitHubResponse::MergeState(MergeStateStatus::Draft));
+            // Log GraphQL errors if present
+            if let Some(ref errors_str) = error_hint {
+                tracing::warn!(
+                    pr = %pr,
+                    errors = %errors_str,
+                    "GraphQL errors in merge state query"
+                );
             }
 
-            let status = parse_merge_state_status(&pr_data.merge_state_status);
+            // If we have no data at all, report the GraphQL errors
+            if response.data.is_none() {
+                let error_msg = error_hint.unwrap_or_else(|| "no data returned".to_string());
+                let full_msg = format!(
+                    "GraphQL error querying PR {} merge state: {}",
+                    pr, error_msg
+                );
+
+                // Check if the GraphQL error indicates a transient condition
+                // (rate limits, internal errors, "try again" messages)
+                if is_rate_limit_error(&error_msg) || is_transient_message(&error_msg) {
+                    return Err(GitHubApiError::transient_without_source(full_msg));
+                }
+
+                return Err(GitHubApiError::permanent_without_source(full_msg));
+            }
+
+            let pr_data = response
+                .data
+                .and_then(|d| d.repository)
+                .and_then(|r| r.pull_request)
+                .ok_or_else(|| {
+                    let suffix = error_hint
+                        .map(|e| format!(" (GraphQL errors: {})", e))
+                        .unwrap_or_default();
+                    GitHubApiError::permanent_without_source(format!(
+                        "PR {} not found{}",
+                        pr, suffix
+                    ))
+                })?;
+
+            let status = resolve_merge_state(&pr_data.merge_state_status, pr_data.is_draft);
             Ok(GitHubResponse::MergeState(status))
         }
         Err(e) => Err(GitHubApiError::from_octocrab(e)),
@@ -403,7 +473,37 @@ fn parse_merge_state_status(status: &str) -> MergeStateStatus {
     }
 }
 
+/// Resolves the final merge state, applying draft override logic.
+///
+/// GitHub may report CLEAN for a draft PR if CI passes, but draft PRs are not
+/// actually mergeable. This function ensures that `is_draft == true` always
+/// results in `MergeStateStatus::Draft`, regardless of the reported status.
+///
+/// This is a pure function extracted for testability.
+pub fn resolve_merge_state(merge_state_status: &str, is_draft: bool) -> MergeStateStatus {
+    if is_draft {
+        MergeStateStatus::Draft
+    } else {
+        parse_merge_state_status(merge_state_status)
+    }
+}
+
 // ─── Squash Merge ─────────────────────────────────────────────────────────────
+
+/// Checks if an error message indicates a SHA mismatch on merge.
+///
+/// GitHub returns HTTP 409 for multiple reasons:
+/// - SHA mismatch: "Head branch was modified. Review and try the merge again."
+/// - Merge conflicts: "Merge conflict" or similar
+///
+/// We only treat it as a SHA mismatch (which triggers re-evaluation) if the
+/// message specifically indicates the head branch changed. Other 409 errors
+/// (like merge conflicts) are permanent failures.
+///
+/// This is a pure function extracted for testability.
+pub fn is_sha_mismatch_error(err_str: &str) -> bool {
+    err_str.to_lowercase().contains("head branch was modified")
+}
 
 async fn squash_merge(
     client: &OctocrabClient,
@@ -450,12 +550,9 @@ async fn squash_merge(
             }
         }
         Err(e) => {
-            // Check if this is a SHA mismatch (409 Conflict)
-            let err_str = e.to_string();
-            if err_str.contains("409")
-                || err_str.to_lowercase().contains("head branch was modified")
-                || err_str.to_lowercase().contains("sha")
-            {
+            // Check if this is a SHA mismatch (409 Conflict with specific message)
+            let err_str = GitHubApiError::extract_message(&e);
+            if is_sha_mismatch_error(&err_str) {
                 Err(GitHubApiError::sha_mismatch(pr, &expected_sha, e))
             } else {
                 Err(GitHubApiError::from_octocrab(e))
@@ -618,15 +715,38 @@ async fn list_comments(
 
 // ─── Repository Settings ──────────────────────────────────────────────────────
 
+/// Checks if an error message indicates we should fall back to "unknown" status.
+///
+/// For branch protection and ruleset queries, 404/403 errors can mean:
+/// - No protection/rulesets configured
+/// - Insufficient permissions to view settings
+/// - Branch/resource doesn't exist
+///
+/// We cannot distinguish these cases via the API, so we return an "unknown"
+/// status and let callers implement "warn and proceed" per DESIGN.md rather
+/// than silently treating these as "no protection" or failing hard.
+///
+/// This is a pure function extracted for testability.
+pub fn should_fallback_to_unknown(err_str: &str) -> bool {
+    let err_lower = err_str.to_lowercase();
+    let is_not_found = err_str.contains("404") || err_lower.contains("not found");
+    let is_forbidden = err_str.contains("403") || err_lower.contains("forbidden");
+    let is_not_protected = err_lower.contains("not protected");
+    is_not_found || is_forbidden || is_not_protected
+}
+
 async fn get_branch_protection(
     client: &OctocrabClient,
     branch: String,
 ) -> Result<GitHubResponse, GitHubApiError> {
+    // URL-encode the branch name to handle special characters like '/'
+    // e.g., "feature/foo" -> "feature%2Ffoo"
+    let encoded_branch = urlencoding::encode(&branch);
     let url = format!(
         "/repos/{}/{}/branches/{}/protection",
         client.owner(),
         client.repo_name(),
-        branch
+        encoded_branch
     );
 
     let result: Result<BranchProtectionResponse, _> = client.inner().get(&url, None::<&()>).await;
@@ -638,10 +758,22 @@ async fn get_branch_protection(
                 .map(|r| r.dismiss_stale_reviews)
                 .unwrap_or(false);
 
-            let required_status_checks = protection
-                .required_status_checks
-                .map(|r| r.contexts)
-                .unwrap_or_default();
+            // Combine legacy `contexts` with modern `checks` array.
+            // The modern format has: {"checks": [{"context": "ci/build", "app_id": 123}]}
+            // We extract just the context names for compatibility.
+            let mut required_status_checks = Vec::new();
+            if let Some(ref checks_config) = protection.required_status_checks {
+                // Add legacy contexts
+                required_status_checks.extend(checks_config.contexts.iter().cloned());
+
+                // Add modern checks (extract context names)
+                for check in &checks_config.checks {
+                    // Avoid duplicates if the same context appears in both
+                    if !required_status_checks.contains(&check.context) {
+                        required_status_checks.push(check.context.clone());
+                    }
+                }
+            }
 
             Ok(GitHubResponse::BranchProtection(BranchProtectionData {
                 dismiss_stale_reviews,
@@ -649,13 +781,15 @@ async fn get_branch_protection(
             }))
         }
         Err(e) => {
-            // 404 means no branch protection - return defaults
-            let err_str = e.to_string();
-            if err_str.contains("404") || err_str.to_lowercase().contains("not found") {
-                Ok(GitHubResponse::BranchProtection(BranchProtectionData {
-                    dismiss_stale_reviews: false,
-                    required_status_checks: vec![],
-                }))
+            let err_str = GitHubApiError::extract_message(&e);
+            if should_fallback_to_unknown(&err_str) {
+                tracing::warn!(
+                    branch = %branch,
+                    error = %err_str,
+                    "Branch protection query failed - could be no protection, \
+                     insufficient permissions, or missing branch"
+                );
+                Ok(GitHubResponse::BranchProtectionUnknown)
             } else {
                 Err(GitHubApiError::from_octocrab(e))
             }
@@ -676,7 +810,21 @@ struct RequiredPullRequestReviews {
 
 #[derive(Debug, Deserialize)]
 struct RequiredStatusChecks {
+    /// Legacy status check contexts (array of strings)
+    #[serde(default)]
     contexts: Vec<String>,
+    /// Modern status checks with app_id (GitHub Apps)
+    #[serde(default)]
+    checks: Vec<RequiredStatusCheck>,
+}
+
+/// A modern required status check entry with optional app_id
+#[derive(Debug, Deserialize)]
+struct RequiredStatusCheck {
+    context: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    app_id: Option<i64>,
 }
 
 async fn get_rulesets(client: &OctocrabClient) -> Result<GitHubResponse, GitHubApiError> {
@@ -705,9 +853,18 @@ async fn get_rulesets(client: &OctocrabClient) -> Result<GitHubResponse, GitHubA
                                 .unwrap_or(false)
                     });
 
+                    // Extract target branch patterns and exclude patterns from conditions
+                    let (target_branches, exclude_patterns) = r
+                        .conditions
+                        .and_then(|c| c.ref_name)
+                        .map(|rn| (rn.include, rn.exclude))
+                        .unwrap_or_default();
+
                     RulesetData {
                         name: r.name,
                         dismiss_stale_reviews_on_push: dismiss_stale,
+                        target_branches,
+                        exclude_patterns,
                     }
                 })
                 .collect();
@@ -715,10 +872,14 @@ async fn get_rulesets(client: &OctocrabClient) -> Result<GitHubResponse, GitHubA
             Ok(GitHubResponse::Rulesets(data))
         }
         Err(e) => {
-            // 404 might mean rulesets aren't available (older API or not enabled)
-            let err_str = e.to_string();
-            if err_str.contains("404") || err_str.to_lowercase().contains("not found") {
-                Ok(GitHubResponse::Rulesets(vec![]))
+            let err_str = GitHubApiError::extract_message(&e);
+            if should_fallback_to_unknown(&err_str) {
+                tracing::warn!(
+                    error = %err_str,
+                    "Rulesets query failed - could be no rulesets, \
+                     insufficient permissions, or unsupported API"
+                );
+                Ok(GitHubResponse::RulesetsUnknown)
             } else {
                 Err(GitHubApiError::from_octocrab(e))
             }
@@ -730,6 +891,26 @@ async fn get_rulesets(client: &OctocrabClient) -> Result<GitHubResponse, GitHubA
 struct RulesetResponse {
     name: String,
     rules: Vec<RulesetRule>,
+    #[serde(default)]
+    conditions: Option<RulesetConditions>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RulesetConditions {
+    #[serde(default)]
+    ref_name: Option<RulesetRefNameCondition>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RulesetRefNameCondition {
+    /// Branch patterns to include (e.g., "refs/heads/main", "refs/heads/*")
+    #[serde(default)]
+    include: Vec<String>,
+    /// Branch patterns to exclude from the ruleset.
+    /// A branch matching any exclude pattern is not targeted, even if it
+    /// matches an include pattern.
+    #[serde(default)]
+    exclude: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -752,12 +933,37 @@ async fn get_repo_settings(client: &OctocrabClient) -> Result<GitHubResponse, Gi
         .await;
 
     match result {
-        Ok(repo) => Ok(GitHubResponse::RepoSettings(RepoSettingsData {
-            default_branch: repo.default_branch.unwrap_or_else(|| "main".to_string()),
-            allow_squash_merge: repo.allow_squash_merge.unwrap_or(true),
-            allow_merge_commit: repo.allow_merge_commit.unwrap_or(true),
-            allow_rebase_merge: repo.allow_rebase_merge.unwrap_or(true),
-        })),
+        Ok(repo) => {
+            // Per DESIGN.md, the squash-only preflight check is a "hard requirement"
+            // with "no warn-and-proceed". If we can't determine the merge method
+            // settings, we must fail rather than default to permissive values that
+            // could incorrectly pass the preflight check.
+            let allow_squash_merge = repo.allow_squash_merge.ok_or_else(|| {
+                GitHubApiError::permanent_without_source(
+                    "Repository settings missing 'allow_squash_merge' field - \
+                     cannot verify squash-only configuration",
+                )
+            })?;
+            let allow_merge_commit = repo.allow_merge_commit.ok_or_else(|| {
+                GitHubApiError::permanent_without_source(
+                    "Repository settings missing 'allow_merge_commit' field - \
+                     cannot verify squash-only configuration",
+                )
+            })?;
+            let allow_rebase_merge = repo.allow_rebase_merge.ok_or_else(|| {
+                GitHubApiError::permanent_without_source(
+                    "Repository settings missing 'allow_rebase_merge' field - \
+                     cannot verify squash-only configuration",
+                )
+            })?;
+
+            Ok(GitHubResponse::RepoSettings(RepoSettingsData {
+                default_branch: repo.default_branch.unwrap_or_else(|| "main".to_string()),
+                allow_squash_merge,
+                allow_merge_commit,
+                allow_rebase_merge,
+            }))
+        }
         Err(e) => Err(GitHubApiError::from_octocrab(e)),
     }
 }
@@ -765,6 +971,9 @@ async fn get_repo_settings(client: &OctocrabClient) -> Result<GitHubResponse, Gi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    // ─── Unit Tests ───────────────────────────────────────────────────────────
 
     #[test]
     fn parse_merge_state_status_all_values() {
@@ -798,5 +1007,217 @@ mod tests {
             MergeStateStatus::Unknown
         );
         assert_eq!(parse_merge_state_status(""), MergeStateStatus::Unknown);
+    }
+
+    // ─── resolve_merge_state tests ────────────────────────────────────────────
+
+    #[test]
+    fn resolve_merge_state_draft_override() {
+        // Draft PRs should always return Draft, regardless of the merge state status
+        assert_eq!(resolve_merge_state("CLEAN", true), MergeStateStatus::Draft);
+        assert_eq!(
+            resolve_merge_state("BLOCKED", true),
+            MergeStateStatus::Draft
+        );
+        assert_eq!(resolve_merge_state("BEHIND", true), MergeStateStatus::Draft);
+    }
+
+    #[test]
+    fn resolve_merge_state_non_draft_passes_through() {
+        // Non-draft PRs should return the parsed merge state status
+        assert_eq!(resolve_merge_state("CLEAN", false), MergeStateStatus::Clean);
+        assert_eq!(
+            resolve_merge_state("BLOCKED", false),
+            MergeStateStatus::Blocked
+        );
+        assert_eq!(
+            resolve_merge_state("BEHIND", false),
+            MergeStateStatus::Behind
+        );
+    }
+
+    // ─── is_sha_mismatch_error tests ──────────────────────────────────────────
+
+    #[test]
+    fn is_sha_mismatch_error_detects_github_message() {
+        assert!(is_sha_mismatch_error(
+            "Head branch was modified. Review and try the merge again."
+        ));
+        assert!(is_sha_mismatch_error(
+            "409 Conflict: Head branch was modified"
+        ));
+        // Case insensitive
+        assert!(is_sha_mismatch_error("HEAD BRANCH WAS MODIFIED"));
+    }
+
+    #[test]
+    fn is_sha_mismatch_error_rejects_other_409s() {
+        // Merge conflicts are 409 but not SHA mismatch
+        assert!(!is_sha_mismatch_error("Merge conflict"));
+        assert!(!is_sha_mismatch_error("409 Conflict: cannot merge"));
+        assert!(!is_sha_mismatch_error("Pull request is not mergeable"));
+    }
+
+    // ─── should_fallback_to_unknown tests ─────────────────────────────────────
+
+    #[test]
+    fn should_fallback_to_unknown_detects_not_found() {
+        assert!(should_fallback_to_unknown("404 Not Found"));
+        assert!(should_fallback_to_unknown("Resource not found"));
+        assert!(should_fallback_to_unknown("Branch not found"));
+    }
+
+    #[test]
+    fn should_fallback_to_unknown_detects_forbidden() {
+        assert!(should_fallback_to_unknown("403 Forbidden"));
+        assert!(should_fallback_to_unknown("Access forbidden"));
+        assert!(should_fallback_to_unknown("Permission denied 403"));
+    }
+
+    #[test]
+    fn should_fallback_to_unknown_rejects_other_errors() {
+        assert!(!should_fallback_to_unknown("500 Internal Server Error"));
+        assert!(!should_fallback_to_unknown("Rate limit exceeded"));
+        assert!(!should_fallback_to_unknown("Timeout"));
+        assert!(!should_fallback_to_unknown("Network error"));
+    }
+
+    // ─── Property Tests ───────────────────────────────────────────────────────
+
+    proptest! {
+        /// Property: is_draft == true implies Draft status, regardless of merge state string
+        #[test]
+        fn prop_draft_always_overrides(status in ".*") {
+            prop_assert_eq!(
+                resolve_merge_state(&status, true),
+                MergeStateStatus::Draft,
+                "Draft PRs must always return Draft status"
+            );
+        }
+
+        /// Property: is_draft == false with known status returns that status
+        #[test]
+        fn prop_non_draft_with_known_status_returns_parsed(
+            status in prop_oneof![
+                Just("CLEAN"),
+                Just("UNSTABLE"),
+                Just("BLOCKED"),
+                Just("BEHIND"),
+                Just("DIRTY"),
+                Just("DRAFT"),
+                Just("HAS_HOOKS"),
+            ]
+        ) {
+            let result = resolve_merge_state(status, false);
+            // Should return the corresponding status, not Unknown
+            prop_assert_ne!(
+                result,
+                MergeStateStatus::Unknown,
+                "Known statuses should parse correctly"
+            );
+        }
+
+        /// Property: is_draft == false with unknown status returns Unknown
+        #[test]
+        fn prop_non_draft_with_unknown_status_returns_unknown(
+            status in "[A-Z]{1,20}"
+                .prop_filter("must not be a known status", |s| {
+                    !matches!(
+                        s.as_str(),
+                        "CLEAN" | "UNSTABLE" | "BLOCKED" | "BEHIND" | "DIRTY" | "UNKNOWN" | "DRAFT" | "HAS_HOOKS"
+                    )
+                })
+        ) {
+            prop_assert_eq!(
+                resolve_merge_state(&status, false),
+                MergeStateStatus::Unknown,
+                "Unknown statuses should return Unknown"
+            );
+        }
+
+        /// Property: "head branch was modified" (case insensitive) implies SHA mismatch
+        #[test]
+        fn prop_sha_mismatch_detected_with_marker(
+            prefix in ".*",
+            suffix in ".*",
+        ) {
+            let err_str = format!("{}head branch was modified{}", prefix, suffix);
+            prop_assert!(
+                is_sha_mismatch_error(&err_str),
+                "Error containing 'head branch was modified' should be SHA mismatch"
+            );
+        }
+
+        /// Property: strings without "head branch was modified" are not SHA mismatch
+        #[test]
+        fn prop_no_sha_mismatch_without_marker(
+            err_str in ".*"
+                .prop_filter("must not contain the marker", |s| {
+                    !s.to_lowercase().contains("head branch was modified")
+                })
+        ) {
+            prop_assert!(
+                !is_sha_mismatch_error(&err_str),
+                "Error without 'head branch was modified' should not be SHA mismatch"
+            );
+        }
+
+        /// Property: "404" or "not found" implies fallback to unknown
+        #[test]
+        fn prop_404_triggers_fallback(prefix in ".*", suffix in ".*") {
+            let err_str = format!("{}404{}", prefix, suffix);
+            prop_assert!(
+                should_fallback_to_unknown(&err_str),
+                "Error containing '404' should trigger fallback"
+            );
+        }
+
+        /// Property: "403" or "forbidden" implies fallback to unknown
+        #[test]
+        fn prop_403_triggers_fallback(prefix in ".*", suffix in ".*") {
+            let err_str = format!("{}403{}", prefix, suffix);
+            prop_assert!(
+                should_fallback_to_unknown(&err_str),
+                "Error containing '403' should trigger fallback"
+            );
+        }
+
+        /// Property: "not found" (case insensitive) implies fallback to unknown
+        #[test]
+        fn prop_not_found_triggers_fallback(prefix in ".*", suffix in ".*") {
+            let err_str = format!("{}not found{}", prefix, suffix);
+            prop_assert!(
+                should_fallback_to_unknown(&err_str),
+                "Error containing 'not found' should trigger fallback"
+            );
+        }
+
+        /// Property: "forbidden" (case insensitive) implies fallback to unknown
+        #[test]
+        fn prop_forbidden_triggers_fallback(prefix in ".*", suffix in ".*") {
+            let err_str = format!("{}forbidden{}", prefix, suffix);
+            prop_assert!(
+                should_fallback_to_unknown(&err_str),
+                "Error containing 'forbidden' should trigger fallback"
+            );
+        }
+
+        /// Property: strings without 404/403/not found/forbidden don't trigger fallback
+        #[test]
+        fn prop_no_fallback_without_markers(
+            err_str in "[a-z0-9 ]{1,100}"
+                .prop_filter("must not contain markers", |s| {
+                    let lower = s.to_lowercase();
+                    !s.contains("404")
+                        && !s.contains("403")
+                        && !lower.contains("not found")
+                        && !lower.contains("forbidden")
+                })
+        ) {
+            prop_assert!(
+                !should_fallback_to_unknown(&err_str),
+                "Error without markers should not trigger fallback"
+            );
+        }
     }
 }
