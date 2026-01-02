@@ -302,7 +302,7 @@ impl GitHubApiError {
 /// These messages indicate GitHub API quirks that resolve with retries:
 /// - Status check propagation delays after a push
 /// - Concurrent modifications to the base branch
-fn is_transient_message(message: &str) -> bool {
+pub fn is_transient_message(message: &str) -> bool {
     let message_lower = message.to_lowercase();
 
     // Status check hasn't propagated yet
@@ -324,7 +324,7 @@ fn is_transient_message(message: &str) -> bool {
 }
 
 /// Checks if an error message indicates a rate limit.
-fn is_rate_limit_error(message: &str) -> bool {
+pub fn is_rate_limit_error(message: &str) -> bool {
     let message_lower = message.to_lowercase();
     message_lower.contains("rate limit")
         || message_lower.contains("api rate")
@@ -333,7 +333,7 @@ fn is_rate_limit_error(message: &str) -> bool {
 }
 
 /// Checks if an error message indicates a network-level error.
-fn is_network_error(message: &str) -> bool {
+pub fn is_network_error(message: &str) -> bool {
     let message_lower = message.to_lowercase();
     message_lower.contains("timeout")
         || message_lower.contains("connection")

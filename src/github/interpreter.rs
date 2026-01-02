@@ -19,7 +19,7 @@ use crate::effects::{
 use crate::types::{CommentId, MergeStateStatus, PrNumber, PrState, Sha};
 
 use super::client::OctocrabClient;
-use super::error::GitHubApiError;
+use super::error::{GitHubApiError, is_rate_limit_error, is_transient_message};
 use super::retry::{RetryConfig, RetryPolicy, retry_with_backoff};
 
 // ─── GraphQL Types ────────────────────────────────────────────────────────────
@@ -416,11 +416,19 @@ async fn get_merge_state(
 
             // If we have no data at all, report the GraphQL errors
             if response.data.is_none() {
-                return Err(GitHubApiError::permanent_without_source(format!(
+                let error_msg = error_hint.unwrap_or_else(|| "no data returned".to_string());
+                let full_msg = format!(
                     "GraphQL error querying PR {} merge state: {}",
-                    pr,
-                    error_hint.unwrap_or_else(|| "no data returned".to_string())
-                )));
+                    pr, error_msg
+                );
+
+                // Check if the GraphQL error indicates a transient condition
+                // (rate limits, internal errors, "try again" messages)
+                if is_rate_limit_error(&error_msg) || is_transient_message(&error_msg) {
+                    return Err(GitHubApiError::transient_without_source(full_msg));
+                }
+
+                return Err(GitHubApiError::permanent_without_source(full_msg));
             }
 
             let pr_data = response
