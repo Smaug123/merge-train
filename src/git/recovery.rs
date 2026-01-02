@@ -213,12 +213,10 @@ pub fn has_merge_conflict(worktree_path: &Path) -> GitResult<bool> {
         return Ok(false);
     }
 
-    use std::process::Command;
-
-    // Check for unmerged paths in the index
-    let output = Command::new("git")
+    // Use git_command for consistent, non-interactive, config-isolated environment.
+    // This prevents hangs on auth prompts and ensures reproducible behavior.
+    let output = super::git_command(worktree_path)
         .args(["diff", "--name-only", "--diff-filter=U"])
-        .current_dir(worktree_path)
         .output()?;
 
     if !output.status.success() {
@@ -295,7 +293,11 @@ mod tests {
             repo: "repo".to_string(),
             default_branch: "main".to_string(),
             worktree_max_age: Duration::from_secs(24 * 3600),
-            sign_commits: false,
+            commit_identity: crate::git::CommitIdentity {
+                name: "Test".to_string(),
+                email: "test@test.com".to_string(),
+                signing_key: None,
+            },
         };
 
         // Create the clone directory and initialize a bare repo
@@ -491,5 +493,26 @@ mod tests {
 
         assert!(!status_100.1); // PR 100 is clean
         assert!(status_200.1); // PR 200 is dirty
+    }
+
+    #[test]
+    fn cleanup_worktree_on_restart_deletes_corrupted() {
+        let (_temp_dir, config) = create_test_repo();
+
+        // Create a worktree
+        let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
+        assert!(worktree.exists());
+
+        // Corrupt the worktree by replacing .git (which points to the real gitdir)
+        // with invalid content. This will cause git commands to fail.
+        let git_file = worktree.join(".git");
+        std::fs::write(&git_file, "gitdir: /nonexistent/path/that/does/not/exist").unwrap();
+
+        // Clean on restart - should detect corruption and delete
+        let result = cleanup_worktree_on_restart(&config, PrNumber(123)).unwrap();
+        assert_eq!(result, CleanupResult::Deleted);
+
+        // Worktree should be gone
+        assert!(!worktree.exists());
     }
 }

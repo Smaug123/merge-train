@@ -10,12 +10,22 @@
 //! throughout the cascade.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::types::PrNumber;
 
 use super::{GitConfig, GitResult, parse_stack_dir_name, run_git_sync};
+
+/// Check if a path is a valid git worktree.
+///
+/// A valid worktree has a `.git` file (not directory) that points to the main repo.
+/// Partial deletions or corruption may leave a directory without this file.
+fn is_valid_worktree(path: &Path) -> bool {
+    // A worktree has a .git *file* (not directory) containing "gitdir: ..."
+    let git_path = path.join(".git");
+    git_path.is_file()
+}
 
 /// Get or create a worktree for a stack.
 ///
@@ -35,24 +45,43 @@ use super::{GitConfig, GitResult, parse_stack_dir_name, run_git_sync};
 pub fn worktree_for_stack(config: &GitConfig, root_pr: PrNumber) -> GitResult<PathBuf> {
     let worktree_path = config.worktree_path(root_pr);
 
-    if !worktree_path.exists() {
-        // Ensure the worktrees directory exists
-        std::fs::create_dir_all(config.worktrees_dir())?;
+    if worktree_path.exists() {
+        // Verify it's actually a valid worktree
+        if is_valid_worktree(&worktree_path) {
+            return Ok(worktree_path);
+        }
 
-        // Create worktree from the shared clone in detached HEAD mode.
-        // Using --detach ensures no branch is "checked out" in this worktree,
-        // avoiding conflicts with other worktrees or the main clone.
-        run_git_sync(
-            &config.clone_dir(),
-            &[
-                "worktree",
-                "add",
-                "--detach",
-                worktree_path.to_str().unwrap(),
-                "HEAD",
-            ],
-        )?;
+        // Stale/corrupted worktree - prune git metadata and remove directory
+        tracing::warn!(
+            path = %worktree_path.display(),
+            pr = root_pr.0,
+            "removing stale worktree directory (missing .git file)"
+        );
+        let _ = prune_worktrees(config);
+        if worktree_path.exists() {
+            std::fs::remove_dir_all(&worktree_path)?;
+        }
     }
+
+    // Ensure the worktrees directory exists
+    std::fs::create_dir_all(config.worktrees_dir())?;
+
+    // Prune before add to clean up any stale git metadata that might conflict
+    let _ = prune_worktrees(config);
+
+    // Create worktree from the shared clone in detached HEAD mode.
+    // Using --detach ensures no branch is "checked out" in this worktree,
+    // avoiding conflicts with other worktrees or the main clone.
+    run_git_sync(
+        &config.clone_dir(),
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            worktree_path.to_str().unwrap(),
+            "HEAD",
+        ],
+    )?;
 
     Ok(worktree_path)
 }
@@ -63,24 +92,44 @@ pub fn worktree_for_stack(config: &GitConfig, root_pr: PrNumber) -> GitResult<Pa
 /// `cleanup_worktree_on_abort` fails (worktree corrupted beyond repair).
 ///
 /// This function is idempotent - if the worktree doesn't exist, it succeeds.
+/// If `git worktree remove` fails (e.g., stale/corrupted metadata), falls back
+/// to pruning git's worktree list and manually removing the directory.
 pub fn remove_worktree(config: &GitConfig, root_pr: PrNumber) -> GitResult<()> {
     let worktree_path = config.worktree_path(root_pr);
 
-    if worktree_path.exists() {
-        // Use --force to remove even if there are uncommitted changes
-        // (we've already cleaned up or decided to discard the state)
-        run_git_sync(
-            &config.clone_dir(),
-            &[
-                "worktree",
-                "remove",
-                "--force",
-                worktree_path.to_str().unwrap(),
-            ],
-        )?;
+    if !worktree_path.exists() {
+        return Ok(());
     }
 
-    Ok(())
+    // Try git worktree remove first
+    let result = run_git_sync(
+        &config.clone_dir(),
+        &[
+            "worktree",
+            "remove",
+            "--force",
+            worktree_path.to_str().unwrap(),
+        ],
+    );
+
+    match result {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            // git worktree remove failed - probably stale/corrupted metadata.
+            // Prune git's worktree list, then remove the directory manually.
+            tracing::warn!(
+                path = %worktree_path.display(),
+                pr = root_pr.0,
+                error = %e,
+                "git worktree remove failed, falling back to manual cleanup"
+            );
+            let _ = prune_worktrees(config);
+            if worktree_path.exists() {
+                std::fs::remove_dir_all(&worktree_path)?;
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Prune stale worktree references (housekeeping).
@@ -118,6 +167,11 @@ pub fn cleanup_stale_worktrees(
         return Ok(vec![]);
     }
 
+    // Prune at the start to clean up stale git metadata for worktrees that
+    // were deleted manually or whose directories no longer exist. This helps
+    // prevent "already registered" errors when we try to recreate worktrees.
+    let _ = prune_worktrees(config);
+
     let mut removed = Vec::new();
 
     for entry in std::fs::read_dir(&worktrees_dir)? {
@@ -142,7 +196,9 @@ pub fn cleanup_stale_worktrees(
             .duration_since(modified)
             .unwrap_or(Duration::MAX);
 
-        if age > config.worktree_max_age {
+        // Use >= to avoid flakiness with coarse timestamp resolution.
+        // When max_age is zero, we want to clean up immediately.
+        if age >= config.worktree_max_age {
             tracing::info!(
                 path = %path.display(),
                 age_hours = age.as_secs() / 3600,
@@ -231,7 +287,11 @@ mod tests {
             repo: "repo".to_string(),
             default_branch: "main".to_string(),
             worktree_max_age: Duration::from_secs(24 * 3600),
-            sign_commits: false,
+            commit_identity: crate::git::CommitIdentity {
+                name: "Test".to_string(),
+                email: "test@test.com".to_string(),
+                signing_key: None,
+            },
         };
 
         // Create the clone directory and initialize a bare repo

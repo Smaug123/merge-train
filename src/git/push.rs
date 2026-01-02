@@ -11,7 +11,7 @@ use std::path::Path;
 
 use crate::types::Sha;
 
-use super::{GitError, GitResult, get_tree_sha, rev_parse, run_git_sync};
+use super::{GitError, GitResult, get_parents, get_tree_sha, rev_parse, run_git_sync};
 
 /// Result of a push operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,14 +57,13 @@ impl PushResult {
 ///
 /// The result of the push operation.
 pub fn push_head_to_branch(worktree: &Path, branch: &str) -> GitResult<PushResult> {
-    use std::process::Command;
-
     let refspec = format!("HEAD:refs/heads/{}", branch);
     let head_sha = rev_parse(worktree, "HEAD")?;
 
-    let output = Command::new("git")
+    // Use git_command for consistent, non-interactive, config-isolated environment.
+    // This prevents hangs on auth prompts and ensures reproducible behavior.
+    let output = super::git_command(worktree)
         .args(["push", "origin", &refspec])
-        .current_dir(worktree)
         .output()?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -101,11 +100,10 @@ pub fn push_head_to_branch(worktree: &Path, branch: &str) -> GitResult<PushResul
 ///
 /// Returns `None` if the branch doesn't exist on the remote.
 pub fn get_remote_ref(worktree: &Path, branch: &str) -> GitResult<Option<Sha>> {
-    use std::process::Command;
-
-    let output = Command::new("git")
+    // Use git_command for consistent, non-interactive, config-isolated environment.
+    // This prevents hangs on auth prompts and ensures reproducible behavior.
+    let output = super::git_command(worktree)
         .args(["ls-remote", "origin", &format!("refs/heads/{}", branch)])
-        .current_dir(worktree)
         .output()?;
 
     if !output.status.success() {
@@ -141,15 +139,24 @@ pub fn get_remote_ref(worktree: &Path, branch: &str) -> GitResult<Option<Sha>> {
 /// * `branch` - The branch to check
 /// * `expected_tree` - The expected tree SHA after push
 /// * `pre_push_sha` - The SHA the remote had before our push
+/// * `expected_second_parent` - For ours-merge scenarios, the expected second parent SHA
 ///
 /// # Returns
 ///
 /// `true` if the push was already completed (remote has our content).
+///
+/// # Note on ours merges
+///
+/// For `-s ours` reconciliation merges, the tree doesn't change. In this case,
+/// tree comparison alone cannot distinguish "our commit made it" from "someone
+/// else pushed a commit with the same tree". We detect this case (expected_tree
+/// == pre_push tree) and validate both parents to confirm our specific merge commit.
 pub fn is_push_completed(
     worktree: &Path,
     branch: &str,
     expected_tree: &Sha,
     pre_push_sha: &Sha,
+    expected_second_parent: Option<&Sha>,
 ) -> GitResult<bool> {
     // Get the current remote ref
     let Some(remote_sha) = get_remote_ref(worktree, branch)? else {
@@ -157,7 +164,7 @@ pub fn is_push_completed(
     };
 
     // Fetch the remote ref to ensure we have it locally
-    run_git_sync(worktree, &["fetch", "origin", branch])?;
+    run_git_sync(worktree, &["fetch", "origin", "--", branch])?;
 
     // Compare tree SHAs
     let remote_tree = get_tree_sha(worktree, remote_sha.as_str())?;
@@ -167,8 +174,38 @@ pub fn is_push_completed(
 
     // Verify the parent chain includes pre_push_sha
     let is_ancestor = super::is_ancestor(worktree, pre_push_sha, &remote_sha)?;
+    if !is_ancestor {
+        return Ok(false);
+    }
 
-    Ok(is_ancestor)
+    // Check for ours merge scenario: if the expected tree equals the pre-push tree,
+    // the tree didn't change (e.g., `-s ours` reconciliation). In this case, tree
+    // comparison alone can't distinguish "our merge commit made it" from "someone
+    // else pushed a commit with the same tree". We validate both parents to confirm
+    // our specific merge commit is there.
+    let pre_push_tree = get_tree_sha(worktree, pre_push_sha.as_str())?;
+    if *expected_tree == pre_push_tree {
+        // Tree didn't change. Validate the parent chain.
+        let parents = get_parents(worktree, remote_sha.as_str())?;
+
+        // First parent must match pre_push_sha
+        if parents.first() != Some(pre_push_sha) {
+            return Ok(false);
+        }
+
+        // If we have an expected second parent, validate it too
+        if let Some(expected_p2) = expected_second_parent
+            && parents.get(1) != Some(expected_p2)
+        {
+            // Second parent doesn't match - this is a different merge commit
+            return Ok(false);
+        }
+
+        // Parents match - our merge commit made it
+        return Ok(true);
+    }
+
+    Ok(true)
 }
 
 /// Information needed to verify push completion during recovery.
@@ -180,6 +217,9 @@ pub struct PushIntent {
     pub expected_tree: Sha,
     /// The SHA the remote had before our push.
     pub pre_push_sha: Sha,
+    /// Expected second parent for ours-merge scenarios.
+    /// When present, validates that the merge commit has this exact second parent.
+    pub expected_second_parent: Option<Sha>,
 }
 
 impl PushIntent {
@@ -189,6 +229,22 @@ impl PushIntent {
             branch: branch.into(),
             expected_tree,
             pre_push_sha,
+            expected_second_parent: None,
+        }
+    }
+
+    /// Create a push intent for an ours-merge with expected second parent.
+    pub fn with_second_parent(
+        branch: impl Into<String>,
+        expected_tree: Sha,
+        pre_push_sha: Sha,
+        second_parent: Sha,
+    ) -> Self {
+        Self {
+            branch: branch.into(),
+            expected_tree,
+            pre_push_sha,
+            expected_second_parent: Some(second_parent),
         }
     }
 
@@ -199,6 +255,7 @@ impl PushIntent {
             &self.branch,
             &self.expected_tree,
             &self.pre_push_sha,
+            self.expected_second_parent.as_ref(),
         )
     }
 }
@@ -232,7 +289,11 @@ mod tests {
             repo: "repo".to_string(),
             default_branch: "main".to_string(),
             worktree_max_age: Duration::from_secs(24 * 3600),
-            sign_commits: false,
+            commit_identity: crate::git::CommitIdentity {
+                name: "Test".to_string(),
+                email: "test@test.com".to_string(),
+                signing_key: None,
+            },
         };
 
         // Create the clone directory and initialize a bare repo
@@ -417,13 +478,15 @@ mod tests {
         let expected_tree = get_tree_sha(&worktree, "HEAD").unwrap();
 
         // Push hasn't happened yet
-        assert!(!is_push_completed(&worktree, "main", &expected_tree, &pre_push_sha).unwrap());
+        assert!(
+            !is_push_completed(&worktree, "main", &expected_tree, &pre_push_sha, None).unwrap()
+        );
 
         // Do the push
         push_head_to_branch(&worktree, "main").unwrap();
 
         // Now it should be detected as completed
-        assert!(is_push_completed(&worktree, "main", &expected_tree, &pre_push_sha).unwrap());
+        assert!(is_push_completed(&worktree, "main", &expected_tree, &pre_push_sha, None).unwrap());
     }
 
     #[test]
@@ -453,5 +516,150 @@ mod tests {
 
         // Now completed
         assert!(intent.is_completed(&worktree).unwrap());
+    }
+
+    #[test]
+    fn is_push_completed_detects_ours_merge() {
+        // Test that is_push_completed correctly detects a completed ours-merge push.
+        // In an ours-merge, the tree doesn't change (expected_tree == pre_push_tree).
+        // The fix checks if remote's first parent is pre_push_sha to confirm our merge made it.
+        let (_temp_dir, config) = create_test_repo();
+        let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
+        run_git_sync(&worktree, &["config", "user.email", "test@test.com"]).unwrap();
+        run_git_sync(&worktree, &["config", "user.name", "Test"]).unwrap();
+
+        // Get pre-push state
+        let pre_push_sha = get_remote_ref(&worktree, "main").unwrap().unwrap();
+        let pre_push_tree = get_tree_sha(&worktree, pre_push_sha.as_str()).unwrap();
+
+        // Create a temporary commit with different content (simulates a feature branch)
+        std::fs::write(worktree.join("feature.txt"), "feature content").unwrap();
+        run_git_sync(&worktree, &["add", "."]).unwrap();
+        run_git_sync(&worktree, &["commit", "-m", "Feature commit"]).unwrap();
+        let feature_sha = rev_parse(&worktree, "HEAD").unwrap();
+
+        // Go back to main (detached) and create an ours merge
+        // This simulates reconciliation after a squash where we keep main's tree
+        run_git_sync(&worktree, &["checkout", "--detach", pre_push_sha.as_str()]).unwrap();
+        run_git_sync(
+            &worktree,
+            &[
+                "merge",
+                "-s",
+                "ours",
+                feature_sha.as_str(),
+                "-m",
+                "Ours merge",
+            ],
+        )
+        .unwrap();
+
+        // The tree should be unchanged (ours merge keeps main's tree)
+        let expected_tree = get_tree_sha(&worktree, "HEAD").unwrap();
+        assert_eq!(
+            expected_tree, pre_push_tree,
+            "Ours merge should preserve main's tree"
+        );
+
+        // Push hasn't happened yet - remote still has pre_push_sha
+        assert!(
+            !is_push_completed(&worktree, "main", &expected_tree, &pre_push_sha, None).unwrap(),
+            "Should not detect completion before push"
+        );
+
+        // Do the push
+        push_head_to_branch(&worktree, "main").unwrap();
+
+        // Now it should be detected as completed (the fix makes this work)
+        // Without expected second parent, it only checks first parent
+        assert!(
+            is_push_completed(&worktree, "main", &expected_tree, &pre_push_sha, None).unwrap(),
+            "Should detect ours-merge push as completed"
+        );
+
+        // With expected second parent, should also succeed
+        assert!(
+            is_push_completed(
+                &worktree,
+                "main",
+                &expected_tree,
+                &pre_push_sha,
+                Some(&feature_sha)
+            )
+            .unwrap(),
+            "Should detect ours-merge with correct second parent"
+        );
+    }
+
+    #[test]
+    fn is_push_completed_rejects_wrong_second_parent() {
+        // Test that is_push_completed rejects an ours-merge with wrong second parent.
+        // This prevents misclassifying a different merge commit as our push.
+        let (_temp_dir, config) = create_test_repo();
+        let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
+        run_git_sync(&worktree, &["config", "user.email", "test@test.com"]).unwrap();
+        run_git_sync(&worktree, &["config", "user.name", "Test"]).unwrap();
+
+        // Get pre-push state
+        let pre_push_sha = get_remote_ref(&worktree, "main").unwrap().unwrap();
+
+        // Create a feature commit
+        std::fs::write(worktree.join("feature.txt"), "feature content").unwrap();
+        run_git_sync(&worktree, &["add", "."]).unwrap();
+        run_git_sync(&worktree, &["commit", "-m", "Feature commit"]).unwrap();
+        let feature_sha = rev_parse(&worktree, "HEAD").unwrap();
+
+        // Create a different commit (to use as wrong second parent)
+        run_git_sync(&worktree, &["checkout", "--detach", pre_push_sha.as_str()]).unwrap();
+        std::fs::write(worktree.join("other.txt"), "other content").unwrap();
+        run_git_sync(&worktree, &["add", "."]).unwrap();
+        run_git_sync(&worktree, &["commit", "-m", "Other commit"]).unwrap();
+        let other_sha = rev_parse(&worktree, "HEAD").unwrap();
+
+        // Go back to main (detached) and create an ours merge with feature_sha
+        run_git_sync(&worktree, &["checkout", "--detach", pre_push_sha.as_str()]).unwrap();
+        run_git_sync(
+            &worktree,
+            &[
+                "merge",
+                "-s",
+                "ours",
+                feature_sha.as_str(),
+                "-m",
+                "Ours merge",
+            ],
+        )
+        .unwrap();
+
+        let expected_tree = get_tree_sha(&worktree, "HEAD").unwrap();
+
+        // Push the merge
+        push_head_to_branch(&worktree, "main").unwrap();
+
+        // With correct second parent - should succeed
+        assert!(
+            is_push_completed(
+                &worktree,
+                "main",
+                &expected_tree,
+                &pre_push_sha,
+                Some(&feature_sha)
+            )
+            .unwrap(),
+            "Should succeed with correct second parent"
+        );
+
+        // With wrong second parent - should fail
+        assert!(
+            !is_push_completed(
+                &worktree,
+                "main",
+                &expected_tree,
+                &pre_push_sha,
+                Some(&other_sha)
+            )
+            .unwrap(),
+            "Should reject wrong second parent"
+        );
     }
 }
