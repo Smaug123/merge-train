@@ -39,7 +39,22 @@ query($owner: String!, $repo: String!, $number: Int!) {
 /// Response from the merge state GraphQL query.
 #[derive(Debug, Deserialize)]
 struct MergeStateQueryResponse {
+    data: Option<MergeStateData>,
+    errors: Option<Vec<GraphQLError>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MergeStateData {
     repository: Option<MergeStateRepository>,
+}
+
+/// GraphQL error from GitHub API.
+#[derive(Debug, Deserialize)]
+struct GraphQLError {
+    message: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    r#type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -380,11 +395,46 @@ async fn get_merge_state(
 
     match result {
         Ok(response) => {
+            // Format GraphQL errors for use in error messages
+            let error_hint = response
+                .errors
+                .as_ref()
+                .filter(|e| !e.is_empty())
+                .map(|errors| {
+                    let msgs: Vec<_> = errors.iter().map(|e| e.message.as_str()).collect();
+                    msgs.join("; ")
+                });
+
+            // Log GraphQL errors if present
+            if let Some(ref errors_str) = error_hint {
+                tracing::warn!(
+                    pr = %pr,
+                    errors = %errors_str,
+                    "GraphQL errors in merge state query"
+                );
+            }
+
+            // If we have no data at all, report the GraphQL errors
+            if response.data.is_none() {
+                return Err(GitHubApiError::permanent_without_source(format!(
+                    "GraphQL error querying PR {} merge state: {}",
+                    pr,
+                    error_hint.unwrap_or_else(|| "no data returned".to_string())
+                )));
+            }
+
             let pr_data = response
-                .repository
+                .data
+                .and_then(|d| d.repository)
                 .and_then(|r| r.pull_request)
                 .ok_or_else(|| {
-                    GitHubApiError::permanent_without_source(format!("PR {} not found", pr))
+                    let suffix = error_hint
+                        .map(|e| format!(" (GraphQL errors: {})", e))
+                        .unwrap_or_default();
+                    GitHubApiError::permanent_without_source(format!(
+                        "PR {} not found{}",
+                        pr, suffix
+                    ))
                 })?;
 
             let status = resolve_merge_state(&pr_data.merge_state_status, pr_data.is_draft);
