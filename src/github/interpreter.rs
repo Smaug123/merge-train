@@ -272,22 +272,12 @@ async fn list_recently_merged_prs(
                 let items = page_result.items;
                 let is_last_page = items.len() < 100;
 
-                // Track how many PRs on this page have merged_at within our window.
-                // We only stop early if the ENTIRE page has no recent merges,
-                // because sorting by `updated` doesn't guarantee merge order.
-                // An old PR with a recent comment appears early, but recent merges
-                // could still be on later pages.
-                let mut page_had_recent_merge = false;
-
                 for pull in items {
                     // Only include merged PRs with merged_at within our window
-                    let _merged_at = match pull.merged_at {
-                        Some(t) if t >= since => {
-                            page_had_recent_merge = true;
-                            t
-                        }
-                        Some(_) => continue, // Merged but too old
-                        None => continue,    // Closed but not merged
+                    match pull.merged_at {
+                        Some(t) if t >= since => {} // Within window, continue processing
+                        Some(_) => continue,        // Merged but too old
+                        None => continue,           // Closed but not merged
                     };
 
                     // IMPORTANT: GitHub's API has eventual consistency. After a PR is merged,
@@ -329,12 +319,13 @@ async fn list_recently_merged_prs(
 
                 // Stop if:
                 // 1. This is the last page (< 100 items)
-                // 2. This entire page had no recent merges (all were old or not merged)
-                // 3. We've hit the safety limit
+                // 2. We've hit the safety limit
                 //
-                // We do NOT stop just because we saw some old PRs, because the
-                // `updated` sort order doesn't correlate with `merged_at`.
-                if is_last_page || !page_had_recent_merge || page >= MAX_PAGES {
+                // IMPORTANT: We do NOT stop based on whether this page had recent merges.
+                // Results are sorted by `updated` (not `merged_at`), so a page could contain
+                // only old PRs with recent comments while recent merges appear on later pages.
+                // We must paginate through all pages (up to MAX_PAGES) to find all recent merges.
+                if is_last_page || page >= MAX_PAGES {
                     break;
                 }
                 page += 1;
@@ -687,9 +678,9 @@ async fn get_branch_protection(
             // 2. User lacks permission to view protection rules
             // 3. Branch doesn't exist
             //
-            // We cannot distinguish these cases via the API. We log a warning
-            // and return empty protection, but callers should be aware this
-            // may under-detect protections if permissions are restricted.
+            // We cannot distinguish these cases via the API. Return
+            // BranchProtectionUnknown so callers can implement "warn and proceed"
+            // per DESIGN.md rather than silently treating 404 as "no protection".
             let err_str = e.to_string();
             if err_str.contains("404") || err_str.to_lowercase().contains("not found") {
                 tracing::warn!(
@@ -697,10 +688,7 @@ async fn get_branch_protection(
                     "Branch protection returned 404 - could be no protection, \
                      insufficient permissions, or missing branch"
                 );
-                Ok(GitHubResponse::BranchProtection(BranchProtectionData {
-                    dismiss_stale_reviews: false,
-                    required_status_checks: vec![],
-                }))
+                Ok(GitHubResponse::BranchProtectionUnknown)
             } else {
                 Err(GitHubApiError::from_octocrab(e))
             }
@@ -764,9 +752,17 @@ async fn get_rulesets(client: &OctocrabClient) -> Result<GitHubResponse, GitHubA
                                 .unwrap_or(false)
                     });
 
+                    // Extract target branch patterns from conditions
+                    let target_branches = r
+                        .conditions
+                        .and_then(|c| c.ref_name)
+                        .map(|rn| rn.include)
+                        .unwrap_or_default();
+
                     RulesetData {
                         name: r.name,
                         dismiss_stale_reviews_on_push: dismiss_stale,
+                        target_branches,
                     }
                 })
                 .collect();
@@ -789,6 +785,23 @@ async fn get_rulesets(client: &OctocrabClient) -> Result<GitHubResponse, GitHubA
 struct RulesetResponse {
     name: String,
     rules: Vec<RulesetRule>,
+    #[serde(default)]
+    conditions: Option<RulesetConditions>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RulesetConditions {
+    #[serde(default)]
+    ref_name: Option<RulesetRefNameCondition>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RulesetRefNameCondition {
+    /// Branch patterns to include (e.g., "refs/heads/main", "refs/heads/*")
+    #[serde(default)]
+    include: Vec<String>,
+    // Note: `exclude` is also available but we only need `include` for
+    // determining if the default branch could be targeted
 }
 
 #[derive(Debug, Deserialize)]
@@ -811,12 +824,37 @@ async fn get_repo_settings(client: &OctocrabClient) -> Result<GitHubResponse, Gi
         .await;
 
     match result {
-        Ok(repo) => Ok(GitHubResponse::RepoSettings(RepoSettingsData {
-            default_branch: repo.default_branch.unwrap_or_else(|| "main".to_string()),
-            allow_squash_merge: repo.allow_squash_merge.unwrap_or(true),
-            allow_merge_commit: repo.allow_merge_commit.unwrap_or(true),
-            allow_rebase_merge: repo.allow_rebase_merge.unwrap_or(true),
-        })),
+        Ok(repo) => {
+            // Per DESIGN.md, the squash-only preflight check is a "hard requirement"
+            // with "no warn-and-proceed". If we can't determine the merge method
+            // settings, we must fail rather than default to permissive values that
+            // could incorrectly pass the preflight check.
+            let allow_squash_merge = repo.allow_squash_merge.ok_or_else(|| {
+                GitHubApiError::permanent_without_source(
+                    "Repository settings missing 'allow_squash_merge' field - \
+                     cannot verify squash-only configuration",
+                )
+            })?;
+            let allow_merge_commit = repo.allow_merge_commit.ok_or_else(|| {
+                GitHubApiError::permanent_without_source(
+                    "Repository settings missing 'allow_merge_commit' field - \
+                     cannot verify squash-only configuration",
+                )
+            })?;
+            let allow_rebase_merge = repo.allow_rebase_merge.ok_or_else(|| {
+                GitHubApiError::permanent_without_source(
+                    "Repository settings missing 'allow_rebase_merge' field - \
+                     cannot verify squash-only configuration",
+                )
+            })?;
+
+            Ok(GitHubResponse::RepoSettings(RepoSettingsData {
+                default_branch: repo.default_branch.unwrap_or_else(|| "main".to_string()),
+                allow_squash_merge,
+                allow_merge_commit,
+                allow_rebase_merge,
+            }))
+        }
         Err(e) => Err(GitHubApiError::from_octocrab(e)),
     }
 }

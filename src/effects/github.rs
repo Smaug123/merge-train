@@ -162,6 +162,15 @@ pub struct RulesetData {
     pub name: String,
     /// Whether this ruleset dismisses stale reviews on push.
     pub dismiss_stale_reviews_on_push: bool,
+    /// Branch patterns this ruleset targets (from `conditions.ref_name.include`).
+    ///
+    /// These are ref patterns like `"refs/heads/main"` or `"refs/heads/*"`.
+    /// Callers should check if the default branch matches any of these patterns
+    /// to determine if the ruleset applies.
+    ///
+    /// Empty if the ruleset has no ref_name conditions (applies to all branches)
+    /// or if the conditions couldn't be parsed.
+    pub target_branches: Vec<String>,
 }
 
 /// Repository settings related to merge methods.
@@ -216,8 +225,19 @@ pub enum GitHubResponse {
     /// Response to `ListComments`.
     Comments(Vec<CommentData>),
 
-    /// Response to `GetBranchProtection`.
+    /// Response to `GetBranchProtection` when protection rules were successfully fetched.
     BranchProtection(BranchProtectionData),
+
+    /// Response to `GetBranchProtection` when the result is unknown.
+    ///
+    /// This occurs when the API returns 404, which could mean:
+    /// 1. The branch has no protection rules
+    /// 2. The caller lacks permission to view protection rules
+    /// 3. The branch doesn't exist
+    ///
+    /// Per DESIGN.md, callers should "warn and proceed" when they receive this,
+    /// since we cannot distinguish missing permissions from no protection.
+    BranchProtectionUnknown,
 
     /// Response to `GetRulesets`.
     Rulesets(Vec<RulesetData>),
@@ -342,12 +362,18 @@ mod tests {
     }
 
     fn arb_ruleset_data() -> impl Strategy<Value = RulesetData> {
-        (arb_branch_name(), any::<bool>()).prop_map(|(name, dismiss_stale_reviews_on_push)| {
-            RulesetData {
-                name,
-                dismiss_stale_reviews_on_push,
-            }
-        })
+        (
+            arb_branch_name(),
+            any::<bool>(),
+            prop::collection::vec(arb_branch_name(), 0..3),
+        )
+            .prop_map(|(name, dismiss_stale_reviews_on_push, target_branches)| {
+                RulesetData {
+                    name,
+                    dismiss_stale_reviews_on_push,
+                    target_branches,
+                }
+            })
     }
 
     fn arb_repo_settings_data() -> impl Strategy<Value = RepoSettingsData> {
@@ -408,6 +434,7 @@ mod tests {
             Just(GitHubResponse::ReactionAdded),
             prop::collection::vec(arb_comment_data(), 0..10).prop_map(GitHubResponse::Comments),
             arb_branch_protection_data().prop_map(GitHubResponse::BranchProtection),
+            Just(GitHubResponse::BranchProtectionUnknown),
             prop::collection::vec(arb_ruleset_data(), 0..5).prop_map(GitHubResponse::Rulesets),
             arb_repo_settings_data().prop_map(GitHubResponse::RepoSettings),
         ]
