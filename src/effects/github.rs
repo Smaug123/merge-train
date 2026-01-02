@@ -162,6 +162,22 @@ pub struct RulesetData {
     pub name: String,
     /// Whether this ruleset dismisses stale reviews on push.
     pub dismiss_stale_reviews_on_push: bool,
+    /// Branch patterns this ruleset targets (from `conditions.ref_name.include`).
+    ///
+    /// These are ref patterns like `"refs/heads/main"` or `"refs/heads/*"`.
+    /// Callers should check if the default branch matches any of these patterns
+    /// (and does NOT match any `exclude_patterns`) to determine if the ruleset applies.
+    ///
+    /// Empty if the ruleset has no ref_name conditions (applies to all branches)
+    /// or if the conditions couldn't be parsed.
+    pub target_branches: Vec<String>,
+    /// Branch patterns to exclude (from `conditions.ref_name.exclude`).
+    ///
+    /// Even if a branch matches `target_branches`, it is excluded if it matches
+    /// any of these patterns. This prevents false-positive dismiss-stale-reviews
+    /// warnings for branches explicitly excluded by the ruleset.
+    #[serde(default)]
+    pub exclude_patterns: Vec<String>,
 }
 
 /// Repository settings related to merge methods.
@@ -186,8 +202,22 @@ pub enum GitHubResponse {
     /// Response to `GetPr`.
     Pr(PrData),
 
-    /// Response to `ListOpenPrs` or `ListRecentlyMergedPrs`.
+    /// Response to `ListOpenPrs`.
     PrList(Vec<PrData>),
+
+    /// Response to `ListRecentlyMergedPrs`.
+    ///
+    /// Includes a flag indicating whether results may be incomplete due to
+    /// pagination limits. GitHub's PR list API doesn't have a "merged since"
+    /// filter, so we list closed PRs sorted by `updated` and filter client-side.
+    /// In repos with many closed PRs, we may hit the pagination limit before
+    /// exhausting all recent merges.
+    RecentlyMergedPrList {
+        prs: Vec<PrData>,
+        /// If true, results may be incomplete because the pagination limit was reached
+        /// before all pages were exhausted. Callers should handle this gracefully.
+        may_be_incomplete: bool,
+    },
 
     /// Response to `GetMergeState`.
     MergeState(MergeStateStatus),
@@ -216,11 +246,33 @@ pub enum GitHubResponse {
     /// Response to `ListComments`.
     Comments(Vec<CommentData>),
 
-    /// Response to `GetBranchProtection`.
+    /// Response to `GetBranchProtection` when protection rules were successfully fetched.
     BranchProtection(BranchProtectionData),
 
-    /// Response to `GetRulesets`.
+    /// Response to `GetBranchProtection` when the result is unknown.
+    ///
+    /// This occurs when the API returns 404, which could mean:
+    /// 1. The branch has no protection rules
+    /// 2. The caller lacks permission to view protection rules
+    /// 3. The branch doesn't exist
+    ///
+    /// Per DESIGN.md, callers should "warn and proceed" when they receive this,
+    /// since we cannot distinguish missing permissions from no protection.
+    BranchProtectionUnknown,
+
+    /// Response to `GetRulesets` when rulesets were successfully fetched.
     Rulesets(Vec<RulesetData>),
+
+    /// Response to `GetRulesets` when the result is unknown.
+    ///
+    /// This occurs when the API returns 404 or 403, which could mean:
+    /// 1. The repository has no rulesets
+    /// 2. The caller lacks permission to view rulesets
+    /// 3. Rulesets aren't available (older API or not enabled)
+    ///
+    /// Per DESIGN.md, callers should "warn and proceed" when they receive this,
+    /// since we cannot distinguish missing permissions from no rulesets.
+    RulesetsUnknown,
 
     /// Response to `GetRepoSettings`.
     RepoSettings(RepoSettingsData),
@@ -342,12 +394,22 @@ mod tests {
     }
 
     fn arb_ruleset_data() -> impl Strategy<Value = RulesetData> {
-        (arb_branch_name(), any::<bool>()).prop_map(|(name, dismiss_stale_reviews_on_push)| {
-            RulesetData {
-                name,
-                dismiss_stale_reviews_on_push,
-            }
-        })
+        (
+            arb_branch_name(),
+            any::<bool>(),
+            prop::collection::vec(arb_branch_name(), 0..3),
+            prop::collection::vec(arb_branch_name(), 0..3),
+        )
+            .prop_map(
+                |(name, dismiss_stale_reviews_on_push, target_branches, exclude_patterns)| {
+                    RulesetData {
+                        name,
+                        dismiss_stale_reviews_on_push,
+                        target_branches,
+                        exclude_patterns,
+                    }
+                },
+            )
     }
 
     fn arb_repo_settings_data() -> impl Strategy<Value = RepoSettingsData> {
@@ -400,6 +462,12 @@ mod tests {
         prop_oneof![
             arb_pr_data().prop_map(GitHubResponse::Pr),
             prop::collection::vec(arb_pr_data(), 0..10).prop_map(GitHubResponse::PrList),
+            (prop::collection::vec(arb_pr_data(), 0..10), any::<bool>()).prop_map(
+                |(prs, may_be_incomplete)| GitHubResponse::RecentlyMergedPrList {
+                    prs,
+                    may_be_incomplete,
+                }
+            ),
             arb_merge_state_status().prop_map(GitHubResponse::MergeState),
             arb_sha().prop_map(|sha| GitHubResponse::Merged { sha }),
             Just(GitHubResponse::Retargeted),
@@ -408,7 +476,9 @@ mod tests {
             Just(GitHubResponse::ReactionAdded),
             prop::collection::vec(arb_comment_data(), 0..10).prop_map(GitHubResponse::Comments),
             arb_branch_protection_data().prop_map(GitHubResponse::BranchProtection),
+            Just(GitHubResponse::BranchProtectionUnknown),
             prop::collection::vec(arb_ruleset_data(), 0..5).prop_map(GitHubResponse::Rulesets),
+            Just(GitHubResponse::RulesetsUnknown),
             arb_repo_settings_data().prop_map(GitHubResponse::RepoSettings),
         ]
     }

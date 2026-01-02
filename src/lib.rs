@@ -8,6 +8,7 @@ pub mod test_utils;
 pub mod commands;
 pub mod effects;
 pub mod git;
+pub mod github;
 pub mod persistence;
 pub mod spool;
 pub mod state;
