@@ -210,10 +210,21 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        // RetargetPr and SquashMerge are too dangerous for automated testing
-        println!("  [SKIP] RetargetPr (too dangerous for automated testing)");
-        println!("  [SKIP] SquashMerge (too dangerous for automated testing)");
+        // RetargetPr and SquashMerge are too dangerous for automated testing.
+        // See test_retarget_pr() and test_squash_merge() at the end of this file
+        // for manual testing instructions.
+        println!("  [SKIP] RetargetPr (see test_retarget_pr for manual testing)");
+        println!("  [SKIP] SquashMerge (see test_squash_merge for manual testing)");
         skipped += 2;
+
+        // Uncomment these lines to manually test dangerous operations:
+        // let pr_data = client.interpret(GitHubEffect::GetPr { pr }).await?;
+        // let head_sha = match pr_data {
+        //     GitHubResponse::Pr(data) => data.head_sha.as_str().to_string(),
+        //     _ => anyhow::bail!("Failed to get PR data"),
+        // };
+        // test_retarget_pr(&client, pr, "some-other-branch").await?;
+        // test_squash_merge(&client, pr, &head_sha).await?;
     } else if test_pr.is_some() {
         println!("  [SKIP] PostComment (ENABLE_MUTATIONS not set)");
         println!("  [SKIP] UpdateComment (ENABLE_MUTATIONS not set)");
@@ -283,6 +294,15 @@ async fn test_get_branch_protection(client: &OctocrabClient) -> anyhow::Result<(
             );
             Ok(())
         }
+        GitHubResponse::BranchProtectionUnknown => {
+            // Per DESIGN.md, this is a valid "warn and proceed" outcome when
+            // permissions are missing or the branch has no protection rules.
+            tracing::warn!(
+                branch = %default_branch,
+                "Branch protection unknown (missing permissions or no rules)"
+            );
+            Ok(())
+        }
         other => anyhow::bail!("Unexpected response: {:?}", other),
     }
 }
@@ -299,6 +319,12 @@ async fn test_get_rulesets(client: &OctocrabClient) -> anyhow::Result<()> {
                     "Ruleset"
                 );
             }
+            Ok(())
+        }
+        GitHubResponse::RulesetsUnknown => {
+            // Per DESIGN.md, this is a valid "warn and proceed" outcome when
+            // permissions are missing or rulesets are not available.
+            tracing::warn!("Rulesets unknown (missing permissions or not available)");
             Ok(())
         }
         other => anyhow::bail!("Unexpected response: {:?}", other),
@@ -329,7 +355,13 @@ async fn test_list_recently_merged_prs(client: &OctocrabClient) -> anyhow::Resul
         .interpret(GitHubEffect::ListRecentlyMergedPrs { since_days: 7 })
         .await?;
     match response {
-        GitHubResponse::PrList(prs) => {
+        GitHubResponse::RecentlyMergedPrList {
+            prs,
+            may_be_incomplete,
+        } => {
+            if may_be_incomplete {
+                tracing::warn!("Recently merged PR list may be incomplete (pagination limit hit)");
+            }
             for pr in &prs {
                 tracing::debug!(
                     number = pr.number.0,
@@ -449,4 +481,70 @@ async fn test_comment_operations(client: &OctocrabClient, pr: PrNumber) -> anyho
     // in the PR history. Users should manually clean up after testing.
 
     Ok(comment_id.0)
+}
+
+// ─── Dangerous Operations (uncomment for manual testing) ───────────────────────
+//
+// These functions are commented out because they mutate PRs in ways that may be
+// difficult to undo. To manually test:
+//
+// 1. Create a test PR on a branch you control
+// 2. Set TEST_PR=<number> and ENABLE_MUTATIONS=1
+// 3. Uncomment the test_retarget_pr and/or test_squash_merge calls in main()
+// 4. Run: cargo run --example github_integration_test
+//
+// For SquashMerge, the expected_sha parameter is critical: it ensures we don't
+// merge stale content. If the HEAD SHA doesn't match, GitHub returns HTTP 409.
+// This is the SHA-guarded merge behavior described in DESIGN.md.
+
+#[allow(dead_code)]
+async fn test_retarget_pr(
+    client: &OctocrabClient,
+    pr: PrNumber,
+    new_base: &str,
+) -> anyhow::Result<()> {
+    let response = client
+        .interpret(GitHubEffect::RetargetPr {
+            pr,
+            new_base: new_base.to_string(),
+        })
+        .await?;
+
+    match response {
+        GitHubResponse::Retargeted => {
+            tracing::info!(pr = pr.0, new_base = %new_base, "Retargeted PR");
+            Ok(())
+        }
+        other => anyhow::bail!("Unexpected response from RetargetPr: {:?}", other),
+    }
+}
+
+#[allow(dead_code)]
+async fn test_squash_merge(
+    client: &OctocrabClient,
+    pr: PrNumber,
+    expected_sha: &str,
+) -> anyhow::Result<()> {
+    use merge_train::types::Sha;
+
+    let sha = Sha::parse(expected_sha).map_err(|e| anyhow::anyhow!("Invalid SHA: {}", e))?;
+
+    let response = client
+        .interpret(GitHubEffect::SquashMerge {
+            pr,
+            expected_sha: sha,
+        })
+        .await?;
+
+    match response {
+        GitHubResponse::Merged { sha } => {
+            tracing::info!(
+                pr = pr.0,
+                merge_sha = %sha.as_str(),
+                "Squash-merged PR"
+            );
+            Ok(())
+        }
+        other => anyhow::bail!("Unexpected response from SquashMerge: {:?}", other),
+    }
 }

@@ -166,11 +166,18 @@ pub struct RulesetData {
     ///
     /// These are ref patterns like `"refs/heads/main"` or `"refs/heads/*"`.
     /// Callers should check if the default branch matches any of these patterns
-    /// to determine if the ruleset applies.
+    /// (and does NOT match any `exclude_patterns`) to determine if the ruleset applies.
     ///
     /// Empty if the ruleset has no ref_name conditions (applies to all branches)
     /// or if the conditions couldn't be parsed.
     pub target_branches: Vec<String>,
+    /// Branch patterns to exclude (from `conditions.ref_name.exclude`).
+    ///
+    /// Even if a branch matches `target_branches`, it is excluded if it matches
+    /// any of these patterns. This prevents false-positive dismiss-stale-reviews
+    /// warnings for branches explicitly excluded by the ruleset.
+    #[serde(default)]
+    pub exclude_patterns: Vec<String>,
 }
 
 /// Repository settings related to merge methods.
@@ -391,14 +398,18 @@ mod tests {
             arb_branch_name(),
             any::<bool>(),
             prop::collection::vec(arb_branch_name(), 0..3),
+            prop::collection::vec(arb_branch_name(), 0..3),
         )
-            .prop_map(|(name, dismiss_stale_reviews_on_push, target_branches)| {
-                RulesetData {
-                    name,
-                    dismiss_stale_reviews_on_push,
-                    target_branches,
-                }
-            })
+            .prop_map(
+                |(name, dismiss_stale_reviews_on_push, target_branches, exclude_patterns)| {
+                    RulesetData {
+                        name,
+                        dismiss_stale_reviews_on_push,
+                        target_branches,
+                        exclude_patterns,
+                    }
+                },
+            )
     }
 
     fn arb_repo_settings_data() -> impl Strategy<Value = RepoSettingsData> {

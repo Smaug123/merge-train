@@ -794,17 +794,18 @@ async fn get_rulesets(client: &OctocrabClient) -> Result<GitHubResponse, GitHubA
                                 .unwrap_or(false)
                     });
 
-                    // Extract target branch patterns from conditions
-                    let target_branches = r
+                    // Extract target branch patterns and exclude patterns from conditions
+                    let (target_branches, exclude_patterns) = r
                         .conditions
                         .and_then(|c| c.ref_name)
-                        .map(|rn| rn.include)
+                        .map(|rn| (rn.include, rn.exclude))
                         .unwrap_or_default();
 
                     RulesetData {
                         name: r.name,
                         dismiss_stale_reviews_on_push: dismiss_stale,
                         target_branches,
+                        exclude_patterns,
                     }
                 })
                 .collect();
@@ -846,8 +847,11 @@ struct RulesetRefNameCondition {
     /// Branch patterns to include (e.g., "refs/heads/main", "refs/heads/*")
     #[serde(default)]
     include: Vec<String>,
-    // Note: `exclude` is also available but we only need `include` for
-    // determining if the default branch could be targeted
+    /// Branch patterns to exclude from the ruleset.
+    /// A branch matching any exclude pattern is not targeted, even if it
+    /// matches an include pattern.
+    #[serde(default)]
+    exclude: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
