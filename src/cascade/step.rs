@@ -141,43 +141,44 @@ pub fn execute_cascade_step(
 }
 
 /// Execute from Idle phase - determine if we have descendants and transition appropriately.
+///
+/// After transitioning to the next phase, immediately execute that phase to produce
+/// effects (rather than returning empty effects which would cause the train to stall).
 fn execute_from_idle(
     train: &mut TrainRecord,
     prs: &HashMap<PrNumber, CachedPr>,
-    _ctx: &StepContext,
+    ctx: &StepContext,
 ) -> StepResult {
     // Compute frozen descendants
     let descendants = compute_open_descendants(train.current_pr, prs);
 
     // Transition to next phase
     let new_phase = crate::state::transitions::start_preparing(descendants.clone());
-    train.cascade_phase = new_phase;
+    train.cascade_phase = new_phase.clone();
     train.increment_seq();
 
-    // If we have descendants, we'll start preparing them
-    // If not, we'll be in SquashPending and ready to merge
-    let (outcome, effects) = if descendants.is_empty() {
-        // No descendants - ready to squash
-        (
-            CascadeStepOutcome::WaitingOnCi {
-                pr_number: train.current_pr,
-            },
-            vec![],
-        )
-    } else {
-        // Has descendants - will prepare them first
-        (
-            CascadeStepOutcome::WaitingOnCi {
-                pr_number: train.current_pr,
-            },
-            vec![],
-        )
-    };
-
-    StepResult {
-        train: train.clone(),
-        outcome,
-        effects,
+    // Immediately execute the new phase to produce effects
+    match new_phase {
+        CascadePhase::Preparing { progress } => {
+            // Has descendants - immediately start preparing the first one
+            execute_preparing(train, progress, prs, ctx)
+        }
+        CascadePhase::SquashPending { progress: _ } => {
+            // No descendants - immediately emit the squash effect
+            let Some(current_pr) = prs.get(&train.current_pr) else {
+                train.abort(TrainError::new("pr_not_found", "Current PR not found"));
+                return StepResult {
+                    train: train.clone(),
+                    outcome: CascadeStepOutcome::Aborted {
+                        pr_number: train.current_pr,
+                        reason: AbortReason::PrClosed,
+                    },
+                    effects: vec![],
+                };
+            };
+            execute_squash_pending(train, DescendantProgress::new(vec![]), current_pr, ctx)
+        }
+        _ => unreachable!("start_preparing only returns Preparing or SquashPending"),
     }
 }
 
@@ -218,18 +219,35 @@ fn execute_preparing(
         };
     };
 
-    let predecessor_head = current_pr.head_sha.clone();
-
     // Store predecessor info for recovery
     train.predecessor_pr = Some(train.current_pr);
-    train.predecessor_head_sha = Some(predecessor_head.clone());
+    train.predecessor_head_sha = Some(current_pr.head_sha.clone());
     train.increment_seq();
 
     // Generate effects for preparation
+    // Fetch via PR refs to ensure we have the latest state
     let effects = vec![
-        // Merge predecessor head into descendant
+        // Fetch both the predecessor and descendant PR refs
+        Effect::Git(GitEffect::Fetch {
+            refspecs: vec![
+                format!(
+                    "refs/pull/{}/head:refs/remotes/origin/pr/{}",
+                    train.current_pr, train.current_pr
+                ),
+                format!(
+                    "refs/pull/{}/head:refs/remotes/origin/pr/{}",
+                    next_descendant, next_descendant
+                ),
+            ],
+        }),
+        // Checkout the descendant branch
+        Effect::Git(GitEffect::Checkout {
+            target: desc_pr.head_ref.clone(),
+            detach: false,
+        }),
+        // Merge predecessor head (using the fetched PR ref)
         Effect::Git(GitEffect::Merge {
-            target: predecessor_head.as_str().to_string(),
+            target: format!("refs/remotes/origin/pr/{}", train.current_pr),
             strategy: MergeStrategy::Default,
             message: format!(
                 "Merge predecessor into {} (merge train preparation)",
@@ -381,7 +399,7 @@ fn execute_retargeting(
     // Find the next descendant to retarget
     let Some(&next_descendant) = progress.remaining().next() else {
         // All descendants retargeted - complete!
-        return complete_cascade(train);
+        return complete_cascade(train, progress);
     };
 
     // Get descendant PR info
@@ -409,25 +427,34 @@ fn execute_retargeting(
 }
 
 /// Handle the case where a PR was merged externally (not by us).
+///
+/// Uses the frozen descendants from the current phase if available, rather than
+/// recomputing descendants (which could include late additions).
 fn handle_external_merge(
     train: &mut TrainRecord,
     merge_sha: Sha,
-    prs: &HashMap<PrNumber, CachedPr>,
+    _prs: &HashMap<PrNumber, CachedPr>,
     _ctx: &StepContext,
 ) -> StepResult {
     // Store the squash SHA
     train.last_squash_sha = Some(merge_sha.clone());
 
-    // Compute descendants for the merged PR
-    let descendants = compute_open_descendants(train.current_pr, prs);
+    // Get frozen descendants from current phase (if any), otherwise empty
+    let progress = train
+        .cascade_phase
+        .progress()
+        .cloned()
+        .unwrap_or_else(|| DescendantProgress::new(vec![]));
 
-    if descendants.is_empty() {
-        // No descendants - cascade complete
-        return complete_cascade(train);
+    // Check remaining (frozen - completed - skipped)
+    let remaining: Vec<PrNumber> = progress.remaining().copied().collect();
+
+    if remaining.is_empty() {
+        // No descendants to process - cascade complete
+        return complete_cascade(train, progress);
     }
 
-    // Transition to Reconciling phase
-    let progress = DescendantProgress::new(descendants);
+    // Transition to Reconciling phase with frozen descendants
     train.cascade_phase = CascadePhase::Reconciling {
         progress,
         squash_sha: merge_sha,
@@ -522,14 +549,49 @@ fn transition_to_retargeting(
 }
 
 /// Complete the cascade (Retargeting -> Idle).
-fn complete_cascade(train: &mut TrainRecord) -> StepResult {
+///
+/// After all descendants have been retargeted, determine the next step:
+/// - If no descendants were successfully processed, the train is truly complete
+/// - If one descendant was processed, advance `current_pr` and continue
+/// - If multiple descendants were processed, emit FanOut for parallel trains
+fn complete_cascade(train: &mut TrainRecord, progress: DescendantProgress) -> StepResult {
     train.cascade_phase = CascadePhase::Idle;
     train.increment_seq();
 
-    StepResult {
-        train: train.clone(),
-        outcome: CascadeStepOutcome::Complete,
-        effects: vec![],
+    // Get descendants that were successfully processed (not skipped)
+    let completed: Vec<PrNumber> = progress.completed.iter().copied().collect();
+
+    match completed.len() {
+        0 => {
+            // No descendants were successfully processed - truly complete
+            StepResult {
+                train: train.clone(),
+                outcome: CascadeStepOutcome::Complete,
+                effects: vec![],
+            }
+        }
+        1 => {
+            // Single descendant - advance current_pr and continue the train
+            train.current_pr = completed[0];
+            train.increment_seq();
+            StepResult {
+                train: train.clone(),
+                outcome: CascadeStepOutcome::WaitingOnCi {
+                    pr_number: completed[0],
+                },
+                effects: vec![],
+            }
+        }
+        _ => {
+            // Multiple descendants - fan out into separate trains
+            StepResult {
+                train: train.clone(),
+                outcome: CascadeStepOutcome::FanOut {
+                    descendants: completed,
+                },
+                effects: vec![],
+            }
+        }
     }
 }
 
@@ -1191,6 +1253,265 @@ mod tests {
                     matches!(outcome, CascadeStepOutcome::Complete),
                     "With no descendants, outcome should be Complete, got: {:?}",
                     outcome
+                );
+            }
+
+            // ─── Bug Fix Tests ───────────────────────────────────────────────────────
+            //
+            // These tests expose bugs described in review comments. They should FAIL
+            // before the fix is applied and PASS after.
+
+            /// Property: After completing Retargeting, cascade advances current_pr or emits FanOut.
+            ///
+            /// BUG: complete_cascade just sets Idle and returns Complete, never advancing
+            /// current_pr or emitting FanOut. The train stops at the root and never
+            /// processes descendants.
+            #[test]
+            fn complete_cascade_advances_or_fans_out(
+                frozen_descendants in arb_unique_descendants(1, 4),
+                sha in arb_sha()
+            ) {
+                let ctx = StepContext::new("main");
+
+                // Build PR map
+                let mut prs = HashMap::new();
+                let root_pr = make_pr_with_predecessor(1, sha.clone(), "main", None);
+                prs.insert(PrNumber(1), root_pr);
+
+                for &pr_num in &frozen_descendants {
+                    let pr = make_pr_with_predecessor(
+                        pr_num.0,
+                        sha.clone(),
+                        "branch-1",
+                        Some(PrNumber(1)),
+                    );
+                    prs.insert(pr_num, pr);
+                }
+
+                // Create a train in Retargeting phase with all descendants completed
+                let mut train = TrainRecord::new(PrNumber(1));
+                let mut progress = DescendantProgress::new(frozen_descendants.clone());
+                for &desc in &frozen_descendants {
+                    progress.mark_completed(desc);
+                }
+                train.cascade_phase = CascadePhase::Retargeting {
+                    progress,
+                    squash_sha: sha.clone(),
+                };
+
+                // Execute step - should complete cascade
+                let result = execute_cascade_step(train, &prs, &ctx);
+
+                // After Retargeting completes with N descendants:
+                // - N=0: Complete (but we have at least 1)
+                // - N=1: should advance current_pr and return WaitingOnCi
+                // - N>1: should return FanOut with all completed descendants
+                match frozen_descendants.len() {
+                    1 => {
+                        // Single descendant: should advance current_pr
+                        prop_assert_eq!(
+                            result.train.current_pr,
+                            frozen_descendants[0],
+                            "With single completed descendant, current_pr should advance to {}",
+                            frozen_descendants[0]
+                        );
+                        prop_assert!(
+                            matches!(result.outcome, CascadeStepOutcome::WaitingOnCi { pr_number } if pr_number == frozen_descendants[0]),
+                            "With single completed descendant, outcome should be WaitingOnCi for that PR, got: {:?}",
+                            result.outcome
+                        );
+                    }
+                    n if n > 1 => {
+                        // Multiple descendants: should fan out
+                        prop_assert!(
+                            matches!(&result.outcome, CascadeStepOutcome::FanOut { descendants } if descendants.len() == n),
+                            "With {} completed descendants, outcome should be FanOut with all of them, got: {:?}",
+                            n, result.outcome
+                        );
+                        if let CascadeStepOutcome::FanOut { descendants } = &result.outcome {
+                            for &desc in &frozen_descendants {
+                                prop_assert!(
+                                    descendants.contains(&desc),
+                                    "FanOut should contain completed descendant {}", desc
+                                );
+                            }
+                        }
+                    }
+                    _ => unreachable!("arb_unique_descendants(1, 4) guarantees at least 1"),
+                }
+            }
+
+            /// Property: External merge uses frozen descendants, not recomputed ones.
+            ///
+            /// BUG: handle_external_merge calls compute_open_descendants() which
+            /// recomputes descendants, ignoring the frozen set and any late additions.
+            #[test]
+            fn external_merge_uses_frozen_descendants(
+                frozen_descendants in arb_unique_descendants(1, 3),
+                late_addition in arb_pr_number(),
+                sha in arb_sha()
+            ) {
+                prop_assume!(!frozen_descendants.contains(&late_addition));
+
+                let ctx = StepContext::new("main");
+
+                // Build PR map with frozen descendants
+                let mut prs = HashMap::new();
+                let root_pr = make_pr_with_predecessor(1, sha.clone(), "main", None);
+                prs.insert(PrNumber(1), root_pr);
+
+                for &pr_num in &frozen_descendants {
+                    let pr = make_pr_with_predecessor(
+                        pr_num.0,
+                        sha.clone(),
+                        "branch-1",
+                        Some(PrNumber(1)),
+                    );
+                    prs.insert(pr_num, pr);
+                }
+
+                // Create train in Preparing phase (descendants frozen)
+                let mut train = TrainRecord::new(PrNumber(1));
+                train.cascade_phase = CascadePhase::Preparing {
+                    progress: DescendantProgress::new(frozen_descendants.clone()),
+                };
+
+                // Now add a late descendant AFTER the freeze
+                let late_pr = make_pr_with_predecessor(
+                    late_addition.0,
+                    sha.clone(),
+                    "branch-1",
+                    Some(PrNumber(1)),
+                );
+                prs.insert(late_addition, late_pr);
+
+                // Simulate external merge by setting PR state to merged
+                let merge_sha = Sha::parse("f".repeat(40)).unwrap();
+                let mut merged_root = make_pr_with_predecessor(1, sha.clone(), "main", None);
+                merged_root.state = PrState::Merged { merge_commit_sha: merge_sha.clone() };
+                prs.insert(PrNumber(1), merged_root);
+
+                // Execute step - should handle external merge
+                let result = execute_cascade_step(train, &prs, &ctx);
+
+                // The result should transition to Reconciling with frozen descendants only
+                prop_assert!(
+                    matches!(&result.train.cascade_phase, CascadePhase::Reconciling { progress, .. }
+                        if progress.frozen_descendants == frozen_descendants),
+                    "External merge should use frozen descendants {:?}, got phase: {:?}",
+                    frozen_descendants, result.train.cascade_phase
+                );
+
+                // Late addition should NOT be in the frozen set
+                if let CascadePhase::Reconciling { progress, .. } = &result.train.cascade_phase {
+                    prop_assert!(
+                        !progress.frozen_descendants.contains(&late_addition),
+                        "Late addition {} should not be in frozen descendants after external merge",
+                        late_addition
+                    );
+                }
+            }
+
+            /// Property: Idle transition produces effects, not just WaitingOnCi.
+            ///
+            /// BUG: execute_from_idle transitions to Preparing/SquashPending but returns
+            /// no effects, causing the train to stall until something else triggers it.
+            #[test]
+            fn idle_transition_produces_effects(
+                descendants in arb_unique_descendants(0, 3),
+                sha in arb_sha()
+            ) {
+                let ctx = StepContext::new("main");
+
+                // Build PR map
+                let mut prs = HashMap::new();
+                let root_pr = make_pr_with_predecessor(1, sha.clone(), "main", None);
+                prs.insert(PrNumber(1), root_pr);
+
+                for &pr_num in &descendants {
+                    let pr = make_pr_with_predecessor(
+                        pr_num.0,
+                        sha.clone(),
+                        "branch-1",
+                        Some(PrNumber(1)),
+                    );
+                    prs.insert(pr_num, pr);
+                }
+
+                // Start from Idle
+                let train = TrainRecord::new(PrNumber(1));
+                prop_assert!(matches!(train.cascade_phase, CascadePhase::Idle));
+
+                // Execute step from Idle
+                let result = execute_cascade_step(train, &prs, &ctx);
+
+                // The transition should produce effects to drive the next operation
+                if descendants.is_empty() {
+                    // No descendants: should go to SquashPending with squash effect
+                    prop_assert!(
+                        matches!(result.train.cascade_phase, CascadePhase::SquashPending { .. }),
+                        "With no descendants, should transition to SquashPending"
+                    );
+                    prop_assert!(
+                        result.effects.iter().any(|e| matches!(e, Effect::GitHub(GitHubEffect::SquashMerge { .. }))),
+                        "Transition to SquashPending should produce SquashMerge effect, got: {:?}",
+                        result.effects
+                    );
+                } else {
+                    // Has descendants: should go to Preparing with merge effects
+                    prop_assert!(
+                        matches!(result.train.cascade_phase, CascadePhase::Preparing { .. }),
+                        "With descendants, should transition to Preparing"
+                    );
+                    prop_assert!(
+                        !result.effects.is_empty(),
+                        "Transition to Preparing should produce effects to start preparation, got empty"
+                    );
+                }
+            }
+
+            /// Property: Preparation includes Fetch effect for PR refs.
+            ///
+            /// BUG: execute_preparing uses cached head_sha directly without fetching
+            /// via refs/pull/<n>/head, which may be stale.
+            #[test]
+            fn preparation_fetches_pr_refs(
+                descendant in arb_pr_number(),
+                sha in arb_sha()
+            ) {
+                let ctx = StepContext::new("main");
+
+                // Build PR map
+                let mut prs = HashMap::new();
+                let root_pr = make_pr_with_predecessor(1, sha.clone(), "main", None);
+                prs.insert(PrNumber(1), root_pr);
+
+                let desc_pr = make_pr_with_predecessor(
+                    descendant.0,
+                    sha.clone(),
+                    "branch-1",
+                    Some(PrNumber(1)),
+                );
+                prs.insert(descendant, desc_pr);
+
+                // Create train in Preparing phase
+                let mut train = TrainRecord::new(PrNumber(1));
+                train.cascade_phase = CascadePhase::Preparing {
+                    progress: DescendantProgress::new(vec![descendant]),
+                };
+
+                let result = execute_cascade_step(train, &prs, &ctx);
+
+                // Should include a Fetch effect to get latest PR refs
+                let has_fetch = result.effects.iter().any(|e| {
+                    matches!(e, Effect::Git(GitEffect::Fetch { refspecs })
+                        if refspecs.iter().any(|r| r.contains("refs/pull/")))
+                });
+
+                prop_assert!(
+                    has_fetch,
+                    "Preparation should fetch PR refs before merging, effects: {:?}",
+                    result.effects
                 );
             }
         }

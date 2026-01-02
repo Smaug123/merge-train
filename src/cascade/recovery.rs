@@ -111,6 +111,7 @@ pub fn compute_recovery_plan(
         };
     }
 
+    let mut plan_train = train.clone();
     let mut actions = Vec::new();
     let mut effects = Vec::new();
 
@@ -149,15 +150,19 @@ pub fn compute_recovery_plan(
             });
         }
 
-        CascadePhase::SquashPending { progress: _ } => {
+        CascadePhase::SquashPending { progress } => {
             // Check if the PR was already merged
             if let Some(current_pr) = prs.get(&train.current_pr) {
                 match &current_pr.state {
-                    PrState::Merged {
-                        merge_commit_sha: _,
-                    } => {
-                        // Already merged - we may have crashed after squash but before
-                        // transitioning. The train state will be updated by the caller.
+                    PrState::Merged { merge_commit_sha } => {
+                        // Already merged - transition to Reconciling phase with the merge SHA
+                        // and preserve the frozen descendants
+                        plan_train.cascade_phase = CascadePhase::Reconciling {
+                            progress: progress.clone(),
+                            squash_sha: merge_commit_sha.clone(),
+                        };
+                        plan_train.last_squash_sha = Some(merge_commit_sha.clone());
+                        plan_train.increment_seq();
                         actions.push(RecoveryAction::ResumeClean);
                     }
                     PrState::Open => {
@@ -245,7 +250,7 @@ pub fn compute_recovery_plan(
     }
 
     RecoveryPlan {
-        train: train.clone(),
+        train: plan_train,
         actions,
         effects,
     }
@@ -863,6 +868,66 @@ mod tests {
                         phase.name()
                     );
                 }
+            }
+
+            // ─── Bug Fix Tests ───────────────────────────────────────────────────────
+            //
+            // These tests expose bugs described in review comments.
+
+            /// Property: Recovery for SquashPending with merged PR captures merge_commit_sha
+            /// and transitions train to Reconciling.
+            ///
+            /// BUG: When the train is in SquashPending and the PR was merged externally,
+            /// recovery returns ResumeClean without capturing merge_commit_sha or
+            /// transitioning the train to Reconciling phase.
+            #[test]
+            fn recovery_squash_pending_with_merged_pr_transitions_to_reconciling(
+                frozen_descendants in arb_unique_descendants(1, 3),
+                merge_sha in arb_sha(),
+                pr_sha in arb_sha()
+            ) {
+                // Create train in SquashPending phase
+                let mut train = TrainRecord::new(PrNumber(1));
+                train.cascade_phase = CascadePhase::SquashPending {
+                    progress: DescendantProgress::new(frozen_descendants.clone()),
+                };
+
+                // Create PR map with merged root and open descendants
+                let mut prs = HashMap::new();
+                let mut root_pr = make_open_pr_for_test(1, "main", None, pr_sha.clone());
+                root_pr.state = PrState::Merged { merge_commit_sha: merge_sha.clone() };
+                prs.insert(PrNumber(1), root_pr);
+
+                for &desc in &frozen_descendants {
+                    let pr = make_open_pr_for_test(desc.0, "branch-1", Some(PrNumber(1)), pr_sha.clone());
+                    prs.insert(desc, pr);
+                }
+
+                let plan = compute_recovery_plan(&train, &prs, &[], "main");
+
+                // The train should be transitioned to Reconciling phase
+                prop_assert!(
+                    matches!(&plan.train.cascade_phase, CascadePhase::Reconciling { squash_sha, .. }
+                        if *squash_sha == merge_sha),
+                    "Recovery for SquashPending with merged PR should transition to Reconciling with merge_commit_sha, got: {:?}",
+                    plan.train.cascade_phase
+                );
+
+                // The frozen descendants should be preserved
+                if let CascadePhase::Reconciling { progress, .. } = &plan.train.cascade_phase {
+                    prop_assert_eq!(
+                        &progress.frozen_descendants,
+                        &frozen_descendants,
+                        "Recovery should preserve frozen descendants"
+                    );
+                }
+
+                // The train's last_squash_sha should be updated
+                prop_assert_eq!(
+                    plan.train.last_squash_sha.as_ref(),
+                    Some(&merge_sha),
+                    "Recovery should update last_squash_sha"
+                );
             }
         }
     }
