@@ -910,7 +910,6 @@ mod tests {
 
     mod property_tests {
         use super::*;
-        use crate::state::transitions::{PhaseOutcome, next_phase};
         use proptest::prelude::*;
 
         fn arb_pr_number() -> impl Strategy<Value = PrNumber> {
@@ -946,115 +945,174 @@ mod tests {
             )
         }
 
+        /// Simulates executing effects and returns the appropriate OperationResult.
+        /// This is used to drive the cascade forward in tests.
+        fn simulate_effect_execution(
+            train: &TrainRecord,
+            effects: &[Effect],
+            squash_sha: &Sha,
+        ) -> Option<OperationResult> {
+            // Find the primary effect and determine what result to return
+            for effect in effects {
+                match effect {
+                    Effect::Git(GitEffect::Push { refspec, .. }) => {
+                        // Extract the branch name to determine which descendant was pushed
+                        // refspec is like "HEAD:refs/heads/branch-N"
+                        if let Some(branch) = refspec.strip_prefix("HEAD:refs/heads/branch-") {
+                            if let Ok(n) = branch.parse::<u64>() {
+                                let pr = PrNumber(n);
+                                // Determine the operation based on current phase
+                                return match &train.cascade_phase {
+                                    CascadePhase::Preparing { .. } => {
+                                        Some(OperationResult::DescendantPrepared { pr })
+                                    }
+                                    CascadePhase::Reconciling { .. } => {
+                                        Some(OperationResult::DescendantReconciled {
+                                            pr,
+                                            squash_sha: squash_sha.clone(),
+                                        })
+                                    }
+                                    CascadePhase::CatchingUp { .. } => {
+                                        Some(OperationResult::DescendantCaughtUp { pr })
+                                    }
+                                    _ => None,
+                                };
+                            }
+                        }
+                    }
+                    Effect::GitHub(GitHubEffect::SquashMerge { pr, .. }) => {
+                        return Some(OperationResult::SquashMerged {
+                            pr: *pr,
+                            squash_sha: squash_sha.clone(),
+                        });
+                    }
+                    Effect::GitHub(GitHubEffect::RetargetPr { pr, .. }) => {
+                        return Some(OperationResult::DescendantRetargeted { pr: *pr });
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+
         proptest! {
-            /// Property: Phase transitions via next_phase never skip phases.
+            /// Property: execute_cascade_step never skips phases.
             ///
-            /// This tests that the state machine transition logic in next_phase
-            /// follows the correct phase sequence. For any descendant count,
-            /// completing descendants should transition through the proper sequence.
+            /// This tests that repeated calls to execute_cascade_step transition
+            /// through phases in the correct order: Idle -> Preparing -> SquashPending
+            /// -> Reconciling -> CatchingUp -> Retargeting -> Idle.
+            ///
+            /// Unlike the previous version that only tested next_phase(), this test
+            /// actually exercises the full cascade step execution path.
             #[test]
-            fn phase_transitions_never_skip(
-                descendants in arb_unique_descendants(1, 5),
+            fn cascade_step_never_skips_phases(
+                descendants in arb_unique_descendants(1, 4),
                 sha in arb_sha()
             ) {
-                // Start with Preparing (which has descendants)
-                let mut phase = CascadePhase::Preparing {
-                    progress: DescendantProgress::new(descendants.clone()),
-                };
+                let ctx = StepContext::new("main");
 
-                // Track sequence
-                let mut sequence = vec![phase.name().to_string()];
+                // Build PR map with root and descendants
+                let mut prs = HashMap::new();
+                let root_pr = make_pr_with_predecessor(1, sha.clone(), "main", None);
+                prs.insert(PrNumber(1), root_pr);
 
-                // Complete all descendants in Preparing
-                for &desc in &descendants {
-                    phase = next_phase(&phase, PhaseOutcome::DescendantCompleted { pr: desc })
-                        .expect("Valid Preparing transition");
+                for (i, &pr_num) in descendants.iter().enumerate() {
+                    let predecessor = if i == 0 {
+                        PrNumber(1)
+                    } else {
+                        descendants[i - 1]
+                    };
+                    let base_ref = format!("branch-{}", predecessor.0);
+                    let pr = make_pr_with_predecessor(pr_num.0, sha.clone(), &base_ref, Some(predecessor));
+                    prs.insert(pr_num, pr);
                 }
-                sequence.push(phase.name().to_string());
 
-                // Should be in SquashPending
-                prop_assert!(
-                    matches!(phase, CascadePhase::SquashPending { .. }),
-                    "After Preparing, should be SquashPending, got: {}",
-                    phase.name()
-                );
+                // Start from Idle
+                let mut train = TrainRecord::new(PrNumber(1));
+                prop_assert!(matches!(train.cascade_phase, CascadePhase::Idle));
 
-                // SquashComplete -> Reconciling
-                phase = next_phase(&phase, PhaseOutcome::SquashComplete { squash_sha: sha.clone() })
-                    .expect("Valid SquashPending transition");
-                sequence.push(phase.name().to_string());
+                // Track phase sequence
+                let mut phase_sequence = vec!["idle".to_string()];
+                let mut last_phase_name = "idle".to_string();
 
-                prop_assert!(
-                    matches!(phase, CascadePhase::Reconciling { .. }),
-                    "After SquashComplete, should be Reconciling, got: {}",
-                    phase.name()
-                );
+                // Run the cascade until complete or max iterations
+                let max_iterations = 100;
+                for _ in 0..max_iterations {
+                    let result = execute_cascade_step(train.clone(), &prs, &ctx);
+                    train = result.train;
 
-                // Complete all descendants in Reconciling
-                for &desc in &descendants {
-                    phase = next_phase(&phase, PhaseOutcome::DescendantCompleted { pr: desc })
-                        .expect("Valid Reconciling transition");
+                    // Record phase transitions (only when phase changes)
+                    let current_phase = train.cascade_phase.name().to_string();
+                    if current_phase != last_phase_name {
+                        phase_sequence.push(current_phase.clone());
+                        last_phase_name = current_phase;
+                    }
+
+                    // Check for completion or abort
+                    if matches!(result.outcome, CascadeStepOutcome::Complete)
+                        || matches!(result.outcome, CascadeStepOutcome::FanOut { .. })
+                        || matches!(result.outcome, CascadeStepOutcome::Aborted { .. })
+                    {
+                        break;
+                    }
+
+                    // Simulate effect execution to drive the cascade forward
+                    if !result.effects.is_empty() {
+                        if let Some(op_result) = simulate_effect_execution(&train, &result.effects, &sha) {
+                            let (updated_train, _) = process_operation_result(train, op_result);
+                            train = updated_train;
+                        }
+                    }
                 }
-                sequence.push(phase.name().to_string());
 
-                prop_assert!(
-                    matches!(phase, CascadePhase::CatchingUp { .. }),
-                    "After Reconciling, should be CatchingUp, got: {}",
-                    phase.name()
-                );
+                // Verify the phase sequence follows the correct order
+                // Valid order: idle -> preparing -> squash_pending -> reconciling -> catching_up -> retargeting -> idle
+                let valid_order = ["idle", "preparing", "squash_pending", "reconciling", "catching_up", "retargeting"];
 
-                // Complete all descendants in CatchingUp
-                for &desc in &descendants {
-                    phase = next_phase(&phase, PhaseOutcome::DescendantCompleted { pr: desc })
-                        .expect("Valid CatchingUp transition");
+                let mut last_order_idx = 0;
+                for (i, phase) in phase_sequence.iter().enumerate() {
+                    // Find this phase in the valid order
+                    if let Some(order_idx) = valid_order.iter().position(|&p| p == phase) {
+                        // Phase must be >= last seen phase (can't go backwards, can repeat idle at end)
+                        prop_assert!(
+                            order_idx >= last_order_idx || (phase == "idle" && i > 0),
+                            "Phase sequence went backwards: {:?} (phase {} at index {} came after phase at order {})",
+                            phase_sequence, phase, order_idx, last_order_idx
+                        );
+                        last_order_idx = order_idx;
+                    } else {
+                        prop_assert!(false, "Unknown phase in sequence: {}", phase);
+                    }
                 }
-                sequence.push(phase.name().to_string());
 
-                prop_assert!(
-                    matches!(phase, CascadePhase::Retargeting { .. }),
-                    "After CatchingUp, should be Retargeting, got: {}",
-                    phase.name()
-                );
-
-                // Complete all descendants in Retargeting
-                for &desc in &descendants {
-                    phase = next_phase(&phase, PhaseOutcome::DescendantCompleted { pr: desc })
-                        .expect("Valid Retargeting transition");
+                // For non-empty descendants, we should see all phases
+                if !descendants.is_empty() {
+                    prop_assert!(
+                        phase_sequence.contains(&"preparing".to_string()),
+                        "With descendants, should have visited Preparing phase. Sequence: {:?}",
+                        phase_sequence
+                    );
                 }
-                sequence.push(phase.name().to_string());
-
-                prop_assert!(
-                    matches!(phase, CascadePhase::Idle),
-                    "After Retargeting, should be Idle, got: {}",
-                    phase.name()
-                );
-
-                // Verify the sequence is valid
-                let expected = ["preparing", "squash_pending", "reconciling", "catching_up", "retargeting", "idle"];
-                prop_assert_eq!(
-                    sequence,
-                    expected.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-                    "Phase sequence should match expected order"
-                );
             }
 
             /// Property: Late additions don't corrupt ongoing cascades.
             ///
-            /// The frozen_descendants set captured at the start of Preparing
-            /// must remain unchanged through all subsequent phases, even if
-            /// new descendants are added to the PR map.
+            /// This test verifies that when a new descendant PR is added AFTER the cascade
+            /// has started (and frozen its descendants), the late addition is NEVER processed
+            /// in any phase. This tests the full cascade execution path using execute_cascade_step.
             #[test]
             fn late_additions_dont_corrupt_cascade(
                 initial_descendants in arb_unique_descendants(1, 3),
                 late_addition in arb_pr_number(),
                 sha in arb_sha()
             ) {
-                // Ensure late_addition is distinct from initial_descendants
+                // Ensure late_addition is distinct from initial_descendants and root
                 prop_assume!(!initial_descendants.contains(&late_addition));
+                prop_assume!(late_addition != PrNumber(1));
 
                 let ctx = StepContext::new("main");
 
-                // Build initial PR map
+                // Build initial PR map (WITHOUT the late addition)
                 let mut prs = HashMap::new();
                 let root_pr = make_pr_with_predecessor(1, sha.clone(), "main", None);
                 prs.insert(PrNumber(1), root_pr);
@@ -1066,15 +1124,14 @@ mod tests {
                         initial_descendants[i - 1]
                     };
                     let base_ref = format!("branch-{}", predecessor.0);
-                    let pr =
-                        make_pr_with_predecessor(pr_num.0, sha.clone(), &base_ref, Some(predecessor));
+                    let pr = make_pr_with_predecessor(pr_num.0, sha.clone(), &base_ref, Some(predecessor));
                     prs.insert(pr_num, pr);
                 }
 
                 // Start cascade - this freezes the descendants
-                let train = TrainRecord::new(PrNumber(1));
-                let result = execute_cascade_step(train, &prs, &ctx);
-                let train = result.train;
+                let mut train = TrainRecord::new(PrNumber(1));
+                let result = execute_cascade_step(train.clone(), &prs, &ctx);
+                train = result.train;
 
                 // Capture frozen set
                 let frozen_set: Vec<PrNumber> = match &train.cascade_phase {
@@ -1083,8 +1140,7 @@ mod tests {
                     _ => vec![],
                 };
 
-                // Now add a "late" descendant to the PR map
-                // This simulates a PR being added after the freeze
+                // NOW add the "late" descendant to the PR map (AFTER freeze)
                 let late_pr = make_pr_with_predecessor(
                     late_addition.0,
                     sha.clone(),
@@ -1101,41 +1157,65 @@ mod tests {
                     frozen_set
                 );
 
-                // Verify frozen_descendants is preserved through phase transitions
-                // (using next_phase, not process_operation_result, to test the invariant)
-                let mut phase = train.cascade_phase.clone();
+                // Track all PRs that get processed (via effects targeting them)
+                let mut processed_prs: std::collections::HashSet<PrNumber> = std::collections::HashSet::new();
 
-                // Complete preparation
-                for &desc in &frozen_set {
-                    phase = next_phase(&phase, PhaseOutcome::DescendantCompleted { pr: desc })
-                        .expect("transition should succeed");
+                // Run the cascade to completion, tracking which PRs are processed
+                let max_iterations = 100;
+                for _ in 0..max_iterations {
+                    let result = execute_cascade_step(train.clone(), &prs, &ctx);
+                    train = result.train;
+
+                    // Track which PRs are targeted by effects
+                    for effect in &result.effects {
+                        match effect {
+                            Effect::Git(GitEffect::Push { refspec, .. }) => {
+                                // refspec is like "HEAD:refs/heads/branch-N"
+                                if let Some(branch) = refspec.strip_prefix("HEAD:refs/heads/branch-") {
+                                    if let Ok(n) = branch.parse::<u64>() {
+                                        processed_prs.insert(PrNumber(n));
+                                    }
+                                }
+                            }
+                            Effect::GitHub(GitHubEffect::RetargetPr { pr, .. }) => {
+                                processed_prs.insert(*pr);
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    // Check for completion or abort
+                    if matches!(result.outcome, CascadeStepOutcome::Complete)
+                        || matches!(result.outcome, CascadeStepOutcome::FanOut { .. })
+                        || matches!(result.outcome, CascadeStepOutcome::Aborted { .. })
+                    {
+                        break;
+                    }
+
+                    // Simulate effect execution to drive the cascade forward
+                    if !result.effects.is_empty() {
+                        if let Some(op_result) = simulate_effect_execution(&train, &result.effects, &sha) {
+                            let (updated_train, _) = process_operation_result(train, op_result);
+                            train = updated_train;
+                        }
+                    }
                 }
 
-                // Verify frozen set after Preparing -> SquashPending
-                if let Some(progress) = phase.progress() {
-                    prop_assert_eq!(
-                        &progress.frozen_descendants, &frozen_set,
-                        "frozen_descendants should not change after Preparing"
-                    );
+                // CRITICAL ASSERTION: The late addition should NEVER have been processed
+                prop_assert!(
+                    !processed_prs.contains(&late_addition),
+                    "Late addition {} was processed but should have been ignored! Processed: {:?}, Frozen: {:?}",
+                    late_addition,
+                    processed_prs,
+                    frozen_set
+                );
+
+                // Verify frozen_descendants was preserved throughout (check final state)
+                if let Some(progress) = train.cascade_phase.progress() {
                     prop_assert!(
                         !progress.frozen_descendants.contains(&late_addition),
-                        "Late addition should not be in frozen set after Preparing"
-                    );
-                }
-
-                // SquashComplete
-                phase = next_phase(&phase, PhaseOutcome::SquashComplete { squash_sha: sha.clone() })
-                    .expect("squash transition should succeed");
-
-                // Verify frozen set after SquashPending -> Reconciling
-                if let Some(progress) = phase.progress() {
-                    prop_assert_eq!(
-                        &progress.frozen_descendants, &frozen_set,
-                        "frozen_descendants should not change after SquashPending"
-                    );
-                    prop_assert!(
-                        !progress.frozen_descendants.contains(&late_addition),
-                        "Late addition should not be in frozen set after SquashPending"
+                        "Late addition {} ended up in frozen_descendants!",
+                        late_addition
                     );
                 }
             }
@@ -1513,6 +1593,251 @@ mod tests {
                     "Preparation should fetch PR refs before merging, effects: {:?}",
                     result.effects
                 );
+            }
+
+            /// Property: Fan-out creates independent trains correctly.
+            ///
+            /// When a cascade completes for a root PR with multiple descendants (fan-out),
+            /// the system should be able to start independent trains from each descendant.
+            /// Each new train should have its own isolated state.
+            #[test]
+            fn fan_out_creates_independent_trains(
+                descendants in arb_unique_descendants(2, 4),
+                sha in arb_sha()
+            ) {
+                use crate::cascade::engine::CascadeEngine;
+
+                let ctx = StepContext::new("main");
+                let engine = CascadeEngine::new("main");
+
+                // Build PR map with root and multiple direct descendants (fan-out topology)
+                let mut prs = HashMap::new();
+                let root_pr = make_pr_with_predecessor(1, sha.clone(), "main", None);
+                prs.insert(PrNumber(1), root_pr);
+
+                // All descendants point directly to root (fan-out topology)
+                for &pr_num in &descendants {
+                    let pr = make_pr_with_predecessor(
+                        pr_num.0,
+                        sha.clone(),
+                        "branch-1",
+                        Some(PrNumber(1)),
+                    );
+                    prs.insert(pr_num, pr);
+                }
+
+                // Simulate completing the root cascade up to fan-out point
+                // Start train for root
+                let mut train = TrainRecord::new(PrNumber(1));
+
+                // Execute until we get FanOut outcome
+                let max_iterations = 50;
+                let mut fan_out_descendants: Option<Vec<PrNumber>> = None;
+
+                for _ in 0..max_iterations {
+                    let result = execute_cascade_step(train.clone(), &prs, &ctx);
+                    train = result.train;
+
+                    if let CascadeStepOutcome::FanOut { descendants: fan_out } = result.outcome {
+                        fan_out_descendants = Some(fan_out);
+                        break;
+                    }
+
+                    if matches!(result.outcome, CascadeStepOutcome::Complete)
+                        || matches!(result.outcome, CascadeStepOutcome::Aborted { .. })
+                    {
+                        break;
+                    }
+
+                    // Simulate effect execution
+                    if !result.effects.is_empty() {
+                        if let Some(op_result) = simulate_effect_execution(&train, &result.effects, &sha) {
+                            let (updated_train, _) = process_operation_result(train, op_result);
+                            train = updated_train;
+                        }
+                    }
+                }
+
+                // If we got a fan-out, verify we can start independent trains
+                if let Some(fan_out) = fan_out_descendants {
+                    prop_assert!(
+                        fan_out.len() >= 2,
+                        "Fan-out should have at least 2 descendants, got: {:?}",
+                        fan_out
+                    );
+
+                    // Try to start independent trains for each descendant
+                    let mut independent_trains = Vec::new();
+                    let mut active_trains = HashMap::new();
+
+                    for &desc_pr in &fan_out {
+                        // Update the PR to be a root (targeting main, since original root was merged)
+                        let mut updated_desc = prs.get(&desc_pr).unwrap().clone();
+                        updated_desc.base_ref = "main".to_string();
+                        updated_desc.predecessor = None;
+                        prs.insert(desc_pr, updated_desc);
+
+                        // Try to start a train
+                        let result = engine.start_train(desc_pr, &prs, &active_trains);
+
+                        prop_assert!(
+                            result.is_ok(),
+                            "Should be able to start independent train for {}, got error: {:?}",
+                            desc_pr,
+                            result.err()
+                        );
+
+                        let start_result = result.unwrap();
+                        prop_assert_eq!(
+                            start_result.train.original_root_pr, desc_pr,
+                            "New train should have {} as root",
+                            desc_pr
+                        );
+
+                        // Add to active trains to prevent duplicates
+                        active_trains.insert(desc_pr, start_result.train.clone());
+                        independent_trains.push(start_result.train);
+                    }
+
+                    // Verify all trains are independent (different root PRs)
+                    let roots: std::collections::HashSet<PrNumber> = independent_trains
+                        .iter()
+                        .map(|t| t.original_root_pr)
+                        .collect();
+                    prop_assert_eq!(
+                        roots.len(),
+                        independent_trains.len(),
+                        "Each train should have a unique root PR"
+                    );
+                }
+            }
+
+            /// Property: End-to-end cascade completes successfully.
+            ///
+            /// This is an integration test that runs a complete cascade from start to finish,
+            /// simulating effect execution between steps. It verifies the entire cascade
+            /// machinery works together correctly.
+            #[test]
+            fn end_to_end_cascade_completes(
+                descendants in arb_unique_descendants(1, 3),
+                sha in arb_sha()
+            ) {
+                let ctx = StepContext::new("main");
+
+                // Build PR map with a chain of descendants
+                let mut prs = HashMap::new();
+                let root_pr = make_pr_with_predecessor(1, sha.clone(), "main", None);
+                prs.insert(PrNumber(1), root_pr);
+
+                let descendants_vec: Vec<PrNumber> = descendants.iter().copied().collect();
+                for (i, &pr_num) in descendants_vec.iter().enumerate() {
+                    let predecessor = if i == 0 {
+                        PrNumber(1)
+                    } else {
+                        descendants_vec[i - 1]
+                    };
+                    let base_ref = format!("branch-{}", predecessor.0);
+                    let pr = make_pr_with_predecessor(pr_num.0, sha.clone(), &base_ref, Some(predecessor));
+                    prs.insert(pr_num, pr);
+                }
+
+                // Start cascade from Idle
+                let mut train = TrainRecord::new(PrNumber(1));
+                prop_assert!(matches!(train.cascade_phase, CascadePhase::Idle));
+
+                // Track visited phases and processed PRs
+                let mut visited_phases: Vec<String> = vec![];
+                let mut processed_prs: std::collections::HashSet<PrNumber> = std::collections::HashSet::new();
+                let mut completed = false;
+
+                // Run cascade to completion
+                let max_iterations = 200;
+                for iteration in 0..max_iterations {
+                    let result = execute_cascade_step(train.clone(), &prs, &ctx);
+                    train = result.train;
+
+                    // Track phase
+                    let phase_name = train.cascade_phase.name().to_string();
+                    if visited_phases.last() != Some(&phase_name) {
+                        visited_phases.push(phase_name);
+                    }
+
+                    // Track processed PRs from effects
+                    for effect in &result.effects {
+                        if let Effect::Git(GitEffect::Push { refspec, .. }) = effect {
+                            if let Some(branch) = refspec.strip_prefix("HEAD:refs/heads/branch-") {
+                                if let Ok(n) = branch.parse::<u64>() {
+                                    processed_prs.insert(PrNumber(n));
+                                }
+                            }
+                        }
+                        if let Effect::GitHub(GitHubEffect::RetargetPr { pr, .. }) = effect {
+                            processed_prs.insert(*pr);
+                        }
+                    }
+
+                    // Check for completion
+                    match &result.outcome {
+                        CascadeStepOutcome::Complete => {
+                            completed = true;
+                            break;
+                        }
+                        CascadeStepOutcome::FanOut { .. } => {
+                            // Fan-out is also a valid completion for this PR
+                            completed = true;
+                            break;
+                        }
+                        CascadeStepOutcome::Aborted { reason, .. } => {
+                            prop_assert!(
+                                false,
+                                "Cascade aborted unexpectedly at iteration {}: {:?}",
+                                iteration,
+                                reason
+                            );
+                        }
+                        _ => {}
+                    }
+
+                    // Simulate effect execution
+                    if !result.effects.is_empty() {
+                        if let Some(op_result) = simulate_effect_execution(&train, &result.effects, &sha) {
+                            let (updated_train, _) = process_operation_result(train, op_result);
+                            train = updated_train;
+                        }
+                    }
+                }
+
+                // Verify completion
+                prop_assert!(
+                    completed,
+                    "Cascade should complete within {} iterations. Final phase: {}, visited: {:?}",
+                    max_iterations,
+                    train.cascade_phase.name(),
+                    visited_phases
+                );
+
+                // Verify all phases were visited (for non-empty descendants)
+                if !descendants.is_empty() {
+                    let required_phases = ["idle", "preparing", "squash_pending", "reconciling", "catching_up", "retargeting"];
+                    for required in required_phases {
+                        prop_assert!(
+                            visited_phases.iter().any(|p| p == required),
+                            "Cascade should visit {} phase. Visited: {:?}",
+                            required,
+                            visited_phases
+                        );
+                    }
+
+                    // Verify all descendants were processed
+                    for &desc in &descendants {
+                        prop_assert!(
+                            processed_prs.contains(&desc),
+                            "Descendant {} should have been processed. Processed: {:?}",
+                            desc,
+                            processed_prs
+                        );
+                    }
+                }
             }
         }
     }

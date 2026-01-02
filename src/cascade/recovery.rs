@@ -710,17 +710,22 @@ mod tests {
         }
 
         proptest! {
-            /// Property: Recovery from any crash point produces a valid recovery plan.
+            /// Property: Recovery from any crash point produces a valid recovery plan
+            /// AND the recovered train can continue cascading.
             ///
             /// For any phase the train might crash in, compute_recovery_plan should:
             /// 1. Return a plan with at least one action
             /// 2. Use the frozen_descendants from the train, not re-query
             /// 3. Produce a plan that can be applied without panicking
+            /// 4. Result in a train that can be used with execute_cascade_step
             #[test]
             fn recovery_from_any_crash_point_produces_valid_plan(
                 frozen_descendants in arb_unique_descendants(1, 5),
                 sha in arb_sha()
             ) {
+                use crate::cascade::step::{execute_cascade_step, StepContext};
+                use crate::types::CascadeStepOutcome;
+
                 let phase = arb_crash_phase(frozen_descendants.clone(), sha.clone());
 
                 proptest!(|(crash_phase in phase)| {
@@ -755,7 +760,7 @@ mod tests {
 
                     // Property 3: Plan can be applied without panicking
                     let verification_results = HashMap::new();
-                    let (recovered_train, _abort_reason) = apply_recovery_plan(plan.clone(), &verification_results);
+                    let (recovered_train, abort_reason) = apply_recovery_plan(plan.clone(), &verification_results);
 
                     // The recovered train should be in a valid state
                     prop_assert!(
@@ -765,6 +770,35 @@ mod tests {
                         "Recovered train should be in a valid state, got: {:?}",
                         recovered_train.state
                     );
+
+                    // Property 4: If train is still running, it should be usable with execute_cascade_step
+                    if recovered_train.state == TrainState::Running && abort_reason.is_none() {
+                        let ctx = StepContext::new("main");
+                        let step_result = execute_cascade_step(recovered_train.clone(), &prs, &ctx);
+
+                        // The step should not panic and should produce a valid outcome
+                        prop_assert!(
+                            matches!(
+                                step_result.outcome,
+                                CascadeStepOutcome::WaitingOnCi { .. }
+                                    | CascadeStepOutcome::Complete
+                                    | CascadeStepOutcome::FanOut { .. }
+                                    | CascadeStepOutcome::Merged { .. }
+                                    | CascadeStepOutcome::Aborted { .. }
+                            ),
+                            "Recovered train should produce valid step outcome, got: {:?}",
+                            step_result.outcome
+                        );
+
+                        // The step should preserve frozen_descendants
+                        if let Some(progress) = step_result.train.cascade_phase.progress() {
+                            prop_assert_eq!(
+                                &progress.frozen_descendants,
+                                &frozen_descendants,
+                                "execute_cascade_step should preserve frozen_descendants after recovery"
+                            );
+                        }
+                    }
                 });
             }
 
