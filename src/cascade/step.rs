@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use crate::cascade::engine::MAX_TRAIN_SIZE;
+use crate::cascade::engine::{MAX_TRAIN_SIZE, format_phase_comment};
 use crate::effects::{Effect, GitEffect, GitHubEffect, MergeStrategy};
 use crate::state::transitions::{PhaseOutcome, next_phase};
 use crate::types::{
@@ -214,12 +214,25 @@ fn execute_preparing(
     train: &mut TrainRecord,
     progress: DescendantProgress,
     prs: &HashMap<PrNumber, CachedPr>,
-    _ctx: &StepContext,
+    ctx: &StepContext,
 ) -> StepResult {
+    // Get current PR info first (needed for transition)
+    let Some(current_pr) = prs.get(&train.current_pr) else {
+        train.abort(TrainError::new("pr_not_found", "Current PR not found"));
+        return StepResult {
+            train: train.clone(),
+            outcome: CascadeStepOutcome::Aborted {
+                pr_number: train.current_pr,
+                reason: AbortReason::PrClosed,
+            },
+            effects: vec![],
+        };
+    };
+
     // Find the next descendant to prepare
     let Some(&next_descendant) = progress.remaining().next() else {
         // All descendants prepared - transition to SquashPending
-        return transition_to_squash_pending(train, progress);
+        return transition_to_squash_pending(train, progress, current_pr, ctx);
     };
 
     // Get descendant PR info
@@ -233,35 +246,35 @@ fn execute_preparing(
         return skip_descendant(train, progress, next_descendant, "PR is no longer open");
     }
 
-    // Get predecessor head SHA (the current PR's head)
-    let Some(current_pr) = prs.get(&train.current_pr) else {
-        train.abort(TrainError::new("pr_not_found", "Current PR not found"));
-        return StepResult {
-            train: train.clone(),
-            outcome: CascadeStepOutcome::Aborted {
-                pr_number: train.current_pr,
-                reason: AbortReason::PrClosed,
-            },
-            effects: vec![],
-        };
-    };
-
     // CRITICAL: Base-branch revalidation before preparing.
     // DESIGN.md requires verifying that descendant.base_ref matches the predecessor's
     // head branch. This prevents merging unrelated stacks if someone retargets a PR
     // between declaration and cascade time.
+    //
+    // ABORT rather than skip: skipping can silently drop retargeted descendants,
+    // leading to incomplete cascades. Aborting makes the issue visible so the user
+    // can fix the stack structure and restart.
     if desc_pr.base_ref != current_pr.head_ref {
-        // Base branch mismatch - this descendant is not actually stacked on the
-        // predecessor anymore. Skip it with a clear reason.
-        return skip_descendant(
-            train,
-            progress,
-            next_descendant,
-            &format!(
-                "PR #{} base branch '{}' doesn't match predecessor's head branch '{}'",
+        train.abort(TrainError::new(
+            "base_branch_mismatch",
+            format!(
+                "PR #{} base branch '{}' doesn't match predecessor's head branch '{}'. \
+                 The PR was likely retargeted. Please fix the stack structure and restart.",
                 next_descendant, desc_pr.base_ref, current_pr.head_ref
             ),
-        );
+        ));
+        return StepResult {
+            train: train.clone(),
+            outcome: CascadeStepOutcome::Aborted {
+                pr_number: next_descendant,
+                reason: AbortReason::BaseBranchMismatch {
+                    pr: next_descendant,
+                    expected_base: current_pr.head_ref.clone(),
+                    actual_base: desc_pr.base_ref.clone(),
+                },
+            },
+            effects: vec![],
+        };
     }
 
     // Store predecessor info for recovery
@@ -347,12 +360,12 @@ fn execute_reconciling(
     progress: DescendantProgress,
     squash_sha: Sha,
     prs: &HashMap<PrNumber, CachedPr>,
-    _ctx: &StepContext,
+    ctx: &StepContext,
 ) -> StepResult {
     // Find the next descendant to reconcile
     let Some(&next_descendant) = progress.remaining().next() else {
         // All descendants reconciled - transition to CatchingUp
-        return transition_to_catching_up(train, progress, squash_sha);
+        return transition_to_catching_up(train, progress, squash_sha, prs, ctx);
     };
 
     // Get descendant PR info
@@ -398,7 +411,7 @@ fn execute_catching_up(
     // Find the next descendant to catch up
     let Some(&next_descendant) = progress.remaining().next() else {
         // All descendants caught up - transition to Retargeting
-        return transition_to_retargeting(train, progress, squash_sha);
+        return transition_to_retargeting(train, progress, squash_sha, prs, ctx);
     };
 
     // Get descendant PR info
@@ -551,9 +564,15 @@ fn handle_external_merge(
 }
 
 /// Transition from Preparing to SquashPending.
+///
+/// After transitioning, immediately executes the SquashPending phase to produce
+/// effects (rather than returning empty effects which would cause the train to stall).
+/// Also emits a status comment update for GitHub-based recovery.
 fn transition_to_squash_pending(
     train: &mut TrainRecord,
     progress: DescendantProgress,
+    current_pr: &CachedPr,
+    ctx: &StepContext,
 ) -> StepResult {
     // All descendants prepared
     let new_phase = next_phase(
@@ -567,20 +586,33 @@ fn transition_to_squash_pending(
     train.cascade_phase = new_phase;
     train.increment_seq();
 
-    StepResult {
-        train: train.clone(),
-        outcome: CascadeStepOutcome::WaitingOnCi {
-            pr_number: train.current_pr,
-        },
-        effects: vec![],
+    // Immediately execute SquashPending to produce effects
+    let mut result = execute_squash_pending(train, progress, current_pr, ctx);
+
+    // Add status comment update for recovery (if we have a comment ID)
+    if let Some(comment_id) = train.status_comment_id {
+        result
+            .effects
+            .push(Effect::GitHub(GitHubEffect::UpdateComment {
+                comment_id,
+                body: format_phase_comment(&result.train),
+            }));
     }
+
+    result
 }
 
 /// Transition from Reconciling to CatchingUp.
+///
+/// After transitioning, immediately executes the CatchingUp phase to produce
+/// effects (rather than returning empty effects which would cause the train to stall).
+/// Also emits a status comment update for GitHub-based recovery.
 fn transition_to_catching_up(
     train: &mut TrainRecord,
     progress: DescendantProgress,
     squash_sha: Sha,
+    prs: &HashMap<PrNumber, CachedPr>,
+    ctx: &StepContext,
 ) -> StepResult {
     let current_phase = CascadePhase::Reconciling {
         progress: progress.clone(),
@@ -590,23 +622,44 @@ fn transition_to_catching_up(
     let new_phase = next_phase(&current_phase, PhaseOutcome::AllComplete)
         .expect("Reconciling -> CatchingUp is valid");
 
-    train.cascade_phase = new_phase;
+    train.cascade_phase = new_phase.clone();
     train.increment_seq();
 
-    StepResult {
-        train: train.clone(),
-        outcome: CascadeStepOutcome::WaitingOnCi {
-            pr_number: train.current_pr,
-        },
-        effects: vec![],
+    // Immediately execute CatchingUp to produce effects
+    let mut result = if let CascadePhase::CatchingUp {
+        progress: new_progress,
+        squash_sha: new_squash_sha,
+    } = new_phase
+    {
+        execute_catching_up(train, new_progress, new_squash_sha, prs, ctx)
+    } else {
+        unreachable!("next_phase for Reconciling -> CatchingUp always returns CatchingUp")
+    };
+
+    // Add status comment update for recovery (if we have a comment ID)
+    if let Some(comment_id) = train.status_comment_id {
+        result
+            .effects
+            .push(Effect::GitHub(GitHubEffect::UpdateComment {
+                comment_id,
+                body: format_phase_comment(&result.train),
+            }));
     }
+
+    result
 }
 
 /// Transition from CatchingUp to Retargeting.
+///
+/// After transitioning, immediately executes the Retargeting phase to produce
+/// effects (rather than returning empty effects which would cause the train to stall).
+/// Also emits a status comment update for GitHub-based recovery.
 fn transition_to_retargeting(
     train: &mut TrainRecord,
     progress: DescendantProgress,
     squash_sha: Sha,
+    prs: &HashMap<PrNumber, CachedPr>,
+    ctx: &StepContext,
 ) -> StepResult {
     let current_phase = CascadePhase::CatchingUp {
         progress: progress.clone(),
@@ -616,16 +669,31 @@ fn transition_to_retargeting(
     let new_phase = next_phase(&current_phase, PhaseOutcome::AllComplete)
         .expect("CatchingUp -> Retargeting is valid");
 
-    train.cascade_phase = new_phase;
+    train.cascade_phase = new_phase.clone();
     train.increment_seq();
 
-    StepResult {
-        train: train.clone(),
-        outcome: CascadeStepOutcome::WaitingOnCi {
-            pr_number: train.current_pr,
-        },
-        effects: vec![],
+    // Immediately execute Retargeting to produce effects
+    let mut result = if let CascadePhase::Retargeting {
+        progress: new_progress,
+        squash_sha: new_squash_sha,
+    } = new_phase
+    {
+        execute_retargeting(train, new_progress, new_squash_sha, prs, ctx)
+    } else {
+        unreachable!("next_phase for CatchingUp -> Retargeting always returns Retargeting")
+    };
+
+    // Add status comment update for recovery (if we have a comment ID)
+    if let Some(comment_id) = train.status_comment_id {
+        result
+            .effects
+            .push(Effect::GitHub(GitHubEffect::UpdateComment {
+                comment_id,
+                body: format_phase_comment(&result.train),
+            }));
     }
+
+    result
 }
 
 /// Complete the cascade (Retargeting -> Idle).
@@ -1750,11 +1818,24 @@ mod tests {
                     let mut independent_trains = Vec::new();
                     let mut active_trains = HashMap::new();
 
+                    // After fan-out, the original root is merged. Update the prs map to reflect this.
+                    // is_root requires: targets default_branch AND (no predecessor OR merged predecessor
+                    // with predecessor_squash_reconciled set).
+                    let mut merged_root = prs.get(&PrNumber(1)).unwrap().clone();
+                    merged_root.state = crate::types::PrState::Merged {
+                        merge_commit_sha: sha.clone(),
+                    };
+                    prs.insert(PrNumber(1), merged_root);
+
                     for &desc_pr in &fan_out {
-                        // Update the PR to be a root (targeting main, since original root was merged)
+                        // Update the PR to be a root:
+                        // 1. Retarget to main (simulating GitHub retarget API call)
+                        // 2. Set predecessor_squash_reconciled (marking reconciliation complete)
+                        // Note: predecessor is NOT cleared - is_root checks if predecessor is merged
+                        // and predecessor_squash_reconciled is set.
                         let mut updated_desc = prs.get(&desc_pr).unwrap().clone();
                         updated_desc.base_ref = "main".to_string();
-                        updated_desc.predecessor = None;
+                        updated_desc.predecessor_squash_reconciled = Some(sha.clone());
                         prs.insert(desc_pr, updated_desc);
 
                         // Try to start a train
@@ -1918,6 +1999,89 @@ mod tests {
                         );
                     }
                 }
+            }
+
+            /// Property: Active trains always produce effects or reach a terminal state.
+            ///
+            /// This property catches bugs where phase transitions return empty effects,
+            /// causing the cascade to stall. For any active, non-blocked train, either:
+            /// 1. The step produces non-empty effects (work is being done)
+            /// 2. The outcome is terminal (Complete or Aborted)
+            /// 3. The train is waiting (WaitingOnCi or Blocked)
+            ///
+            /// The key insight: if a train is active and the outcome suggests work should
+            /// continue (WaitingOnCi with same phase), there MUST be effects to execute.
+            /// Empty effects + WaitingOnCi = stall.
+            #[test]
+            fn active_train_produces_progress_or_terminates(
+                descendants in arb_unique_descendants(0, 4),
+                sha in arb_sha(),
+                phase_index in 0usize..6
+            ) {
+                let ctx = StepContext::new("main");
+
+                // Build PR map
+                let mut prs = HashMap::new();
+                let root_pr = make_pr_with_predecessor(1, sha.clone(), "main", None);
+                prs.insert(PrNumber(1), root_pr);
+
+                let descendants_vec: Vec<PrNumber> = descendants.iter().copied().collect();
+                for (i, &pr_num) in descendants_vec.iter().enumerate() {
+                    let predecessor = if i == 0 {
+                        PrNumber(1)
+                    } else {
+                        descendants_vec[i - 1]
+                    };
+                    let base_ref = format!("branch-{}", predecessor.0);
+                    let pr = make_pr_with_predecessor(pr_num.0, sha.clone(), &base_ref, Some(predecessor));
+                    prs.insert(pr_num, pr);
+                }
+
+                // Create train in various phases
+                let mut train = TrainRecord::new(PrNumber(1));
+                let progress = DescendantProgress::new(descendants_vec.clone());
+
+                // Set up train in different phases to test each transition
+                train.cascade_phase = match phase_index {
+                    0 => CascadePhase::Idle,
+                    1 => CascadePhase::Preparing { progress: progress.clone() },
+                    2 => CascadePhase::SquashPending { progress: progress.clone() },
+                    3 => CascadePhase::Reconciling { progress: progress.clone(), squash_sha: sha.clone() },
+                    4 => CascadePhase::CatchingUp { progress: progress.clone(), squash_sha: sha.clone() },
+                    _ => CascadePhase::Retargeting { progress, squash_sha: sha.clone() },
+                };
+
+                // Set required fields for later phases
+                if phase_index >= 3 {
+                    train.last_squash_sha = Some(sha.clone());
+                    train.predecessor_head_sha = Some(sha.clone());
+                }
+
+                let result = execute_cascade_step(train, &prs, &ctx);
+
+                // The key property: active trains must make progress
+                let is_terminal = matches!(
+                    result.outcome,
+                    CascadeStepOutcome::Complete | CascadeStepOutcome::Aborted { .. }
+                );
+                let is_waiting = matches!(
+                    result.outcome,
+                    CascadeStepOutcome::WaitingOnCi { .. } | CascadeStepOutcome::Blocked { .. }
+                );
+                let is_fan_out = matches!(result.outcome, CascadeStepOutcome::FanOut { .. });
+                let has_effects = !result.effects.is_empty();
+
+                // If the train is still active and waiting, it must have produced effects
+                // (otherwise it's stalled). Terminal states and fan-out are allowed to have
+                // empty effects since they represent completion.
+                prop_assert!(
+                    is_terminal || is_fan_out || has_effects || !is_waiting,
+                    "Active train in waiting state must produce effects to avoid stall. \
+                     Outcome: {:?}, Effects: {}, Phase: {}",
+                    result.outcome,
+                    result.effects.len(),
+                    result.train.cascade_phase.name()
+                );
             }
         }
     }

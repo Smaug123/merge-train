@@ -718,88 +718,95 @@ mod tests {
             /// 2. Use the frozen_descendants from the train, not re-query
             /// 3. Produce a plan that can be applied without panicking
             /// 4. Result in a train that can be used with execute_cascade_step
+            ///
+            /// Note: Uses prop_flat_map to generate crash_phase from frozen_descendants,
+            /// ensuring proper cartesian product testing (not nested proptest! calls).
             #[test]
             fn recovery_from_any_crash_point_produces_valid_plan(
-                frozen_descendants in arb_unique_descendants(1, 5),
-                sha in arb_sha()
+                (frozen_descendants, sha, crash_phase) in arb_unique_descendants(1, 5)
+                    .prop_flat_map(|desc| {
+                        (Just(desc.clone()), arb_sha())
+                            .prop_flat_map(move |(desc2, sha)| {
+                                let desc3 = desc2.clone();
+                                let sha2 = sha.clone();
+                                arb_crash_phase(desc2, sha.clone())
+                                    .prop_map(move |phase| (desc3.clone(), sha2.clone(), phase))
+                            })
+                    })
             ) {
                 use crate::cascade::step::{execute_cascade_step, StepContext};
                 use crate::types::CascadeStepOutcome;
 
-                let phase = arb_crash_phase(frozen_descendants.clone(), sha.clone());
+                let mut train = TrainRecord::new(PrNumber(1));
+                train.cascade_phase = crash_phase.clone();
+                train.predecessor_head_sha = Some(sha.clone());
+                train.last_squash_sha = crash_phase.squash_sha().cloned();
 
-                proptest!(|(crash_phase in phase)| {
-                    let mut train = TrainRecord::new(PrNumber(1));
-                    train.cascade_phase = crash_phase.clone();
-                    train.predecessor_head_sha = Some(sha.clone());
-                    train.last_squash_sha = crash_phase.squash_sha().cloned();
+                // Build PR map with all frozen descendants
+                let mut prs = HashMap::new();
+                let root_pr = make_open_pr_for_test(1, "main", None, sha.clone());
+                prs.insert(PrNumber(1), root_pr);
 
-                    // Build PR map with all frozen descendants
-                    let mut prs = HashMap::new();
-                    let root_pr = make_open_pr_for_test(1, "main", None, sha.clone());
-                    prs.insert(PrNumber(1), root_pr);
+                for &desc in &frozen_descendants {
+                    let pr = make_open_pr_for_test(desc.0, "branch-1", Some(PrNumber(1)), sha.clone());
+                    prs.insert(desc, pr);
+                }
 
-                    for &desc in &frozen_descendants {
-                        let pr = make_open_pr_for_test(desc.0, "branch-1", Some(PrNumber(1)), sha.clone());
-                        prs.insert(desc, pr);
-                    }
+                let plan = compute_recovery_plan(&train, &prs, &[], "main");
 
-                    let plan = compute_recovery_plan(&train, &prs, &[], "main");
+                // Property 1: Plan should have at least one action
+                prop_assert!(!plan.actions.is_empty(), "Recovery plan should have at least one action");
 
-                    // Property 1: Plan should have at least one action
-                    prop_assert!(!plan.actions.is_empty(), "Recovery plan should have at least one action");
+                // Property 2: Train in plan should preserve frozen_descendants
+                if let Some(progress) = plan.train.cascade_phase.progress() {
+                    prop_assert_eq!(
+                        &progress.frozen_descendants,
+                        &frozen_descendants,
+                        "Recovery plan should preserve frozen_descendants"
+                    );
+                }
 
-                    // Property 2: Train in plan should preserve frozen_descendants
-                    if let Some(progress) = plan.train.cascade_phase.progress() {
+                // Property 3: Plan can be applied without panicking
+                let verification_results = HashMap::new();
+                let (recovered_train, abort_reason) = apply_recovery_plan(plan.clone(), &verification_results);
+
+                // The recovered train should be in a valid state
+                prop_assert!(
+                    recovered_train.state == TrainState::Running
+                        || recovered_train.state == TrainState::NeedsManualReview
+                        || recovered_train.state == TrainState::Aborted,
+                    "Recovered train should be in a valid state, got: {:?}",
+                    recovered_train.state
+                );
+
+                // Property 4: If train is still running, it should be usable with execute_cascade_step
+                if recovered_train.state == TrainState::Running && abort_reason.is_none() {
+                    let ctx = StepContext::new("main");
+                    let step_result = execute_cascade_step(recovered_train.clone(), &prs, &ctx);
+
+                    // The step should not panic and should produce a valid outcome
+                    prop_assert!(
+                        matches!(
+                            step_result.outcome,
+                            CascadeStepOutcome::WaitingOnCi { .. }
+                                | CascadeStepOutcome::Complete
+                                | CascadeStepOutcome::FanOut { .. }
+                                | CascadeStepOutcome::Merged { .. }
+                                | CascadeStepOutcome::Aborted { .. }
+                        ),
+                        "Recovered train should produce valid step outcome, got: {:?}",
+                        step_result.outcome
+                    );
+
+                    // The step should preserve frozen_descendants
+                    if let Some(progress) = step_result.train.cascade_phase.progress() {
                         prop_assert_eq!(
                             &progress.frozen_descendants,
                             &frozen_descendants,
-                            "Recovery plan should preserve frozen_descendants"
+                            "execute_cascade_step should preserve frozen_descendants after recovery"
                         );
                     }
-
-                    // Property 3: Plan can be applied without panicking
-                    let verification_results = HashMap::new();
-                    let (recovered_train, abort_reason) = apply_recovery_plan(plan.clone(), &verification_results);
-
-                    // The recovered train should be in a valid state
-                    prop_assert!(
-                        recovered_train.state == TrainState::Running
-                            || recovered_train.state == TrainState::NeedsManualReview
-                            || recovered_train.state == TrainState::Aborted,
-                        "Recovered train should be in a valid state, got: {:?}",
-                        recovered_train.state
-                    );
-
-                    // Property 4: If train is still running, it should be usable with execute_cascade_step
-                    if recovered_train.state == TrainState::Running && abort_reason.is_none() {
-                        let ctx = StepContext::new("main");
-                        let step_result = execute_cascade_step(recovered_train.clone(), &prs, &ctx);
-
-                        // The step should not panic and should produce a valid outcome
-                        prop_assert!(
-                            matches!(
-                                step_result.outcome,
-                                CascadeStepOutcome::WaitingOnCi { .. }
-                                    | CascadeStepOutcome::Complete
-                                    | CascadeStepOutcome::FanOut { .. }
-                                    | CascadeStepOutcome::Merged { .. }
-                                    | CascadeStepOutcome::Aborted { .. }
-                            ),
-                            "Recovered train should produce valid step outcome, got: {:?}",
-                            step_result.outcome
-                        );
-
-                        // The step should preserve frozen_descendants
-                        if let Some(progress) = step_result.train.cascade_phase.progress() {
-                            prop_assert_eq!(
-                                &progress.frozen_descendants,
-                                &frozen_descendants,
-                                "execute_cascade_step should preserve frozen_descendants after recovery"
-                            );
-                        }
-                    }
-                });
+                }
             }
 
             /// Property: Recovery always uses frozen descendants, never re-queries.
