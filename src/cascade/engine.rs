@@ -16,7 +16,7 @@ use crate::types::{
 };
 
 /// Maximum number of PRs allowed in a single train.
-const MAX_TRAIN_SIZE: usize = 50;
+pub const MAX_TRAIN_SIZE: usize = 50;
 
 /// Errors that can occur in cascade operations.
 #[derive(Debug, Error)]
@@ -129,6 +129,16 @@ impl CascadeEngine {
             return Err(CascadeError::NotARoot(
                 root_pr,
                 "PR is not open".to_string(),
+            ));
+        }
+
+        // Check if PR is a draft - DESIGN.md requires explicit draft check.
+        // GitHub's mergeStateStatus can be CLEAN for drafts (if CI passes), but
+        // the merge API will reject drafts. Check explicitly via is_draft field.
+        if pr.is_draft {
+            return Err(CascadeError::NotARoot(
+                root_pr,
+                "PR is a draft. Please mark it as ready for review first".to_string(),
             ));
         }
 
@@ -358,13 +368,27 @@ impl CascadeEngine {
     }
 
     /// Creates the outcome for the current cascade step.
+    ///
+    /// CRITICAL: Uses frozen progress from the current phase when available.
+    /// This prevents late additions from leaking into outcomes. Only compute
+    /// descendants fresh when in Idle phase (no frozen set yet).
     pub fn create_step_outcome(
         &self,
         train: &TrainRecord,
         prs: &HashMap<PrNumber, CachedPr>,
     ) -> CascadeStepOutcome {
-        // Determine outcome based on descendants
-        let descendants = self.compute_frozen_descendants(train.current_pr, prs);
+        // Use frozen descendants from the current phase if available.
+        // This ensures late additions don't leak into outcomes.
+        let descendants: Vec<PrNumber> = match train.cascade_phase.progress() {
+            Some(progress) => {
+                // Use the frozen set, filtered by what's completed (remaining)
+                progress.remaining().copied().collect()
+            }
+            None => {
+                // Idle phase - no frozen set yet, compute fresh
+                self.compute_frozen_descendants(train.current_pr, prs)
+            }
+        };
 
         match descendants.len() {
             0 => CascadeStepOutcome::Complete,
@@ -399,11 +423,18 @@ pub enum TrainAction {
 }
 
 /// Format the initial status comment when starting a train.
+///
+/// CRITICAL: Includes machine-readable JSON payload in HTML comment for
+/// GitHub-based recovery. See DESIGN.md "Status comments" section.
 fn format_start_comment(train: &TrainRecord, stack: &MergeStack) -> String {
+    // Serialize train state as JSON for recovery
+    let json_payload = format_train_json(train);
+
     let mut lines = vec![
+        format!("<!-- merge-train-state\n{}\n-->", json_payload),
         "## Merge Train Status".to_string(),
         String::new(),
-        format!("**Status:** Running"),
+        "**Status:** Running".to_string(),
         format!("**Root PR:** #{}", train.original_root_pr),
         format!("**Current PR:** #{}", train.current_pr),
         format!("**Phase:** {}", train.cascade_phase.name()),
@@ -426,8 +457,15 @@ fn format_start_comment(train: &TrainRecord, stack: &MergeStack) -> String {
 }
 
 /// Format the status comment when a train is stopped.
+///
+/// CRITICAL: Includes machine-readable JSON payload in HTML comment for
+/// GitHub-based recovery. See DESIGN.md "Status comments" section.
 fn format_stop_comment(train: &TrainRecord) -> String {
+    // Serialize train state as JSON for recovery
+    let json_payload = format_train_json(train);
+
     [
+        format!("<!-- merge-train-state\n{}\n-->", json_payload),
         "## Merge Train Status".to_string(),
         String::new(),
         "**Status:** Stopped".to_string(),
@@ -439,6 +477,19 @@ fn format_stop_comment(train: &TrainRecord) -> String {
         "*Use `@merge-train start` to restart.*".to_string(),
     ]
     .join("\n")
+}
+
+/// Format train record as JSON for status comment recovery payload.
+///
+/// This produces the machine-readable JSON that enables GitHub-based recovery
+/// when local state is lost. The format matches DESIGN.md specifications.
+fn format_train_json(train: &TrainRecord) -> String {
+    // Use serde to serialize the train record, which produces the correct
+    // structure including cascade_phase with frozen_descendants
+    serde_json::to_string_pretty(train).unwrap_or_else(|e| {
+        // This should never fail for a valid TrainRecord, but handle it gracefully
+        format!("{{\"error\": \"serialization failed: {}\"}}", e)
+    })
 }
 
 #[cfg(test)]

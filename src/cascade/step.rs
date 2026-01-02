@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 
+use crate::cascade::engine::MAX_TRAIN_SIZE;
 use crate::effects::{Effect, GitEffect, GitHubEffect, MergeStrategy};
 use crate::state::transitions::{PhaseOutcome, next_phase};
 use crate::types::{
@@ -152,6 +153,32 @@ fn execute_from_idle(
     // Compute frozen descendants
     let descendants = compute_open_descendants(train.current_pr, prs);
 
+    // Check max-train-size when entering Preparing phase.
+    // This catches late additions that could exceed the limit even though
+    // the initial train was within bounds.
+    // The +1 accounts for the current PR itself.
+    if descendants.len() + 1 > MAX_TRAIN_SIZE {
+        train.abort(TrainError::new(
+            "train_too_large",
+            format!(
+                "Train size {} exceeds maximum {}. Too many descendants were added.",
+                descendants.len() + 1,
+                MAX_TRAIN_SIZE
+            ),
+        ));
+        return StepResult {
+            train: train.clone(),
+            outcome: CascadeStepOutcome::Aborted {
+                pr_number: train.current_pr,
+                reason: AbortReason::TrainTooLarge {
+                    pr_count: descendants.len() + 1,
+                    max_allowed: MAX_TRAIN_SIZE,
+                },
+            },
+            effects: vec![],
+        };
+    }
+
     // Transition to next phase
     let new_phase = crate::state::transitions::start_preparing(descendants.clone());
     train.cascade_phase = new_phase.clone();
@@ -219,6 +246,24 @@ fn execute_preparing(
         };
     };
 
+    // CRITICAL: Base-branch revalidation before preparing.
+    // DESIGN.md requires verifying that descendant.base_ref matches the predecessor's
+    // head branch. This prevents merging unrelated stacks if someone retargets a PR
+    // between declaration and cascade time.
+    if desc_pr.base_ref != current_pr.head_ref {
+        // Base branch mismatch - this descendant is not actually stacked on the
+        // predecessor anymore. Skip it with a clear reason.
+        return skip_descendant(
+            train,
+            progress,
+            next_descendant,
+            &format!(
+                "PR #{} base branch '{}' doesn't match predecessor's head branch '{}'",
+                next_descendant, desc_pr.base_ref, current_pr.head_ref
+            ),
+        );
+    }
+
     // Store predecessor info for recovery
     train.predecessor_pr = Some(train.current_pr);
     train.predecessor_head_sha = Some(current_pr.head_sha.clone());
@@ -226,6 +271,9 @@ fn execute_preparing(
 
     // Generate effects for preparation
     // Fetch via PR refs to ensure we have the latest state
+    // CRITICAL: We must checkout the fetched PR ref (detached), not the local branch name.
+    // The local branch may be stale if the remote advanced. Checking out the fetched ref
+    // ensures we start from the latest state on GitHub.
     let effects = vec![
         // Fetch both the predecessor and descendant PR refs
         Effect::Git(GitEffect::Fetch {
@@ -240,10 +288,11 @@ fn execute_preparing(
                 ),
             ],
         }),
-        // Checkout the descendant branch
+        // Checkout the descendant's PR ref (fetched state, not local branch)
+        // Using detached mode since we're checking out a remote ref
         Effect::Git(GitEffect::Checkout {
-            target: desc_pr.head_ref.clone(),
-            detach: false,
+            target: format!("refs/remotes/origin/pr/{}", next_descendant),
+            detach: true,
         }),
         // Merge predecessor head (using the fetched PR ref)
         Effect::Git(GitEffect::Merge {
@@ -254,7 +303,7 @@ fn execute_preparing(
                 desc_pr.head_ref
             ),
         }),
-        // Push the result
+        // Push the result to the descendant's branch
         Effect::Git(GitEffect::Push {
             refspec: format!("HEAD:refs/heads/{}", desc_pr.head_ref),
             force: false,
@@ -362,7 +411,24 @@ fn execute_catching_up(
     }
 
     // Generate catch-up effects
+    // CRITICAL: Must fetch and checkout the descendant branch before merging.
+    // The worktree may still be on a different branch from a prior operation.
     let effects = vec![
+        // Fetch the descendant's latest state and the default branch
+        Effect::Git(GitEffect::Fetch {
+            refspecs: vec![
+                format!(
+                    "refs/pull/{}/head:refs/remotes/origin/pr/{}",
+                    next_descendant, next_descendant
+                ),
+                ctx.default_branch.clone(),
+            ],
+        }),
+        // Checkout the descendant's PR ref (fetched state)
+        Effect::Git(GitEffect::Checkout {
+            target: format!("refs/remotes/origin/pr/{}", next_descendant),
+            detach: true,
+        }),
         // Merge origin/main
         Effect::Git(GitEffect::Merge {
             target: format!("origin/{}", ctx.default_branch),
@@ -428,23 +494,37 @@ fn execute_retargeting(
 
 /// Handle the case where a PR was merged externally (not by us).
 ///
-/// Uses the frozen descendants from the current phase if available, rather than
-/// recomputing descendants (which could include late additions).
+/// Uses the frozen descendants from the current phase if available. If in Idle
+/// phase (no frozen set yet), computes the descendant set - these descendants
+/// weren't yet promised preparation, so this is a valid freeze point.
 fn handle_external_merge(
     train: &mut TrainRecord,
     merge_sha: Sha,
-    _prs: &HashMap<PrNumber, CachedPr>,
+    prs: &HashMap<PrNumber, CachedPr>,
     _ctx: &StepContext,
 ) -> StepResult {
     // Store the squash SHA
     train.last_squash_sha = Some(merge_sha.clone());
 
-    // Get frozen descendants from current phase (if any), otherwise empty
-    let progress = train
-        .cascade_phase
-        .progress()
-        .cloned()
-        .unwrap_or_else(|| DescendantProgress::new(vec![]));
+    // Get frozen descendants from current phase if available.
+    // If in Idle phase (external merge before we started cascade), we need to
+    // compute and freeze the descendants now - they haven't been promised
+    // preparation yet, so this is a valid freeze point.
+    let progress = match &train.cascade_phase {
+        CascadePhase::Idle => {
+            // Compute descendants now - this becomes the frozen set
+            let descendants = compute_open_descendants(train.current_pr, prs);
+            DescendantProgress::new(descendants)
+        }
+        _ => {
+            // Use the existing frozen set from the current phase
+            train
+                .cascade_phase
+                .progress()
+                .cloned()
+                .unwrap_or_else(|| DescendantProgress::new(vec![]))
+        }
+    };
 
     // Check remaining (frozen - completed - skipped)
     let remaining: Vec<PrNumber> = progress.remaining().copied().collect();
