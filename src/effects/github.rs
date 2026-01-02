@@ -195,8 +195,22 @@ pub enum GitHubResponse {
     /// Response to `GetPr`.
     Pr(PrData),
 
-    /// Response to `ListOpenPrs` or `ListRecentlyMergedPrs`.
+    /// Response to `ListOpenPrs`.
     PrList(Vec<PrData>),
+
+    /// Response to `ListRecentlyMergedPrs`.
+    ///
+    /// Includes a flag indicating whether results may be incomplete due to
+    /// pagination limits. GitHub's PR list API doesn't have a "merged since"
+    /// filter, so we list closed PRs sorted by `updated` and filter client-side.
+    /// In repos with many closed PRs, we may hit the pagination limit before
+    /// exhausting all recent merges.
+    RecentlyMergedPrList {
+        prs: Vec<PrData>,
+        /// If true, results may be incomplete because the pagination limit was reached
+        /// before all pages were exhausted. Callers should handle this gracefully.
+        may_be_incomplete: bool,
+    },
 
     /// Response to `GetMergeState`.
     MergeState(MergeStateStatus),
@@ -239,8 +253,19 @@ pub enum GitHubResponse {
     /// since we cannot distinguish missing permissions from no protection.
     BranchProtectionUnknown,
 
-    /// Response to `GetRulesets`.
+    /// Response to `GetRulesets` when rulesets were successfully fetched.
     Rulesets(Vec<RulesetData>),
+
+    /// Response to `GetRulesets` when the result is unknown.
+    ///
+    /// This occurs when the API returns 404 or 403, which could mean:
+    /// 1. The repository has no rulesets
+    /// 2. The caller lacks permission to view rulesets
+    /// 3. Rulesets aren't available (older API or not enabled)
+    ///
+    /// Per DESIGN.md, callers should "warn and proceed" when they receive this,
+    /// since we cannot distinguish missing permissions from no rulesets.
+    RulesetsUnknown,
 
     /// Response to `GetRepoSettings`.
     RepoSettings(RepoSettingsData),
@@ -426,6 +451,12 @@ mod tests {
         prop_oneof![
             arb_pr_data().prop_map(GitHubResponse::Pr),
             prop::collection::vec(arb_pr_data(), 0..10).prop_map(GitHubResponse::PrList),
+            (prop::collection::vec(arb_pr_data(), 0..10), any::<bool>()).prop_map(
+                |(prs, may_be_incomplete)| GitHubResponse::RecentlyMergedPrList {
+                    prs,
+                    may_be_incomplete,
+                }
+            ),
             arb_merge_state_status().prop_map(GitHubResponse::MergeState),
             arb_sha().prop_map(|sha| GitHubResponse::Merged { sha }),
             Just(GitHubResponse::Retargeted),
@@ -436,6 +467,7 @@ mod tests {
             arb_branch_protection_data().prop_map(GitHubResponse::BranchProtection),
             Just(GitHubResponse::BranchProtectionUnknown),
             prop::collection::vec(arb_ruleset_data(), 0..5).prop_map(GitHubResponse::Rulesets),
+            Just(GitHubResponse::RulesetsUnknown),
             arb_repo_settings_data().prop_map(GitHubResponse::RepoSettings),
         ]
     }

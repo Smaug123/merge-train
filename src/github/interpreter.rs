@@ -325,16 +325,30 @@ async fn list_recently_merged_prs(
                 // Results are sorted by `updated` (not `merged_at`), so a page could contain
                 // only old PRs with recent comments while recent merges appear on later pages.
                 // We must paginate through all pages (up to MAX_PAGES) to find all recent merges.
-                if is_last_page || page >= MAX_PAGES {
-                    break;
+                if is_last_page {
+                    // Naturally exhausted all pages - results are complete
+                    return Ok(GitHubResponse::RecentlyMergedPrList {
+                        prs: all_prs,
+                        may_be_incomplete: false,
+                    });
+                }
+                if page >= MAX_PAGES {
+                    // Hit the safety limit before exhausting pages - results may be incomplete
+                    tracing::warn!(
+                        pages = page,
+                        prs_found = all_prs.len(),
+                        "Hit pagination limit for recently merged PRs; results may be incomplete"
+                    );
+                    return Ok(GitHubResponse::RecentlyMergedPrList {
+                        prs: all_prs,
+                        may_be_incomplete: true,
+                    });
                 }
                 page += 1;
             }
             Err(e) => return Err(GitHubApiError::from_octocrab(e)),
         }
     }
-
-    Ok(GitHubResponse::PrList(all_prs))
 }
 
 // ─── Merge State (GraphQL) ────────────────────────────────────────────────────
@@ -678,14 +692,23 @@ async fn get_branch_protection(
             // 2. User lacks permission to view protection rules
             // 3. Branch doesn't exist
             //
+            // 403 means insufficient permissions to view protection rules.
+            //
             // We cannot distinguish these cases via the API. Return
             // BranchProtectionUnknown so callers can implement "warn and proceed"
-            // per DESIGN.md rather than silently treating 404 as "no protection".
+            // per DESIGN.md rather than silently treating these as "no protection"
+            // or failing hard.
             let err_str = e.to_string();
-            if err_str.contains("404") || err_str.to_lowercase().contains("not found") {
+            let is_not_found =
+                err_str.contains("404") || err_str.to_lowercase().contains("not found");
+            let is_forbidden =
+                err_str.contains("403") || err_str.to_lowercase().contains("forbidden");
+
+            if is_not_found || is_forbidden {
                 tracing::warn!(
                     branch = %branch,
-                    "Branch protection returned 404 - could be no protection, \
+                    error = %err_str,
+                    "Branch protection query failed - could be no protection, \
                      insufficient permissions, or missing branch"
                 );
                 Ok(GitHubResponse::BranchProtectionUnknown)
@@ -770,10 +793,24 @@ async fn get_rulesets(client: &OctocrabClient) -> Result<GitHubResponse, GitHubA
             Ok(GitHubResponse::Rulesets(data))
         }
         Err(e) => {
-            // 404 might mean rulesets aren't available (older API or not enabled)
+            // 404 might mean rulesets aren't available (older API or not enabled).
+            // 403 means insufficient permissions to view rulesets.
+            //
+            // We cannot distinguish "no rulesets" from "cannot read rulesets", so
+            // return RulesetsUnknown to let callers implement "warn and proceed".
             let err_str = e.to_string();
-            if err_str.contains("404") || err_str.to_lowercase().contains("not found") {
-                Ok(GitHubResponse::Rulesets(vec![]))
+            let is_not_found =
+                err_str.contains("404") || err_str.to_lowercase().contains("not found");
+            let is_forbidden =
+                err_str.contains("403") || err_str.to_lowercase().contains("forbidden");
+
+            if is_not_found || is_forbidden {
+                tracing::warn!(
+                    error = %err_str,
+                    "Rulesets query failed - could be no rulesets, \
+                     insufficient permissions, or unsupported API"
+                );
+                Ok(GitHubResponse::RulesetsUnknown)
             } else {
                 Err(GitHubApiError::from_octocrab(e))
             }
