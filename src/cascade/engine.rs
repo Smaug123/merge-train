@@ -52,6 +52,13 @@ pub enum CascadeError {
     /// Phase transition error.
     #[error("Invalid phase transition: {0}")]
     InvalidTransition(String),
+
+    /// External merge occurred before preparation completed.
+    /// This violates the "prepare before squash" invariant and can drop content.
+    #[error("External merge with {} unprepared descendant(s): {:?}", unprepared_descendants.len(), unprepared_descendants)]
+    PreparationIncomplete {
+        unprepared_descendants: Vec<PrNumber>,
+    },
 }
 
 /// Result of starting a train.
@@ -329,6 +336,15 @@ impl CascadeEngine {
             };
         }
 
+        // Check if PR is a draft. CRITICAL: GitHub's mergeStateStatus can be CLEAN
+        // for a draft PR (if CI passes), but the merge API will reject it with
+        // "Pull request is in draft state." We must check is_draft explicitly.
+        if current_pr.is_draft {
+            return TrainAction::Block {
+                reason: BlockReason::Draft,
+            };
+        }
+
         // Evaluate merge state status
         match current_pr.merge_state_status {
             MergeStateStatus::Clean | MergeStateStatus::Unstable => {
@@ -568,13 +584,57 @@ pub fn format_phase_comment(train: &TrainRecord) -> String {
 ///
 /// This produces the machine-readable JSON that enables GitHub-based recovery
 /// when local state is lost. The format matches DESIGN.md specifications.
+/// Maximum error message size in JSON (4KB per DESIGN.md)
+const MAX_ERROR_MESSAGE_SIZE: usize = 4 * 1024;
+
+/// Maximum error stderr size in JSON (2KB per DESIGN.md)
+const MAX_ERROR_STDERR_SIZE: usize = 2 * 1024;
+
+/// Maximum status comment JSON size (60KB per DESIGN.md)
+const MAX_STATUS_COMMENT_SIZE: usize = 60 * 1024;
+
+/// Truncate a string to a maximum length, adding "..." if truncated.
+fn truncate_string(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        // Truncate with ellipsis indicator
+        let truncate_at = max_len.saturating_sub(3);
+        format!("{}...", &s[..truncate_at])
+    }
+}
+
 fn format_train_json(train: &TrainRecord) -> String {
-    // Use serde to serialize the train record, which produces the correct
-    // structure including cascade_phase with frozen_descendants
-    serde_json::to_string_pretty(train).unwrap_or_else(|e| {
+    // Create a copy with truncated error fields to avoid exceeding size limits
+    let mut train_copy = train.clone();
+
+    // Truncate error fields per DESIGN.md limits
+    if let Some(ref mut error) = train_copy.error {
+        error.message = truncate_string(&error.message, MAX_ERROR_MESSAGE_SIZE);
+        if let Some(ref stderr) = error.stderr {
+            error.stderr = Some(truncate_string(stderr, MAX_ERROR_STDERR_SIZE));
+        }
+    }
+
+    // Exclude local-only fields from status comment JSON:
+    // status_comment_id is redundant (the comment already knows its own ID)
+    // and not needed for GitHub-based recovery
+    train_copy.status_comment_id = None;
+
+    // Use compact serialization (not pretty) to save space
+    let json = serde_json::to_string(&train_copy).unwrap_or_else(|e| {
         // This should never fail for a valid TrainRecord, but handle it gracefully
         format!("{{\"error\": \"serialization failed: {}\"}}", e)
-    })
+    });
+
+    // Verify size is under limit (60KB per DESIGN.md)
+    debug_assert!(
+        json.len() < MAX_STATUS_COMMENT_SIZE,
+        "Status comment JSON ({} bytes) exceeds 60KB limit",
+        json.len()
+    );
+
+    json
 }
 
 #[cfg(test)]
@@ -1086,6 +1146,141 @@ mod tests {
                     "Starting train for descendant #2 should fail"
                 );
             }
+        }
+    }
+
+    // ─── Bug Regression Tests ─────────────────────────────────────────────────
+    //
+    // These tests expose specific bugs from review comments. Each test should
+    // FAIL before the corresponding fix is applied and PASS after.
+
+    mod bug_regression_tests {
+        use super::*;
+        use crate::types::{CommentId, DescendantProgress};
+
+        fn make_sha(n: u64) -> Sha {
+            Sha::parse(format!("{:0>40x}", n)).unwrap()
+        }
+
+        /// Regression test: evaluate_train must block draft PRs even if they have CLEAN
+        /// mergeStateStatus. GitHub's API can report CLEAN for drafts (if CI passes),
+        /// but the merge API will reject them.
+        #[test]
+        fn evaluate_train_blocks_draft_prs() {
+            let engine = CascadeEngine::new("main");
+
+            let train = TrainRecord::new(PrNumber(1));
+
+            // Create a draft PR that reports CLEAN status (this can happen per DESIGN.md).
+            // We construct directly because CachedPr::new() has a debug_assert preventing
+            // this combination, but GitHub's API can actually return it.
+            let draft_pr = CachedPr {
+                number: PrNumber(1),
+                head_sha: make_sha(1),
+                head_ref: "branch-1".to_string(),
+                base_ref: "main".to_string(),
+                predecessor: None,
+                state: PrState::Open,
+                merge_state_status: MergeStateStatus::Clean, // Draft can still be CLEAN!
+                is_draft: true,                              // This is the key: it's a draft
+                closed_at: None,
+                predecessor_squash_reconciled: None,
+            };
+
+            let prs = HashMap::from([(PrNumber(1), draft_pr)]);
+
+            let action = engine.evaluate_train(&train, &prs);
+
+            assert!(
+                matches!(
+                    action,
+                    TrainAction::Block {
+                        reason: BlockReason::Draft
+                    }
+                ),
+                "evaluate_train must return Block {{ reason: Draft }} for draft PRs. \
+                 Got: {:?}",
+                action
+            );
+        }
+
+        /// Regression test: Status comment JSON must use compact serialization,
+        /// omit local-only fields, and respect the 60KB size limit.
+        #[test]
+        fn status_comment_json_has_size_guard() {
+            // Create a train with a large number of descendants (within the 50 PR limit)
+            let mut train = TrainRecord::new(PrNumber(1));
+            train.status_comment_id = Some(CommentId(12345)); // LOCAL-ONLY field
+
+            // Add many descendants to approach size limits
+            let descendants: Vec<PrNumber> = (2..=45).map(PrNumber).collect();
+            train.cascade_phase = CascadePhase::Preparing {
+                progress: DescendantProgress::new(descendants),
+            };
+
+            // Generate the status comment JSON
+            let json = format_train_json(&train);
+
+            // status_comment_id should be omitted from JSON (it's local-only)
+            assert!(
+                !json.contains("status_comment_id"),
+                "status_comment_id should be omitted from recovery JSON. \
+                 JSON: {}",
+                json
+            );
+
+            // Should use compact serialization, not pretty-printed
+            let has_excessive_whitespace = json.lines().count() > 10;
+            assert!(
+                !has_excessive_whitespace,
+                "Status comment JSON should use compact format. Lines: {}",
+                json.lines().count()
+            );
+
+            // Verify size is under 60KB
+            assert!(
+                json.len() < 60 * 1024,
+                "Status comment JSON ({} bytes) exceeds 60KB limit",
+                json.len()
+            );
+        }
+
+        /// Regression test: format_train_json must truncate error fields per DESIGN.md.
+        /// error.message: Maximum 4KB, error.stderr: Maximum 2KB
+        #[test]
+        fn status_comment_truncates_error_fields() {
+            let mut train = TrainRecord::new(PrNumber(1));
+
+            // Create an error with very long message and stderr
+            let long_message = "x".repeat(10_000); // 10KB, over 4KB limit
+            let long_stderr = "y".repeat(5_000); // 5KB, over 2KB limit
+
+            train.abort(
+                TrainError::new("test_error", long_message.clone())
+                    .with_stderr(long_stderr.clone()),
+            );
+
+            let json = format_train_json(&train);
+
+            // Check that message was truncated (should not contain full 10KB string)
+            assert!(
+                !json.contains(&long_message),
+                "error.message ({} bytes) should be truncated to 4KB limit",
+                long_message.len()
+            );
+
+            // Check that stderr was truncated (should not contain full 5KB string)
+            assert!(
+                !json.contains(&long_stderr),
+                "error.stderr ({} bytes) should be truncated to 2KB limit",
+                long_stderr.len()
+            );
+
+            // Verify truncation indicator is present
+            assert!(
+                json.contains("..."),
+                "Truncated fields should have '...' indicator"
+            );
         }
     }
 }

@@ -30,6 +30,7 @@ pub enum PhaseAction {
     Reconcile {
         descendant: PrNumber,
         squash_sha: Sha,
+        default_branch: String,
         target_branch: String,
     },
 
@@ -146,6 +147,7 @@ pub fn squash_pending_next_action(current_pr: &CachedPr) -> PhaseAction {
 pub fn reconciling_next_action(
     progress: &DescendantProgress,
     squash_sha: &Sha,
+    default_branch: &str,
     prs: &HashMap<PrNumber, CachedPr>,
 ) -> PhaseAction {
     for pr_number in progress.remaining() {
@@ -155,6 +157,7 @@ pub fn reconciling_next_action(
             return PhaseAction::Reconcile {
                 descendant: *pr_number,
                 squash_sha: squash_sha.clone(),
+                default_branch: default_branch.to_string(),
                 target_branch: desc_pr.head_ref.clone(),
             };
         }
@@ -221,7 +224,7 @@ pub fn next_action(
         CascadePhase::Reconciling {
             progress,
             squash_sha,
-        } => reconciling_next_action(progress, squash_sha, prs),
+        } => reconciling_next_action(progress, squash_sha, default_branch, prs),
 
         CascadePhase::CatchingUp { progress, .. } => {
             catching_up_next_action(progress, default_branch, prs)
@@ -266,12 +269,16 @@ pub fn action_to_effects(action: &PhaseAction) -> Vec<Effect> {
 
         PhaseAction::Reconcile {
             squash_sha,
+            default_branch,
             target_branch,
             ..
         } => {
             vec![
                 Effect::Git(GitEffect::MergeReconcile {
                     squash_sha: squash_sha.clone(),
+                    // TODO: Compute and provide expected_squash_parent for validation.
+                    expected_squash_parent: None,
+                    default_branch: default_branch.clone(),
                     target_branch: target_branch.clone(),
                 }),
                 Effect::Git(GitEffect::Push {
@@ -446,16 +453,18 @@ mod tests {
 
         let prs = HashMap::from([(PrNumber(2), pr2)]);
 
-        let action = reconciling_next_action(&progress, &squash_sha, &prs);
+        let action = reconciling_next_action(&progress, &squash_sha, "main", &prs);
 
         match action {
             PhaseAction::Reconcile {
                 descendant,
                 squash_sha: action_sha,
+                default_branch,
                 ..
             } => {
                 assert_eq!(descendant, PrNumber(2));
                 assert_eq!(action_sha, squash_sha);
+                assert_eq!(default_branch, "main");
             }
             _ => panic!("Expected Reconcile action"),
         }
@@ -517,6 +526,7 @@ mod tests {
         let action = PhaseAction::Reconcile {
             descendant: PrNumber(2),
             squash_sha: make_sha(1000),
+            default_branch: "main".to_string(),
             target_branch: "branch-2".to_string(),
         };
 
@@ -524,10 +534,10 @@ mod tests {
 
         assert_eq!(effects.len(), 2);
         assert!(matches!(
-            effects[0],
-            Effect::Git(GitEffect::MergeReconcile { .. })
+            &effects[0],
+            Effect::Git(GitEffect::MergeReconcile { default_branch, .. }) if default_branch == "main"
         ));
-        assert!(matches!(effects[1], Effect::Git(GitEffect::Push { .. })));
+        assert!(matches!(&effects[1], Effect::Git(GitEffect::Push { .. })));
     }
 
     #[test]

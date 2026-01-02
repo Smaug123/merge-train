@@ -130,6 +130,14 @@ pub enum AbortReason {
         descendant: PrNumber,
     },
 
+    /// External merge occurred before preparation completed.
+    /// Multiple descendants were not prepared, violating the "prepare before
+    /// squash" invariant.
+    PreparationIncomplete {
+        /// The descendants that weren't prepared.
+        unprepared_descendants: Vec<PrNumber>,
+    },
+
     /// Repository has merge hooks or merge queue enabled (incompatible config).
     ///
     /// This occurs when GitHub reports `HAS_HOOKS` status, indicating either
@@ -169,6 +177,7 @@ impl AbortReason {
             AbortReason::StatusCommentTooLarge => "status_comment_too_large",
             AbortReason::TrainTooLarge { .. } => "train_too_large",
             AbortReason::PreparationMissing { .. } => "preparation_missing",
+            AbortReason::PreparationIncomplete { .. } => "preparation_incomplete",
             AbortReason::MergeHooksEnabled => "merge_hooks_enabled",
             AbortReason::BaseBranchMismatch { .. } => "base_branch_mismatch",
         }
@@ -215,6 +224,16 @@ impl AbortReason {
             }
             AbortReason::PreparationMissing { descendant } => {
                 format!("Descendant {} was not prepared before squash", descendant)
+            }
+            AbortReason::PreparationIncomplete {
+                unprepared_descendants,
+            } => {
+                format!(
+                    "External merge before preparation completed: {} descendant(s) unprepared: {:?}. \
+                     Manual intervention required.",
+                    unprepared_descendants.len(),
+                    unprepared_descendants
+                )
             }
             AbortReason::MergeHooksEnabled => {
                 "Repository has merge hooks or merge queue enabled, which is incompatible with merge-train".to_string()

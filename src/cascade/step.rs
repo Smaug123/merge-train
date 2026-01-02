@@ -238,12 +238,26 @@ fn execute_preparing(
     // Get descendant PR info
     let Some(desc_pr) = prs.get(&next_descendant) else {
         // Descendant not found - skip it
-        return skip_descendant(train, progress, next_descendant, "PR not found in cache");
+        return skip_descendant(
+            train,
+            progress,
+            next_descendant,
+            "PR not found in cache",
+            prs,
+            ctx,
+        );
     };
 
     // Check if descendant is still open
     if !desc_pr.state.is_open() {
-        return skip_descendant(train, progress, next_descendant, "PR is no longer open");
+        return skip_descendant(
+            train,
+            progress,
+            next_descendant,
+            "PR is no longer open",
+            prs,
+            ctx,
+        );
     }
 
     // CRITICAL: Base-branch revalidation before preparing.
@@ -370,11 +384,25 @@ fn execute_reconciling(
 
     // Get descendant PR info
     let Some(desc_pr) = prs.get(&next_descendant) else {
-        return skip_descendant(train, progress, next_descendant, "PR not found in cache");
+        return skip_descendant(
+            train,
+            progress,
+            next_descendant,
+            "PR not found in cache",
+            prs,
+            ctx,
+        );
     };
 
     if !desc_pr.state.is_open() {
-        return skip_descendant(train, progress, next_descendant, "PR is no longer open");
+        return skip_descendant(
+            train,
+            progress,
+            next_descendant,
+            "PR is no longer open",
+            prs,
+            ctx,
+        );
     }
 
     // Generate reconciliation effects (two merges: $SQUASH_SHA^ then ours-merge $SQUASH_SHA)
@@ -382,6 +410,11 @@ fn execute_reconciling(
         // Perform the two-step reconciliation merge
         Effect::Git(GitEffect::MergeReconcile {
             squash_sha: squash_sha.clone(),
+            // TODO: Compute and provide expected_squash_parent for validation.
+            // Currently None - interpreter will compute $SQUASH_SHA^ but cannot verify
+            // it against an expected value.
+            expected_squash_parent: None,
+            default_branch: ctx.default_branch.clone(),
             target_branch: desc_pr.head_ref.clone(),
         }),
         // Push the result
@@ -416,11 +449,25 @@ fn execute_catching_up(
 
     // Get descendant PR info
     let Some(desc_pr) = prs.get(&next_descendant) else {
-        return skip_descendant(train, progress, next_descendant, "PR not found in cache");
+        return skip_descendant(
+            train,
+            progress,
+            next_descendant,
+            "PR not found in cache",
+            prs,
+            ctx,
+        );
     };
 
     if !desc_pr.state.is_open() {
-        return skip_descendant(train, progress, next_descendant, "PR is no longer open");
+        return skip_descendant(
+            train,
+            progress,
+            next_descendant,
+            "PR is no longer open",
+            prs,
+            ctx,
+        );
     }
 
     // Generate catch-up effects
@@ -483,11 +530,25 @@ fn execute_retargeting(
 
     // Get descendant PR info
     let Some(desc_pr) = prs.get(&next_descendant) else {
-        return skip_descendant(train, progress, next_descendant, "PR not found in cache");
+        return skip_descendant(
+            train,
+            progress,
+            next_descendant,
+            "PR not found in cache",
+            prs,
+            ctx,
+        );
     };
 
     if !desc_pr.state.is_open() {
-        return skip_descendant(train, progress, next_descendant, "PR is no longer open");
+        return skip_descendant(
+            train,
+            progress,
+            next_descendant,
+            "PR is no longer open",
+            prs,
+            ctx,
+        );
     }
 
     // Generate retarget effect
@@ -510,6 +571,13 @@ fn execute_retargeting(
 /// Uses the frozen descendants from the current phase if available. If in Idle
 /// phase (no frozen set yet), computes the descendant set - these descendants
 /// weren't yet promised preparation, so this is a valid freeze point.
+///
+/// CRITICAL: If in Preparing phase with unprepared descendants, aborts with an
+/// error. Moving to Reconciling with unprepared descendants violates the
+/// "prepare before squash" invariant and can drop predecessor content.
+///
+/// Also emits a status comment update to record the merge SHA and phase
+/// transition for GitHub-based recovery.
 fn handle_external_merge(
     train: &mut TrainRecord,
     merge_sha: Sha,
@@ -523,21 +591,66 @@ fn handle_external_merge(
     // If in Idle phase (external merge before we started cascade), we need to
     // compute and freeze the descendants now - they haven't been promised
     // preparation yet, so this is a valid freeze point.
-    let progress = match &train.cascade_phase {
+    let (progress, was_preparing) = match &train.cascade_phase {
         CascadePhase::Idle => {
             // Compute descendants now - this becomes the frozen set
             let descendants = compute_open_descendants(train.current_pr, prs);
-            DescendantProgress::new(descendants)
+            (DescendantProgress::new(descendants), false)
+        }
+        CascadePhase::Preparing { progress } => {
+            // We were in Preparing phase - check if any descendants are unprepared
+            (progress.clone(), true)
         }
         _ => {
             // Use the existing frozen set from the current phase
-            train
+            let progress = train
                 .cascade_phase
                 .progress()
                 .cloned()
-                .unwrap_or_else(|| DescendantProgress::new(vec![]))
+                .unwrap_or_else(|| DescendantProgress::new(vec![]));
+            (progress, false)
         }
     };
+
+    // CRITICAL: If we were preparing and have unprepared descendants, abort.
+    // These descendants don't have the predecessor's content merged into them,
+    // so reconciliation would drop changes.
+    if was_preparing {
+        let unprepared: Vec<PrNumber> = progress.remaining().copied().collect();
+        if !unprepared.is_empty() {
+            let reason = AbortReason::PreparationIncomplete {
+                unprepared_descendants: unprepared.clone(),
+            };
+            train.abort(TrainError::new(
+                "preparation_incomplete",
+                format!(
+                    "PR was merged externally before preparation completed. \
+                     {} descendant(s) were not prepared: {:?}. \
+                     Manual intervention required: merge the predecessor's content \
+                     into these branches or rebase them.",
+                    unprepared.len(),
+                    unprepared
+                ),
+            ));
+            return StepResult {
+                train: train.clone(),
+                outcome: CascadeStepOutcome::Aborted {
+                    pr_number: train.current_pr,
+                    reason,
+                },
+                effects: train
+                    .status_comment_id
+                    .map(|comment_id| {
+                        Effect::GitHub(GitHubEffect::UpdateComment {
+                            comment_id,
+                            body: format_phase_comment(train),
+                        })
+                    })
+                    .into_iter()
+                    .collect(),
+            };
+        }
+    }
 
     // Check remaining (frozen - completed - skipped)
     let remaining: Vec<PrNumber> = progress.remaining().copied().collect();
@@ -554,12 +667,25 @@ fn handle_external_merge(
     };
     train.increment_seq();
 
+    // CRITICAL: Emit status comment update to record last_squash_sha and
+    // Reconciling phase for GitHub-based recovery
+    let effects = train
+        .status_comment_id
+        .map(|comment_id| {
+            Effect::GitHub(GitHubEffect::UpdateComment {
+                comment_id,
+                body: format_phase_comment(train),
+            })
+        })
+        .into_iter()
+        .collect();
+
     StepResult {
         train: train.clone(),
         outcome: CascadeStepOutcome::Merged {
             pr_number: train.current_pr,
         },
-        effects: vec![],
+        effects,
     }
 }
 
@@ -702,6 +828,9 @@ fn transition_to_retargeting(
 /// - If no descendants were successfully processed, the train is truly complete
 /// - If one descendant was processed, advance `current_pr` and continue
 /// - If multiple descendants were processed, emit FanOut for parallel trains
+///
+/// CRITICAL: Always emits a status comment update to ensure GitHub-based recovery
+/// can see the new current_pr or completion state.
 fn complete_cascade(train: &mut TrainRecord, progress: DescendantProgress) -> StepResult {
     train.cascade_phase = CascadePhase::Idle;
     train.increment_seq();
@@ -709,25 +838,46 @@ fn complete_cascade(train: &mut TrainRecord, progress: DescendantProgress) -> St
     // Get descendants that were successfully processed (not skipped)
     let completed: Vec<PrNumber> = progress.completed.iter().copied().collect();
 
+    // Build status comment update effect if we have a comment ID
+    let status_update_effect = train.status_comment_id.map(|comment_id| {
+        Effect::GitHub(GitHubEffect::UpdateComment {
+            comment_id,
+            body: format_phase_comment(train),
+        })
+    });
+
     match completed.len() {
         0 => {
             // No descendants were successfully processed - truly complete
             StepResult {
                 train: train.clone(),
                 outcome: CascadeStepOutcome::Complete,
-                effects: vec![],
+                effects: status_update_effect.into_iter().collect(),
             }
         }
         1 => {
             // Single descendant - advance current_pr and continue the train
             train.current_pr = completed[0];
             train.increment_seq();
+
+            // Update status comment again after advancing current_pr
+            let effects = train
+                .status_comment_id
+                .map(|comment_id| {
+                    Effect::GitHub(GitHubEffect::UpdateComment {
+                        comment_id,
+                        body: format_phase_comment(train),
+                    })
+                })
+                .into_iter()
+                .collect();
+
             StepResult {
                 train: train.clone(),
                 outcome: CascadeStepOutcome::WaitingOnCi {
                     pr_number: completed[0],
                 },
-                effects: vec![],
+                effects,
             }
         }
         _ => {
@@ -737,18 +887,23 @@ fn complete_cascade(train: &mut TrainRecord, progress: DescendantProgress) -> St
                 outcome: CascadeStepOutcome::FanOut {
                     descendants: completed,
                 },
-                effects: vec![],
+                effects: status_update_effect.into_iter().collect(),
             }
         }
     }
 }
 
-/// Skip a descendant that can't be processed.
+/// Skip a descendant that can't be processed, then continue the cascade.
+///
+/// After marking the descendant as skipped, this function recursively calls
+/// `execute_cascade_step` to process the next descendant, preventing cascade stalls.
 fn skip_descendant(
     train: &mut TrainRecord,
     mut progress: DescendantProgress,
     descendant: PrNumber,
     _reason: &str,
+    prs: &HashMap<PrNumber, CachedPr>,
+    ctx: &StepContext,
 ) -> StepResult {
     progress.mark_skipped(descendant);
 
@@ -772,13 +927,9 @@ fn skip_descendant(
     };
     train.increment_seq();
 
-    StepResult {
-        train: train.clone(),
-        outcome: CascadeStepOutcome::WaitingOnCi {
-            pr_number: train.current_pr,
-        },
-        effects: vec![],
-    }
+    // Recursively call execute_cascade_step to process the next descendant.
+    // This prevents the cascade from stalling when descendants are skipped.
+    execute_cascade_step(train.clone(), prs, ctx)
 }
 
 /// Compute open descendants of a PR.
@@ -801,17 +952,21 @@ fn compute_open_descendants(pr: PrNumber, prs: &HashMap<PrNumber, CachedPr>) -> 
 ///
 /// This is called after effects have been executed to record the outcome
 /// and potentially advance to the next phase.
+///
+/// Returns (updated_train, optional_outcome, effects_to_execute).
+/// The effects include status comment updates for phase transitions that
+/// are critical for GitHub-based recovery.
 pub fn process_operation_result(
     mut train: TrainRecord,
     operation: OperationResult,
-) -> (TrainRecord, Option<CascadeStepOutcome>) {
+) -> (TrainRecord, Option<CascadeStepOutcome>, Vec<Effect>) {
     match operation {
         OperationResult::DescendantPrepared { pr } => {
             if let Some(progress) = train.cascade_phase.progress_mut() {
                 progress.mark_completed(pr);
             }
             train.increment_seq();
-            (train, None)
+            (train, None, vec![])
         }
         OperationResult::DescendantReconciled { pr, squash_sha: _ } => {
             if let Some(progress) = train.cascade_phase.progress_mut() {
@@ -820,21 +975,21 @@ pub fn process_operation_result(
             // Record the squash SHA for this descendant (for late-addition tracking)
             // This would update the PR cache in the full implementation
             train.increment_seq();
-            (train, None)
+            (train, None, vec![])
         }
         OperationResult::DescendantCaughtUp { pr } => {
             if let Some(progress) = train.cascade_phase.progress_mut() {
                 progress.mark_completed(pr);
             }
             train.increment_seq();
-            (train, None)
+            (train, None, vec![])
         }
         OperationResult::DescendantRetargeted { pr } => {
             if let Some(progress) = train.cascade_phase.progress_mut() {
                 progress.mark_completed(pr);
             }
             train.increment_seq();
-            (train, None)
+            (train, None, vec![])
         }
         OperationResult::SquashMerged { pr, squash_sha } => {
             train.last_squash_sha = Some(squash_sha.clone());
@@ -852,7 +1007,25 @@ pub fn process_operation_result(
                 }
             }
             train.increment_seq();
-            (train, Some(CascadeStepOutcome::Merged { pr_number: pr }))
+
+            // CRITICAL: Emit status comment update after squash transition.
+            // This ensures GitHub-based recovery can see `last_squash_sha` and the
+            // Reconciling phase, preventing re-squash or recovery failures if the
+            // bot crashes before the next phase transition.
+            let effects = if let Some(comment_id) = train.status_comment_id {
+                vec![Effect::GitHub(GitHubEffect::UpdateComment {
+                    comment_id,
+                    body: format_phase_comment(&train),
+                })]
+            } else {
+                vec![]
+            };
+
+            (
+                train,
+                Some(CascadeStepOutcome::Merged { pr_number: pr }),
+                effects,
+            )
         }
         OperationResult::OperationFailed { pr, error } => {
             train.abort(TrainError::new(error.error_type(), error.description()));
@@ -862,6 +1035,7 @@ pub fn process_operation_result(
                     pr_number: pr,
                     reason: error,
                 }),
+                vec![],
             )
         }
         OperationResult::DescendantSkipped { pr, reason: _ } => {
@@ -869,7 +1043,7 @@ pub fn process_operation_result(
                 progress.mark_skipped(pr);
             }
             train.increment_seq();
-            (train, None)
+            (train, None, vec![])
         }
     }
 }
@@ -1019,7 +1193,7 @@ mod tests {
         };
 
         let squash_sha = make_sha(0x123);
-        let (updated_train, outcome) = process_operation_result(
+        let (updated_train, outcome, _effects) = process_operation_result(
             train,
             OperationResult::SquashMerged {
                 pr: PrNumber(1),
@@ -1041,7 +1215,7 @@ mod tests {
         train.cascade_phase = CascadePhase::Preparing { progress };
 
         // Simulate skipping PR #2
-        let (updated_train, _) = process_operation_result(
+        let (updated_train, _, _effects) = process_operation_result(
             train,
             OperationResult::DescendantSkipped {
                 pr: PrNumber(2),
@@ -1207,7 +1381,7 @@ mod tests {
                     // Simulate effect execution to drive the cascade forward
                     if !result.effects.is_empty() {
                         if let Some(op_result) = simulate_effect_execution(&train, &result.effects, &sha) {
-                            let (updated_train, _) = process_operation_result(train, op_result);
+                            let (updated_train, _, _effects) = process_operation_result(train, op_result);
                             train = updated_train;
                         }
                     }
@@ -1343,7 +1517,7 @@ mod tests {
                     // Simulate effect execution to drive the cascade forward
                     if !result.effects.is_empty() {
                         if let Some(op_result) = simulate_effect_execution(&train, &result.effects, &sha) {
-                            let (updated_train, _) = process_operation_result(train, op_result);
+                            let (updated_train, _, _effects) = process_operation_result(train, op_result);
                             train = updated_train;
                         }
                     }
@@ -1598,11 +1772,14 @@ mod tests {
                     prs.insert(pr_num, pr);
                 }
 
-                // Create train in Preparing phase (descendants frozen)
+                // Create train in SquashPending phase (after preparation completes).
+                // We use SquashPending because:
+                // 1. It means all preparation is done (frozen descendants were prepared)
+                // 2. External merge is expected to happen in this phase
+                // 3. Transition to Reconciling preserves the frozen set (not late additions)
                 let mut train = TrainRecord::new(PrNumber(1));
-                train.cascade_phase = CascadePhase::Preparing {
-                    progress: DescendantProgress::new(frozen_descendants.clone()),
-                };
+                let progress = DescendantProgress::new(frozen_descendants.clone());
+                train.cascade_phase = CascadePhase::SquashPending { progress };
 
                 // Now add a late descendant AFTER the freeze
                 let late_pr = make_pr_with_predecessor(
@@ -1800,7 +1977,7 @@ mod tests {
                     // Simulate effect execution
                     if !result.effects.is_empty() {
                         if let Some(op_result) = simulate_effect_execution(&train, &result.effects, &sha) {
-                            let (updated_train, _) = process_operation_result(train, op_result);
+                            let (updated_train, _, _effects) = process_operation_result(train, op_result);
                             train = updated_train;
                         }
                     }
@@ -1962,7 +2139,7 @@ mod tests {
                     // Simulate effect execution
                     if !result.effects.is_empty() {
                         if let Some(op_result) = simulate_effect_execution(&train, &result.effects, &sha) {
-                            let (updated_train, _) = process_operation_result(train, op_result);
+                            let (updated_train, _, _effects) = process_operation_result(train, op_result);
                             train = updated_train;
                         }
                     }
@@ -2083,6 +2260,285 @@ mod tests {
                     result.train.cascade_phase.name()
                 );
             }
+        }
+    }
+
+    // ─── Bug Regression Tests ─────────────────────────────────────────────────
+    //
+    // These tests expose specific bugs from review comments. Each test should
+    // FAIL before the corresponding fix is applied and PASS after.
+
+    mod bug_regression_tests {
+        use super::*;
+        use crate::types::CommentId;
+
+        fn make_sha(n: u64) -> Sha {
+            Sha::parse(format!("{:0>40x}", n)).unwrap()
+        }
+
+        fn make_open_pr(number: u64, base_ref: &str, predecessor: Option<u64>) -> CachedPr {
+            CachedPr::new(
+                PrNumber(number),
+                make_sha(number),
+                format!("branch-{}", number),
+                base_ref.to_string(),
+                predecessor.map(PrNumber),
+                PrState::Open,
+                MergeStateStatus::Clean,
+                false,
+            )
+        }
+
+        /// Regression test: process_operation_result must emit a status comment update
+        /// when transitioning to Reconciling after squash. This ensures GitHub-based
+        /// recovery can see last_squash_sha, preventing re-squash or recovery failures
+        /// if the bot crashes.
+        #[test]
+        fn squash_merged_emits_status_comment_update() {
+            let mut train = TrainRecord::new(PrNumber(1));
+            train.cascade_phase = CascadePhase::SquashPending {
+                progress: DescendantProgress::new(vec![PrNumber(2)]),
+            };
+            // CRITICAL: Train has a status comment ID
+            train.status_comment_id = Some(CommentId(12345));
+
+            let squash_sha = make_sha(0xabc);
+            let (updated_train, outcome, effects) = process_operation_result(
+                train,
+                OperationResult::SquashMerged {
+                    pr: PrNumber(1),
+                    squash_sha: squash_sha.clone(),
+                },
+            );
+
+            // Verify the transition happened
+            assert!(matches!(
+                updated_train.cascade_phase,
+                CascadePhase::Reconciling { .. }
+            ));
+            assert!(matches!(outcome, Some(CascadeStepOutcome::Merged { .. })));
+            assert_eq!(updated_train.last_squash_sha, Some(squash_sha));
+
+            // Verify status comment update effect is emitted
+            let has_comment_update = effects.iter().any(|e| {
+                matches!(e, Effect::GitHub(GitHubEffect::UpdateComment { comment_id, .. })
+                    if *comment_id == CommentId(12345))
+            });
+            assert!(
+                has_comment_update,
+                "process_operation_result must emit UpdateComment effect when transitioning \
+                 to Reconciling. Effects: {:?}",
+                effects
+            );
+        }
+
+        /// Regression test: complete_cascade must emit a status comment update when
+        /// changing phase to Idle and advancing current_pr.
+        #[test]
+        fn complete_cascade_emits_status_comment_update() {
+            let mut train = TrainRecord::new(PrNumber(1));
+            // Status comment exists
+            train.status_comment_id = Some(CommentId(12345));
+
+            // Set up Retargeting phase with one completed descendant
+            let mut progress = DescendantProgress::new(vec![PrNumber(2)]);
+            progress.mark_completed(PrNumber(2));
+            train.cascade_phase = CascadePhase::Retargeting {
+                progress,
+                squash_sha: make_sha(0xabc),
+            };
+
+            // Build PR map
+            let pr1 = make_open_pr(1, "main", None);
+            let mut pr2 = make_open_pr(2, "branch-1", Some(1));
+            pr2.head_ref = "branch-2".to_string();
+            let prs = HashMap::from([(PrNumber(1), pr1), (PrNumber(2), pr2)]);
+            let ctx = StepContext::new("main");
+
+            // Execute cascade step - should complete and advance current_pr
+            let result = execute_cascade_step(train, &prs, &ctx);
+
+            // Should have advanced current_pr to the completed descendant
+            assert_eq!(result.train.current_pr, PrNumber(2));
+
+            // Verify status comment update is emitted
+            let has_comment_update = result.effects.iter().any(|e| {
+                matches!(e, Effect::GitHub(GitHubEffect::UpdateComment { comment_id, .. })
+                    if *comment_id == CommentId(12345))
+            });
+
+            assert!(
+                has_comment_update,
+                "complete_cascade must emit status comment update when advancing current_pr. \
+                 Effects: {:?}",
+                result.effects
+            );
+        }
+
+        /// Regression test: handle_external_merge must emit a status comment update
+        /// when changing phase to Reconciling and storing squash_sha.
+        #[test]
+        fn external_merge_emits_status_comment_update() {
+            let mut train = TrainRecord::new(PrNumber(1));
+            // Status comment exists
+            train.status_comment_id = Some(CommentId(12345));
+
+            // In Preparing phase with descendants - but ALL COMPLETED (prepared)
+            // This is required because handle_external_merge now aborts if
+            // descendants weren't prepared.
+            let mut progress = DescendantProgress::new(vec![PrNumber(2)]);
+            progress.mark_completed(PrNumber(2)); // Descendant was prepared
+            train.cascade_phase = CascadePhase::Preparing { progress };
+
+            // Build PR map with root PR merged externally
+            let merge_sha = make_sha(0xfff);
+            let mut pr1 = make_open_pr(1, "main", None);
+            pr1.state = PrState::Merged {
+                merge_commit_sha: merge_sha.clone(),
+            };
+            let mut pr2 = make_open_pr(2, "branch-1", Some(1));
+            pr2.head_ref = "branch-2".to_string();
+
+            let prs = HashMap::from([(PrNumber(1), pr1), (PrNumber(2), pr2)]);
+            let ctx = StepContext::new("main");
+
+            // Execute cascade step - should handle external merge and advance to Idle
+            // because all descendants were already prepared
+            let result = execute_cascade_step(train, &prs, &ctx);
+
+            // Since the only descendant was already completed, complete_cascade is called
+            // and current_pr is advanced to PR #2
+            assert_eq!(result.train.current_pr, PrNumber(2));
+            assert_eq!(result.train.last_squash_sha, Some(merge_sha));
+
+            // Verify status comment update is emitted
+            let has_comment_update = result.effects.iter().any(|e| {
+                matches!(e, Effect::GitHub(GitHubEffect::UpdateComment { comment_id, .. })
+                    if *comment_id == CommentId(12345))
+            });
+
+            assert!(
+                has_comment_update,
+                "handle_external_merge must emit status comment update. \
+                 Effects: {:?}",
+                result.effects
+            );
+        }
+
+        /// Regression test: handle_external_merge must abort if descendants weren't
+        /// prepared. Moving to Reconciling with unprepared descendants violates the
+        /// "prepare before squash" invariant and can drop predecessor content.
+        #[test]
+        fn external_merge_verifies_descendants_prepared() {
+            let mut train = TrainRecord::new(PrNumber(1));
+            // In Preparing phase with TWO descendants, but NONE completed
+            train.cascade_phase = CascadePhase::Preparing {
+                progress: DescendantProgress::new(vec![PrNumber(2), PrNumber(3)]),
+            };
+
+            // Build PR map with root PR merged externally BEFORE preparation completed
+            let merge_sha = make_sha(0xfff);
+            let mut pr1 = make_open_pr(1, "main", None);
+            pr1.state = PrState::Merged {
+                merge_commit_sha: merge_sha.clone(),
+            };
+            let mut pr2 = make_open_pr(2, "branch-1", Some(1));
+            pr2.head_ref = "branch-2".to_string();
+            let mut pr3 = make_open_pr(3, "branch-2", Some(2));
+            pr3.head_ref = "branch-3".to_string();
+
+            let prs = HashMap::from([(PrNumber(1), pr1), (PrNumber(2), pr2), (PrNumber(3), pr3)]);
+            let ctx = StepContext::new("main");
+
+            // Execute cascade step
+            let result = execute_cascade_step(train, &prs, &ctx);
+
+            // Should abort because descendants weren't prepared
+            assert!(
+                matches!(result.outcome, CascadeStepOutcome::Aborted { .. }),
+                "handle_external_merge must abort when descendants are unprepared. \
+                 Got outcome: {:?}",
+                result.outcome
+            );
+
+            // Verify it's a PreparationIncomplete error
+            if let CascadeStepOutcome::Aborted { reason, .. } = &result.outcome {
+                assert!(
+                    matches!(reason, AbortReason::PreparationIncomplete { .. }),
+                    "Abort reason should be PreparationIncomplete, got: {:?}",
+                    reason
+                );
+            }
+        }
+
+        /// BUG: skip_descendant returns WaitingOnCi with no effects. Without a poll tick,
+        /// the cascade can stall after a closed/missing descendant.
+        #[test]
+        fn skip_descendant_continues_cascade() {
+            let mut train = TrainRecord::new(PrNumber(1));
+            // In Preparing phase with two descendants
+            train.cascade_phase = CascadePhase::Preparing {
+                progress: DescendantProgress::new(vec![PrNumber(2), PrNumber(3)]),
+            };
+
+            // Build PR map - PR #2 is CLOSED (will be skipped), PR #3 is open
+            let pr1 = make_open_pr(1, "main", None);
+            let mut pr2 = CachedPr::new(
+                PrNumber(2),
+                make_sha(2),
+                "branch-2".to_string(),
+                "branch-1".to_string(),
+                Some(PrNumber(1)),
+                PrState::Closed, // CLOSED - will be skipped
+                MergeStateStatus::Clean,
+                false,
+            );
+            pr2.head_ref = "branch-2".to_string();
+            let mut pr3 = make_open_pr(3, "branch-1", Some(1));
+            pr3.head_ref = "branch-3".to_string();
+
+            let prs = HashMap::from([(PrNumber(1), pr1), (PrNumber(2), pr2), (PrNumber(3), pr3)]);
+            let ctx = StepContext::new("main");
+
+            // Execute cascade step - should skip PR #2 and continue to PR #3
+            let result = execute_cascade_step(train, &prs, &ctx);
+
+            // PR #2 should be skipped
+            if let CascadePhase::Preparing { progress } = &result.train.cascade_phase {
+                assert!(
+                    progress.skipped.contains(&PrNumber(2)),
+                    "PR #2 should be marked as skipped"
+                );
+            }
+
+            // BUG: skip_descendant returns WaitingOnCi with empty effects.
+            // The cascade will stall because there's nothing to trigger the next step.
+            //
+            // The fix should either:
+            // 1. Immediately invoke the next step after skipping (tail recursion), OR
+            // 2. Return effects to process the next descendant
+            //
+            // Option 1 is cleaner: after skipping, call execute_cascade_step again
+            // to process the next descendant.
+
+            // Check that we either have effects to continue OR moved past the skipped PR
+            let has_effects = !result.effects.is_empty();
+            let skipped_and_continued =
+                if let CascadePhase::Preparing { progress } = &result.train.cascade_phase {
+                    // If we skipped PR #2, we should have moved on to process PR #3
+                    progress.skipped.contains(&PrNumber(2))
+                        && (has_effects || progress.completed.contains(&PrNumber(3)))
+                } else {
+                    false
+                };
+
+            assert!(
+                has_effects || skipped_and_continued,
+                "BUG: skip_descendant returns empty effects, causing cascade to stall. \
+                 Outcome: {:?}, Effects: {:?}",
+                result.outcome,
+                result.effects
+            );
         }
     }
 }
