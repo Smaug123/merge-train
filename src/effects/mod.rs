@@ -9,6 +9,8 @@
 //!
 //! Interpreters that execute these effects are defined in later stages.
 
+use serde::{Deserialize, Serialize};
+
 pub mod git;
 pub mod github;
 pub mod interpreter;
@@ -19,3 +21,15 @@ pub use github::{
     RepoSettingsData, RulesetData,
 };
 pub use interpreter::{GitHubInterpreter, GitInterpreter};
+
+/// A unified effect type encompassing both Git and GitHub operations.
+///
+/// This is the primary effect type returned by cascade operations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "effect_type", rename_all = "snake_case")]
+pub enum Effect {
+    /// A Git operation.
+    Git(GitEffect),
+    /// A GitHub API operation.
+    GitHub(GitHubEffect),
+}

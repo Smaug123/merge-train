@@ -130,12 +130,34 @@ pub enum AbortReason {
         descendant: PrNumber,
     },
 
+    /// External merge occurred before preparation completed.
+    /// Multiple descendants were not prepared, violating the "prepare before
+    /// squash" invariant.
+    PreparationIncomplete {
+        /// The descendants that weren't prepared.
+        unprepared_descendants: Vec<PrNumber>,
+    },
+
     /// Repository has merge hooks or merge queue enabled (incompatible config).
     ///
     /// This occurs when GitHub reports `HAS_HOOKS` status, indicating either
     /// GitHub Enterprise pre-receive hooks or GitHub's merge queue is enabled.
     /// Both are incompatible with merge-train (see DESIGN.md non-goals).
     MergeHooksEnabled,
+
+    /// PR base branch doesn't match predecessor's head branch.
+    ///
+    /// This occurs when a PR was retargeted between cascade start and the
+    /// preparation phase. The stack structure no longer matches what was
+    /// declared, so the cascade must abort.
+    BaseBranchMismatch {
+        /// The PR with the mismatched base branch.
+        pr: PrNumber,
+        /// The expected base branch (predecessor's head branch).
+        expected_base: String,
+        /// The actual base branch on the PR.
+        actual_base: String,
+    },
 }
 
 impl AbortReason {
@@ -155,7 +177,9 @@ impl AbortReason {
             AbortReason::StatusCommentTooLarge => "status_comment_too_large",
             AbortReason::TrainTooLarge { .. } => "train_too_large",
             AbortReason::PreparationMissing { .. } => "preparation_missing",
+            AbortReason::PreparationIncomplete { .. } => "preparation_incomplete",
             AbortReason::MergeHooksEnabled => "merge_hooks_enabled",
+            AbortReason::BaseBranchMismatch { .. } => "base_branch_mismatch",
         }
     }
 
@@ -201,8 +225,28 @@ impl AbortReason {
             AbortReason::PreparationMissing { descendant } => {
                 format!("Descendant {} was not prepared before squash", descendant)
             }
+            AbortReason::PreparationIncomplete {
+                unprepared_descendants,
+            } => {
+                format!(
+                    "External merge before preparation completed: {} descendant(s) unprepared: {:?}. \
+                     Manual intervention required.",
+                    unprepared_descendants.len(),
+                    unprepared_descendants
+                )
+            }
             AbortReason::MergeHooksEnabled => {
                 "Repository has merge hooks or merge queue enabled, which is incompatible with merge-train".to_string()
+            }
+            AbortReason::BaseBranchMismatch {
+                pr,
+                expected_base,
+                actual_base,
+            } => {
+                format!(
+                    "PR #{} base branch '{}' doesn't match predecessor's head branch '{}' (was PR retargeted?)",
+                    pr, actual_base, expected_base
+                )
             }
         }
     }
@@ -338,6 +382,18 @@ mod tests {
             }),
             arb_pr_number().prop_map(|descendant| AbortReason::PreparationMissing { descendant }),
             Just(AbortReason::MergeHooksEnabled),
+            (
+                arb_pr_number(),
+                "[a-zA-Z0-9_/-]{1,30}",
+                "[a-zA-Z0-9_/-]{1,30}"
+            )
+                .prop_map(|(pr, expected_base, actual_base)| {
+                    AbortReason::BaseBranchMismatch {
+                        pr,
+                        expected_base,
+                        actual_base,
+                    }
+                }),
         ]
     }
 
@@ -458,6 +514,11 @@ mod tests {
                     descendant: PrNumber(2),
                 },
                 AbortReason::MergeHooksEnabled,
+                AbortReason::BaseBranchMismatch {
+                    pr: PrNumber(3),
+                    expected_base: "feature-1".into(),
+                    actual_base: "main".into(),
+                },
             ];
 
             for reason in &reasons {

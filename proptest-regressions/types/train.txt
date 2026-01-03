@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc e684e92da2a75894991d6f38f0990c1743008188aac1013f8b321ba0c6ab9c90 # shrinks to record = TrainRecord { version: 1, recovery_seq: 0, state: Running, original_root_pr: PrNumber(0), current_pr: PrNumber(0), cascade_phase: Idle, predecessor_pr: None, predecessor_head_sha: None, last_squash_sha: None, started_at: 2000-01-01T00:00:00Z, ended_at: None, error: None, status_comment_id: Some(CommentId(0)) }
