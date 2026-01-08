@@ -85,18 +85,39 @@ pub enum GitEffect {
     ///
     /// This ensures the descendant branch contains all the predecessor's changes
     /// and is properly marked as containing the squash commit.
+    ///
+    /// # Interpreter Validation Requirements
+    ///
+    /// **CRITICAL**: The interpreter MUST validate the squash commit before
+    /// reconciliation, regardless of whether `expected_squash_parent` is provided:
+    ///
+    /// 1. **Single parent check**: Verify `squash_sha` has exactly one parent.
+    ///    If it has multiple parents, it's a regular merge commit, not a squash.
+    ///    Abort with an error indicating non-squash merge detected.
+    ///
+    /// 2. **Default branch ancestry**: Verify the computed `$SQUASH_SHA^` is on
+    ///    the `origin/{default_branch}` history (i.e., is an ancestor of the
+    ///    default branch HEAD). This ensures the squash landed on the correct
+    ///    branch and wasn't somehow misdirected.
+    ///
+    /// 3. **Expected parent match** (if `expected_squash_parent` is `Some`):
+    ///    Additionally verify the computed parent matches the expected value.
+    ///
+    /// Failing any of these checks should abort the operation with a descriptive
+    /// error. This prevents non-squash merges from corrupting the cascade.
     MergeReconcile {
         /// The squash commit SHA to reconcile against.
         squash_sha: Sha,
         /// The expected parent of the squash commit (`$SQUASH_SHA^`), if known.
         ///
-        /// When provided, this allows the interpreter to verify that the squash
-        /// commit is valid:
-        /// - The squash has exactly one parent (it's actually a squash merge)
-        /// - The parent resolves to the expected SHA
+        /// When provided, the interpreter should verify that the computed parent
+        /// matches this value. When `None`, the interpreter computes the parent
+        /// itself but cannot verify against an expected value.
         ///
-        /// When `None`, the interpreter should compute `$SQUASH_SHA^` itself but
-        /// cannot verify it against an expected value.
+        /// Note: Currently this is always `None` because the squash parent is not
+        /// known until after the GitHub squash-merge API returns. Future work:
+        /// extend SquashMerge response to include parent SHA, or add a pre-flight
+        /// RevParse effect. The interpreter MUST still validate even when None.
         #[serde(skip_serializing_if = "Option::is_none")]
         expected_squash_parent: Option<Sha>,
         /// The default branch name (e.g., "main").

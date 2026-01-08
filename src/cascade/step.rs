@@ -150,19 +150,27 @@ fn execute_from_idle(
     prs: &HashMap<PrNumber, CachedPr>,
     ctx: &StepContext,
 ) -> StepResult {
-    // Compute frozen descendants
-    let descendants = compute_open_descendants(train.current_pr, prs);
+    // Compute DIRECT descendants for the frozen set.
+    // The frozen set should only include PRs whose predecessor is the current PR,
+    // because we only prepare direct children. Transitive descendants (children of
+    // children) will be handled when their predecessor becomes the current PR.
+    let direct_descendants = compute_direct_descendants(train.current_pr, prs);
+
+    // Compute ALL transitive descendants for size check.
+    // The train size limit should consider the entire reachable chain, not just
+    // direct children. This catches deep chains that could exceed 50 PRs.
+    let total_descendants = compute_all_descendants(train.current_pr, prs);
 
     // Check max-train-size when entering Preparing phase.
     // This catches late additions that could exceed the limit even though
     // the initial train was within bounds.
     // The +1 accounts for the current PR itself.
-    if descendants.len() + 1 > MAX_TRAIN_SIZE {
+    if total_descendants.len() + 1 > MAX_TRAIN_SIZE {
         train.abort(TrainError::new(
             "train_too_large",
             format!(
                 "Train size {} exceeds maximum {}. Too many descendants were added.",
-                descendants.len() + 1,
+                total_descendants.len() + 1,
                 MAX_TRAIN_SIZE
             ),
         ));
@@ -171,7 +179,7 @@ fn execute_from_idle(
             outcome: CascadeStepOutcome::Aborted {
                 pr_number: train.current_pr,
                 reason: AbortReason::TrainTooLarge {
-                    pr_count: descendants.len() + 1,
+                    pr_count: total_descendants.len() + 1,
                     max_allowed: MAX_TRAIN_SIZE,
                 },
             },
@@ -179,13 +187,13 @@ fn execute_from_idle(
         };
     }
 
-    // Transition to next phase
-    let new_phase = crate::state::transitions::start_preparing(descendants.clone());
+    // Transition to next phase using DIRECT descendants for the frozen set
+    let new_phase = crate::state::transitions::start_preparing(direct_descendants.clone());
     train.cascade_phase = new_phase.clone();
     train.increment_seq();
 
     // Immediately execute the new phase to produce effects
-    match new_phase {
+    let mut result = match new_phase {
         CascadePhase::Preparing { progress } => {
             // Has descendants - immediately start preparing the first one
             execute_preparing(train, progress, prs, ctx)
@@ -206,7 +214,21 @@ fn execute_from_idle(
             execute_squash_pending(train, DescendantProgress::new(vec![]), current_pr, ctx)
         }
         _ => unreachable!("start_preparing only returns Preparing or SquashPending"),
+    };
+
+    // CRITICAL: Emit status comment update for Idle → Preparing/SquashPending transition.
+    // This ensures GitHub-based recovery can see the phase transition and frozen descendants
+    // immediately, not just after the first descendant is processed.
+    if let Some(comment_id) = result.train.status_comment_id {
+        result
+            .effects
+            .push(Effect::GitHub(GitHubEffect::UpdateComment {
+                comment_id,
+                body: format_phase_comment(&result.train),
+            }));
     }
+
+    result
 }
 
 /// Execute Preparing phase - merge predecessor head into the next descendant.
@@ -407,12 +429,16 @@ fn execute_reconciling(
 
     // Generate reconciliation effects (two merges: $SQUASH_SHA^ then ours-merge $SQUASH_SHA)
     let effects = vec![
-        // Perform the two-step reconciliation merge
+        // Perform the two-step reconciliation merge.
+        // CRITICAL: The interpreter MUST validate squash_sha even though
+        // expected_squash_parent is None. See MergeReconcile docs for requirements:
+        // 1. Verify squash_sha has exactly one parent (is actually a squash)
+        // 2. Verify that parent is on origin/{default_branch} history
         Effect::Git(GitEffect::MergeReconcile {
             squash_sha: squash_sha.clone(),
-            // TODO: Compute and provide expected_squash_parent for validation.
-            // Currently None - interpreter will compute $SQUASH_SHA^ but cannot verify
-            // it against an expected value.
+            // Note: expected_squash_parent is None because we don't have the parent
+            // SHA at this point. The interpreter computes $SQUASH_SHA^ itself and
+            // MUST validate it's a valid squash (single parent, on default branch).
             expected_squash_parent: None,
             default_branch: ctx.default_branch.clone(),
             target_branch: desc_pr.head_ref.clone(),
@@ -568,13 +594,19 @@ fn execute_retargeting(
 
 /// Handle the case where a PR was merged externally (not by us).
 ///
-/// Uses the frozen descendants from the current phase if available. If in Idle
-/// phase (no frozen set yet), computes the descendant set - these descendants
-/// weren't yet promised preparation, so this is a valid freeze point.
+/// CRITICAL: External merges bypass our controlled cascade flow and can drop
+/// predecessor content if descendants weren't prepared. This function handles
+/// all phases, aborting when necessary to prevent data loss.
 ///
-/// CRITICAL: If in Preparing phase with unprepared descendants, aborts with an
-/// error. Moving to Reconciling with unprepared descendants violates the
-/// "prepare before squash" invariant and can drop predecessor content.
+/// Phase-specific handling:
+/// - **Idle**: Has unprepared descendants (none were promised yet). Must abort
+///   to prevent skipping preparation entirely.
+/// - **Preparing**: Has unprepared descendants (some remain). Must abort.
+/// - **SquashPending**: All descendants are prepared but the squash was expected
+///   to be done by us. Progress must be RESET (completed cleared) before
+///   entering Reconciling, since the external merge bypassed our squash.
+/// - **Reconciling/CatchingUp/Retargeting**: Already past squash; can continue
+///   with existing progress.
 ///
 /// Also emits a status comment update to record the merge SHA and phase
 /// transition for GitHub-based recovery.
@@ -587,69 +619,82 @@ fn handle_external_merge(
     // Store the squash SHA
     train.last_squash_sha = Some(merge_sha.clone());
 
-    // Get frozen descendants from current phase if available.
-    // If in Idle phase (external merge before we started cascade), we need to
-    // compute and freeze the descendants now - they haven't been promised
-    // preparation yet, so this is a valid freeze point.
-    let (progress, was_preparing) = match &train.cascade_phase {
+    // CRITICAL: Handle each phase appropriately.
+    // Idle and SquashPending are problematic because descendants weren't
+    // prepared yet OR the completed set doesn't apply to reconciliation.
+    let (progress, needs_abort) = match &train.cascade_phase {
         CascadePhase::Idle => {
-            // Compute descendants now - this becomes the frozen set
-            let descendants = compute_open_descendants(train.current_pr, prs);
-            (DescendantProgress::new(descendants), false)
+            // External merge in Idle = preparation was never started.
+            // ALL direct descendants are unprepared. Must abort if there are any.
+            // (Transitive descendants would be handled when their predecessor
+            // becomes a new root, so we only consider direct children here.)
+            let descendants = compute_direct_descendants(train.current_pr, prs);
+            if descendants.is_empty() {
+                // No descendants - can complete safely
+                (DescendantProgress::new(vec![]), false)
+            } else {
+                // Has descendants that weren't prepared
+                (DescendantProgress::new(descendants), true)
+            }
         }
         CascadePhase::Preparing { progress } => {
             // We were in Preparing phase - check if any descendants are unprepared
-            (progress.clone(), true)
+            let has_unprepared = progress.remaining().next().is_some();
+            (progress.clone(), has_unprepared)
         }
-        _ => {
-            // Use the existing frozen set from the current phase
-            let progress = train
-                .cascade_phase
-                .progress()
-                .cloned()
-                .unwrap_or_else(|| DescendantProgress::new(vec![]));
-            (progress, false)
+        CascadePhase::SquashPending { progress } => {
+            // External merge in SquashPending = squash bypassed our control.
+            // The `completed` set tracks which descendants were PREPARED, but
+            // reconciliation needs a fresh start (none are reconciled yet).
+            // CRITICAL: Reset progress by keeping frozen_descendants but clearing
+            // completed/skipped so reconciliation processes all of them.
+            let fresh_progress = DescendantProgress::new(progress.frozen_descendants.clone());
+            (fresh_progress, false)
+        }
+        CascadePhase::Reconciling { progress, .. }
+        | CascadePhase::CatchingUp { progress, .. }
+        | CascadePhase::Retargeting { progress, .. } => {
+            // Already past squash - use existing progress
+            (progress.clone(), false)
         }
     };
 
-    // CRITICAL: If we were preparing and have unprepared descendants, abort.
+    // CRITICAL: If we have unprepared descendants, abort.
     // These descendants don't have the predecessor's content merged into them,
     // so reconciliation would drop changes.
-    if was_preparing {
+    if needs_abort {
         let unprepared: Vec<PrNumber> = progress.remaining().copied().collect();
-        if !unprepared.is_empty() {
-            let reason = AbortReason::PreparationIncomplete {
-                unprepared_descendants: unprepared.clone(),
-            };
-            train.abort(TrainError::new(
-                "preparation_incomplete",
-                format!(
-                    "PR was merged externally before preparation completed. \
-                     {} descendant(s) were not prepared: {:?}. \
-                     Manual intervention required: merge the predecessor's content \
-                     into these branches or rebase them.",
-                    unprepared.len(),
-                    unprepared
-                ),
-            ));
-            return StepResult {
-                train: train.clone(),
-                outcome: CascadeStepOutcome::Aborted {
-                    pr_number: train.current_pr,
-                    reason,
-                },
-                effects: train
-                    .status_comment_id
-                    .map(|comment_id| {
-                        Effect::GitHub(GitHubEffect::UpdateComment {
-                            comment_id,
-                            body: format_phase_comment(train),
-                        })
+        let reason = AbortReason::PreparationIncomplete {
+            unprepared_descendants: unprepared.clone(),
+        };
+        train.abort(TrainError::new(
+            "preparation_incomplete",
+            format!(
+                "PR was merged externally before preparation completed. \
+                 {} descendant(s) were not prepared: {:?}. \
+                 Manual intervention required: merge the predecessor's content \
+                 into these branches or rebase them.",
+                unprepared.len(),
+                unprepared
+            ),
+        ));
+        return StepResult {
+            train: train.clone(),
+            outcome: CascadeStepOutcome::Aborted {
+                pr_number: train.current_pr,
+                reason,
+            },
+            effects: train
+                .status_comment_id
+                .map(|comment_id| {
+                    Effect::GitHub(GitHubEffect::UpdateComment {
+                        comment_id,
+                        body: format_phase_comment(train),
                     })
-                    .into_iter()
-                    .collect(),
-            };
-        }
+                })
+                .into_iter()
+                .collect(),
+        };
     }
 
     // Check remaining (frozen - completed - skipped)
@@ -932,20 +977,33 @@ fn skip_descendant(
     execute_cascade_step(train.clone(), prs, ctx)
 }
 
-/// Compute open descendants of a PR.
-fn compute_open_descendants(pr: PrNumber, prs: &HashMap<PrNumber, CachedPr>) -> Vec<PrNumber> {
+/// Compute ALL open descendants of a PR (transitive, not just direct).
+///
+/// Returns ALL descendants transitively reachable from the given PR, not just
+/// immediate children. This is important for accurate train size calculations.
+///
+/// For example, if main <- #1 <- #2 <- #3, compute_all_descendants(#1) will
+/// return [#2, #3], not just [#2].
+///
+/// Note: Closed PRs are excluded AND block traversal (so descendants of a closed
+/// PR are also excluded).
+fn compute_all_descendants(pr: PrNumber, prs: &HashMap<PrNumber, CachedPr>) -> Vec<PrNumber> {
     let descendants_index = crate::state::build_descendants_index(prs);
+    crate::state::descendants::collect_all_descendants(pr, &descendants_index, prs)
+}
 
-    descendants_index
-        .get(&pr)
-        .map(|descs| {
-            descs
-                .iter()
-                .filter(|d| prs.get(d).map(|p| p.state.is_open()).unwrap_or(false))
-                .copied()
-                .collect()
-        })
-        .unwrap_or_default()
+/// Compute DIRECT (immediate) open descendants of a PR.
+///
+/// Returns only PRs whose predecessor field points directly to the given PR.
+/// This is used for the frozen set during cascade, since we only prepare
+/// direct children - transitive descendants are handled when their
+/// immediate predecessor becomes the current PR.
+///
+/// For example, if main <- #1 <- #2 <- #3, compute_direct_descendants(#1)
+/// returns only [#2], not [#2, #3].
+fn compute_direct_descendants(pr: PrNumber, prs: &HashMap<PrNumber, CachedPr>) -> Vec<PrNumber> {
+    let descendants_index = crate::state::build_descendants_index(prs);
+    crate::state::descendants::collect_direct_descendants(pr, &descendants_index, prs)
 }
 
 /// Process the result of an operation and update the train state.
@@ -2539,6 +2597,363 @@ mod tests {
                 result.outcome,
                 result.effects
             );
+        }
+
+        // ─────────────────────────────────────────────────────────────────────────────
+        // Property-based tests that would have caught review comment bugs
+        // ─────────────────────────────────────────────────────────────────────────────
+
+        mod property_based_bug_detection {
+            use super::*;
+            use proptest::prelude::*;
+
+            fn arb_sha() -> impl Strategy<Value = Sha> {
+                "[0-9a-f]{40}".prop_map(|s| Sha::parse(s).unwrap())
+            }
+
+            fn arb_pr_number() -> impl Strategy<Value = PrNumber> {
+                (2u64..100).prop_map(PrNumber)
+            }
+
+            fn arb_unique_descendants(
+                min: usize,
+                max: usize,
+            ) -> impl Strategy<Value = Vec<PrNumber>> {
+                prop::collection::hash_set(arb_pr_number(), min..max)
+                    .prop_map(|set| set.into_iter().collect())
+            }
+
+            /// BUG #1: handle_external_merge only aborts when phase is Preparing.
+            /// External merge in Idle or SquashPending can skip preparation entirely.
+            ///
+            /// Property: For ANY phase with unprepared direct descendants, an external
+            /// merge MUST abort (not silently proceed to Reconciling).
+            #[test]
+            fn external_merge_in_idle_with_descendants_must_abort() {
+                proptest!(|(
+                    descendants in arb_unique_descendants(1, 3),
+                    merge_sha in arb_sha()
+                )| {
+                    // Create train in Idle phase (no preparation started)
+                    let train = TrainRecord::new(PrNumber(1));
+                    prop_assert!(matches!(train.cascade_phase, CascadePhase::Idle));
+
+                    // Build PR map - root is merged externally, descendants exist
+                    let pr1 = CachedPr::new(
+                        PrNumber(1),
+                        merge_sha.clone(),
+                        "branch-1".to_string(),
+                        "main".to_string(),
+                        None,
+                        PrState::Merged { merge_commit_sha: merge_sha.clone() },
+                        MergeStateStatus::Clean,
+                        false,
+                    );
+                    let mut prs = HashMap::from([(PrNumber(1), pr1)]);
+
+                    // Add descendants (all are DIRECT children of #1 - unprepared)
+                    for &desc in &descendants {
+                        let desc_pr = CachedPr::new(
+                            desc,
+                            merge_sha.clone(),
+                            format!("branch-{}", desc.0),
+                            "branch-1".to_string(), // base is root's head branch
+                            Some(PrNumber(1)),
+                            PrState::Open,
+                            MergeStateStatus::Clean,
+                            false,
+                        );
+                        prs.insert(desc, desc_pr);
+                    }
+
+                    let ctx = StepContext::new("main");
+                    let result = execute_cascade_step(train, &prs, &ctx);
+
+                    // MUST abort - descendants were never prepared
+                    prop_assert!(
+                        matches!(result.outcome, CascadeStepOutcome::Aborted { .. }),
+                        "External merge in Idle with descendants MUST abort. \
+                         Descendants: {:?}, Outcome: {:?}",
+                        descendants, result.outcome
+                    );
+
+                    if let CascadeStepOutcome::Aborted { reason, .. } = &result.outcome {
+                        prop_assert!(
+                            matches!(reason, AbortReason::PreparationIncomplete { .. }),
+                            "Should be PreparationIncomplete, got: {:?}",
+                            reason
+                        );
+                    }
+                });
+            }
+
+            /// BUG #1 (continued): External merge in SquashPending must reset progress.
+            /// The completed set tracks PREPARED descendants, not RECONCILED ones.
+            ///
+            /// Property: External merge in SquashPending must start Reconciling with
+            /// empty completed set (all descendants need reconciliation).
+            #[test]
+            fn external_merge_in_squash_pending_resets_completed() {
+                proptest!(|(
+                    descendants in arb_unique_descendants(1, 3),
+                    merge_sha in arb_sha()
+                )| {
+                    // Create train in SquashPending with ALL descendants "prepared"
+                    let mut progress = DescendantProgress::new(descendants.clone());
+                    for &desc in &descendants {
+                        progress.mark_completed(desc);
+                    }
+                    let mut train = TrainRecord::new(PrNumber(1));
+                    train.cascade_phase = CascadePhase::SquashPending { progress };
+
+                    // Build PR map - root is merged externally
+                    let pr1 = CachedPr::new(
+                        PrNumber(1),
+                        merge_sha.clone(),
+                        "branch-1".to_string(),
+                        "main".to_string(),
+                        None,
+                        PrState::Merged { merge_commit_sha: merge_sha.clone() },
+                        MergeStateStatus::Clean,
+                        false,
+                    );
+                    let mut prs = HashMap::from([(PrNumber(1), pr1)]);
+
+                    for &desc in &descendants {
+                        let desc_pr = CachedPr::new(
+                            desc,
+                            merge_sha.clone(),
+                            format!("branch-{}", desc.0),
+                            "branch-1".to_string(),
+                            Some(PrNumber(1)),
+                            PrState::Open,
+                            MergeStateStatus::Clean,
+                            false,
+                        );
+                        prs.insert(desc, desc_pr);
+                    }
+
+                    let ctx = StepContext::new("main");
+                    let result = execute_cascade_step(train, &prs, &ctx);
+
+                    // Should transition to Reconciling (not abort - prep is complete)
+                    prop_assert!(
+                        matches!(result.train.cascade_phase, CascadePhase::Reconciling { .. }),
+                        "External merge in SquashPending should transition to Reconciling. \
+                         Got: {:?}",
+                        result.train.cascade_phase
+                    );
+
+                    // CRITICAL: The completed set must be RESET, not carried over
+                    if let CascadePhase::Reconciling { progress, .. } = &result.train.cascade_phase {
+                        prop_assert!(
+                            progress.completed.is_empty(),
+                            "BUG: completed set was carried over from SquashPending! \
+                             Completed: {:?}. These descendants were PREPARED, not RECONCILED.",
+                            progress.completed
+                        );
+                        prop_assert_eq!(
+                            progress.remaining().count(),
+                            descendants.len(),
+                            "All descendants should need reconciliation"
+                        );
+                    }
+                });
+            }
+
+            /// BUG #3: Idle → Preparing/SquashPending transitions don't update status comment.
+            ///
+            /// Property: Every phase transition MUST emit a status comment update
+            /// (when status_comment_id is set).
+            #[test]
+            fn idle_transition_emits_status_comment_update() {
+                proptest!(|(
+                    descendants in arb_unique_descendants(0, 3),
+                    sha in arb_sha()
+                )| {
+                    let mut train = TrainRecord::new(PrNumber(1));
+                    train.status_comment_id = Some(CommentId(12345));
+
+                    // Build PR map
+                    let pr1 = CachedPr::new(
+                        PrNumber(1),
+                        sha.clone(),
+                        "branch-1".to_string(),
+                        "main".to_string(),
+                        None,
+                        PrState::Open,
+                        MergeStateStatus::Clean,
+                        false,
+                    );
+                    let mut prs = HashMap::from([(PrNumber(1), pr1)]);
+
+                    for &desc in &descendants {
+                        let desc_pr = CachedPr::new(
+                            desc,
+                            sha.clone(),
+                            format!("branch-{}", desc.0),
+                            "branch-1".to_string(),
+                            Some(PrNumber(1)),
+                            PrState::Open,
+                            MergeStateStatus::Clean,
+                            false,
+                        );
+                        prs.insert(desc, desc_pr);
+                    }
+
+                    let ctx = StepContext::new("main");
+                    let result = execute_cascade_step(train, &prs, &ctx);
+
+                    // Should have transitioned from Idle
+                    let transitioned = !matches!(result.train.cascade_phase, CascadePhase::Idle);
+
+                    if transitioned {
+                        // MUST emit status comment update for GitHub-based recovery
+                        let has_comment_update = result.effects.iter().any(|e| {
+                            matches!(e, Effect::GitHub(GitHubEffect::UpdateComment { comment_id, .. })
+                                if *comment_id == CommentId(12345))
+                        });
+                        prop_assert!(
+                            has_comment_update,
+                            "BUG: Idle → {:?} transition did not emit status comment update! \
+                             Effects: {:?}",
+                            result.train.cascade_phase.name(),
+                            result.effects
+                        );
+                    }
+                });
+            }
+
+            /// BUG #6: Late-addition size check only counts direct descendants.
+            /// Deep chains can exceed the 50-PR limit without triggering abort.
+            ///
+            /// Property: Train size check must count ALL transitive descendants,
+            /// not just immediate children.
+            #[test]
+            fn train_size_check_counts_transitive_descendants() {
+                // Create a deep linear chain that exceeds limit
+                // Root <- D1 <- D2 <- ... <- DN where N > MAX_TRAIN_SIZE
+                const CHAIN_LENGTH: usize = 55; // Exceeds MAX_TRAIN_SIZE (50)
+
+                let sha = Sha::parse("abcd1234abcd1234abcd1234abcd1234abcd1234").unwrap();
+                let train = TrainRecord::new(PrNumber(1));
+
+                // Build a DEEP chain: 1 <- 2 <- 3 <- ... <- 55
+                let mut prs = HashMap::new();
+                let pr1 = CachedPr::new(
+                    PrNumber(1),
+                    sha.clone(),
+                    "branch-1".to_string(),
+                    "main".to_string(),
+                    None,
+                    PrState::Open,
+                    MergeStateStatus::Clean,
+                    false,
+                );
+                prs.insert(PrNumber(1), pr1);
+
+                for i in 2..=(CHAIN_LENGTH as u64) {
+                    let pr = CachedPr::new(
+                        PrNumber(i),
+                        sha.clone(),
+                        format!("branch-{}", i),
+                        format!("branch-{}", i - 1), // base is predecessor's head
+                        Some(PrNumber(i - 1)),       // predecessor is previous in chain
+                        PrState::Open,
+                        MergeStateStatus::Clean,
+                        false,
+                    );
+                    prs.insert(PrNumber(i), pr);
+                }
+
+                let ctx = StepContext::new("main");
+                let result = execute_cascade_step(train, &prs, &ctx);
+
+                // MUST abort due to train too large
+                // BUG: If only counting direct descendants, would only see 1 (PR #2)
+                // and proceed, but the full chain is 55 PRs.
+                assert!(
+                    matches!(
+                        result.outcome,
+                        CascadeStepOutcome::Aborted {
+                            reason: AbortReason::TrainTooLarge { .. },
+                            ..
+                        }
+                    ),
+                    "BUG: Deep chain of {} PRs should trigger TrainTooLarge abort. \
+                     Only direct descendants counted? Outcome: {:?}",
+                    CHAIN_LENGTH,
+                    result.outcome
+                );
+
+                if let CascadeStepOutcome::Aborted {
+                    reason: AbortReason::TrainTooLarge { pr_count, .. },
+                    ..
+                } = &result.outcome
+                {
+                    assert_eq!(
+                        *pr_count, CHAIN_LENGTH,
+                        "BUG: pr_count should be {} (full chain), not just direct descendants",
+                        CHAIN_LENGTH
+                    );
+                }
+            }
+
+            /// BUG #6 (property version): For any chain structure, size check must
+            /// count all reachable PRs.
+            #[test]
+            fn transitive_descendant_count_is_correct() {
+                proptest!(|(chain_length in 2usize..10)| {
+                    let sha = Sha::parse("abcd1234abcd1234abcd1234abcd1234abcd1234").unwrap();
+
+                    // Build a linear chain
+                    let mut prs = HashMap::new();
+                    let pr1 = CachedPr::new(
+                        PrNumber(1),
+                        sha.clone(),
+                        "branch-1".to_string(),
+                        "main".to_string(),
+                        None,
+                        PrState::Open,
+                        MergeStateStatus::Clean,
+                        false,
+                    );
+                    prs.insert(PrNumber(1), pr1);
+
+                    for i in 2..=(chain_length as u64) {
+                        let pr = CachedPr::new(
+                            PrNumber(i),
+                            sha.clone(),
+                            format!("branch-{}", i),
+                            format!("branch-{}", i - 1),
+                            Some(PrNumber(i - 1)),
+                            PrState::Open,
+                            MergeStateStatus::Clean,
+                            false,
+                        );
+                        prs.insert(PrNumber(i), pr);
+                    }
+
+                    // compute_all_descendants should return chain_length - 1 descendants
+                    let all_desc = compute_all_descendants(PrNumber(1), &prs);
+                    prop_assert_eq!(
+                        all_desc.len(),
+                        chain_length - 1,
+                        "compute_all_descendants should find {} transitive descendants, found {}",
+                        chain_length - 1,
+                        all_desc.len()
+                    );
+
+                    // compute_direct_descendants should return only 1 (PR #2)
+                    let direct_desc = compute_direct_descendants(PrNumber(1), &prs);
+                    prop_assert_eq!(
+                        direct_desc.len(),
+                        1,
+                        "compute_direct_descendants should find exactly 1 direct child"
+                    );
+                    prop_assert!(direct_desc.contains(&PrNumber(2)));
+                });
+            }
         }
     }
 }

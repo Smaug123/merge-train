@@ -237,6 +237,16 @@ pub fn next_action(
 }
 
 /// Convert a PhaseAction to Effects.
+///
+/// **WARNING**: This function produces a MINIMAL effect set that omits Fetch and
+/// Checkout effects. The actual `execute_cascade_step` in step.rs builds a more
+/// complete sequence with Fetch/Checkout to ensure operations run on fresh refs.
+///
+/// If you use this function directly, you MUST prepend appropriate Fetch and
+/// Checkout effects yourself. Otherwise operations may run on stale local refs.
+///
+/// This function is primarily useful for testing effect serialization or for
+/// contexts where the caller handles Fetch/Checkout separately.
 pub fn action_to_effects(action: &PhaseAction) -> Vec<Effect> {
     match action {
         PhaseAction::Prepare {
@@ -244,6 +254,9 @@ pub fn action_to_effects(action: &PhaseAction) -> Vec<Effect> {
             target_branch,
             ..
         } => {
+            // NOTE: This is INCOMPLETE - does not include Fetch and Checkout!
+            // execute_cascade_step adds those effects before Merge.
+            // See step.rs execute_preparing() for the complete sequence.
             vec![
                 Effect::Git(GitEffect::Merge {
                     target: predecessor_head.as_str().to_string(),
@@ -273,10 +286,16 @@ pub fn action_to_effects(action: &PhaseAction) -> Vec<Effect> {
             target_branch,
             ..
         } => {
+            // NOTE: This function is not currently used by execute_cascade_step
+            // (which builds effects directly with Fetch/Checkout). If used in
+            // the future, callers must prepend Fetch and Checkout effects.
+            //
+            // CRITICAL: The interpreter MUST validate squash_sha even though
+            // expected_squash_parent is None. See MergeReconcile docs for validation
+            // requirements (single parent check, default branch ancestry).
             vec![
                 Effect::Git(GitEffect::MergeReconcile {
                     squash_sha: squash_sha.clone(),
-                    // TODO: Compute and provide expected_squash_parent for validation.
                     expected_squash_parent: None,
                     default_branch: default_branch.clone(),
                     target_branch: target_branch.clone(),
@@ -293,6 +312,9 @@ pub fn action_to_effects(action: &PhaseAction) -> Vec<Effect> {
             target_branch,
             ..
         } => {
+            // NOTE: This is INCOMPLETE - does not include Fetch and Checkout!
+            // execute_cascade_step adds those effects before Merge.
+            // See step.rs execute_catching_up() for the complete sequence.
             vec![
                 Effect::Git(GitEffect::Merge {
                     target: format!("origin/{}", default_branch),

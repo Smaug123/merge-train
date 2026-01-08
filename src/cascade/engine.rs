@@ -594,13 +594,25 @@ const MAX_ERROR_STDERR_SIZE: usize = 2 * 1024;
 const MAX_STATUS_COMMENT_SIZE: usize = 60 * 1024;
 
 /// Truncate a string to a maximum length, adding "..." if truncated.
+///
+/// Handles UTF-8 correctly by finding a valid character boundary. The result
+/// will be at most `max_len` bytes, including the "..." suffix if truncated.
 fn truncate_string(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         s.to_string()
     } else {
-        // Truncate with ellipsis indicator
+        // Reserve space for "..." suffix
         let truncate_at = max_len.saturating_sub(3);
-        format!("{}...", &s[..truncate_at])
+        // Find a valid UTF-8 character boundary at or before truncate_at.
+        // This avoids panicking when truncate_at falls in the middle of a
+        // multi-byte UTF-8 character.
+        let safe_truncate_at = s
+            .char_indices()
+            .take_while(|(i, _)| *i <= truncate_at)
+            .last()
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        format!("{}...", &s[..safe_truncate_at])
     }
 }
 
@@ -627,12 +639,27 @@ fn format_train_json(train: &TrainRecord) -> String {
         format!("{{\"error\": \"serialization failed: {}\"}}", e)
     });
 
-    // Verify size is under limit (60KB per DESIGN.md)
-    debug_assert!(
-        json.len() < MAX_STATUS_COMMENT_SIZE,
-        "Status comment JSON ({} bytes) exceeds 60KB limit",
-        json.len()
-    );
+    // Enforce size limit (60KB per DESIGN.md) in release builds, not just debug.
+    // If exceeded, return a minimal error payload rather than potentially causing
+    // GitHub API failures or corrupted recovery data.
+    if json.len() >= MAX_STATUS_COMMENT_SIZE {
+        // Log the issue (eprintln for now; in production this would use tracing)
+        eprintln!(
+            "WARN: Status comment JSON ({} bytes) exceeds 60KB limit. \
+             Returning minimal error payload.",
+            json.len()
+        );
+
+        // Return a minimal valid JSON that indicates the problem
+        return format!(
+            r#"{{"version":{},"recovery_seq":{},"state":"needs_manual_review","original_root_pr":{},"current_pr":{},"error":{{"error_type":"status_comment_too_large","message":"Status comment exceeded 60KB limit ({}). Recovery data truncated."}}}}"#,
+            train.version,
+            train.recovery_seq,
+            train.original_root_pr.0,
+            train.current_pr.0,
+            json.len()
+        );
+    }
 
     json
 }
@@ -1281,6 +1308,160 @@ mod tests {
                 json.contains("..."),
                 "Truncated fields should have '...' indicator"
             );
+        }
+
+        // ─────────────────────────────────────────────────────────────────────────────
+        // Property-based tests that would have caught review comment bugs
+        // ─────────────────────────────────────────────────────────────────────────────
+
+        mod property_based_bug_detection {
+            use super::*;
+            use proptest::prelude::*;
+
+            /// BUG #5: truncate_string can panic on non-ASCII boundaries.
+            ///
+            /// Property: truncate_string NEVER panics, regardless of input string
+            /// content or max_len value. The output is always valid UTF-8.
+            #[test]
+            fn truncate_string_never_panics() {
+                proptest!(|(
+                    s in "\\PC{0,200}",  // Any Unicode string up to 200 chars
+                    max_len in 0usize..100
+                )| {
+                    // This should never panic
+                    let result = truncate_string(&s, max_len);
+
+                    // Result should be valid UTF-8 (it's a String, so it is)
+                    prop_assert!(result.len() <= max_len.max(3), // at least "..."
+                        "Result length {} exceeds max_len {}",
+                        result.len(), max_len
+                    );
+
+                    // If truncated, should end with "..."
+                    if s.len() > max_len && max_len >= 3 {
+                        prop_assert!(
+                            result.ends_with("..."),
+                            "Truncated string should end with '...'"
+                        );
+                    }
+                });
+            }
+
+            /// BUG #5 (specific cases): truncate_string with multi-byte UTF-8.
+            ///
+            /// Property: Truncation at any position within multi-byte characters
+            /// should find a valid boundary and not panic.
+            #[test]
+            fn truncate_string_handles_multibyte_chars() {
+                // Test with various multi-byte UTF-8 strings
+                let test_cases = [
+                    "Hello 世界!", // Chinese
+                    "Привет мир",  // Russian
+                    "🎉🎊🎁🎈",    // Emojis (4-byte UTF-8)
+                    "café résumé", // Latin with diacritics
+                    "αβγδε",       // Greek
+                    "こんにちは",  // Japanese
+                ];
+
+                for s in &test_cases {
+                    // Try truncating at every possible byte position
+                    for max_len in 0..=s.len() + 5 {
+                        let result = truncate_string(s, max_len);
+
+                        // Should never panic, and result should be valid UTF-8
+                        assert!(
+                            result.len() <= max_len.max(3),
+                            "truncate_string({:?}, {}) = {:?} exceeds max",
+                            s,
+                            max_len,
+                            result
+                        );
+                    }
+                }
+            }
+
+            /// BUG #4: Status comment size enforcement is only debug_assert.
+            ///
+            /// Property: format_train_json ALWAYS returns a string under 60KB,
+            /// even in release builds, even with pathologically large input.
+            #[test]
+            fn format_train_json_enforces_size_limit() {
+                proptest!(|(
+                    desc_count in 0usize..50,
+                    error_msg_len in 0usize..20000,
+                    stderr_len in 0usize..10000
+                )| {
+                    let mut train = TrainRecord::new(PrNumber(1));
+
+                    // Add many descendants
+                    let descendants: Vec<PrNumber> = (2..=(desc_count as u64 + 1))
+                        .map(PrNumber)
+                        .collect();
+                    if !descendants.is_empty() {
+                        train.cascade_phase = CascadePhase::Preparing {
+                            progress: DescendantProgress::new(descendants),
+                        };
+                    }
+
+                    // Add a large error
+                    if error_msg_len > 0 {
+                        let msg = "E".repeat(error_msg_len);
+                        let mut error = TrainError::new("test", msg);
+                        if stderr_len > 0 {
+                            error = error.with_stderr("S".repeat(stderr_len));
+                        }
+                        train.abort(error);
+                    }
+
+                    let json = format_train_json(&train);
+
+                    // MUST be under 60KB - this is a hard requirement, not just debug
+                    prop_assert!(
+                        json.len() < 60 * 1024,
+                        "BUG: format_train_json returned {} bytes, exceeding 60KB limit. \
+                         This would fail in release builds!",
+                        json.len()
+                    );
+
+                    // Must be valid JSON
+                    prop_assert!(
+                        serde_json::from_str::<serde_json::Value>(&json).is_ok(),
+                        "format_train_json must return valid JSON"
+                    );
+                });
+            }
+
+            /// BUG #4 (extreme case): Even with max-size input, should not exceed limit.
+            #[test]
+            fn format_train_json_handles_extreme_input() {
+                let mut train = TrainRecord::new(PrNumber(1));
+
+                // Max descendants (50 is the limit per MAX_TRAIN_SIZE)
+                let descendants: Vec<PrNumber> = (2..=50).map(PrNumber).collect();
+                train.cascade_phase = CascadePhase::Preparing {
+                    progress: DescendantProgress::new(descendants),
+                };
+
+                // Max error sizes
+                let huge_msg = "X".repeat(100_000); // 100KB message
+                let huge_stderr = "Y".repeat(50_000); // 50KB stderr
+                train.abort(TrainError::new("huge_error", huge_msg).with_stderr(huge_stderr));
+
+                let json = format_train_json(&train);
+
+                // Even with extreme input, must stay under 60KB
+                assert!(
+                    json.len() < 60 * 1024,
+                    "BUG: Extreme input produced {} byte JSON, exceeding 60KB limit",
+                    json.len()
+                );
+
+                // Must still be valid JSON
+                assert!(
+                    serde_json::from_str::<serde_json::Value>(&json).is_ok(),
+                    "Extreme input must still produce valid JSON"
+                );
+            }
         }
     }
 }
