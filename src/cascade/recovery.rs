@@ -22,7 +22,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::effects::{Effect, GitHubEffect};
+use crate::cascade::engine::format_phase_comment;
+use crate::effects::{Effect, GitEffect, GitHubEffect};
 use crate::git::PushIntent;
 use crate::types::{
     AbortReason, CachedPr, CascadePhase, DescendantProgress, PrNumber, PrState, Sha, TrainRecord,
@@ -156,13 +157,32 @@ pub fn compute_recovery_plan(
                 match &current_pr.state {
                     PrState::Merged { merge_commit_sha } => {
                         // Already merged - transition to Reconciling phase with the merge SHA
-                        // and preserve the frozen descendants
+                        // and preserve the frozen descendants.
+                        //
+                        // CRITICAL: We need to validate the merge was a squash before proceeding.
+                        // The validation effect will run before any reconciliation effects.
                         plan_train.cascade_phase = CascadePhase::Reconciling {
                             progress: progress.clone(),
                             squash_sha: merge_commit_sha.clone(),
                         };
                         plan_train.last_squash_sha = Some(merge_commit_sha.clone());
                         plan_train.increment_seq();
+
+                        // Add squash validation effect - must run first
+                        effects.push(Effect::Git(GitEffect::ValidateSquashCommit {
+                            squash_sha: merge_commit_sha.clone(),
+                            default_branch: default_branch.to_string(),
+                        }));
+
+                        // Add status comment update for GitHub-based recovery.
+                        // This ensures a second crash can see the Reconciling phase and squash SHA.
+                        if let Some(comment_id) = plan_train.status_comment_id {
+                            effects.push(Effect::GitHub(GitHubEffect::UpdateComment {
+                                comment_id,
+                                body: format_phase_comment(&plan_train),
+                            }));
+                        }
+
                         actions.push(RecoveryAction::ResumeClean);
                     }
                     PrState::Open => {
@@ -552,6 +572,68 @@ mod tests {
             plan.actions
                 .iter()
                 .any(|a| matches!(a, RecoveryAction::ResumeClean))
+        );
+
+        // CRITICAL: Must emit ValidateSquashCommit effect
+        assert!(
+            plan.effects
+                .iter()
+                .any(|e| matches!(e, Effect::Git(GitEffect::ValidateSquashCommit { .. }))),
+            "Recovery must validate squash commit. Effects: {:?}",
+            plan.effects
+        );
+    }
+
+    /// Regression test: recovery from SquashPending → Reconciling must emit status comment update.
+    /// Without this, a second crash before the next transition would see stale phase in GitHub.
+    #[test]
+    fn recovery_squash_pending_merged_emits_status_comment_update() {
+        use crate::types::CommentId;
+
+        let mut train = TrainRecord::new(PrNumber(1));
+        train.status_comment_id = Some(CommentId(12345));
+        train.cascade_phase = CascadePhase::SquashPending {
+            progress: DescendantProgress::new(vec![PrNumber(2)]),
+        };
+
+        let mut pr1 = make_open_pr(1, "main", None);
+        pr1.state = PrState::Merged {
+            merge_commit_sha: make_sha(5000),
+        };
+        let pr2 = make_open_pr(2, "branch-1", Some(1));
+        let prs = HashMap::from([(PrNumber(1), pr1), (PrNumber(2), pr2)]);
+
+        let plan = compute_recovery_plan(&train, &prs, &[], "main");
+
+        // Must have status comment update effect
+        let has_comment_update = plan.effects.iter().any(|e| {
+            matches!(
+                e,
+                Effect::GitHub(GitHubEffect::UpdateComment {
+                    comment_id: CommentId(12345),
+                    ..
+                })
+            )
+        });
+        assert!(
+            has_comment_update,
+            "Recovery must emit status comment update. Effects: {:?}",
+            plan.effects
+        );
+
+        // Validation effect must come before comment update (run first)
+        let validation_idx = plan
+            .effects
+            .iter()
+            .position(|e| matches!(e, Effect::Git(GitEffect::ValidateSquashCommit { .. })));
+        let comment_idx = plan
+            .effects
+            .iter()
+            .position(|e| matches!(e, Effect::GitHub(GitHubEffect::UpdateComment { .. })));
+
+        assert!(
+            validation_idx < comment_idx,
+            "Validation must run before comment update"
         );
     }
 
@@ -968,6 +1050,70 @@ mod tests {
                     plan.train.last_squash_sha.as_ref(),
                     Some(&merge_sha),
                     "Recovery should update last_squash_sha"
+                );
+            }
+
+            /// Property: Recovery transitions that change phase MUST emit status comment update.
+            /// Without this, a second crash before the next operation leaves stale phase in GitHub.
+            ///
+            /// BUG: Recovery from SquashPending (with merged PR) transitions to Reconciling
+            /// but doesn't emit a status comment update effect.
+            #[test]
+            fn recovery_phase_transitions_emit_status_comment_update(
+                frozen_descendants in arb_unique_descendants(1, 3),
+                merge_sha in arb_sha(),
+                pr_sha in arb_sha()
+            ) {
+                use crate::types::CommentId;
+
+                // Create train in SquashPending phase with status comment
+                let mut train = TrainRecord::new(PrNumber(1));
+                train.status_comment_id = Some(CommentId(12345));
+                train.cascade_phase = CascadePhase::SquashPending {
+                    progress: DescendantProgress::new(frozen_descendants.clone()),
+                };
+
+                // Create PR map with merged root
+                let mut prs = HashMap::new();
+                let mut root_pr = make_open_pr_for_test(1, "main", None, pr_sha.clone());
+                root_pr.state = PrState::Merged { merge_commit_sha: merge_sha.clone() };
+                prs.insert(PrNumber(1), root_pr);
+
+                for &desc in &frozen_descendants {
+                    let pr = make_open_pr_for_test(desc.0, "branch-1", Some(PrNumber(1)), pr_sha.clone());
+                    prs.insert(desc, pr);
+                }
+
+                let plan = compute_recovery_plan(&train, &prs, &[], "main");
+
+                // Phase changed from SquashPending to Reconciling
+                prop_assert!(
+                    matches!(&plan.train.cascade_phase, CascadePhase::Reconciling { .. }),
+                    "Recovery should transition to Reconciling"
+                );
+
+                // MUST have status comment update effect
+                let has_comment_update = plan.effects.iter().any(|e| {
+                    matches!(e, Effect::GitHub(GitHubEffect::UpdateComment {
+                        comment_id: CommentId(12345), ..
+                    }))
+                });
+                prop_assert!(
+                    has_comment_update,
+                    "BUG: Recovery phase transition did not emit status comment update! \
+                     Phase changed from SquashPending to Reconciling, but no UpdateComment effect. \
+                     Effects: {:?}",
+                    plan.effects
+                );
+
+                // Also must have ValidateSquashCommit effect
+                let has_validation = plan.effects.iter().any(|e| {
+                    matches!(e, Effect::Git(GitEffect::ValidateSquashCommit { .. }))
+                });
+                prop_assert!(
+                    has_validation,
+                    "BUG: Recovery should emit ValidateSquashCommit effect. Effects: {:?}",
+                    plan.effects
                 );
             }
         }

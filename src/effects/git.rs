@@ -129,6 +129,26 @@ pub enum GitEffect {
         target_branch: String,
     },
 
+    /// Validate a squash commit without performing reconciliation.
+    ///
+    /// Use this when you need to verify a squash commit is valid but have no
+    /// descendants to reconcile (e.g., external merge of a PR with no descendants).
+    ///
+    /// The interpreter MUST validate:
+    /// 1. **Single parent check**: Verify `squash_sha` has exactly one parent.
+    ///    If it has multiple parents, it's a regular merge commit, not a squash.
+    /// 2. **Default branch ancestry**: Verify the computed `$SQUASH_SHA^` is on
+    ///    the `origin/{default_branch}` history.
+    ///
+    /// If validation fails, the interpreter should return an error that causes
+    /// the train to abort.
+    ValidateSquashCommit {
+        /// The squash commit SHA to validate.
+        squash_sha: Sha,
+        /// The default branch name (e.g., "main").
+        default_branch: String,
+    },
+
     /// Push refs to a remote.
     Push {
         /// The refspec to push (e.g., "HEAD:refs/heads/feature").

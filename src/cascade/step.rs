@@ -638,9 +638,18 @@ fn handle_external_merge(
             }
         }
         CascadePhase::Preparing { progress } => {
-            // We were in Preparing phase - check if any descendants are unprepared
+            // External merge in Preparing phase.
+            // If any descendants are unprepared, abort (they don't have predecessor content).
+            // If all are prepared, reset progress for reconciliation - the "completed" set
+            // tracks which descendants were PREPARED, not reconciled. All must be reconciled.
             let has_unprepared = progress.remaining().next().is_some();
-            (progress.clone(), has_unprepared)
+            if has_unprepared {
+                (progress.clone(), true)
+            } else {
+                // All prepared - reset for reconciliation (same logic as SquashPending)
+                let fresh_progress = DescendantProgress::new(progress.frozen_descendants.clone());
+                (fresh_progress, false)
+            }
         }
         CascadePhase::SquashPending { progress } => {
             // External merge in SquashPending = squash bypassed our control.
@@ -701,8 +710,20 @@ fn handle_external_merge(
     let remaining: Vec<PrNumber> = progress.remaining().copied().collect();
 
     if remaining.is_empty() {
-        // No descendants to process - cascade complete
-        return complete_cascade(train, progress);
+        // No descendants to process - cascade complete.
+        // CRITICAL: Still validate the squash commit to enforce squash-only requirement.
+        // Even with no descendants, a non-squash merge violates linear history.
+        let mut result = complete_cascade(train, progress);
+
+        // Add validation effect to ensure the external merge was a squash
+        result.effects.insert(
+            0,
+            Effect::Git(GitEffect::ValidateSquashCommit {
+                squash_sha: merge_sha,
+                default_branch: _ctx.default_branch.clone(),
+            }),
+        );
+        return result;
     }
 
     // Transition to Reconciling phase with frozen descendants
@@ -2435,6 +2456,11 @@ mod tests {
 
         /// Regression test: handle_external_merge must emit a status comment update
         /// when changing phase to Reconciling and storing squash_sha.
+        ///
+        /// CRITICAL: External merge in Preparing with all descendants prepared must
+        /// transition to Reconciling (not complete the cascade). The "completed" set
+        /// in Preparing tracks "prepared" not "reconciled" - all descendants still
+        /// need reconciliation.
         #[test]
         fn external_merge_emits_status_comment_update() {
             let mut train = TrainRecord::new(PrNumber(1));
@@ -2460,14 +2486,36 @@ mod tests {
             let prs = HashMap::from([(PrNumber(1), pr1), (PrNumber(2), pr2)]);
             let ctx = StepContext::new("main");
 
-            // Execute cascade step - should handle external merge and advance to Idle
-            // because all descendants were already prepared
+            // Execute cascade step - should transition to Reconciling with reset progress
             let result = execute_cascade_step(train, &prs, &ctx);
 
-            // Since the only descendant was already completed, complete_cascade is called
-            // and current_pr is advanced to PR #2
-            assert_eq!(result.train.current_pr, PrNumber(2));
-            assert_eq!(result.train.last_squash_sha, Some(merge_sha));
+            // CRITICAL: Must transition to Reconciling (not complete cascade).
+            // Current PR stays at #1 because we're reconciling, not advancing.
+            assert_eq!(result.train.current_pr, PrNumber(1));
+            assert_eq!(result.train.last_squash_sha, Some(merge_sha.clone()));
+
+            // Phase must be Reconciling with reset progress (descendant NOT in completed set)
+            match &result.train.cascade_phase {
+                CascadePhase::Reconciling {
+                    progress,
+                    squash_sha,
+                } => {
+                    assert_eq!(*squash_sha, merge_sha);
+                    // Progress must be reset - descendant should be in frozen set but NOT completed
+                    assert!(
+                        progress.frozen_descendants.contains(&PrNumber(2)),
+                        "Descendant must be in frozen_descendants"
+                    );
+                    assert!(
+                        !progress.completed.contains(&PrNumber(2)),
+                        "Descendant must NOT be in completed set (needs reconciliation)"
+                    );
+                }
+                other => panic!(
+                    "Expected Reconciling phase, got {:?}",
+                    std::mem::discriminant(other)
+                ),
+            }
 
             // Verify status comment update is emitted
             let has_comment_update = result.effects.iter().any(|e| {
@@ -2527,6 +2575,64 @@ mod tests {
                     reason
                 );
             }
+        }
+
+        /// Regression test: external merge with NO descendants must still emit
+        /// ValidateSquashCommit effect to enforce squash-only requirement.
+        /// Even with no descendants to corrupt, a non-squash merge violates linear history.
+        #[test]
+        fn external_merge_no_descendants_validates_squash() {
+            let mut train = TrainRecord::new(PrNumber(1));
+            train.status_comment_id = Some(CommentId(12345));
+            // In Idle phase (no descendants)
+            train.cascade_phase = CascadePhase::Idle;
+
+            // Build PR map with root PR merged externally
+            let merge_sha = make_sha(0xfff);
+            let mut pr1 = make_open_pr(1, "main", None);
+            pr1.state = PrState::Merged {
+                merge_commit_sha: merge_sha.clone(),
+            };
+
+            let prs = HashMap::from([(PrNumber(1), pr1)]);
+            let ctx = StepContext::new("main");
+
+            // Execute cascade step
+            let result = execute_cascade_step(train, &prs, &ctx);
+
+            // Should complete (no descendants to process)
+            assert!(
+                matches!(result.outcome, CascadeStepOutcome::Complete),
+                "Expected Complete outcome, got: {:?}",
+                result.outcome
+            );
+
+            // CRITICAL: Must emit ValidateSquashCommit effect
+            let has_validation = result.effects.iter().any(|e| {
+                matches!(
+                    e,
+                    Effect::Git(GitEffect::ValidateSquashCommit {
+                        squash_sha,
+                        default_branch
+                    }) if squash_sha == &merge_sha && default_branch == "main"
+                )
+            });
+            assert!(
+                has_validation,
+                "External merge with no descendants must emit ValidateSquashCommit. \
+                 Effects: {:?}",
+                result.effects
+            );
+
+            // Validation should be first effect (before status update)
+            assert!(
+                matches!(
+                    &result.effects[0],
+                    Effect::Git(GitEffect::ValidateSquashCommit { .. })
+                ),
+                "ValidateSquashCommit must be first effect. Effects: {:?}",
+                result.effects
+            );
         }
 
         /// BUG: skip_descendant returns WaitingOnCi with no effects. Without a poll tick,
@@ -2758,6 +2864,190 @@ mod tests {
                             "All descendants should need reconciliation"
                         );
                     }
+                });
+            }
+
+            /// BUG #1b: External merge in Preparing with ALL descendants prepared skips reconciliation.
+            /// The completed set in Preparing tracks "prepared" not "reconciled".
+            ///
+            /// Property: External merge in Preparing (with all prepared) must transition to
+            /// Reconciling with reset progress, not skip directly to complete_cascade.
+            #[test]
+            fn external_merge_in_preparing_all_prepared_resets_completed() {
+                proptest!(|(
+                    descendants in arb_unique_descendants(1, 3),
+                    merge_sha in arb_sha()
+                )| {
+                    // Create train in Preparing with ALL descendants already "prepared" (completed)
+                    let mut progress = DescendantProgress::new(descendants.clone());
+                    for &desc in &descendants {
+                        progress.mark_completed(desc);
+                    }
+                    let mut train = TrainRecord::new(PrNumber(1));
+                    train.cascade_phase = CascadePhase::Preparing { progress };
+
+                    // Build PR map - root is merged externally
+                    let pr1 = CachedPr::new(
+                        PrNumber(1),
+                        merge_sha.clone(),
+                        "branch-1".to_string(),
+                        "main".to_string(),
+                        None,
+                        PrState::Merged { merge_commit_sha: merge_sha.clone() },
+                        MergeStateStatus::Clean,
+                        false,
+                    );
+                    let mut prs = HashMap::from([(PrNumber(1), pr1)]);
+
+                    for &desc in &descendants {
+                        let desc_pr = CachedPr::new(
+                            desc,
+                            merge_sha.clone(),
+                            format!("branch-{}", desc.0),
+                            "branch-1".to_string(),
+                            Some(PrNumber(1)),
+                            PrState::Open,
+                            MergeStateStatus::Clean,
+                            false,
+                        );
+                        prs.insert(desc, desc_pr);
+                    }
+
+                    let ctx = StepContext::new("main");
+                    let result = execute_cascade_step(train, &prs, &ctx);
+
+                    // CRITICAL: Must transition to Reconciling (not Idle/complete)
+                    prop_assert!(
+                        matches!(result.train.cascade_phase, CascadePhase::Reconciling { .. }),
+                        "External merge in Preparing (all prepared) must transition to Reconciling. \
+                         Got: {:?}. BUG: skipped reconciliation!",
+                        result.train.cascade_phase
+                    );
+
+                    // The completed set must be RESET - "prepared" != "reconciled"
+                    if let CascadePhase::Reconciling { progress, .. } = &result.train.cascade_phase {
+                        prop_assert!(
+                            progress.completed.is_empty(),
+                            "BUG: completed set was carried over from Preparing! \
+                             Completed: {:?}. These descendants were PREPARED, not RECONCILED.",
+                            progress.completed
+                        );
+                        prop_assert_eq!(
+                            progress.remaining().count(),
+                            descendants.len(),
+                            "All descendants should need reconciliation"
+                        );
+                    }
+                });
+            }
+
+            /// BUG #2: External merges with NO descendants don't validate squash semantics.
+            /// Non-squash merges (merge commits, rebase) violate the squash-only requirement.
+            ///
+            /// Property: External merge with NO descendants must emit ValidateSquashCommit.
+            /// (With descendants, validation happens during reconciliation in the next step.)
+            #[test]
+            fn external_merge_no_descendants_emits_validate_squash_effect() {
+                proptest!(|(merge_sha in arb_sha())| {
+                    let mut train = TrainRecord::new(PrNumber(1));
+                    train.status_comment_id = Some(CommentId(12345));
+                    train.cascade_phase = CascadePhase::Idle; // No descendants
+
+                    // Build PR map - root is merged externally, no descendants
+                    let pr1 = CachedPr::new(
+                        PrNumber(1),
+                        merge_sha.clone(),
+                        "branch-1".to_string(),
+                        "main".to_string(),
+                        None,
+                        PrState::Merged { merge_commit_sha: merge_sha.clone() },
+                        MergeStateStatus::Clean,
+                        false,
+                    );
+                    let prs = HashMap::from([(PrNumber(1), pr1)]);
+
+                    let ctx = StepContext::new("main");
+                    let result = execute_cascade_step(train, &prs, &ctx);
+
+                    // Should complete (no descendants to process)
+                    prop_assert!(
+                        matches!(result.outcome, CascadeStepOutcome::Complete),
+                        "External merge with no descendants should Complete. Got: {:?}",
+                        result.outcome
+                    );
+
+                    // MUST have ValidateSquashCommit effect
+                    let has_validate_effect = result.effects.iter().any(|e| {
+                        matches!(e, Effect::Git(GitEffect::ValidateSquashCommit { .. }))
+                    });
+
+                    prop_assert!(
+                        has_validate_effect,
+                        "BUG: External merge with no descendants must emit ValidateSquashCommit. \
+                         Effects: {:?}",
+                        result.effects
+                    );
+                });
+            }
+
+            /// Property: External merge WITH descendants transitions to Reconciling.
+            /// Validation then happens during reconciliation (MergeReconcile validates).
+            #[test]
+            fn external_merge_with_descendants_transitions_to_reconciling() {
+                proptest!(|(
+                    descendants in arb_unique_descendants(1, 3),
+                    merge_sha in arb_sha()
+                )| {
+                    let mut train = TrainRecord::new(PrNumber(1));
+                    train.status_comment_id = Some(CommentId(12345));
+
+                    // SquashPending with all descendants "prepared"
+                    let mut progress = DescendantProgress::new(descendants.clone());
+                    for &desc in &descendants {
+                        progress.mark_completed(desc);
+                    }
+                    train.cascade_phase = CascadePhase::SquashPending { progress };
+
+                    // Build PR map - root is merged externally
+                    let pr1 = CachedPr::new(
+                        PrNumber(1),
+                        merge_sha.clone(),
+                        "branch-1".to_string(),
+                        "main".to_string(),
+                        None,
+                        PrState::Merged { merge_commit_sha: merge_sha.clone() },
+                        MergeStateStatus::Clean,
+                        false,
+                    );
+                    let mut prs = HashMap::from([(PrNumber(1), pr1)]);
+
+                    for &desc in &descendants {
+                        let desc_pr = CachedPr::new(
+                            desc,
+                            merge_sha.clone(),
+                            format!("branch-{}", desc.0),
+                            "branch-1".to_string(),
+                            Some(PrNumber(1)),
+                            PrState::Open,
+                            MergeStateStatus::Clean,
+                            false,
+                        );
+                        prs.insert(desc, desc_pr);
+                    }
+
+                    let ctx = StepContext::new("main");
+                    let result = execute_cascade_step(train, &prs, &ctx);
+
+                    // Must transition to Reconciling (not complete)
+                    prop_assert!(
+                        matches!(result.train.cascade_phase, CascadePhase::Reconciling { .. }),
+                        "External merge with descendants must transition to Reconciling. \
+                         Got: {:?}",
+                        result.train.cascade_phase
+                    );
+
+                    // The reconciliation step will validate via MergeReconcile
+                    // (but that's in the NEXT execute_cascade_step call, not this one)
                 });
             }
 
