@@ -282,14 +282,42 @@ pub fn compute_recovery_plan(
                         actions.push(RecoveryAction::ResumeClean);
                     }
                     PrState::Open => {
-                        // Need to retry squash
+                        // CRITICAL: Verify the PR head hasn't changed since preparation.
+                        // Same guard as execute_squash_pending in step.rs:416-439.
+                        // If someone pushed new commits after preparation, those commits
+                        // would be squashed without proper preparation of descendants.
+                        if let Some(recorded_sha) = &train.predecessor_head_sha {
+                            if current_pr.head_sha != *recorded_sha {
+                                actions.push(RecoveryAction::NeedsManualReview {
+                                    reason: format!(
+                                        "PR head changed since preparation: {} -> {}. \
+                                         New commits were not prepared into descendants.",
+                                        recorded_sha, current_pr.head_sha
+                                    ),
+                                });
+                                return RecoveryPlan {
+                                    train: plan_train,
+                                    actions,
+                                    effects,
+                                };
+                            }
+                        }
+
+                        // Use recorded predecessor_head_sha for expected_sha, falling back to
+                        // current head_sha only if no recorded SHA exists (shouldn't happen
+                        // in normal operation, but handles edge cases gracefully).
+                        let expected_sha = train
+                            .predecessor_head_sha
+                            .clone()
+                            .unwrap_or_else(|| current_pr.head_sha.clone());
+
                         actions.push(RecoveryAction::RetrySquash {
                             pr: train.current_pr,
-                            expected_sha: current_pr.head_sha.clone(),
+                            expected_sha: expected_sha.clone(),
                         });
                         effects.push(Effect::GitHub(GitHubEffect::SquashMerge {
                             pr: train.current_pr,
-                            expected_sha: current_pr.head_sha.clone(),
+                            expected_sha,
                         }));
                     }
                     PrState::Closed => {
@@ -637,27 +665,74 @@ pub fn verify_descendants_prepared(
         }
     };
 
+    // CRITICAL: Fetch descendant PR refs before verification.
+    // Without this, git merge-base may fail if objects aren't local, returning
+    // non-zero (same as "not ancestor") and causing false negatives.
+    let refspecs: Vec<String> = descendants
+        .iter()
+        .map(|(pr_num, _)| format!("+refs/pull/{}/head", pr_num.0))
+        .collect();
+
+    if !refspecs.is_empty() {
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg("-C").arg(worktree).arg("fetch").arg("origin");
+        for refspec in &refspecs {
+            cmd.arg(refspec);
+        }
+        let output = cmd
+            .output()
+            .map_err(|e| crate::git::GitError::CommandFailed {
+                command: "git fetch".to_string(),
+                stderr: e.to_string(),
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(crate::git::GitError::FetchFailed {
+                refspec: refspecs.join(", "),
+                details: stderr.to_string(),
+            });
+        }
+    }
+
     // Verify each descendant
     let mut results = HashMap::new();
     for (pr_num, head_sha) in descendants {
         let key = format!("prepared:{}", pr_num.0);
 
         // Run: git merge-base --is-ancestor <pred_sha> <head_sha>
-        let status = std::process::Command::new("git")
+        // Use output() instead of status() to distinguish error types.
+        let output = std::process::Command::new("git")
             .arg("-C")
             .arg(worktree)
             .arg("merge-base")
             .arg("--is-ancestor")
             .arg(pred_sha.as_str())
             .arg(head_sha.as_str())
-            .status()
+            .output()
             .map_err(|e| crate::git::GitError::CommandFailed {
                 command: "git merge-base --is-ancestor".to_string(),
                 stderr: e.to_string(),
             })?;
 
-        // Exit code 0 = is ancestor (prepared), non-zero = not ancestor (unprepared)
-        results.insert(key, status.success());
+        match output.status.code() {
+            // Exit code 0 = is ancestor (prepared)
+            Some(0) => {
+                results.insert(key, true);
+            }
+            // Exit code 1 = not ancestor (unprepared)
+            Some(1) => {
+                results.insert(key, false);
+            }
+            // Other exit codes (e.g., 128) = fatal error, likely missing objects
+            _ => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(crate::git::GitError::CommandFailed {
+                    command: "git merge-base --is-ancestor".to_string(),
+                    stderr: format!("Exit code {:?}: {}", output.status.code(), stderr),
+                });
+            }
+        }
     }
 
     Ok(results)

@@ -12,7 +12,7 @@ use crate::state::topology::{MergeStack, is_root};
 use crate::state::{build_descendants_index, compute_stacks};
 use crate::types::{
     AbortReason, BlockReason, CachedPr, CascadePhase, CascadeStepOutcome, MergeStateStatus,
-    PrNumber, Sha, TrainError, TrainRecord,
+    PrNumber, Sha, TrainError, TrainRecord, TrainState,
 };
 
 /// Maximum number of PRs allowed in a single train.
@@ -627,6 +627,20 @@ pub fn format_phase_comment(train: &TrainRecord) -> Result<String, CascadeError>
             format!(" ({}/{} descendants)", completed, total)
         });
 
+    // Derive status text from train.state for consistency with JSON payload.
+    // Previously this hardcoded "Running" even when the train was aborted.
+    let status_text = match train.state {
+        TrainState::Running => format!("Running ({}{})", phase_name, progress_info),
+        TrainState::WaitingCi => format!("Waiting for CI ({}{})", phase_name, progress_info),
+        TrainState::Stopped => "Stopped".to_string(),
+        TrainState::Aborted => train
+            .error
+            .as_ref()
+            .map(|e| format!("Aborted: {}", e.error_type))
+            .unwrap_or_else(|| "Aborted".to_string()),
+        TrainState::NeedsManualReview => "Needs Manual Review".to_string(),
+    };
+
     Ok([
         format!(
             "<!-- merge-train-state\n{}\n-->",
@@ -634,7 +648,7 @@ pub fn format_phase_comment(train: &TrainRecord) -> Result<String, CascadeError>
         ),
         "## Merge Train Status".to_string(),
         String::new(),
-        format!("**Status:** Running ({}{})", phase_name, progress_info),
+        format!("**Status:** {}", status_text),
         format!("**Current PR:** #{}", train.current_pr),
         format!("**Root PR:** #{}", train.original_root_pr),
         String::new(),
