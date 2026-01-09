@@ -541,7 +541,10 @@ fn format_start_comment(train: &TrainRecord, stack: &MergeStack) -> Result<Strin
     let json_payload = format_train_json(train)?;
 
     let mut lines = vec![
-        format!("<!-- merge-train-state\n{}\n-->", json_payload),
+        format!(
+            "<!-- merge-train-state\n{}\n-->",
+            escape_for_html_comment(&json_payload)
+        ),
         "## Merge Train Status".to_string(),
         String::new(),
         "**Status:** Running".to_string(),
@@ -578,7 +581,10 @@ fn format_stop_comment(train: &TrainRecord) -> Result<String, CascadeError> {
     let json_payload = format_train_json(train)?;
 
     Ok([
-        format!("<!-- merge-train-state\n{}\n-->", json_payload),
+        format!(
+            "<!-- merge-train-state\n{}\n-->",
+            escape_for_html_comment(&json_payload)
+        ),
         "## Merge Train Status".to_string(),
         String::new(),
         "**Status:** Stopped".to_string(),
@@ -622,7 +628,10 @@ pub fn format_phase_comment(train: &TrainRecord) -> Result<String, CascadeError>
         });
 
     Ok([
-        format!("<!-- merge-train-state\n{}\n-->", json_payload),
+        format!(
+            "<!-- merge-train-state\n{}\n-->",
+            escape_for_html_comment(&json_payload)
+        ),
         "## Merge Train Status".to_string(),
         String::new(),
         format!("**Status:** Running ({}{})", phase_name, progress_info),
@@ -714,6 +723,17 @@ fn format_train_json(train: &TrainRecord) -> Result<String, CascadeError> {
     }
 
     Ok(json)
+}
+
+/// Escape JSON for safe embedding in HTML comments.
+///
+/// HTML comments terminate at `-->`, so if the JSON payload contains this
+/// sequence (e.g., in error messages or stderr from git), it would corrupt
+/// the recovery payload. We escape `-->` as `--\u003e`, which is valid JSON
+/// (unicode escape for `>`). When parsed, serde_json automatically decodes
+/// `\u003e` back to `>`, so the original string is recovered.
+fn escape_for_html_comment(json: &str) -> String {
+    json.replace("-->", r"--\u003e")
 }
 
 #[cfg(test)]
@@ -1536,6 +1556,80 @@ mod tests {
                     }
                     Err(e) => panic!("Unexpected error: {:?}", e),
                 }
+            }
+
+            /// Property: escape_for_html_comment prevents --> from terminating comments,
+            /// and the escaped JSON still parses correctly, recovering the original value.
+            #[test]
+            fn escape_for_html_comment_preserves_json_semantics() {
+                proptest!(|(
+                    prefix in "[a-zA-Z0-9 ]{0,20}",
+                    suffix in "[a-zA-Z0-9 ]{0,20}",
+                    arrow_count in 1usize..5
+                )| {
+                    // Create a string with --> embedded
+                    let dangerous_content = format!("{}{}{}", prefix, "-->".repeat(arrow_count), suffix);
+
+                    // Create a TrainRecord with this dangerous content in an error
+                    let mut train = TrainRecord::new(PrNumber(1));
+                    let error = TrainError::new("git", dangerous_content.clone())
+                        .with_stderr(format!("stderr also has --> in it: {}", dangerous_content));
+                    train.abort(error);
+
+                    // Serialize and escape
+                    let json = format_train_json(&train).expect("should serialize");
+                    let escaped = escape_for_html_comment(&json);
+
+                    // Property 1: No --> in escaped output
+                    prop_assert!(
+                        !escaped.contains("-->"),
+                        "Escaped JSON must not contain -->, but found: {}",
+                        escaped.chars().take(200).collect::<String>()
+                    );
+
+                    // Property 2: Escaped JSON is still valid JSON
+                    let parsed: serde_json::Value = serde_json::from_str(&escaped)
+                        .expect("Escaped JSON must still be valid JSON");
+
+                    // Property 3: The original content is recoverable after parsing
+                    let error_obj = parsed.get("error").expect("should have error field");
+                    let message = error_obj.get("message").and_then(|v| v.as_str()).expect("should have message");
+                    let stderr = error_obj.get("stderr").and_then(|v| v.as_str()).expect("should have stderr");
+
+                    prop_assert!(
+                        message.contains("-->"),
+                        "Original --> should be recovered in message after parsing"
+                    );
+                    prop_assert!(
+                        stderr.contains("-->"),
+                        "Original --> should be recovered in stderr after parsing"
+                    );
+                });
+            }
+
+            /// Edge case: Multiple overlapping --> sequences
+            #[test]
+            fn escape_handles_overlapping_arrows() {
+                // Test case: "-->" appears multiple times, including "---->>" (overlapping)
+                let input = r#"{"msg":"a-->b---->c"}"#;
+                let escaped = escape_for_html_comment(input);
+
+                assert!(
+                    !escaped.contains("-->"),
+                    "Should escape all --> occurrences"
+                );
+                assert_eq!(
+                    escaped, r#"{"msg":"a--\u003eb----\u003ec"}"#,
+                    "Each --> should be escaped independently"
+                );
+
+                // Verify it round-trips correctly
+                let parsed: serde_json::Value = serde_json::from_str(&escaped).unwrap();
+                assert_eq!(
+                    parsed.get("msg").unwrap().as_str().unwrap(),
+                    "a-->b---->c",
+                    "Original string should be recovered after parsing"
+                );
             }
         }
     }

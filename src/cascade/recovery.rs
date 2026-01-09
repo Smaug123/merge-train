@@ -613,16 +613,12 @@ pub fn verify_descendants_prepared(
                     }
 
                     let stdout = String::from_utf8_lossy(&output.stdout);
-                    let sha_str = stdout
-                        .split_whitespace()
-                        .next()
-                        .ok_or_else(|| crate::git::GitError::CommandFailed {
+                    let sha_str = stdout.split_whitespace().next().ok_or_else(|| {
+                        crate::git::GitError::CommandFailed {
                             command: "git ls-remote".to_string(),
-                            stderr: format!(
-                                "No SHA found for refs/pull/{}/head",
-                                pr_num.0
-                            ),
-                        })?;
+                            stderr: format!("No SHA found for refs/pull/{}/head", pr_num.0),
+                        }
+                    })?;
 
                     Sha::parse(sha_str.to_string()).map_err(|_| {
                         crate::git::GitError::CommandFailed {
