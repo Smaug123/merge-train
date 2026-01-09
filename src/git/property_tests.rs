@@ -13,7 +13,7 @@
 use proptest::prelude::*;
 use proptest::test_runner::Config as ProptestConfig;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -212,7 +212,7 @@ fn add_commit_to_main(config: &GitConfig, filename: &str, content: &str) -> Sha 
 }
 
 /// Read file content from a worktree.
-fn read_file(worktree: &PathBuf, filename: &str) -> Option<String> {
+fn read_file(worktree: &Path, filename: &str) -> Option<String> {
     std::fs::read_to_string(worktree.join(filename)).ok()
 }
 
