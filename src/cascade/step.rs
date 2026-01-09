@@ -11,7 +11,7 @@ use crate::effects::{Effect, GitEffect, GitHubEffect, MergeStrategy};
 use crate::state::transitions::{PhaseOutcome, next_phase};
 use crate::types::{
     AbortReason, CachedPr, CascadePhase, CascadeStepOutcome, DescendantProgress, PrNumber, PrState,
-    Sha, TrainError, TrainRecord,
+    Sha, TrainError, TrainRecord, TrainState,
 };
 
 /// Context for executing a cascade step.
@@ -78,6 +78,11 @@ pub fn execute_cascade_step(
     ctx: &StepContext,
 ) -> StepResult {
     let current_pr_number = train.current_pr;
+
+    // Resume from WaitingCi if needed - we're actively processing now
+    if train.state == TrainState::WaitingCi {
+        train.resume();
+    }
 
     // Get current PR info
     let Some(current_pr) = prs.get(&current_pr_number) else {
@@ -416,10 +421,6 @@ fn execute_squash_pending(
     if let Some(recorded_sha) = train.predecessor_head_sha.clone()
         && current_pr.head_sha != recorded_sha
     {
-        let details = format!(
-            "PR head changed since preparation: {} -> {}",
-            recorded_sha, current_pr.head_sha
-        );
         train.abort(TrainError::new(
             "head_sha_changed",
             format!(
@@ -432,7 +433,10 @@ fn execute_squash_pending(
             train: train.clone(),
             outcome: CascadeStepOutcome::Aborted {
                 pr_number: train.current_pr,
-                reason: AbortReason::PushRejected { details },
+                reason: AbortReason::HeadShaChanged {
+                    expected: recorded_sha,
+                    actual: current_pr.head_sha.clone(),
+                },
             },
             effects: vec![],
         };
@@ -491,6 +495,17 @@ fn execute_reconciling(
             prs,
             ctx,
         );
+    }
+
+    // Draft PRs should wait, not be reconciled - per DESIGN.md lines 90-92
+    if desc_pr.is_draft {
+        return StepResult {
+            train: train.clone(),
+            outcome: CascadeStepOutcome::WaitingOnCi {
+                pr_number: next_descendant,
+            },
+            effects: vec![],
+        };
     }
 
     // Generate reconciliation effects
@@ -583,6 +598,17 @@ fn execute_catching_up(
         );
     }
 
+    // Draft PRs should wait, not be caught up - per DESIGN.md lines 90-92
+    if desc_pr.is_draft {
+        return StepResult {
+            train: train.clone(),
+            outcome: CascadeStepOutcome::WaitingOnCi {
+                pr_number: next_descendant,
+            },
+            effects: vec![],
+        };
+    }
+
     // Generate catch-up effects
     // CRITICAL: Must fetch and checkout the descendant branch before merging.
     // The worktree may still be on a different branch from a prior operation.
@@ -665,6 +691,17 @@ fn execute_retargeting(
             prs,
             ctx,
         );
+    }
+
+    // Draft PRs should wait, not be retargeted - per DESIGN.md lines 90-92
+    if desc_pr.is_draft {
+        return StepResult {
+            train: train.clone(),
+            outcome: CascadeStepOutcome::WaitingOnCi {
+                pr_number: next_descendant,
+            },
+            effects: vec![],
+        };
     }
 
     // Generate retarget effect
@@ -1069,6 +1106,7 @@ fn transition_to_retargeting(
 fn complete_cascade(train: &mut TrainRecord, progress: DescendantProgress) -> StepResult {
     train.cascade_phase = CascadePhase::Idle;
     train.predecessor_head_sha = None; // Clear stale SHA from previous cascade cycle
+    train.predecessor_pr = None; // Clear stale PR from previous cascade cycle
     train.increment_seq();
 
     // Get descendants that were successfully processed (not skipped)
@@ -1119,6 +1157,7 @@ fn complete_cascade(train: &mut TrainRecord, progress: DescendantProgress) -> St
             // Single descendant - advance current_pr and continue the train
             train.current_pr = completed[0];
             train.predecessor_head_sha = None; // Clear - was for the old current_pr
+            train.predecessor_pr = None; // Clear - was for the old current_pr
             train.increment_seq();
 
             // Update status comment again after advancing current_pr

@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::ids::PrNumber;
+use super::ids::{PrNumber, Sha};
 
 /// Reason why a cascade step is blocked and waiting.
 ///
@@ -158,6 +158,17 @@ pub enum AbortReason {
         /// The actual base branch on the PR.
         actual_base: String,
     },
+
+    /// PR head changed after cascade preparation started.
+    ///
+    /// This happens when someone pushes new commits while the cascade is in progress.
+    /// The cascade must abort to prevent merging unreviewed/unprepared commits.
+    HeadShaChanged {
+        /// Original SHA when preparation began.
+        expected: Sha,
+        /// Current SHA on the PR.
+        actual: Sha,
+    },
 }
 
 impl AbortReason {
@@ -180,6 +191,7 @@ impl AbortReason {
             AbortReason::PreparationIncomplete { .. } => "preparation_incomplete",
             AbortReason::MergeHooksEnabled => "merge_hooks_enabled",
             AbortReason::BaseBranchMismatch { .. } => "base_branch_mismatch",
+            AbortReason::HeadShaChanged { .. } => "head_sha_changed",
         }
     }
 
@@ -246,6 +258,13 @@ impl AbortReason {
                 format!(
                     "PR #{} base branch '{}' doesn't match predecessor's head branch '{}' (was PR retargeted?)",
                     pr, actual_base, expected_base
+                )
+            }
+            AbortReason::HeadShaChanged { expected, actual } => {
+                format!(
+                    "PR head changed after preparation (was {}, now {}). \
+                     New commits must be reviewed before merging.",
+                    expected, actual
                 )
             }
         }
@@ -346,6 +365,10 @@ mod tests {
         any::<u64>().prop_map(PrNumber)
     }
 
+    fn arb_sha() -> impl Strategy<Value = Sha> {
+        "[0-9a-f]{40}".prop_map(|s| Sha::parse(&s).unwrap())
+    }
+
     fn arb_block_reason() -> impl Strategy<Value = BlockReason> {
         prop_oneof![
             Just(BlockReason::Blocked),
@@ -394,6 +417,9 @@ mod tests {
                         actual_base,
                     }
                 }),
+            (arb_sha(), arb_sha()).prop_map(|(expected, actual)| {
+                AbortReason::HeadShaChanged { expected, actual }
+            }),
         ]
     }
 
@@ -518,6 +544,10 @@ mod tests {
                     pr: PrNumber(3),
                     expected_base: "feature-1".into(),
                     actual_base: "main".into(),
+                },
+                AbortReason::HeadShaChanged {
+                    expected: Sha::parse("a".repeat(40)).unwrap(),
+                    actual: Sha::parse("b".repeat(40)).unwrap(),
                 },
             ];
 
