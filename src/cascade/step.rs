@@ -310,6 +310,18 @@ fn execute_preparing(
         );
     }
 
+    // Draft PRs should wait, not be prepared - per DESIGN.md lines 90-92
+    if desc_pr.is_draft {
+        train.wait_for_ci();
+        return StepResult {
+            train: train.clone(),
+            outcome: CascadeStepOutcome::WaitingOnCi {
+                pr_number: next_descendant,
+            },
+            effects: vec![],
+        };
+    }
+
     // CRITICAL: Base-branch revalidation before preparing.
     // DESIGN.md requires verifying that descendant.base_ref matches the predecessor's
     // head branch. This prevents merging unrelated stacks if someone retargets a PR
@@ -499,6 +511,7 @@ fn execute_reconciling(
 
     // Draft PRs should wait, not be reconciled - per DESIGN.md lines 90-92
     if desc_pr.is_draft {
+        train.wait_for_ci();
         return StepResult {
             train: train.clone(),
             outcome: CascadeStepOutcome::WaitingOnCi {
@@ -600,6 +613,7 @@ fn execute_catching_up(
 
     // Draft PRs should wait, not be caught up - per DESIGN.md lines 90-92
     if desc_pr.is_draft {
+        train.wait_for_ci();
         return StepResult {
             train: train.clone(),
             outcome: CascadeStepOutcome::WaitingOnCi {
@@ -695,6 +709,7 @@ fn execute_retargeting(
 
     // Draft PRs should wait, not be retargeted - per DESIGN.md lines 90-92
     if desc_pr.is_draft {
+        train.wait_for_ci();
         return StepResult {
             train: train.clone(),
             outcome: CascadeStepOutcome::WaitingOnCi {
@@ -3834,6 +3849,167 @@ mod tests {
                         "DescendantRetargeted WITHOUT train.last_squash_sha should NOT emit \
                          RecordReconciliation. Effects: {:?}",
                         effects
+                    );
+                });
+            }
+
+            /// Draft descendants in Preparing phase should return WaitingOnCi with empty effects.
+            ///
+            /// Property: When a descendant is a draft (is_draft=true) during Preparing phase,
+            /// the cascade step should return WaitingOnCi with no effects, and set train.state
+            /// to WaitingCi.
+            #[test]
+            fn draft_descendant_waits_in_preparing() {
+                proptest!(|(
+                    descendant_pr in arb_pr_number(),
+                    sha in arb_sha()
+                )| {
+                    // Create train in Preparing phase
+                    let mut train = TrainRecord::new(PrNumber(1));
+                    train.status_comment_id = Some(CommentId(12345));
+                    train.predecessor_head_sha = Some(sha.clone());
+
+                    let progress = DescendantProgress::new(vec![descendant_pr]);
+                    train.cascade_phase = CascadePhase::Preparing { progress };
+
+                    // Build PR map with OPEN root and draft descendant
+                    let pr1 = CachedPr::new(
+                        PrNumber(1),
+                        sha.clone(),
+                        "branch-1".to_string(),
+                        "main".to_string(),
+                        None,
+                        PrState::Open,
+                        MergeStateStatus::Clean,
+                        false,
+                    );
+                    // Descendant is a DRAFT
+                    let desc_pr = CachedPr::new(
+                        descendant_pr,
+                        sha.clone(),
+                        format!("branch-{}", descendant_pr.0),
+                        "branch-1".to_string(),
+                        Some(PrNumber(1)),
+                        PrState::Open,
+                        MergeStateStatus::Draft,
+                        true,
+                    );
+                    let prs = HashMap::from([
+                        (PrNumber(1), pr1),
+                        (descendant_pr, desc_pr),
+                    ]);
+
+                    let ctx = StepContext::new("main");
+                    let result = execute_cascade_step(train, &prs, &ctx);
+
+                    // Draft descendants should return WaitingOnCi
+                    prop_assert!(
+                        matches!(result.outcome, CascadeStepOutcome::WaitingOnCi { pr_number } if pr_number == descendant_pr),
+                        "Draft descendant should return WaitingOnCi, got {:?}",
+                        result.outcome
+                    );
+
+                    // Effects should be empty (no modifications to draft PRs)
+                    prop_assert!(
+                        result.effects.is_empty(),
+                        "Draft descendant should have empty effects, got {:?}",
+                        result.effects
+                    );
+
+                    // Train state should be WaitingCi
+                    prop_assert!(
+                        matches!(result.train.state, TrainState::WaitingCi),
+                        "Draft descendant should set train.state to WaitingCi, got {:?}",
+                        result.train.state
+                    );
+                });
+            }
+
+            /// Draft descendants in post-squash phases should also wait.
+            ///
+            /// Tests Reconciling, CatchingUp, and Retargeting phases. These require special
+            /// setup since the root PR must be Open (Merged roots trigger external merge handling).
+            #[test]
+            fn draft_descendant_waits_in_post_squash_phases() {
+                proptest!(|(
+                    descendant_pr in arb_pr_number(),
+                    sha in arb_sha(),
+                    phase_selector in 0u8..3
+                )| {
+                    // Create train in a post-squash phase
+                    let mut train = TrainRecord::new(PrNumber(1));
+                    train.status_comment_id = Some(CommentId(12345));
+                    train.last_squash_sha = Some(sha.clone());
+
+                    let progress = DescendantProgress::new(vec![descendant_pr]);
+                    train.cascade_phase = match phase_selector {
+                        0 => CascadePhase::Reconciling {
+                            progress,
+                            squash_sha: sha.clone(),
+                        },
+                        1 => CascadePhase::CatchingUp {
+                            progress,
+                            squash_sha: sha.clone(),
+                        },
+                        _ => CascadePhase::Retargeting {
+                            progress,
+                            squash_sha: sha.clone(),
+                        },
+                    };
+
+                    // Root must be OPEN to avoid external merge handling path.
+                    // In practice, after squash the root is Merged and external merge
+                    // handling transitions us to Reconciling. But for testing the phase
+                    // handlers directly, we use Open to bypass that logic.
+                    let pr1 = CachedPr::new(
+                        PrNumber(1),
+                        sha.clone(),
+                        "branch-1".to_string(),
+                        "main".to_string(),
+                        None,
+                        PrState::Open,
+                        MergeStateStatus::Clean,
+                        false,
+                    );
+                    // Descendant is a DRAFT
+                    let desc_pr = CachedPr::new(
+                        descendant_pr,
+                        sha.clone(),
+                        format!("branch-{}", descendant_pr.0),
+                        "branch-1".to_string(),
+                        Some(PrNumber(1)),
+                        PrState::Open,
+                        MergeStateStatus::Draft,
+                        true,
+                    );
+                    let prs = HashMap::from([
+                        (PrNumber(1), pr1),
+                        (descendant_pr, desc_pr),
+                    ]);
+
+                    let ctx = StepContext::new("main");
+                    let result = execute_cascade_step(train, &prs, &ctx);
+
+                    // Draft descendants should return WaitingOnCi
+                    prop_assert!(
+                        matches!(result.outcome, CascadeStepOutcome::WaitingOnCi { pr_number } if pr_number == descendant_pr),
+                        "Draft descendant in phase {} should return WaitingOnCi, got {:?}",
+                        phase_selector,
+                        result.outcome
+                    );
+
+                    // Effects should be empty (no modifications to draft PRs)
+                    prop_assert!(
+                        result.effects.is_empty(),
+                        "Draft descendant should have empty effects, got {:?}",
+                        result.effects
+                    );
+
+                    // Train state should be WaitingCi
+                    prop_assert!(
+                        matches!(result.train.state, TrainState::WaitingCi),
+                        "Draft descendant should set train.state to WaitingCi, got {:?}",
+                        result.train.state
                     );
                 });
             }

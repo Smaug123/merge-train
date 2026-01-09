@@ -409,22 +409,12 @@ impl CascadeEngine {
                 reason: BlockReason::Blocked,
             },
             MergeStateStatus::Behind => {
-                // If we're in Idle phase and the current PR is a root (targets the default branch),
-                // we can update the branch. This handles both:
-                // - The original root (train.current_pr == train.original_root_pr)
-                // - Retargeted descendants that became new roots after fan-out
-                //
-                // After fan-out, descendants become independent trains with their own TrainRecord.
-                // These PRs now target the default branch, so they should also be able to handle
-                // BEHIND by re-running catch-up to merge in the latest changes from main.
-                if matches!(train.cascade_phase, CascadePhase::Idle)
-                    && current_pr.base_ref == self.default_branch
-                {
-                    TrainAction::UpdateBranch
-                } else {
-                    TrainAction::Block {
-                        reason: BlockReason::Behind,
-                    }
+                // TODO: BEHIND roots (Idle phase, targets default branch) should be updated
+                // by merging main and pushing, rather than blocked. This requires implementing
+                // merge+push effects in the cascade step machinery. For now, treat all BEHIND
+                // PRs the same way.
+                TrainAction::Block {
+                    reason: BlockReason::Behind,
                 }
             }
             MergeStateStatus::Dirty => TrainAction::Abort {
@@ -529,9 +519,6 @@ pub enum TrainAction {
 
     /// Train must be aborted due to an error.
     Abort { reason: AbortReason },
-
-    /// The root branch needs to be updated (BEHIND status).
-    UpdateBranch,
 
     /// The PR was merged externally; advance the train.
     AdvanceAfterExternalMerge { merge_sha: Sha },
@@ -970,7 +957,9 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_train_returns_update_branch_for_behind_root() {
+    fn evaluate_train_returns_block_for_behind_root() {
+        // TODO: BEHIND roots should eventually be updated (merge main, push) instead of blocked.
+        // For now, we treat them the same as non-root BEHIND PRs.
         let engine = CascadeEngine::new("main");
 
         let train = TrainRecord::new(PrNumber(1));
@@ -979,7 +968,12 @@ mod tests {
 
         let action = engine.evaluate_train(&train, &prs);
 
-        assert_eq!(action, TrainAction::UpdateBranch);
+        assert_eq!(
+            action,
+            TrainAction::Block {
+                reason: BlockReason::Behind
+            }
+        );
     }
 
     #[test]
