@@ -493,8 +493,26 @@ fn execute_reconciling(
         );
     }
 
-    // Generate reconciliation effects (two merges: $SQUASH_SHA^ then ours-merge $SQUASH_SHA)
+    // Generate reconciliation effects
+    // CRITICAL: Must fetch and checkout the descendant branch before merging.
+    // The worktree may still be on a different branch from a prior operation.
     let effects = vec![
+        // Fetch the descendant's latest state and the default branch
+        // (default branch needed to ensure squash_sha is available locally)
+        Effect::Git(GitEffect::Fetch {
+            refspecs: vec![
+                format!(
+                    "+refs/pull/{}/head:refs/remotes/origin/pr/{}",
+                    next_descendant, next_descendant
+                ),
+                ctx.default_branch.clone(),
+            ],
+        }),
+        // Checkout the descendant's PR ref (fetched state)
+        Effect::Git(GitEffect::Checkout {
+            target: format!("refs/remotes/origin/pr/{}", next_descendant),
+            detach: true,
+        }),
         // Perform the two-step reconciliation merge.
         // CRITICAL: The interpreter MUST validate squash_sha even though
         // expected_squash_parent is None. See MergeReconcile docs for requirements:
@@ -1783,11 +1801,27 @@ mod tests {
                 // Track all PRs that get processed (via effects targeting them)
                 let mut processed_prs: std::collections::HashSet<PrNumber> = std::collections::HashSet::new();
 
+                // Track phases visited to verify cascade actually runs to completion
+                let mut phase_sequence: Vec<String> = vec![];
+
                 // Run the cascade to completion, tracking which PRs are processed
                 let max_iterations = 100;
                 for _ in 0..max_iterations {
                     let result = execute_cascade_step(train.clone(), &prs, &ctx);
                     train = result.train;
+
+                    // Track phase transitions
+                    let phase_name = match &train.cascade_phase {
+                        CascadePhase::Idle => "idle",
+                        CascadePhase::Preparing { .. } => "preparing",
+                        CascadePhase::SquashPending { .. } => "squash_pending",
+                        CascadePhase::Reconciling { .. } => "reconciling",
+                        CascadePhase::CatchingUp { .. } => "catching_up",
+                        CascadePhase::Retargeting { .. } => "retargeting",
+                    };
+                    if phase_sequence.last().map_or(true, |last| last != phase_name) {
+                        phase_sequence.push(phase_name.to_string());
+                    }
 
                     // Track which PRs are targeted by effects
                     for effect in &result.effects {
@@ -1823,6 +1857,26 @@ mod tests {
                         }
                     }
                 }
+
+                // Verify cascade actually ran through phases (not just first-step)
+                if !initial_descendants.is_empty() {
+                    let required_phases = ["preparing", "squash_pending", "reconciling", "catching_up", "retargeting"];
+                    for required_phase in required_phases {
+                        prop_assert!(
+                            phase_sequence.contains(&required_phase.to_string()),
+                            "Cascade should have visited {} phase but only visited: {:?}",
+                            required_phase,
+                            phase_sequence
+                        );
+                    }
+                }
+
+                // Verify we actually completed (not just hit max_iterations)
+                prop_assert!(
+                    phase_sequence.last() == Some(&"idle".to_string()),
+                    "Cascade should have completed (returned to Idle), but ended in: {:?}",
+                    phase_sequence.last()
+                );
 
                 // CRITICAL ASSERTION: The late addition should NEVER have been processed
                 prop_assert!(
