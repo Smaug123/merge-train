@@ -621,9 +621,7 @@ pub fn verify_descendants_prepared(
             // Fallback: fetch refs/pull/<predecessor_pr>/head via git ls-remote
             match predecessor_pr {
                 Some(pr_num) => {
-                    let output = std::process::Command::new("git")
-                        .arg("-C")
-                        .arg(worktree)
+                    let output = crate::git::git_command(worktree)
                         .arg("ls-remote")
                         .arg("origin")
                         .arg(format!("refs/pull/{}/head", pr_num.0))
@@ -674,8 +672,8 @@ pub fn verify_descendants_prepared(
         .collect();
 
     if !refspecs.is_empty() {
-        let mut cmd = std::process::Command::new("git");
-        cmd.arg("-C").arg(worktree).arg("fetch").arg("origin");
+        let mut cmd = crate::git::git_command(worktree);
+        cmd.arg("fetch").arg("origin");
         for refspec in &refspecs {
             cmd.arg(refspec);
         }
@@ -702,9 +700,7 @@ pub fn verify_descendants_prepared(
 
         // Run: git merge-base --is-ancestor <pred_sha> <head_sha>
         // Use output() instead of status() to distinguish error types.
-        let output = std::process::Command::new("git")
-            .arg("-C")
-            .arg(worktree)
+        let output = crate::git::git_command(worktree)
             .arg("merge-base")
             .arg("--is-ancestor")
             .arg(pred_sha.as_str())
