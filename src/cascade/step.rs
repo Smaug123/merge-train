@@ -406,29 +406,29 @@ fn execute_squash_pending(
     // CRITICAL: Verify the PR head hasn't changed since preparation.
     // If someone pushed new commits after we prepared descendants, those commits
     // would be squashed without proper preparation of descendants (data loss risk).
-    if let Some(recorded_sha) = train.predecessor_head_sha.clone() {
-        if current_pr.head_sha != recorded_sha {
-            let details = format!(
-                "PR head changed since preparation: {} -> {}",
+    if let Some(recorded_sha) = train.predecessor_head_sha.clone()
+        && current_pr.head_sha != recorded_sha
+    {
+        let details = format!(
+            "PR head changed since preparation: {} -> {}",
+            recorded_sha, current_pr.head_sha
+        );
+        train.abort(TrainError::new(
+            "head_sha_changed",
+            format!(
+                "PR head changed since preparation (was {}, now {}). \
+                 Aborting to prevent merging unreviewed/unprepared commits.",
                 recorded_sha, current_pr.head_sha
-            );
-            train.abort(TrainError::new(
-                "head_sha_changed",
-                format!(
-                    "PR head changed since preparation (was {}, now {}). \
-                     Aborting to prevent merging unreviewed/unprepared commits.",
-                    recorded_sha, current_pr.head_sha
-                ),
-            ));
-            return StepResult {
-                train: train.clone(),
-                outcome: CascadeStepOutcome::Aborted {
-                    pr_number: train.current_pr,
-                    reason: AbortReason::PushRejected { details },
-                },
-                effects: vec![],
-            };
-        }
+            ),
+        ));
+        return StepResult {
+            train: train.clone(),
+            outcome: CascadeStepOutcome::Aborted {
+                pr_number: train.current_pr,
+                reason: AbortReason::PushRejected { details },
+            },
+            effects: vec![],
+        };
     }
 
     // Generate squash-merge effect

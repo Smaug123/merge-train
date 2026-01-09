@@ -137,8 +137,8 @@ pub fn compute_recovery_plan(
         CascadePhase::Preparing { progress } => {
             // CRITICAL: Check if the current PR was merged externally during the crash.
             // If so, we need to handle it like handle_external_merge does in step.rs.
-            if let Some(current_pr) = prs.get(&train.current_pr) {
-                if let PrState::Merged { merge_commit_sha } = &current_pr.state {
+            if let Some(current_pr) = prs.get(&train.current_pr)
+                && let PrState::Merged { merge_commit_sha } = &current_pr.state {
                     // PR was merged externally while in Preparing phase.
                     // Check if all descendants were prepared before the merge.
                     let remaining: Vec<_> = progress.remaining().collect();
@@ -201,7 +201,6 @@ pub fn compute_recovery_plan(
                         effects,
                     };
                 }
-            }
 
             // Normal case: PR not merged, continue with preparation recovery.
             // CRITICAL: Use frozen_descendants, not current descendants
