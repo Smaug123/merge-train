@@ -351,11 +351,11 @@ fn execute_preparing(
         Effect::Git(GitEffect::Fetch {
             refspecs: vec![
                 format!(
-                    "refs/pull/{}/head:refs/remotes/origin/pr/{}",
+                    "+refs/pull/{}/head:refs/remotes/origin/pr/{}",
                     train.current_pr, train.current_pr
                 ),
                 format!(
-                    "refs/pull/{}/head:refs/remotes/origin/pr/{}",
+                    "+refs/pull/{}/head:refs/remotes/origin/pr/{}",
                     next_descendant, next_descendant
                 ),
             ],
@@ -566,7 +566,7 @@ fn execute_catching_up(
         Effect::Git(GitEffect::Fetch {
             refspecs: vec![
                 format!(
-                    "refs/pull/{}/head:refs/remotes/origin/pr/{}",
+                    "+refs/pull/{}/head:refs/remotes/origin/pr/{}",
                     next_descendant, next_descendant
                 ),
                 ctx.default_branch.clone(),
@@ -1043,6 +1043,7 @@ fn transition_to_retargeting(
 /// can see the new current_pr or completion state.
 fn complete_cascade(train: &mut TrainRecord, progress: DescendantProgress) -> StepResult {
     train.cascade_phase = CascadePhase::Idle;
+    train.predecessor_head_sha = None; // Clear stale SHA from previous cascade cycle
     train.increment_seq();
 
     // Get descendants that were successfully processed (not skipped)
@@ -1092,6 +1093,7 @@ fn complete_cascade(train: &mut TrainRecord, progress: DescendantProgress) -> St
         1 => {
             // Single descendant - advance current_pr and continue the train
             train.current_pr = completed[0];
+            train.predecessor_head_sha = None; // Clear - was for the old current_pr
             train.increment_seq();
 
             // Update status comment again after advancing current_pr

@@ -138,16 +138,17 @@ pub fn compute_recovery_plan(
             // CRITICAL: Check if the current PR was merged externally during the crash.
             // If so, we need to handle it like handle_external_merge does in step.rs.
             if let Some(current_pr) = prs.get(&train.current_pr)
-                && let PrState::Merged { merge_commit_sha } = &current_pr.state {
-                    // PR was merged externally while in Preparing phase.
-                    // Check if all descendants were prepared before the merge.
-                    let remaining: Vec<_> = progress.remaining().collect();
+                && let PrState::Merged { merge_commit_sha } = &current_pr.state
+            {
+                // PR was merged externally while in Preparing phase.
+                // Check if all descendants were prepared before the merge.
+                let remaining: Vec<_> = progress.remaining().collect();
 
-                    if !remaining.is_empty() {
-                        // ABORT: Unprepared descendants exist. Reconciling them now would
-                        // skip preparation, potentially losing predecessor content.
-                        // This matches the behavior in handle_external_merge.
-                        actions.push(RecoveryAction::NeedsManualReview {
+                if !remaining.is_empty() {
+                    // ABORT: Unprepared descendants exist. Reconciling them now would
+                    // skip preparation, potentially losing predecessor content.
+                    // This matches the behavior in handle_external_merge.
+                    actions.push(RecoveryAction::NeedsManualReview {
                             reason: format!(
                                 "PR #{} was merged externally while {} descendants were still unprepared. \
                                  Reconciling now would skip preparation and risk data loss. \
@@ -156,51 +157,51 @@ pub fn compute_recovery_plan(
                                 remaining.len()
                             ),
                         });
-                        return RecoveryPlan {
-                            train: plan_train,
-                            actions,
-                            effects,
-                        };
-                    }
-
-                    // All descendants are prepared. Transition to Reconciling with reset progress.
-                    // The "completed" set tracked preparation, not reconciliation - reset it.
-                    let mut reset_progress =
-                        DescendantProgress::new(progress.frozen_descendants.clone());
-                    // Preserve skipped set (closed PRs should stay skipped)
-                    reset_progress.skipped = progress.skipped.clone();
-
-                    plan_train.cascade_phase = CascadePhase::Reconciling {
-                        progress: reset_progress,
-                        squash_sha: merge_commit_sha.clone(),
-                    };
-                    plan_train.last_squash_sha = Some(merge_commit_sha.clone());
-                    plan_train.increment_seq();
-
-                    // Add squash validation effect - must run first
-                    effects.push(Effect::Git(GitEffect::ValidateSquashCommit {
-                        squash_sha: merge_commit_sha.clone(),
-                        default_branch: default_branch.to_string(),
-                    }));
-
-                    // Add status comment update for GitHub-based recovery.
-                    // Use expect() here because per DESIGN.md, oversize should never happen
-                    // with proper size limits. If it does, it's a bug that needs immediate attention.
-                    if let Some(comment_id) = plan_train.status_comment_id {
-                        effects.push(Effect::GitHub(GitHubEffect::UpdateComment {
-                            comment_id,
-                            body: format_phase_comment(&plan_train)
-                                .expect("Status comment oversize during recovery - this is a bug"),
-                        }));
-                    }
-
-                    actions.push(RecoveryAction::ResumeClean);
                     return RecoveryPlan {
                         train: plan_train,
                         actions,
                         effects,
                     };
                 }
+
+                // All descendants are prepared. Transition to Reconciling with reset progress.
+                // The "completed" set tracked preparation, not reconciliation - reset it.
+                let mut reset_progress =
+                    DescendantProgress::new(progress.frozen_descendants.clone());
+                // Preserve skipped set (closed PRs should stay skipped)
+                reset_progress.skipped = progress.skipped.clone();
+
+                plan_train.cascade_phase = CascadePhase::Reconciling {
+                    progress: reset_progress,
+                    squash_sha: merge_commit_sha.clone(),
+                };
+                plan_train.last_squash_sha = Some(merge_commit_sha.clone());
+                plan_train.increment_seq();
+
+                // Add squash validation effect - must run first
+                effects.push(Effect::Git(GitEffect::ValidateSquashCommit {
+                    squash_sha: merge_commit_sha.clone(),
+                    default_branch: default_branch.to_string(),
+                }));
+
+                // Add status comment update for GitHub-based recovery.
+                // Use expect() here because per DESIGN.md, oversize should never happen
+                // with proper size limits. If it does, it's a bug that needs immediate attention.
+                if let Some(comment_id) = plan_train.status_comment_id {
+                    effects.push(Effect::GitHub(GitHubEffect::UpdateComment {
+                        comment_id,
+                        body: format_phase_comment(&plan_train)
+                            .expect("Status comment oversize during recovery - this is a bug"),
+                    }));
+                }
+
+                actions.push(RecoveryAction::ResumeClean);
+                return RecoveryPlan {
+                    train: plan_train,
+                    actions,
+                    effects,
+                };
+            }
 
             // Normal case: PR not merged, continue with preparation recovery.
             // CRITICAL: Use frozen_descendants, not current descendants
@@ -224,13 +225,18 @@ pub fn compute_recovery_plan(
             if let Some(current_pr) = prs.get(&train.current_pr) {
                 match &current_pr.state {
                     PrState::Merged { merge_commit_sha } => {
-                        // Already merged - transition to Reconciling phase with the merge SHA
-                        // and preserve the frozen descendants.
+                        // Already merged - transition to Reconciling phase with the merge SHA.
+                        // CRITICAL: Reset progress.completed because it tracks PREPARATION, not
+                        // reconciliation. Preserve skipped (closed PRs stay skipped).
                         //
                         // CRITICAL: We need to validate the merge was a squash before proceeding.
                         // The validation effect will run before any reconciliation effects.
+                        let mut reset_progress =
+                            DescendantProgress::new(progress.frozen_descendants.clone());
+                        reset_progress.skipped = progress.skipped.clone();
+
                         plan_train.cascade_phase = CascadePhase::Reconciling {
-                            progress: progress.clone(),
+                            progress: reset_progress,
                             squash_sha: merge_commit_sha.clone(),
                         };
                         plan_train.last_squash_sha = Some(merge_commit_sha.clone());
