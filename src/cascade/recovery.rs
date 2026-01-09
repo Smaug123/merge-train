@@ -75,6 +75,24 @@ pub enum RecoveryAction {
     /// Retry retarget.
     RetryRetarget { pr: PrNumber, new_base: String },
 
+    /// Verify all descendants were prepared before reconciliation.
+    ///
+    /// Per DESIGN.md "Verifying preparation before reconciliation": on recovery
+    /// to Reconciling phase, verify that `predecessor_head_sha` is an ancestor
+    /// of each descendant's head. This ensures preparation actually occurred
+    /// before the squash.
+    ///
+    /// Uses `predecessor_head_sha` if available, otherwise falls back to fetching
+    /// `refs/pull/<predecessor_pr>/head` via git ls-remote.
+    VerifyPrepared {
+        /// The predecessor head SHA (if known). Use this first.
+        predecessor_head_sha: Option<Sha>,
+        /// The predecessor PR number (for fallback fetch if SHA is missing).
+        predecessor_pr: Option<PrNumber>,
+        /// List of (descendant PR, head SHA) to verify.
+        descendants: Vec<(PrNumber, Sha)>,
+    },
+
     /// Resume from a clean state (no in-progress operations).
     ResumeClean,
 
@@ -291,6 +309,28 @@ pub fn compute_recovery_plan(
             progress,
             squash_sha,
         } => {
+            // CRITICAL: Per DESIGN.md "Verifying preparation before reconciliation",
+            // verify each remaining descendant was prepared before the squash.
+            // This prevents data loss if the PR was merged externally mid-prepare.
+            let remaining_descendants: Vec<_> = progress
+                .remaining()
+                .filter_map(|pr_num| {
+                    prs.get(pr_num)
+                        .filter(|p| p.state.is_open())
+                        .map(|p| (*pr_num, p.head_sha.clone()))
+                })
+                .collect();
+
+            if !remaining_descendants.is_empty() {
+                // Per DESIGN.md: use predecessor_head_sha, or fallback to fetching
+                // refs/pull/<predecessor_pr>/head via git ls-remote
+                actions.push(RecoveryAction::VerifyPrepared {
+                    predecessor_head_sha: train.predecessor_head_sha.clone(),
+                    predecessor_pr: train.predecessor_pr,
+                    descendants: remaining_descendants,
+                });
+            }
+
             recover_multi_descendant_phase(&mut actions, &mut effects, progress, prs, |desc_pr| {
                 RecoveryAction::RetryMerge {
                     descendant: desc_pr.number,
@@ -470,6 +510,31 @@ pub fn apply_recovery_plan(
                     // Push didn't complete - will be retried
                 }
             }
+            RecoveryAction::VerifyPrepared { descendants, .. } => {
+                // Check verification results for each descendant.
+                // The key format is "prepared:<pr_number>" and value is true if
+                // the predecessor head is an ancestor of the descendant's head.
+                let mut unprepared = Vec::new();
+                for (pr_num, _head_sha) in descendants {
+                    let key = format!("prepared:{}", pr_num.0);
+                    if let Some(&is_prepared) = verification_results.get(&key)
+                        && !is_prepared
+                    {
+                        unprepared.push(*pr_num);
+                    }
+                    // If no result, verification hasn't been run yet - will be handled by executor
+                }
+
+                if !unprepared.is_empty() {
+                    needs_manual_review = true;
+                    manual_review_reason = format!(
+                        "Descendants {:?} were not prepared before squash. \
+                         The predecessor head is not an ancestor of their heads. \
+                         Manual intervention required: merge main into these branches or rebase.",
+                        unprepared.iter().map(|p| p.0).collect::<Vec<_>>()
+                    );
+                }
+            }
             RecoveryAction::NeedsManualReview { reason } => {
                 needs_manual_review = true;
                 manual_review_reason = reason.clone();
@@ -491,6 +556,115 @@ pub fn apply_recovery_plan(
     }
 
     (plan.train, None)
+}
+
+/// Verify that descendants were prepared before reconciliation.
+///
+/// Per DESIGN.md "Verifying preparation before reconciliation": checks that
+/// the predecessor head SHA is an ancestor of each descendant's head.
+///
+/// # Arguments
+///
+/// * `worktree` - Path to the git worktree
+/// * `action` - The VerifyPrepared action containing what to verify
+///
+/// # Returns
+///
+/// A map of `"prepared:<pr_number>" -> bool` indicating whether each descendant
+/// was properly prepared. Returns `Err` if git operations fail or if the
+/// predecessor SHA cannot be determined.
+pub fn verify_descendants_prepared(
+    worktree: &Path,
+    action: &RecoveryAction,
+) -> Result<HashMap<String, bool>, crate::git::GitError> {
+    let RecoveryAction::VerifyPrepared {
+        predecessor_head_sha,
+        predecessor_pr,
+        descendants,
+    } = action
+    else {
+        return Ok(HashMap::new());
+    };
+
+    // Determine the predecessor head SHA to use
+    let pred_sha = match predecessor_head_sha {
+        Some(sha) => sha.clone(),
+        None => {
+            // Fallback: fetch refs/pull/<predecessor_pr>/head via git ls-remote
+            match predecessor_pr {
+                Some(pr_num) => {
+                    let output = std::process::Command::new("git")
+                        .arg("-C")
+                        .arg(worktree)
+                        .arg("ls-remote")
+                        .arg("origin")
+                        .arg(format!("refs/pull/{}/head", pr_num.0))
+                        .output()
+                        .map_err(|e| crate::git::GitError::CommandFailed {
+                            command: "git ls-remote".to_string(),
+                            stderr: e.to_string(),
+                        })?;
+
+                    if !output.status.success() {
+                        return Err(crate::git::GitError::CommandFailed {
+                            command: "git ls-remote".to_string(),
+                            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                        });
+                    }
+
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let sha_str = stdout
+                        .split_whitespace()
+                        .next()
+                        .ok_or_else(|| crate::git::GitError::CommandFailed {
+                            command: "git ls-remote".to_string(),
+                            stderr: format!(
+                                "No SHA found for refs/pull/{}/head",
+                                pr_num.0
+                            ),
+                        })?;
+
+                    Sha::parse(sha_str.to_string()).map_err(|_| {
+                        crate::git::GitError::CommandFailed {
+                            command: "git ls-remote".to_string(),
+                            stderr: format!("Invalid SHA: {}", sha_str),
+                        }
+                    })?
+                }
+                None => {
+                    return Err(crate::git::GitError::CommandFailed {
+                        command: "verify_descendants_prepared".to_string(),
+                        stderr: "Neither predecessor_head_sha nor predecessor_pr available for verification".to_string(),
+                    });
+                }
+            }
+        }
+    };
+
+    // Verify each descendant
+    let mut results = HashMap::new();
+    for (pr_num, head_sha) in descendants {
+        let key = format!("prepared:{}", pr_num.0);
+
+        // Run: git merge-base --is-ancestor <pred_sha> <head_sha>
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(worktree)
+            .arg("merge-base")
+            .arg("--is-ancestor")
+            .arg(pred_sha.as_str())
+            .arg(head_sha.as_str())
+            .status()
+            .map_err(|e| crate::git::GitError::CommandFailed {
+                command: "git merge-base --is-ancestor".to_string(),
+                stderr: e.to_string(),
+            })?;
+
+        // Exit code 0 = is ancestor (prepared), non-zero = not ancestor (unprepared)
+        results.insert(key, status.success());
+    }
+
+    Ok(results)
 }
 
 /// Check if a descendant is ready to be processed in recovery.
@@ -1306,6 +1480,204 @@ mod tests {
                         "All descendants should need reconciliation"
                     );
                 }
+            }
+
+            // ─── Reconciling Verification Tests ─────────────────────────────────────────
+            //
+            // These tests verify the DESIGN.md requirement: "On recovery to Reconciling phase,
+            // before proceeding, the bot MUST verify for each descendant not in completed".
+
+            /// Property: Recovery for Reconciling phase with remaining descendants MUST emit
+            /// VerifyPrepared action before RetryMerge actions.
+            ///
+            /// Per DESIGN.md "Verifying preparation before reconciliation": verification must
+            /// happen BEFORE reconciliation proceeds, to prevent silent data loss.
+            #[test]
+            fn reconciling_recovery_emits_verify_prepared_before_retry(
+                frozen_descendants in arb_unique_descendants(1, 3),
+                squash_sha in arb_sha(),
+                pr_sha in arb_sha()
+            ) {
+                // Create train in Reconciling phase
+                let mut train = TrainRecord::new(PrNumber(1));
+                train.cascade_phase = CascadePhase::Reconciling {
+                    progress: DescendantProgress::new(frozen_descendants.clone()),
+                    squash_sha: squash_sha.clone(),
+                };
+                train.predecessor_head_sha = Some(pr_sha.clone());
+                train.predecessor_pr = Some(PrNumber(999)); // For fallback
+
+                // Create PR map
+                let mut prs = HashMap::new();
+                let root_pr = make_open_pr_for_test(1, "main", None, pr_sha.clone());
+                prs.insert(PrNumber(1), root_pr);
+
+                for &desc in &frozen_descendants {
+                    let pr = make_open_pr_for_test(desc.0, "branch-1", Some(PrNumber(1)), pr_sha.clone());
+                    prs.insert(desc, pr);
+                }
+
+                let plan = compute_recovery_plan(&train, &prs, &[], "main");
+
+                // MUST have VerifyPrepared action
+                let has_verify_prepared = plan.actions.iter().any(|a| {
+                    matches!(a, RecoveryAction::VerifyPrepared { .. })
+                });
+                prop_assert!(
+                    has_verify_prepared,
+                    "BUG: Recovery for Reconciling phase MUST emit VerifyPrepared action. \
+                     Actions: {:?}",
+                    plan.actions
+                );
+
+                // VerifyPrepared MUST come before any RetryMerge
+                let verify_idx = plan.actions.iter().position(|a| {
+                    matches!(a, RecoveryAction::VerifyPrepared { .. })
+                });
+                let first_retry_idx = plan.actions.iter().position(|a| {
+                    matches!(a, RecoveryAction::RetryMerge { .. })
+                });
+
+                if let (Some(v_idx), Some(r_idx)) = (verify_idx, first_retry_idx) {
+                    prop_assert!(
+                        v_idx < r_idx,
+                        "VerifyPrepared (idx {}) must come before RetryMerge (idx {}). \
+                         Actions: {:?}",
+                        v_idx, r_idx, plan.actions
+                    );
+                }
+            }
+
+            /// Property: VerifyPrepared action contains all remaining open descendants
+            /// with their correct head SHAs.
+            #[test]
+            fn verify_prepared_contains_all_remaining_descendants(
+                frozen_descendants in arb_unique_descendants(1, 3),
+                squash_sha in arb_sha(),
+                pr_sha in arb_sha()
+            ) {
+                let mut train = TrainRecord::new(PrNumber(1));
+                train.cascade_phase = CascadePhase::Reconciling {
+                    progress: DescendantProgress::new(frozen_descendants.clone()),
+                    squash_sha: squash_sha.clone(),
+                };
+                train.predecessor_head_sha = Some(pr_sha.clone());
+
+                let mut prs = HashMap::new();
+                prs.insert(PrNumber(1), make_open_pr_for_test(1, "main", None, pr_sha.clone()));
+
+                for &desc in &frozen_descendants {
+                    let pr = make_open_pr_for_test(desc.0, "branch-1", Some(PrNumber(1)), pr_sha.clone());
+                    prs.insert(desc, pr);
+                }
+
+                let plan = compute_recovery_plan(&train, &prs, &[], "main");
+
+                // Find the VerifyPrepared action
+                let verify_action = plan.actions.iter().find(|a| {
+                    matches!(a, RecoveryAction::VerifyPrepared { .. })
+                });
+
+                if let Some(RecoveryAction::VerifyPrepared { descendants, predecessor_head_sha, .. }) = verify_action {
+                    // Should contain all frozen descendants
+                    let verified_prs: std::collections::HashSet<_> = descendants.iter().map(|(pr, _)| *pr).collect();
+                    let expected_prs: std::collections::HashSet<_> = frozen_descendants.iter().copied().collect();
+
+                    prop_assert_eq!(
+                        verified_prs,
+                        expected_prs,
+                        "VerifyPrepared should contain all frozen descendants"
+                    );
+
+                    // predecessor_head_sha should match train's
+                    prop_assert_eq!(
+                        predecessor_head_sha.as_ref(),
+                        Some(&pr_sha),
+                        "VerifyPrepared should use train's predecessor_head_sha"
+                    );
+                } else {
+                    prop_assert!(false, "No VerifyPrepared action found");
+                }
+            }
+
+            /// Property: apply_recovery_plan with failed verification produces NeedsManualReview.
+            #[test]
+            fn apply_recovery_plan_failed_verification_needs_review(
+                pr_number in 2u64..100,
+            ) {
+                let descendants = vec![(PrNumber(pr_number), Sha::parse("a".repeat(40)).unwrap())];
+                let actions = vec![
+                    RecoveryAction::VerifyPrepared {
+                        predecessor_head_sha: Some(Sha::parse("b".repeat(40)).unwrap()),
+                        predecessor_pr: None,
+                        descendants: descendants.clone(),
+                    },
+                    RecoveryAction::RetryMerge {
+                        descendant: PrNumber(pr_number),
+                        source: "reconcile:abc".to_string(),
+                        target_branch: format!("branch-{}", pr_number),
+                    },
+                ];
+
+                let plan = RecoveryPlan {
+                    train: TrainRecord::new(PrNumber(1)),
+                    actions,
+                    effects: vec![],
+                };
+
+                // Simulate failed verification - descendant was NOT prepared
+                let mut verification_results = HashMap::new();
+                verification_results.insert(format!("prepared:{}", pr_number), false);
+
+                let (train, abort_reason) = apply_recovery_plan(plan, &verification_results);
+
+                prop_assert_eq!(
+                    train.state,
+                    TrainState::NeedsManualReview,
+                    "Failed verification should result in NeedsManualReview"
+                );
+                prop_assert!(
+                    abort_reason.is_some(),
+                    "Failed verification should produce abort reason"
+                );
+            }
+
+            /// Property: apply_recovery_plan with passed verification does NOT produce NeedsManualReview.
+            #[test]
+            fn apply_recovery_plan_passed_verification_continues(
+                pr_number in 2u64..100,
+            ) {
+                let descendants = vec![(PrNumber(pr_number), Sha::parse("a".repeat(40)).unwrap())];
+                let actions = vec![
+                    RecoveryAction::VerifyPrepared {
+                        predecessor_head_sha: Some(Sha::parse("b".repeat(40)).unwrap()),
+                        predecessor_pr: None,
+                        descendants: descendants.clone(),
+                    },
+                    RecoveryAction::ResumeClean,
+                ];
+
+                let plan = RecoveryPlan {
+                    train: TrainRecord::new(PrNumber(1)),
+                    actions,
+                    effects: vec![],
+                };
+
+                // Simulate passed verification - descendant WAS prepared
+                let mut verification_results = HashMap::new();
+                verification_results.insert(format!("prepared:{}", pr_number), true);
+
+                let (train, abort_reason) = apply_recovery_plan(plan, &verification_results);
+
+                prop_assert_eq!(
+                    train.state,
+                    TrainState::Running,
+                    "Passed verification should keep train running"
+                );
+                prop_assert!(
+                    abort_reason.is_none(),
+                    "Passed verification should NOT produce abort reason"
+                );
             }
         }
     }
