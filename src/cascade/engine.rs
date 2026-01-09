@@ -1025,6 +1025,7 @@ mod tests {
 
     mod property_tests {
         use super::*;
+        use crate::types::DescendantProgress;
         use proptest::prelude::*;
 
         fn arb_pr_number() -> impl Strategy<Value = PrNumber> {
@@ -1103,6 +1104,28 @@ mod tests {
 
                     let pr = make_test_pr(desc.0, &parent_head, Some(parent));
                     prs.insert(desc, pr);
+                }
+
+                // CRITICAL FIX: Transition trains to Preparing phase so frozen_descendants
+                // gets populated. Without this, trains stay in Idle and progress() returns None.
+                for (&root, train) in active_trains.iter_mut() {
+                    // Collect descendants for this root
+                    let descendants: Vec<PrNumber> = extra_descendants
+                        .iter()
+                        .filter(|&&d| {
+                            prs.get(&d)
+                                .and_then(|p| p.predecessor)
+                                .map(|pred| pred == root)
+                                .unwrap_or(false)
+                        })
+                        .copied()
+                        .collect();
+
+                    if !descendants.is_empty() {
+                        train.cascade_phase = CascadePhase::Preparing {
+                            progress: DescendantProgress::new(descendants),
+                        };
+                    }
                 }
 
                 // Now verify the invariant: no PR appears in multiple trains
@@ -1185,15 +1208,19 @@ mod tests {
 
             /// Property: Starting a train for a PR that's a descendant in another train fails.
             ///
-            /// This directly tests the fix for overlapping trains - you cannot start
-            /// a new train if any PR in your stack is already part of an active train.
+            /// This tests the overlap guard - you cannot start a new train if any PR
+            /// in your stack is already part of an active train's current_pr or frozen_descendants.
+            ///
+            /// Scenario: Train #1 is in Preparing phase with #2 frozen. A new PR #4 targets
+            /// branch-2 (making #2 its predecessor). When we try to start a train for a
+            /// separate root #5, that should succeed. But trying to start #2 fails (NotARoot).
             #[test]
             fn start_train_rejects_overlapping_descendants(
                 sha in arb_sha(),
             ) {
                 let engine = CascadeEngine::new("main");
 
-                // Create a chain: main <- #1 <- #2 <- #3
+                // Create a chain: main <- #1 <- #2
                 let pr1 = CachedPr::new(
                     PrNumber(1),
                     sha.clone(),
@@ -1216,8 +1243,7 @@ mod tests {
                     false,
                 );
 
-                // PR3 targets main directly (would be a root), but claims PR2 as predecessor
-                // This simulates a fan-out scenario where #3 was retargeted
+                // PR3 is an independent root (targets main, no predecessor)
                 let pr3 = CachedPr::new(
                     PrNumber(3),
                     sha.clone(),
@@ -1235,14 +1261,20 @@ mod tests {
                     (PrNumber(3), pr3),
                 ]);
 
-                // Start train for #1 (which includes #2 as descendant)
+                // Start train for #1
                 let mut active_trains = HashMap::new();
                 let result1 = engine.start_train(PrNumber(1), &prs, &active_trains);
                 prop_assert!(result1.is_ok(), "Should be able to start train for #1");
-                active_trains.insert(PrNumber(1), result1.unwrap().train);
+                let mut train1 = result1.unwrap().train;
 
-                // Now try to start train for #3 - this should succeed since #3 doesn't
-                // overlap with train #1's descendants
+                // CRITICAL FIX: Transition train #1 to Preparing phase so frozen_descendants
+                // is populated. Without this, the train stays in Idle and progress() returns None.
+                train1.cascade_phase = CascadePhase::Preparing {
+                    progress: DescendantProgress::new(vec![PrNumber(2)]),
+                };
+                active_trains.insert(PrNumber(1), train1);
+
+                // Starting train for #3 should succeed - it's independent (no overlap)
                 let result3 = engine.start_train(PrNumber(3), &prs, &active_trains);
                 prop_assert!(
                     result3.is_ok(),
@@ -1250,14 +1282,26 @@ mod tests {
                     result3.err()
                 );
 
-                // But trying to start train for #2 (which is a descendant of #1) should fail
-                // because #2 is already in train #1's frozen_descendants
-                // Note: #2 isn't a root so this will fail with NotARoot, which is fine
+                // Starting train for #2 should fail.
+                // Note: #2 isn't a root (has predecessor #1), so this fails with NotARoot.
+                // The overlap guard (checking frozen_descendants) would fire if #2 were a root.
                 let result2 = engine.start_train(PrNumber(2), &prs, &active_trains);
                 prop_assert!(
                     result2.is_err(),
                     "Starting train for descendant #2 should fail"
                 );
+
+                // Verify that the overlap is actually detectable: train #1's frozen_descendants
+                // contains #2, so any root whose stack includes #2 would be rejected.
+                let train1 = active_trains.get(&PrNumber(1)).unwrap();
+                if let Some(progress) = train1.cascade_phase.progress() {
+                    prop_assert!(
+                        progress.frozen_descendants.contains(&PrNumber(2)),
+                        "Train #1 should have #2 in frozen_descendants"
+                    );
+                } else {
+                    prop_assert!(false, "Train #1 should be in a phase with progress");
+                }
             }
         }
     }

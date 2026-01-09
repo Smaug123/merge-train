@@ -220,6 +220,15 @@ fn execute_from_idle(
                     effects: vec![],
                 };
             };
+
+            // Record head SHA for the squash-time guard (same as in execute_preparing).
+            // Without this, trains with no descendants skip the guard entirely because
+            // predecessor_head_sha remains None.
+            train.predecessor_pr = Some(train.current_pr);
+            if train.predecessor_head_sha.is_none() {
+                train.predecessor_head_sha = Some(current_pr.head_sha.clone());
+            }
+
             execute_squash_pending(train, DescendantProgress::new(vec![]), current_pr, ctx)
         }
         _ => unreachable!("start_preparing only returns Preparing or SquashPending"),
@@ -228,15 +237,17 @@ fn execute_from_idle(
     // CRITICAL: Emit status comment update for Idle → Preparing/SquashPending transition.
     // This ensures GitHub-based recovery can see the phase transition and frozen descendants
     // immediately, not just after the first descendant is processed.
+    //
+    // CRASH SAFETY: Prepend (insert at 0) rather than append. If the executor crashes
+    // between executing effects, the comment should already reflect the new phase.
+    // Ordering: [UpdateComment, ...operational effects]
     if let Some(comment_id) = result.train.status_comment_id {
         match format_phase_comment(&result.train) {
             Ok(body) => {
-                result
-                    .effects
-                    .push(Effect::GitHub(GitHubEffect::UpdateComment {
-                        comment_id,
-                        body,
-                    }));
+                result.effects.insert(
+                    0,
+                    Effect::GitHub(GitHubEffect::UpdateComment { comment_id, body }),
+                );
             }
             Err(CascadeError::StatusCommentOversize { .. }) => {
                 result.train.abort(TrainError::new(
@@ -791,8 +802,12 @@ fn handle_external_merge(
             if has_unprepared {
                 (progress.clone(), true)
             } else {
-                // All prepared - reset for reconciliation (same logic as SquashPending)
-                let fresh_progress = DescendantProgress::new(progress.frozen_descendants.clone());
+                // All prepared - reset for reconciliation (same logic as SquashPending).
+                // CRITICAL: Preserve skipped set - closed/failed descendants should remain
+                // skipped through subsequent phases.
+                let mut fresh_progress =
+                    DescendantProgress::new(progress.frozen_descendants.clone());
+                fresh_progress.skipped = progress.skipped.clone();
                 (fresh_progress, false)
             }
         }
@@ -800,9 +815,10 @@ fn handle_external_merge(
             // External merge in SquashPending = squash bypassed our control.
             // The `completed` set tracks which descendants were PREPARED, but
             // reconciliation needs a fresh start (none are reconciled yet).
-            // CRITICAL: Reset progress by keeping frozen_descendants but clearing
-            // completed/skipped so reconciliation processes all of them.
-            let fresh_progress = DescendantProgress::new(progress.frozen_descendants.clone());
+            // CRITICAL: Preserve skipped set - closed/failed descendants should remain
+            // skipped through subsequent phases (not reintroduced for reconciliation).
+            let mut fresh_progress = DescendantProgress::new(progress.frozen_descendants.clone());
+            fresh_progress.skipped = progress.skipped.clone();
             (fresh_progress, false)
         }
         CascadePhase::Reconciling { progress, .. }
@@ -945,16 +961,16 @@ fn transition_to_squash_pending(
     // Immediately execute SquashPending to produce effects
     let mut result = execute_squash_pending(train, progress, current_pr, ctx);
 
-    // Add status comment update for recovery (if we have a comment ID)
+    // Add status comment update for recovery (if we have a comment ID).
+    // CRASH SAFETY: Prepend (insert at 0) rather than append. If the executor crashes
+    // between executing effects, the comment should already reflect the new phase.
     if let Some(comment_id) = train.status_comment_id {
         match format_phase_comment(&result.train) {
             Ok(body) => {
-                result
-                    .effects
-                    .push(Effect::GitHub(GitHubEffect::UpdateComment {
-                        comment_id,
-                        body,
-                    }));
+                result.effects.insert(
+                    0,
+                    Effect::GitHub(GitHubEffect::UpdateComment { comment_id, body }),
+                );
             }
             Err(CascadeError::StatusCommentOversize { .. }) => {
                 result.train.abort(TrainError::new(
@@ -1011,16 +1027,16 @@ fn transition_to_catching_up(
         unreachable!("next_phase for Reconciling -> CatchingUp always returns CatchingUp")
     };
 
-    // Add status comment update for recovery (if we have a comment ID)
+    // Add status comment update for recovery (if we have a comment ID).
+    // CRASH SAFETY: Prepend (insert at 0) rather than append. If the executor crashes
+    // between executing effects, the comment should already reflect the new phase.
     if let Some(comment_id) = train.status_comment_id {
         match format_phase_comment(&result.train) {
             Ok(body) => {
-                result
-                    .effects
-                    .push(Effect::GitHub(GitHubEffect::UpdateComment {
-                        comment_id,
-                        body,
-                    }));
+                result.effects.insert(
+                    0,
+                    Effect::GitHub(GitHubEffect::UpdateComment { comment_id, body }),
+                );
             }
             Err(CascadeError::StatusCommentOversize { .. }) => {
                 result.train.abort(TrainError::new(
@@ -1077,16 +1093,16 @@ fn transition_to_retargeting(
         unreachable!("next_phase for CatchingUp -> Retargeting always returns Retargeting")
     };
 
-    // Add status comment update for recovery (if we have a comment ID)
+    // Add status comment update for recovery (if we have a comment ID).
+    // CRASH SAFETY: Prepend (insert at 0) rather than append. If the executor crashes
+    // between executing effects, the comment should already reflect the new phase.
     if let Some(comment_id) = train.status_comment_id {
         match format_phase_comment(&result.train) {
             Ok(body) => {
-                result
-                    .effects
-                    .push(Effect::GitHub(GitHubEffect::UpdateComment {
-                        comment_id,
-                        body,
-                    }));
+                result.effects.insert(
+                    0,
+                    Effect::GitHub(GitHubEffect::UpdateComment { comment_id, body }),
+                );
             }
             Err(CascadeError::StatusCommentOversize { .. }) => {
                 result.train.abort(TrainError::new(
@@ -3123,6 +3139,195 @@ mod tests {
                 new_sha,
                 new_sha
             );
+        }
+
+        /// Regression test: trains with NO descendants must record predecessor_head_sha
+        /// so the squash-time guard can detect post-start pushes.
+        ///
+        /// Bug scenario (before fix):
+        /// 1. Train starts with no descendants, head SHA is X
+        /// 2. Someone pushes to PR, head SHA becomes Y
+        /// 3. Bot squash-merges - guard doesn't fire because predecessor_head_sha was never set
+        /// 4. Result: Unreviewed commits Y are merged
+        #[test]
+        fn no_descendants_train_records_head_sha() {
+            let original_sha = make_sha(0x111);
+
+            // Create train in Idle phase (no descendants)
+            let train = TrainRecord::new(PrNumber(1));
+
+            // Build PR map with single PR (no descendants)
+            let pr1 = CachedPr::new(
+                PrNumber(1),
+                original_sha.clone(),
+                "branch-1".to_string(),
+                "main".to_string(),
+                None,
+                PrState::Open,
+                MergeStateStatus::Clean,
+                false,
+            );
+            let prs = HashMap::from([(PrNumber(1), pr1)]);
+            let ctx = StepContext::new("main");
+
+            // Execute cascade step - should transition to SquashPending
+            let result = execute_cascade_step(train, &prs, &ctx);
+
+            // Phase should be SquashPending (no descendants to prepare)
+            assert!(
+                matches!(
+                    result.train.cascade_phase,
+                    CascadePhase::SquashPending { .. }
+                ),
+                "Should transition to SquashPending with no descendants. Got: {:?}",
+                result.train.cascade_phase
+            );
+
+            // CRITICAL: predecessor_head_sha must be recorded
+            assert_eq!(
+                result.train.predecessor_head_sha,
+                Some(original_sha.clone()),
+                "BUG: Trains with no descendants must record predecessor_head_sha \
+                 for the squash-time guard. Without this, post-start pushes go undetected."
+            );
+
+            // predecessor_pr should also be set
+            assert_eq!(
+                result.train.predecessor_pr,
+                Some(PrNumber(1)),
+                "predecessor_pr should be set to current_pr"
+            );
+        }
+
+        /// Regression test: trains with NO descendants must abort on head SHA change.
+        ///
+        /// This verifies the guard actually fires for no-descendant trains after the fix.
+        #[test]
+        fn no_descendants_train_aborts_on_head_change() {
+            let original_sha = make_sha(0x111);
+            let new_sha = make_sha(0x222);
+
+            // Setup: train already in SquashPending with recorded SHA
+            let mut train = TrainRecord::new(PrNumber(1));
+            train.cascade_phase = CascadePhase::SquashPending {
+                progress: DescendantProgress::new(vec![]),
+            };
+            train.predecessor_pr = Some(PrNumber(1));
+            train.predecessor_head_sha = Some(original_sha.clone());
+            train.state = TrainState::Running;
+
+            // Build PR map with CHANGED head SHA (simulates post-start push)
+            let pr1 = CachedPr::new(
+                PrNumber(1),
+                new_sha.clone(), // HEAD CHANGED
+                "branch-1".to_string(),
+                "main".to_string(),
+                None,
+                PrState::Open,
+                MergeStateStatus::Clean,
+                false,
+            );
+            let prs = HashMap::from([(PrNumber(1), pr1)]);
+            let ctx = StepContext::new("main");
+
+            // Execute cascade step - should abort
+            let result = execute_cascade_step(train, &prs, &ctx);
+
+            // Must abort due to head SHA change
+            assert!(
+                matches!(
+                    result.outcome,
+                    CascadeStepOutcome::Aborted {
+                        reason: AbortReason::HeadShaChanged { .. },
+                        ..
+                    }
+                ),
+                "Train with no descendants must abort on head SHA change. \
+                 Original: {}, New: {}, Outcome: {:?}",
+                original_sha,
+                new_sha,
+                result.outcome
+            );
+        }
+
+        /// Regression test: external merge must preserve the skipped set.
+        ///
+        /// Bug scenario (before fix):
+        /// 1. Train in Preparing phase with descendants #2 (skipped/closed) and #3
+        /// 2. Descendant #3 is prepared, #2 was skipped (closed PR)
+        /// 3. External merge happens
+        /// 4. BUG: DescendantProgress::new() clears skipped set
+        /// 5. Result: #2 is reintroduced for reconciliation, causing errors
+        #[test]
+        fn external_merge_preserves_skipped_descendants() {
+            let merge_sha = make_sha(0xfff);
+
+            // Setup: train in SquashPending with one descendant skipped
+            let mut train = TrainRecord::new(PrNumber(1));
+            let mut progress = DescendantProgress::new(vec![PrNumber(2), PrNumber(3)]);
+            progress.mark_completed(PrNumber(3)); // #3 was prepared
+            progress.mark_skipped(PrNumber(2)); // #2 was skipped (closed)
+            train.cascade_phase = CascadePhase::SquashPending { progress };
+
+            // Build PR map with root PR merged externally
+            let mut pr1 = make_open_pr(1, "main", None);
+            pr1.state = PrState::Merged {
+                merge_commit_sha: merge_sha.clone(),
+            };
+            // #2 is closed (skipped)
+            let mut pr2 = CachedPr::new(
+                PrNumber(2),
+                make_sha(2),
+                "branch-2".to_string(),
+                "branch-1".to_string(),
+                Some(PrNumber(1)),
+                PrState::Closed,
+                MergeStateStatus::Clean,
+                false,
+            );
+            pr2.head_ref = "branch-2".to_string();
+            // #3 is open
+            let mut pr3 = make_open_pr(3, "branch-1", Some(1));
+            pr3.head_ref = "branch-3".to_string();
+
+            let prs = HashMap::from([(PrNumber(1), pr1), (PrNumber(2), pr2), (PrNumber(3), pr3)]);
+            let ctx = StepContext::new("main");
+
+            // Execute cascade step - should transition to Reconciling
+            let result = execute_cascade_step(train, &prs, &ctx);
+
+            // Phase must be Reconciling
+            match &result.train.cascade_phase {
+                CascadePhase::Reconciling { progress, .. } => {
+                    // CRITICAL: Skipped set must be preserved
+                    assert!(
+                        progress.skipped.contains(&PrNumber(2)),
+                        "BUG: Skipped descendant #2 was dropped during external merge handling. \
+                         Skipped set: {:?}",
+                        progress.skipped
+                    );
+
+                    // Completed set should be reset (prepared != reconciled)
+                    assert!(
+                        !progress.completed.contains(&PrNumber(3)),
+                        "Completed set should be reset for reconciliation"
+                    );
+
+                    // Only #3 should be in remaining() (not #2 which is skipped)
+                    let remaining: Vec<_> = progress.remaining().copied().collect();
+                    assert_eq!(
+                        remaining,
+                        vec![PrNumber(3)],
+                        "Only unskipped descendants should be in remaining(). \
+                         Got: {:?}",
+                        remaining
+                    );
+                }
+                other => panic!(
+                    "Expected Reconciling phase, got {:?}",
+                    std::mem::discriminant(other)
+                ),
+            }
         }
 
         // ─────────────────────────────────────────────────────────────────────────────
