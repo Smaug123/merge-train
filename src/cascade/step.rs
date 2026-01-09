@@ -224,7 +224,7 @@ fn execute_from_idle(
             .effects
             .push(Effect::GitHub(GitHubEffect::UpdateComment {
                 comment_id,
-                body: format_phase_comment(&result.train),
+                body: format_phase_comment(&result.train).expect("Status comment oversize - bug"),
             }));
     }
 
@@ -359,6 +359,11 @@ fn execute_preparing(
         }),
     ];
 
+    // Update train state to WaitingCi for consistency with how abort/stop work.
+    // This prevents callers from forgetting to update state and potentially
+    // re-running steps prematurely.
+    train.wait_for_ci();
+
     StepResult {
         train: train.clone(),
         outcome: CascadeStepOutcome::WaitingOnCi {
@@ -380,6 +385,9 @@ fn execute_squash_pending(
         pr: train.current_pr,
         expected_sha: current_pr.head_sha.clone(),
     })];
+
+    // Update train state to WaitingCi for consistency.
+    train.wait_for_ci();
 
     StepResult {
         train: train.clone(),
@@ -449,6 +457,9 @@ fn execute_reconciling(
             force: false,
         }),
     ];
+
+    // Update train state to WaitingCi for consistency.
+    train.wait_for_ci();
 
     StepResult {
         train: train.clone(),
@@ -531,6 +542,9 @@ fn execute_catching_up(
         }),
     ];
 
+    // Update train state to WaitingCi for consistency.
+    train.wait_for_ci();
+
     StepResult {
         train: train.clone(),
         outcome: CascadeStepOutcome::WaitingOnCi {
@@ -582,6 +596,9 @@ fn execute_retargeting(
         pr: next_descendant,
         new_base: ctx.default_branch.clone(),
     })];
+
+    // Update train state to WaitingCi for consistency.
+    train.wait_for_ci();
 
     StepResult {
         train: train.clone(),
@@ -698,7 +715,7 @@ fn handle_external_merge(
                 .map(|comment_id| {
                     Effect::GitHub(GitHubEffect::UpdateComment {
                         comment_id,
-                        body: format_phase_comment(train),
+                        body: format_phase_comment(train).expect("Status comment oversize - bug"),
                     })
                 })
                 .into_iter()
@@ -740,7 +757,7 @@ fn handle_external_merge(
         .map(|comment_id| {
             Effect::GitHub(GitHubEffect::UpdateComment {
                 comment_id,
-                body: format_phase_comment(train),
+                body: format_phase_comment(train).expect("Status comment oversize - bug"),
             })
         })
         .into_iter()
@@ -787,7 +804,7 @@ fn transition_to_squash_pending(
             .effects
             .push(Effect::GitHub(GitHubEffect::UpdateComment {
                 comment_id,
-                body: format_phase_comment(&result.train),
+                body: format_phase_comment(&result.train).expect("Status comment oversize - bug"),
             }));
     }
 
@@ -834,7 +851,7 @@ fn transition_to_catching_up(
             .effects
             .push(Effect::GitHub(GitHubEffect::UpdateComment {
                 comment_id,
-                body: format_phase_comment(&result.train),
+                body: format_phase_comment(&result.train).expect("Status comment oversize - bug"),
             }));
     }
 
@@ -881,7 +898,7 @@ fn transition_to_retargeting(
             .effects
             .push(Effect::GitHub(GitHubEffect::UpdateComment {
                 comment_id,
-                body: format_phase_comment(&result.train),
+                body: format_phase_comment(&result.train).expect("Status comment oversize - bug"),
             }));
     }
 
@@ -908,7 +925,7 @@ fn complete_cascade(train: &mut TrainRecord, progress: DescendantProgress) -> St
     let status_update_effect = train.status_comment_id.map(|comment_id| {
         Effect::GitHub(GitHubEffect::UpdateComment {
             comment_id,
-            body: format_phase_comment(train),
+            body: format_phase_comment(train).expect("Status comment oversize - bug"),
         })
     });
 
@@ -932,11 +949,14 @@ fn complete_cascade(train: &mut TrainRecord, progress: DescendantProgress) -> St
                 .map(|comment_id| {
                     Effect::GitHub(GitHubEffect::UpdateComment {
                         comment_id,
-                        body: format_phase_comment(train),
+                        body: format_phase_comment(train).expect("Status comment oversize - bug"),
                     })
                 })
                 .into_iter()
                 .collect();
+
+            // Update train state to WaitingCi for consistency.
+            train.wait_for_ci();
 
             StepResult {
                 train: train.clone(),
@@ -1068,7 +1088,20 @@ pub fn process_operation_result(
                 progress.mark_completed(pr);
             }
             train.increment_seq();
-            (train, None, vec![])
+
+            // CRITICAL: Emit RecordReconciliation effect so is_root() will recognize
+            // this descendant as a valid new root after the cascade completes.
+            // Without this, fan-out descendants cannot start new trains.
+            // DESIGN.md: "Record that reconciliation completed — CRITICAL for is_root()"
+            let effects = if let Some(squash_sha) = train.last_squash_sha.clone() {
+                vec![Effect::RecordReconciliation { pr, squash_sha }]
+            } else {
+                // This shouldn't happen in normal operation - retargeting only occurs
+                // after squash merge. Log for debugging if it does.
+                vec![]
+            };
+
+            (train, None, effects)
         }
         OperationResult::SquashMerged { pr, squash_sha } => {
             train.last_squash_sha = Some(squash_sha.clone());
@@ -1094,7 +1127,7 @@ pub fn process_operation_result(
             let effects = if let Some(comment_id) = train.status_comment_id {
                 vec![Effect::GitHub(GitHubEffect::UpdateComment {
                     comment_id,
-                    body: format_phase_comment(&train),
+                    body: format_phase_comment(&train).expect("Status comment oversize - bug"),
                 })]
             } else {
                 vec![]
@@ -2711,6 +2744,7 @@ mod tests {
 
         mod property_based_bug_detection {
             use super::*;
+            use crate::types::TrainState;
             use proptest::prelude::*;
 
             fn arb_sha() -> impl Strategy<Value = Sha> {
@@ -3242,6 +3276,193 @@ mod tests {
                         "compute_direct_descendants should find exactly 1 direct child"
                     );
                     prop_assert!(direct_desc.contains(&PrNumber(2)));
+                });
+            }
+
+            // ─────────────────────────────────────────────────────────────────────────────
+            // Tests for review comment fixes (WaitingOnCi state, RecordReconciliation)
+            // ─────────────────────────────────────────────────────────────────────────────
+
+            /// Review Comment #6 fix: WaitingOnCi outcomes MUST set train.state to WaitingCi.
+            ///
+            /// Property: Whenever execute_cascade_step returns CascadeStepOutcome::WaitingOnCi,
+            /// the returned train.state MUST be TrainState::WaitingCi.
+            #[test]
+            fn waiting_on_ci_outcome_sets_train_state() {
+                proptest!(|(
+                    descendants in arb_unique_descendants(1, 3),
+                    sha in arb_sha()
+                )| {
+                    // Create train in Preparing phase with multiple descendants
+                    let mut train = TrainRecord::new(PrNumber(1));
+                    train.status_comment_id = Some(CommentId(12345));
+                    train.predecessor_head_sha = Some(sha.clone());
+
+                    // Set up Preparing phase
+                    let progress = DescendantProgress::new(descendants.clone());
+                    train.cascade_phase = CascadePhase::Preparing { progress };
+
+                    // Build PR map with root open, descendants exist
+                    let pr1 = CachedPr::new(
+                        PrNumber(1),
+                        sha.clone(),
+                        "branch-1".to_string(),
+                        "main".to_string(),
+                        None,
+                        PrState::Open,
+                        MergeStateStatus::Clean,
+                        false,
+                    );
+                    let mut prs = HashMap::from([(PrNumber(1), pr1)]);
+
+                    // Add descendants as open PRs based on branch-1
+                    for &desc in &descendants {
+                        let desc_pr = CachedPr::new(
+                            desc,
+                            sha.clone(),
+                            format!("branch-{}", desc.0),
+                            "branch-1".to_string(),
+                            Some(PrNumber(1)),
+                            PrState::Open,
+                            MergeStateStatus::Clean,
+                            false,
+                        );
+                        prs.insert(desc, desc_pr);
+                    }
+
+                    let ctx = StepContext::new("main");
+                    let result = execute_cascade_step(train, &prs, &ctx);
+
+                    // If outcome is WaitingOnCi, train.state MUST be WaitingCi
+                    if matches!(result.outcome, CascadeStepOutcome::WaitingOnCi { .. }) {
+                        prop_assert!(
+                            matches!(result.train.state, TrainState::WaitingCi),
+                            "BUG (Review Comment #6): WaitingOnCi outcome returned but \
+                             train.state is {:?}, not WaitingCi. \
+                             Outcome: {:?}",
+                            result.train.state,
+                            result.outcome
+                        );
+                    }
+                });
+            }
+
+            /// Review Comment #2 fix: DescendantRetargeted MUST emit RecordReconciliation.
+            ///
+            /// Property: When processing OperationResult::DescendantRetargeted with
+            /// last_squash_sha set, the step MUST emit Effect::RecordReconciliation.
+            #[test]
+            fn descendant_retargeted_emits_record_reconciliation() {
+                proptest!(|(
+                    descendant_pr in arb_pr_number(),
+                    squash_sha in arb_sha(),
+                    head_sha in arb_sha()
+                )| {
+                    // Create train in Retargeting phase with a descendant to retarget
+                    let mut train = TrainRecord::new(PrNumber(1));
+                    train.status_comment_id = Some(CommentId(12345));
+                    train.last_squash_sha = Some(squash_sha.clone());
+
+                    // Set up Retargeting phase with descendant pending
+                    let progress = DescendantProgress::new(vec![descendant_pr]);
+                    train.cascade_phase = CascadePhase::Retargeting {
+                        progress,
+                        squash_sha: squash_sha.clone(),
+                    };
+
+                    // Build PR map
+                    let pr1 = CachedPr::new(
+                        PrNumber(1),
+                        head_sha.clone(),
+                        "branch-1".to_string(),
+                        "main".to_string(),
+                        None,
+                        PrState::Merged { merge_commit_sha: squash_sha.clone() },
+                        MergeStateStatus::Clean,
+                        false,
+                    );
+                    let desc_pr = CachedPr::new(
+                        descendant_pr,
+                        head_sha.clone(),
+                        format!("branch-{}", descendant_pr.0),
+                        "main".to_string(), // Already retargeted to main
+                        None,               // Predecessor cleared
+                        PrState::Open,
+                        MergeStateStatus::Clean,
+                        false,
+                    );
+                    let _prs = HashMap::from([(PrNumber(1), pr1), (descendant_pr, desc_pr)]);
+
+                    // Simulate retarget completion via operation result
+                    let op_result = OperationResult::DescendantRetargeted { pr: descendant_pr };
+                    let (updated_train, _, effects) =
+                        process_operation_result(train.clone(), op_result);
+
+                    // MUST emit RecordReconciliation for the retargeted descendant
+                    let has_record_reconciliation = effects.iter().any(|e| {
+                        match e {
+                            Effect::RecordReconciliation { pr, squash_sha: s } =>
+                                *pr == descendant_pr && *s == squash_sha,
+                            _ => false,
+                        }
+                    });
+
+                    prop_assert!(
+                        has_record_reconciliation,
+                        "BUG (Review Comment #2): DescendantRetargeted with last_squash_sha \
+                         MUST emit RecordReconciliation. \
+                         descendant_pr: {:?}, last_squash_sha: {:?}, effects: {:?}",
+                        descendant_pr,
+                        train.last_squash_sha,
+                        effects
+                    );
+
+                    // Verify the descendant is marked completed in progress
+                    if let CascadePhase::Retargeting { progress, .. } = &updated_train.cascade_phase {
+                        prop_assert!(
+                            progress.completed.contains(&descendant_pr),
+                            "Descendant should be marked completed after retarget"
+                        );
+                    }
+                });
+            }
+
+            /// Review Comment #2 (continued): No RecordReconciliation without last_squash_sha.
+            ///
+            /// Property: When last_squash_sha is None, DescendantRetargeted should NOT
+            /// emit RecordReconciliation (nothing to record).
+            #[test]
+            fn descendant_retargeted_no_effect_without_squash_sha() {
+                proptest!(|(
+                    descendant_pr in arb_pr_number(),
+                    head_sha in arb_sha()
+                )| {
+                    // Create train WITHOUT last_squash_sha set
+                    let mut train = TrainRecord::new(PrNumber(1));
+                    train.last_squash_sha = None; // Critical: no squash SHA
+
+                    // Set up Retargeting phase (squash_sha is in phase but last_squash_sha is None)
+                    let progress = DescendantProgress::new(vec![descendant_pr]);
+                    train.cascade_phase = CascadePhase::Retargeting {
+                        progress,
+                        squash_sha: head_sha.clone(), // Phase has it, but train.last_squash_sha doesn't
+                    };
+
+                    // Simulate retarget completion
+                    let op_result = OperationResult::DescendantRetargeted { pr: descendant_pr };
+                    let (_, _, effects) = process_operation_result(train, op_result);
+
+                    // Should NOT emit RecordReconciliation (no last_squash_sha on train)
+                    let has_record_reconciliation = effects.iter().any(|e| {
+                        matches!(e, Effect::RecordReconciliation { .. })
+                    });
+
+                    prop_assert!(
+                        !has_record_reconciliation,
+                        "DescendantRetargeted WITHOUT train.last_squash_sha should NOT emit \
+                         RecordReconciliation. Effects: {:?}",
+                        effects
+                    );
                 });
             }
         }

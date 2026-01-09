@@ -59,6 +59,17 @@ pub enum CascadeError {
     PreparationIncomplete {
         unprepared_descendants: Vec<PrNumber>,
     },
+
+    /// Status comment size limit exceeded after truncation.
+    ///
+    /// Per DESIGN.md: "If STILL too large after aggressive truncation, this indicates
+    /// a bug in the size estimation (the 50 PR limit with truncation should always fit).
+    /// The bot MUST NOT post a minimal comment without JSON, as this would silently
+    /// disable GitHub-based recovery."
+    #[error(
+        "Status comment size ({actual_size} bytes) exceeded {max_size} byte limit. This is a bug — please report it. Train aborted to prevent recovery data loss."
+    )]
+    StatusCommentOversize { actual_size: usize, max_size: usize },
 }
 
 /// Result of starting a train.
@@ -212,9 +223,20 @@ impl CascadeEngine {
             }
         }
 
-        // Check stack size
-        if stack.len() > MAX_TRAIN_SIZE {
-            return Err(CascadeError::TrainTooLarge(stack.len(), MAX_TRAIN_SIZE));
+        // Check stack size using ALL transitive descendants, not just linear stack.
+        // This correctly handles fan-out trees where a root may have many direct descendants.
+        // For example: main <- #1 <- {#2, #3, #4, ...} would have stack.len() = 1 but
+        // could have 50+ transitive descendants that all need processing.
+        let descendants_index = build_descendants_index(prs);
+        let all_descendants =
+            crate::state::descendants::collect_all_descendants(root_pr, &descendants_index, prs);
+        let total_train_size = all_descendants.len() + 1; // +1 for root PR
+
+        if total_train_size > MAX_TRAIN_SIZE {
+            return Err(CascadeError::TrainTooLarge(
+                total_train_size,
+                MAX_TRAIN_SIZE,
+            ));
         }
 
         // Create the train record
@@ -222,10 +244,16 @@ impl CascadeEngine {
 
         // Generate effects for starting the train
         let effects = vec![
+            // Create worktree for this stack.
+            // DESIGN.md: "Each stack has its own isolated worktree"
+            // The worktree name is keyed by original_root_pr for stability during retargeting.
+            Effect::Git(GitEffect::CreateWorktree {
+                name: format!("stack-{}", root_pr),
+            }),
             // Post initial status comment
             Effect::GitHub(GitHubEffect::PostComment {
                 pr: root_pr,
-                body: format_start_comment(&train, &stack),
+                body: format_start_comment(&train, &stack)?,
             }),
             // Add reaction to the start command (if we had the comment ID)
             // This would be handled by the webhook handler
@@ -280,7 +308,7 @@ impl CascadeEngine {
         if let Some(comment_id) = train.status_comment_id {
             effects.push(Effect::GitHub(GitHubEffect::UpdateComment {
                 comment_id,
-                body: format_stop_comment(&train),
+                body: format_stop_comment(&train)?,
             }));
         }
 
@@ -487,9 +515,12 @@ pub enum TrainAction {
 ///
 /// CRITICAL: Includes machine-readable JSON payload in HTML comment for
 /// GitHub-based recovery. See DESIGN.md "Status comments" section.
-fn format_start_comment(train: &TrainRecord, stack: &MergeStack) -> String {
+///
+/// Returns an error if the status comment would exceed size limits, which
+/// should cause the caller to abort the train.
+fn format_start_comment(train: &TrainRecord, stack: &MergeStack) -> Result<String, CascadeError> {
     // Serialize train state as JSON for recovery
-    let json_payload = format_train_json(train);
+    let json_payload = format_train_json(train)?;
 
     let mut lines = vec![
         format!("<!-- merge-train-state\n{}\n-->", json_payload),
@@ -514,18 +545,21 @@ fn format_start_comment(train: &TrainRecord, stack: &MergeStack) -> String {
     lines.push("---".to_string());
     lines.push("*Use `@merge-train stop` to cancel.*".to_string());
 
-    lines.join("\n")
+    Ok(lines.join("\n"))
 }
 
 /// Format the status comment when a train is stopped.
 ///
 /// CRITICAL: Includes machine-readable JSON payload in HTML comment for
 /// GitHub-based recovery. See DESIGN.md "Status comments" section.
-fn format_stop_comment(train: &TrainRecord) -> String {
+///
+/// Returns an error if the status comment would exceed size limits, which
+/// should cause the caller to abort the train.
+fn format_stop_comment(train: &TrainRecord) -> Result<String, CascadeError> {
     // Serialize train state as JSON for recovery
-    let json_payload = format_train_json(train);
+    let json_payload = format_train_json(train)?;
 
-    [
+    Ok([
         format!("<!-- merge-train-state\n{}\n-->", json_payload),
         "## Merge Train Status".to_string(),
         String::new(),
@@ -537,7 +571,7 @@ fn format_stop_comment(train: &TrainRecord) -> String {
         "---".to_string(),
         "*Use `@merge-train start` to restart.*".to_string(),
     ]
-    .join("\n")
+    .join("\n"))
 }
 
 /// Format the status comment for a phase update.
@@ -545,8 +579,11 @@ fn format_stop_comment(train: &TrainRecord) -> String {
 /// CRITICAL: Includes machine-readable JSON payload in HTML comment for
 /// GitHub-based recovery. This should be called when transitioning between
 /// phases to keep the recovery state in sync.
-pub fn format_phase_comment(train: &TrainRecord) -> String {
-    let json_payload = format_train_json(train);
+///
+/// Returns an error if the status comment would exceed size limits. Per DESIGN.md,
+/// callers MUST abort the train in this case to prevent recovery data loss.
+pub fn format_phase_comment(train: &TrainRecord) -> Result<String, CascadeError> {
+    let json_payload = format_train_json(train)?;
 
     let phase_name = match &train.cascade_phase {
         CascadePhase::Idle => "Idle",
@@ -566,7 +603,7 @@ pub fn format_phase_comment(train: &TrainRecord) -> String {
             format!(" ({}/{} descendants)", completed, total)
         });
 
-    [
+    Ok([
         format!("<!-- merge-train-state\n{}\n-->", json_payload),
         "## Merge Train Status".to_string(),
         String::new(),
@@ -577,7 +614,7 @@ pub fn format_phase_comment(train: &TrainRecord) -> String {
         "---".to_string(),
         "*Use `@merge-train stop` to stop the train.*".to_string(),
     ]
-    .join("\n")
+    .join("\n"))
 }
 
 /// Format train record as JSON for status comment recovery payload.
@@ -616,7 +653,7 @@ fn truncate_string(s: &str, max_len: usize) -> String {
     }
 }
 
-fn format_train_json(train: &TrainRecord) -> String {
+fn format_train_json(train: &TrainRecord) -> Result<String, CascadeError> {
     // Create a copy with truncated error fields to avoid exceeding size limits
     let mut train_copy = train.clone();
 
@@ -639,29 +676,26 @@ fn format_train_json(train: &TrainRecord) -> String {
         format!("{{\"error\": \"serialization failed: {}\"}}", e)
     });
 
-    // Enforce size limit (60KB per DESIGN.md) in release builds, not just debug.
-    // If exceeded, return a minimal error payload rather than potentially causing
-    // GitHub API failures or corrupted recovery data.
+    // Enforce size limit (60KB per DESIGN.md) in release builds.
+    // Per DESIGN.md: "If STILL too large after aggressive truncation, this indicates
+    // a bug in the size estimation. The bot MUST NOT post a minimal comment without
+    // JSON, as this would silently disable GitHub-based recovery."
     if json.len() >= MAX_STATUS_COMMENT_SIZE {
         // Log the issue (eprintln for now; in production this would use tracing)
         eprintln!(
-            "WARN: Status comment JSON ({} bytes) exceeds 60KB limit. \
-             Returning minimal error payload.",
-            json.len()
+            "ERROR: Status comment JSON ({} bytes) exceeds {} byte limit. \
+             Aborting train to prevent recovery data loss.",
+            json.len(),
+            MAX_STATUS_COMMENT_SIZE
         );
 
-        // Return a minimal valid JSON that indicates the problem
-        return format!(
-            r#"{{"version":{},"recovery_seq":{},"state":"needs_manual_review","original_root_pr":{},"current_pr":{},"error":{{"error_type":"status_comment_too_large","message":"Status comment exceeded 60KB limit ({}). Recovery data truncated."}}}}"#,
-            train.version,
-            train.recovery_seq,
-            train.original_root_pr.0,
-            train.current_pr.0,
-            json.len()
-        );
+        return Err(CascadeError::StatusCommentOversize {
+            actual_size: json.len(),
+            max_size: MAX_STATUS_COMMENT_SIZE,
+        });
     }
 
-    json
+    Ok(json)
 }
 
 #[cfg(test)]
@@ -1246,7 +1280,7 @@ mod tests {
             };
 
             // Generate the status comment JSON
-            let json = format_train_json(&train);
+            let json = format_train_json(&train).expect("Should not overflow with moderate input");
 
             // status_comment_id should be omitted from JSON (it's local-only)
             assert!(
@@ -1287,7 +1321,7 @@ mod tests {
                     .with_stderr(long_stderr.clone()),
             );
 
-            let json = format_train_json(&train);
+            let json = format_train_json(&train).expect("Should not overflow with moderate input");
 
             // Check that message was truncated (should not contain full 10KB string)
             assert!(
@@ -1413,25 +1447,35 @@ mod tests {
                         train.abort(error);
                     }
 
-                    let json = format_train_json(&train);
+                    // format_train_json now returns Result - it should either succeed
+                    // with a reasonably-sized JSON, or error if oversize.
+                    match format_train_json(&train) {
+                        Ok(json) => {
+                            // If it succeeds, MUST be under 60KB
+                            prop_assert!(
+                                json.len() < 60 * 1024,
+                                "BUG: format_train_json returned {} bytes, exceeding 60KB limit",
+                                json.len()
+                            );
 
-                    // MUST be under 60KB - this is a hard requirement, not just debug
-                    prop_assert!(
-                        json.len() < 60 * 1024,
-                        "BUG: format_train_json returned {} bytes, exceeding 60KB limit. \
-                         This would fail in release builds!",
-                        json.len()
-                    );
-
-                    // Must be valid JSON
-                    prop_assert!(
-                        serde_json::from_str::<serde_json::Value>(&json).is_ok(),
-                        "format_train_json must return valid JSON"
-                    );
+                            // Must be valid JSON
+                            prop_assert!(
+                                serde_json::from_str::<serde_json::Value>(&json).is_ok(),
+                                "format_train_json must return valid JSON"
+                            );
+                        }
+                        Err(CascadeError::StatusCommentOversize { .. }) => {
+                            // Expected for extreme inputs - this is correct behavior per DESIGN.md
+                        }
+                        Err(e) => {
+                            prop_assert!(false, "Unexpected error: {:?}", e);
+                        }
+                    }
                 });
             }
 
-            /// BUG #4 (extreme case): Even with max-size input, should not exceed limit.
+            /// BUG #4 (extreme case): Even with max-size input, should either succeed
+            /// under 60KB OR return StatusCommentOversize error.
             #[test]
             fn format_train_json_handles_extreme_input() {
                 let mut train = TrainRecord::new(PrNumber(1));
@@ -1447,20 +1491,33 @@ mod tests {
                 let huge_stderr = "Y".repeat(50_000); // 50KB stderr
                 train.abort(TrainError::new("huge_error", huge_msg).with_stderr(huge_stderr));
 
-                let json = format_train_json(&train);
+                match format_train_json(&train) {
+                    Ok(json) => {
+                        // If it succeeds, must stay under 60KB
+                        assert!(
+                            json.len() < 60 * 1024,
+                            "BUG: Extreme input produced {} byte JSON, exceeding 60KB limit",
+                            json.len()
+                        );
 
-                // Even with extreme input, must stay under 60KB
-                assert!(
-                    json.len() < 60 * 1024,
-                    "BUG: Extreme input produced {} byte JSON, exceeding 60KB limit",
-                    json.len()
-                );
-
-                // Must still be valid JSON
-                assert!(
-                    serde_json::from_str::<serde_json::Value>(&json).is_ok(),
-                    "Extreme input must still produce valid JSON"
-                );
+                        // Must still be valid JSON
+                        assert!(
+                            serde_json::from_str::<serde_json::Value>(&json).is_ok(),
+                            "Extreme input must still produce valid JSON"
+                        );
+                    }
+                    Err(CascadeError::StatusCommentOversize {
+                        actual_size,
+                        max_size,
+                    }) => {
+                        // Expected for extreme inputs - verify the error is sensible
+                        assert!(
+                            actual_size > max_size,
+                            "Oversize error should report actual > max"
+                        );
+                    }
+                    Err(e) => panic!("Unexpected error: {:?}", e),
+                }
             }
         }
     }

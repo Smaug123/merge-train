@@ -22,6 +22,8 @@ pub use github::{
 };
 pub use interpreter::{GitHubInterpreter, GitInterpreter};
 
+use crate::types::{PrNumber, Sha};
+
 /// A unified effect type encompassing both Git and GitHub operations.
 ///
 /// This is the primary effect type returned by cascade operations.
@@ -32,4 +34,17 @@ pub enum Effect {
     Git(GitEffect),
     /// A GitHub API operation.
     GitHub(GitHubEffect),
+    /// Record that a PR has been reconciled with its predecessor's squash commit.
+    ///
+    /// This updates `predecessor_squash_reconciled` on the PR, which is CRITICAL
+    /// for `is_root()` to recognize retargeted descendants as valid new roots.
+    /// Without this, fan-out descendants cannot start new trains after cascade.
+    ///
+    /// DESIGN.md: "Record that reconciliation completed — CRITICAL for is_root() to return true"
+    RecordReconciliation {
+        /// The PR that was reconciled.
+        pr: PrNumber,
+        /// The squash commit SHA that was reconciled into this PR's branch.
+        squash_sha: Sha,
+    },
 }

@@ -135,6 +135,75 @@ pub fn compute_recovery_plan(
         }
 
         CascadePhase::Preparing { progress } => {
+            // CRITICAL: Check if the current PR was merged externally during the crash.
+            // If so, we need to handle it like handle_external_merge does in step.rs.
+            if let Some(current_pr) = prs.get(&train.current_pr) {
+                if let PrState::Merged { merge_commit_sha } = &current_pr.state {
+                    // PR was merged externally while in Preparing phase.
+                    // Check if all descendants were prepared before the merge.
+                    let remaining: Vec<_> = progress.remaining().collect();
+
+                    if !remaining.is_empty() {
+                        // ABORT: Unprepared descendants exist. Reconciling them now would
+                        // skip preparation, potentially losing predecessor content.
+                        // This matches the behavior in handle_external_merge.
+                        actions.push(RecoveryAction::NeedsManualReview {
+                            reason: format!(
+                                "PR #{} was merged externally while {} descendants were still unprepared. \
+                                 Reconciling now would skip preparation and risk data loss. \
+                                 Manual intervention required.",
+                                train.current_pr,
+                                remaining.len()
+                            ),
+                        });
+                        return RecoveryPlan {
+                            train: plan_train,
+                            actions,
+                            effects,
+                        };
+                    }
+
+                    // All descendants are prepared. Transition to Reconciling with reset progress.
+                    // The "completed" set tracked preparation, not reconciliation - reset it.
+                    let mut reset_progress =
+                        DescendantProgress::new(progress.frozen_descendants.clone());
+                    // Preserve skipped set (closed PRs should stay skipped)
+                    reset_progress.skipped = progress.skipped.clone();
+
+                    plan_train.cascade_phase = CascadePhase::Reconciling {
+                        progress: reset_progress,
+                        squash_sha: merge_commit_sha.clone(),
+                    };
+                    plan_train.last_squash_sha = Some(merge_commit_sha.clone());
+                    plan_train.increment_seq();
+
+                    // Add squash validation effect - must run first
+                    effects.push(Effect::Git(GitEffect::ValidateSquashCommit {
+                        squash_sha: merge_commit_sha.clone(),
+                        default_branch: default_branch.to_string(),
+                    }));
+
+                    // Add status comment update for GitHub-based recovery.
+                    // Use expect() here because per DESIGN.md, oversize should never happen
+                    // with proper size limits. If it does, it's a bug that needs immediate attention.
+                    if let Some(comment_id) = plan_train.status_comment_id {
+                        effects.push(Effect::GitHub(GitHubEffect::UpdateComment {
+                            comment_id,
+                            body: format_phase_comment(&plan_train)
+                                .expect("Status comment oversize during recovery - this is a bug"),
+                        }));
+                    }
+
+                    actions.push(RecoveryAction::ResumeClean);
+                    return RecoveryPlan {
+                        train: plan_train,
+                        actions,
+                        effects,
+                    };
+                }
+            }
+
+            // Normal case: PR not merged, continue with preparation recovery.
             // CRITICAL: Use frozen_descendants, not current descendants
             recover_multi_descendant_phase(&mut actions, &mut effects, progress, prs, |desc_pr| {
                 if let Some(pred_sha) = &train.predecessor_head_sha {
@@ -176,10 +245,14 @@ pub fn compute_recovery_plan(
 
                         // Add status comment update for GitHub-based recovery.
                         // This ensures a second crash can see the Reconciling phase and squash SHA.
+                        // Use expect() here because per DESIGN.md, oversize should never happen
+                        // with proper size limits. If it does, it's a bug that needs immediate attention.
                         if let Some(comment_id) = plan_train.status_comment_id {
                             effects.push(Effect::GitHub(GitHubEffect::UpdateComment {
                                 comment_id,
-                                body: format_phase_comment(&plan_train),
+                                body: format_phase_comment(&plan_train).expect(
+                                    "Status comment oversize during recovery - this is a bug",
+                                ),
                             }));
                         }
 
@@ -1115,6 +1188,119 @@ mod tests {
                     "BUG: Recovery should emit ValidateSquashCommit effect. Effects: {:?}",
                     plan.effects
                 );
+            }
+
+            /// Review Comment #1 fix: Recovery from Preparing with externally merged PR
+            /// must abort if descendants are unprepared.
+            ///
+            /// Property: When train is in Preparing phase and root PR was merged externally
+            /// with unprepared descendants remaining, recovery MUST produce NeedsManualReview.
+            #[test]
+            fn recovery_preparing_external_merge_with_unprepared_descendants_aborts(
+                frozen_descendants in arb_unique_descendants(1, 3),
+                merge_sha in arb_sha(),
+                pr_sha in arb_sha()
+            ) {
+                // Create train in Preparing phase with unprepared descendants
+                let mut train = TrainRecord::new(PrNumber(1));
+                // No descendants marked completed - they're all unprepared
+                let progress = DescendantProgress::new(frozen_descendants.clone());
+                train.cascade_phase = CascadePhase::Preparing { progress };
+                train.predecessor_head_sha = Some(pr_sha.clone());
+
+                // Root PR was merged externally while in Preparing
+                let mut prs = HashMap::new();
+                let mut root_pr = make_open_pr_for_test(1, "main", None, pr_sha.clone());
+                root_pr.state = PrState::Merged { merge_commit_sha: merge_sha.clone() };
+                prs.insert(PrNumber(1), root_pr);
+
+                for &desc in &frozen_descendants {
+                    let pr = make_open_pr_for_test(desc.0, "branch-1", Some(PrNumber(1)), pr_sha.clone());
+                    prs.insert(desc, pr);
+                }
+
+                let plan = compute_recovery_plan(&train, &prs, &[], "main");
+
+                // MUST produce NeedsManualReview action
+                let has_manual_review = plan.actions.iter().any(|a| {
+                    matches!(a, RecoveryAction::NeedsManualReview { .. })
+                });
+                prop_assert!(
+                    has_manual_review,
+                    "BUG (Review Comment #1): Recovery from Preparing with externally merged PR \
+                     and unprepared descendants MUST abort with NeedsManualReview. \
+                     Unprepared: {:?}, Actions: {:?}",
+                    frozen_descendants,
+                    plan.actions
+                );
+            }
+
+            /// Review Comment #1 fix (continued): Recovery from Preparing with ALL descendants
+            /// prepared should transition to Reconciling (not abort).
+            ///
+            /// Property: When all descendants are prepared, external merge in Preparing should
+            /// successfully transition to Reconciling with reset progress.
+            #[test]
+            fn recovery_preparing_external_merge_all_prepared_transitions(
+                frozen_descendants in arb_unique_descendants(1, 3),
+                merge_sha in arb_sha(),
+                pr_sha in arb_sha()
+            ) {
+                // Create train in Preparing phase with ALL descendants prepared
+                let mut train = TrainRecord::new(PrNumber(1));
+                let mut progress = DescendantProgress::new(frozen_descendants.clone());
+                for &desc in &frozen_descendants {
+                    progress.mark_completed(desc);
+                }
+                train.cascade_phase = CascadePhase::Preparing { progress };
+                train.predecessor_head_sha = Some(pr_sha.clone());
+
+                // Root PR was merged externally
+                let mut prs = HashMap::new();
+                let mut root_pr = make_open_pr_for_test(1, "main", None, pr_sha.clone());
+                root_pr.state = PrState::Merged { merge_commit_sha: merge_sha.clone() };
+                prs.insert(PrNumber(1), root_pr);
+
+                for &desc in &frozen_descendants {
+                    let pr = make_open_pr_for_test(desc.0, "branch-1", Some(PrNumber(1)), pr_sha.clone());
+                    prs.insert(desc, pr);
+                }
+
+                let plan = compute_recovery_plan(&train, &prs, &[], "main");
+
+                // Should NOT have NeedsManualReview (all were prepared)
+                let has_manual_review = plan.actions.iter().any(|a| {
+                    matches!(a, RecoveryAction::NeedsManualReview { .. })
+                });
+                prop_assert!(
+                    !has_manual_review,
+                    "Recovery from Preparing with all descendants prepared should NOT abort. \
+                     Actions: {:?}",
+                    plan.actions
+                );
+
+                // Should transition to Reconciling
+                prop_assert!(
+                    matches!(&plan.train.cascade_phase, CascadePhase::Reconciling { squash_sha, .. }
+                        if *squash_sha == merge_sha),
+                    "Recovery should transition to Reconciling. Got: {:?}",
+                    plan.train.cascade_phase
+                );
+
+                // CRITICAL: The completed set should be RESET (prepared != reconciled)
+                if let CascadePhase::Reconciling { progress, .. } = &plan.train.cascade_phase {
+                    prop_assert!(
+                        progress.completed.is_empty(),
+                        "BUG: completed set should be reset on transition to Reconciling. \
+                         Completed: {:?}. These were PREPARED, not RECONCILED.",
+                        progress.completed
+                    );
+                    prop_assert_eq!(
+                        progress.remaining().count(),
+                        frozen_descendants.len(),
+                        "All descendants should need reconciliation"
+                    );
+                }
             }
         }
     }
