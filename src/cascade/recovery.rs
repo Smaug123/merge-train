@@ -355,21 +355,21 @@ pub fn compute_recovery_plan(
                         // Same guard as execute_squash_pending in step.rs:416-439.
                         // If someone pushed new commits after preparation, those commits
                         // would be squashed without proper preparation of descendants.
-                        if let Some(recorded_sha) = &train.predecessor_head_sha {
-                            if current_pr.head_sha != *recorded_sha {
-                                actions.push(RecoveryAction::NeedsManualReview {
-                                    reason: format!(
-                                        "PR head changed since preparation: {} -> {}. \
+                        if let Some(recorded_sha) = &train.predecessor_head_sha
+                            && current_pr.head_sha != *recorded_sha
+                        {
+                            actions.push(RecoveryAction::NeedsManualReview {
+                                reason: format!(
+                                    "PR head changed since preparation: {} -> {}. \
                                          New commits were not prepared into descendants.",
-                                        recorded_sha, current_pr.head_sha
-                                    ),
-                                });
-                                return RecoveryPlan {
-                                    train: plan_train,
-                                    actions,
-                                    effects,
-                                };
-                            }
+                                    recorded_sha, current_pr.head_sha
+                                ),
+                            });
+                            return RecoveryPlan {
+                                train: plan_train,
+                                actions,
+                                effects,
+                            };
                         }
 
                         // Use recorded predecessor_head_sha for expected_sha, falling back to

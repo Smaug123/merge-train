@@ -1594,26 +1594,26 @@ mod tests {
                     Effect::Git(GitEffect::Push { refspec, .. }) => {
                         // Extract the branch name to determine which descendant was pushed
                         // refspec is like "HEAD:refs/heads/branch-N"
-                        if let Some(branch) = refspec.strip_prefix("HEAD:refs/heads/branch-") {
-                            if let Ok(n) = branch.parse::<u64>() {
-                                let pr = PrNumber(n);
-                                // Determine the operation based on current phase
-                                return match &train.cascade_phase {
-                                    CascadePhase::Preparing { .. } => {
-                                        Some(OperationResult::DescendantPrepared { pr })
-                                    }
-                                    CascadePhase::Reconciling { .. } => {
-                                        Some(OperationResult::DescendantReconciled {
-                                            pr,
-                                            squash_sha: squash_sha.clone(),
-                                        })
-                                    }
-                                    CascadePhase::CatchingUp { .. } => {
-                                        Some(OperationResult::DescendantCaughtUp { pr })
-                                    }
-                                    _ => None,
-                                };
-                            }
+                        if let Some(branch) = refspec.strip_prefix("HEAD:refs/heads/branch-")
+                            && let Ok(n) = branch.parse::<u64>()
+                        {
+                            let pr = PrNumber(n);
+                            // Determine the operation based on current phase
+                            return match &train.cascade_phase {
+                                CascadePhase::Preparing { .. } => {
+                                    Some(OperationResult::DescendantPrepared { pr })
+                                }
+                                CascadePhase::Reconciling { .. } => {
+                                    Some(OperationResult::DescendantReconciled {
+                                        pr,
+                                        squash_sha: squash_sha.clone(),
+                                    })
+                                }
+                                CascadePhase::CatchingUp { .. } => {
+                                    Some(OperationResult::DescendantCaughtUp { pr })
+                                }
+                                _ => None,
+                            };
                         }
                     }
                     Effect::GitHub(GitHubEffect::SquashMerge { pr, .. }) => {
@@ -1693,12 +1693,11 @@ mod tests {
                     }
 
                     // Simulate effect execution to drive the cascade forward
-                    if !result.effects.is_empty() {
-                        if let Some(op_result) = simulate_effect_execution(&train, &result.effects, &sha) {
+                    if !result.effects.is_empty()
+                        && let Some(op_result) = simulate_effect_execution(&train, &result.effects, &sha) {
                             let (updated_train, _, _effects) = process_operation_result(train, op_result);
                             train = updated_train;
                         }
-                    }
                 }
 
                 // Verify the phase sequence follows the correct order
@@ -1819,7 +1818,7 @@ mod tests {
                         CascadePhase::CatchingUp { .. } => "catching_up",
                         CascadePhase::Retargeting { .. } => "retargeting",
                     };
-                    if phase_sequence.last().map_or(true, |last| last != phase_name) {
+                    if phase_sequence.last().is_none_or(|last| last != phase_name) {
                         phase_sequence.push(phase_name.to_string());
                     }
 
@@ -1828,11 +1827,10 @@ mod tests {
                         match effect {
                             Effect::Git(GitEffect::Push { refspec, .. }) => {
                                 // refspec is like "HEAD:refs/heads/branch-N"
-                                if let Some(branch) = refspec.strip_prefix("HEAD:refs/heads/branch-") {
-                                    if let Ok(n) = branch.parse::<u64>() {
+                                if let Some(branch) = refspec.strip_prefix("HEAD:refs/heads/branch-")
+                                    && let Ok(n) = branch.parse::<u64>() {
                                         processed_prs.insert(PrNumber(n));
                                     }
-                                }
                             }
                             Effect::GitHub(GitHubEffect::RetargetPr { pr, .. }) => {
                                 processed_prs.insert(*pr);
@@ -1850,12 +1848,11 @@ mod tests {
                     }
 
                     // Simulate effect execution to drive the cascade forward
-                    if !result.effects.is_empty() {
-                        if let Some(op_result) = simulate_effect_execution(&train, &result.effects, &sha) {
+                    if !result.effects.is_empty()
+                        && let Some(op_result) = simulate_effect_execution(&train, &result.effects, &sha) {
                             let (updated_train, _, _effects) = process_operation_result(train, op_result);
                             train = updated_train;
                         }
-                    }
                 }
 
                 // Verify cascade actually ran through phases (not just first-step)
@@ -2330,12 +2327,11 @@ mod tests {
                     }
 
                     // Simulate effect execution
-                    if !result.effects.is_empty() {
-                        if let Some(op_result) = simulate_effect_execution(&train, &result.effects, &sha) {
+                    if !result.effects.is_empty()
+                        && let Some(op_result) = simulate_effect_execution(&train, &result.effects, &sha) {
                             let (updated_train, _, _effects) = process_operation_result(train, op_result);
                             train = updated_train;
                         }
-                    }
                 }
 
                 // Fan-out MUST occur for this topology (multiple direct descendants of root).
@@ -2430,7 +2426,7 @@ mod tests {
                 let root_pr = make_pr_with_predecessor(1, sha.clone(), "main", None);
                 prs.insert(PrNumber(1), root_pr);
 
-                let descendants_vec: Vec<PrNumber> = descendants.iter().copied().collect();
+                let descendants_vec: Vec<PrNumber> = descendants.to_vec();
                 for (i, &pr_num) in descendants_vec.iter().enumerate() {
                     let predecessor = if i == 0 {
                         PrNumber(1)
@@ -2465,13 +2461,11 @@ mod tests {
 
                     // Track processed PRs from effects
                     for effect in &result.effects {
-                        if let Effect::Git(GitEffect::Push { refspec, .. }) = effect {
-                            if let Some(branch) = refspec.strip_prefix("HEAD:refs/heads/branch-") {
-                                if let Ok(n) = branch.parse::<u64>() {
+                        if let Effect::Git(GitEffect::Push { refspec, .. }) = effect
+                            && let Some(branch) = refspec.strip_prefix("HEAD:refs/heads/branch-")
+                                && let Ok(n) = branch.parse::<u64>() {
                                     processed_prs.insert(PrNumber(n));
                                 }
-                            }
-                        }
                         if let Effect::GitHub(GitHubEffect::RetargetPr { pr, .. }) = effect {
                             processed_prs.insert(*pr);
                         }
@@ -2500,12 +2494,11 @@ mod tests {
                     }
 
                     // Simulate effect execution
-                    if !result.effects.is_empty() {
-                        if let Some(op_result) = simulate_effect_execution(&train, &result.effects, &sha) {
+                    if !result.effects.is_empty()
+                        && let Some(op_result) = simulate_effect_execution(&train, &result.effects, &sha) {
                             let (updated_train, _, _effects) = process_operation_result(train, op_result);
                             train = updated_train;
                         }
-                    }
                 }
 
                 // Verify completion
@@ -2565,7 +2558,7 @@ mod tests {
                 let root_pr = make_pr_with_predecessor(1, sha.clone(), "main", None);
                 prs.insert(PrNumber(1), root_pr);
 
-                let descendants_vec: Vec<PrNumber> = descendants.iter().copied().collect();
+                let descendants_vec: Vec<PrNumber> = descendants.to_vec();
                 for (i, &pr_num) in descendants_vec.iter().enumerate() {
                     let predecessor = if i == 0 {
                         PrNumber(1)

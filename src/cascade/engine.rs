@@ -1115,7 +1115,7 @@ mod tests {
                 let mut seen_prs: std::collections::HashSet<PrNumber> = std::collections::HashSet::new();
                 let mut duplicates: Vec<PrNumber> = Vec::new();
 
-                for (_, train) in &active_trains {
+                for train in active_trains.values() {
                     // Check current_pr
                     if seen_prs.contains(&train.current_pr) {
                         duplicates.push(train.current_pr);
