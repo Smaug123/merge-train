@@ -291,22 +291,18 @@ impl EventLog {
             let line = match std::str::from_utf8(&line_bytes) {
                 Ok(s) => s,
                 Err(_) => {
-                    // Invalid UTF-8 - treat as corruption, truncate at line start
-                    last_valid_pos = line_start;
+                    // Invalid UTF-8 - treat as corruption. Don't update last_valid_pos;
+                    // truncate at the last known good position (end of last valid event).
                     break;
                 }
             };
 
-            // Skip empty lines that end with newline.
-            // A whitespace-only "line" without trailing newline (e.g., lone \r at EOF)
-            // is garbage and should be truncated, not accepted.
+            // Skip empty/whitespace-only lines without advancing last_valid_pos.
+            // This ensures trailing whitespace (garbage from crash) gets truncated.
+            // Empty lines in the middle of valid events are preserved since we only
+            // truncate from last_valid_pos to EOF.
             let trimmed = line.trim();
             if trimmed.is_empty() {
-                if has_newline {
-                    last_valid_pos = current_pos;
-                    last_line_had_newline = true;
-                }
-                // else: whitespace without newline is garbage, don't advance last_valid_pos
                 continue;
             }
 
@@ -340,10 +336,9 @@ impl EventLog {
                     last_line_had_newline = has_newline;
                 }
                 Err(_) => {
-                    // Invalid JSON - this is the partial line from a crash
-                    // Don't update last_valid_pos, and stop reading
-                    // We'll truncate at line_start
-                    last_valid_pos = line_start;
+                    // Invalid JSON - this is the partial line from a crash.
+                    // Don't update last_valid_pos - truncate at the last known
+                    // good position (end of last valid event).
                     break;
                 }
             }
