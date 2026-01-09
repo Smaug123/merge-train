@@ -189,6 +189,17 @@ pub fn compute_recovery_plan(
                 // Preserve skipped set (closed PRs should stay skipped)
                 reset_progress.skipped = progress.skipped.clone();
 
+                // Per DESIGN.md: Any transition TO Reconciling must verify preparation.
+                // Collect remaining open descendants for verification BEFORE moving reset_progress.
+                let remaining_descendants: Vec<_> = reset_progress
+                    .remaining()
+                    .filter_map(|pr_num| {
+                        prs.get(pr_num)
+                            .filter(|p| p.state.is_open())
+                            .map(|p| (*pr_num, p.head_sha.clone()))
+                    })
+                    .collect();
+
                 plan_train.cascade_phase = CascadePhase::Reconciling {
                     progress: reset_progress,
                     squash_sha: merge_commit_sha.clone(),
@@ -227,6 +238,14 @@ pub fn compute_recovery_plan(
                             };
                         }
                     }
+                }
+
+                if !remaining_descendants.is_empty() {
+                    actions.push(RecoveryAction::VerifyPrepared {
+                        predecessor_head_sha: train.predecessor_head_sha.clone(),
+                        predecessor_pr: train.predecessor_pr,
+                        descendants: remaining_descendants,
+                    });
                 }
 
                 actions.push(RecoveryAction::ResumeClean);
@@ -269,6 +288,17 @@ pub fn compute_recovery_plan(
                             DescendantProgress::new(progress.frozen_descendants.clone());
                         reset_progress.skipped = progress.skipped.clone();
 
+                        // Per DESIGN.md: Any transition TO Reconciling must verify preparation.
+                        // Collect remaining open descendants for verification BEFORE moving reset_progress.
+                        let remaining_descendants: Vec<_> = reset_progress
+                            .remaining()
+                            .filter_map(|pr_num| {
+                                prs.get(pr_num)
+                                    .filter(|p| p.state.is_open())
+                                    .map(|p| (*pr_num, p.head_sha.clone()))
+                            })
+                            .collect();
+
                         plan_train.cascade_phase = CascadePhase::Reconciling {
                             progress: reset_progress,
                             squash_sha: merge_commit_sha.clone(),
@@ -308,6 +338,14 @@ pub fn compute_recovery_plan(
                                     };
                                 }
                             }
+                        }
+
+                        if !remaining_descendants.is_empty() {
+                            actions.push(RecoveryAction::VerifyPrepared {
+                                predecessor_head_sha: train.predecessor_head_sha.clone(),
+                                predecessor_pr: train.predecessor_pr,
+                                descendants: remaining_descendants,
+                            });
                         }
 
                         actions.push(RecoveryAction::ResumeClean);
@@ -1465,6 +1503,18 @@ mod tests {
                     "BUG: Recovery should emit ValidateSquashCommit effect. Effects: {:?}",
                     plan.effects
                 );
+
+                // MUST have VerifyPrepared action for remaining descendants
+                // Per DESIGN.md: Any transition TO Reconciling must verify preparation
+                let has_verify_prepared = plan.actions.iter().any(|a| {
+                    matches!(a, RecoveryAction::VerifyPrepared { .. })
+                });
+                prop_assert!(
+                    has_verify_prepared,
+                    "BUG: Recovery transitioning to Reconciling MUST emit VerifyPrepared action. \
+                     Actions: {:?}",
+                    plan.actions
+                );
             }
 
             /// Review Comment #1 fix: Recovery from Preparing with externally merged PR
@@ -1578,6 +1628,18 @@ mod tests {
                         "All descendants should need reconciliation"
                     );
                 }
+
+                // MUST have VerifyPrepared action for remaining descendants
+                // Per DESIGN.md: Any transition TO Reconciling must verify preparation
+                let has_verify_prepared = plan.actions.iter().any(|a| {
+                    matches!(a, RecoveryAction::VerifyPrepared { .. })
+                });
+                prop_assert!(
+                    has_verify_prepared,
+                    "BUG: Recovery transitioning to Reconciling MUST emit VerifyPrepared action. \
+                     Actions: {:?}",
+                    plan.actions
+                );
             }
 
             // ─── Reconciling Verification Tests ─────────────────────────────────────────

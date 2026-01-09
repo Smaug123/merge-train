@@ -70,6 +70,14 @@ pub enum CascadeError {
         "Status comment size ({actual_size} bytes) exceeded {max_size} byte limit. This is a bug — please report it. Train aborted to prevent recovery data loss."
     )]
     StatusCommentOversize { actual_size: usize, max_size: usize },
+
+    /// Failed to serialize train record to JSON.
+    ///
+    /// This should never happen for a valid TrainRecord, but if it does,
+    /// we propagate the error rather than producing invalid JSON that would
+    /// break GitHub-based recovery.
+    #[error("Failed to serialize train record: {0}")]
+    SerializationFailed(String),
 }
 
 /// Result of starting a train.
@@ -712,10 +720,8 @@ fn format_train_json(train: &TrainRecord) -> Result<String, CascadeError> {
     train_copy.status_comment_id = None;
 
     // Use compact serialization (not pretty) to save space
-    let json = serde_json::to_string(&train_copy).unwrap_or_else(|e| {
-        // This should never fail for a valid TrainRecord, but handle it gracefully
-        format!("{{\"error\": \"serialization failed: {}\"}}", e)
-    });
+    let json = serde_json::to_string(&train_copy)
+        .map_err(|e| CascadeError::SerializationFailed(e.to_string()))?;
 
     // Enforce size limit (60KB per DESIGN.md) in release builds.
     // Per DESIGN.md: "If STILL too large after aggressive truncation, this indicates
