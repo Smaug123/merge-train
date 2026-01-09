@@ -373,6 +373,24 @@ impl CascadeEngine {
             };
         }
 
+        // During Reconciling/CatchingUp/Retargeting phases, the descendant's base branch
+        // no longer exists (deleted after predecessor's squash-merge). GitHub's
+        // mergeStateStatus is unreliable in this state (may report BEHIND, BLOCKED,
+        // or UNKNOWN). We ignore it and proceed - actual conflicts will be detected
+        // when we attempt the git operations.
+        //
+        // Per DESIGN.md: "Ignore mergeStateStatus entirely during these phases —
+        // it's meaningless when the base branch doesn't exist"
+        let ignore_merge_status = matches!(
+            train.cascade_phase,
+            CascadePhase::Reconciling { .. }
+                | CascadePhase::CatchingUp { .. }
+                | CascadePhase::Retargeting { .. }
+        );
+        if ignore_merge_status {
+            return TrainAction::Proceed;
+        }
+
         // Evaluate merge state status
         match current_pr.merge_state_status {
             MergeStateStatus::Clean | MergeStateStatus::Unstable => {

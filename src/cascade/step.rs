@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use crate::cascade::engine::{MAX_TRAIN_SIZE, format_phase_comment};
+use crate::cascade::engine::{CascadeError, MAX_TRAIN_SIZE, format_phase_comment};
 use crate::effects::{Effect, GitEffect, GitHubEffect, MergeStrategy};
 use crate::state::transitions::{PhaseOutcome, next_phase};
 use crate::types::{
@@ -151,9 +151,13 @@ fn execute_from_idle(
     ctx: &StepContext,
 ) -> StepResult {
     // Compute DIRECT descendants for the frozen set.
-    // The frozen set should only include PRs whose predecessor is the current PR,
-    // because we only prepare direct children. Transitive descendants (children of
+    // Per DESIGN.md, this is a "per-PR freeze" - we freeze only the descendants that
+    // will be prepared before THIS PR squashes. Transitive descendants (children of
     // children) will be handled when their predecessor becomes the current PR.
+    //
+    // The "traversing through open PRs" in DESIGN.md refers to how we compute which
+    // PRs are descendants (closed PRs block traversal in the index), not that we
+    // freeze all transitive descendants.
     let direct_descendants = compute_direct_descendants(train.current_pr, prs);
 
     // Compute ALL transitive descendants for size check.
@@ -220,12 +224,31 @@ fn execute_from_idle(
     // This ensures GitHub-based recovery can see the phase transition and frozen descendants
     // immediately, not just after the first descendant is processed.
     if let Some(comment_id) = result.train.status_comment_id {
-        result
-            .effects
-            .push(Effect::GitHub(GitHubEffect::UpdateComment {
-                comment_id,
-                body: format_phase_comment(&result.train).expect("Status comment oversize - bug"),
-            }));
+        match format_phase_comment(&result.train) {
+            Ok(body) => {
+                result
+                    .effects
+                    .push(Effect::GitHub(GitHubEffect::UpdateComment {
+                        comment_id,
+                        body,
+                    }));
+            }
+            Err(CascadeError::StatusCommentOversize { .. }) => {
+                result.train.abort(TrainError::new(
+                    "status_comment_oversize",
+                    "Status comment exceeds size limit",
+                ));
+                return StepResult {
+                    train: result.train,
+                    outcome: CascadeStepOutcome::Aborted {
+                        pr_number: train.current_pr,
+                        reason: AbortReason::StatusCommentTooLarge,
+                    },
+                    effects: vec![],
+                };
+            }
+            Err(e) => unreachable!("Unexpected error formatting comment: {:?}", e),
+        }
     }
 
     result
@@ -380,6 +403,34 @@ fn execute_squash_pending(
     current_pr: &CachedPr,
     _ctx: &StepContext,
 ) -> StepResult {
+    // CRITICAL: Verify the PR head hasn't changed since preparation.
+    // If someone pushed new commits after we prepared descendants, those commits
+    // would be squashed without proper preparation of descendants (data loss risk).
+    if let Some(recorded_sha) = train.predecessor_head_sha.clone() {
+        if current_pr.head_sha != recorded_sha {
+            let details = format!(
+                "PR head changed since preparation: {} -> {}",
+                recorded_sha, current_pr.head_sha
+            );
+            train.abort(TrainError::new(
+                "head_sha_changed",
+                format!(
+                    "PR head changed since preparation (was {}, now {}). \
+                     Aborting to prevent merging unreviewed/unprepared commits.",
+                    recorded_sha, current_pr.head_sha
+                ),
+            ));
+            return StepResult {
+                train: train.clone(),
+                outcome: CascadeStepOutcome::Aborted {
+                    pr_number: train.current_pr,
+                    reason: AbortReason::PushRejected { details },
+                },
+                effects: vec![],
+            };
+        }
+    }
+
     // Generate squash-merge effect
     let effects = vec![Effect::GitHub(GitHubEffect::SquashMerge {
         pr: train.current_pr,
@@ -642,10 +693,10 @@ fn handle_external_merge(
     let (progress, needs_abort) = match &train.cascade_phase {
         CascadePhase::Idle => {
             // External merge in Idle = preparation was never started.
-            // ALL direct descendants are unprepared. Must abort if there are any.
-            // (Transitive descendants would be handled when their predecessor
-            // becomes a new root, so we only consider direct children here.)
-            let descendants = compute_direct_descendants(train.current_pr, prs);
+            // ALL descendants (direct and transitive) are unprepared. Must abort if
+            // there are any. Per DESIGN.md, we freeze all descendants at once, so
+            // an external merge bypassing preparation is unsafe for the entire tree.
+            let descendants = compute_all_descendants(train.current_pr, prs);
             if descendants.is_empty() {
                 // No descendants - can complete safely
                 (DescendantProgress::new(vec![]), false)
@@ -704,22 +755,24 @@ fn handle_external_merge(
                 unprepared
             ),
         ));
+        // Try to update status comment, but don't panic if it's too large
+        // (we're already aborting for another reason)
+        let effects = train
+            .status_comment_id
+            .and_then(|comment_id| {
+                format_phase_comment(train)
+                    .ok()
+                    .map(|body| Effect::GitHub(GitHubEffect::UpdateComment { comment_id, body }))
+            })
+            .into_iter()
+            .collect();
         return StepResult {
             train: train.clone(),
             outcome: CascadeStepOutcome::Aborted {
                 pr_number: train.current_pr,
                 reason,
             },
-            effects: train
-                .status_comment_id
-                .map(|comment_id| {
-                    Effect::GitHub(GitHubEffect::UpdateComment {
-                        comment_id,
-                        body: format_phase_comment(train).expect("Status comment oversize - bug"),
-                    })
-                })
-                .into_iter()
-                .collect(),
+            effects,
         };
     }
 
@@ -752,16 +805,33 @@ fn handle_external_merge(
 
     // CRITICAL: Emit status comment update to record last_squash_sha and
     // Reconciling phase for GitHub-based recovery
-    let effects = train
-        .status_comment_id
-        .map(|comment_id| {
-            Effect::GitHub(GitHubEffect::UpdateComment {
-                comment_id,
-                body: format_phase_comment(train).expect("Status comment oversize - bug"),
-            })
-        })
-        .into_iter()
-        .collect();
+    let effects = if let Some(comment_id) = train.status_comment_id {
+        match format_phase_comment(train) {
+            Ok(body) => {
+                vec![Effect::GitHub(GitHubEffect::UpdateComment {
+                    comment_id,
+                    body,
+                })]
+            }
+            Err(CascadeError::StatusCommentOversize { .. }) => {
+                train.abort(TrainError::new(
+                    "status_comment_oversize",
+                    "Status comment exceeds size limit",
+                ));
+                return StepResult {
+                    train: train.clone(),
+                    outcome: CascadeStepOutcome::Aborted {
+                        pr_number: train.current_pr,
+                        reason: AbortReason::StatusCommentTooLarge,
+                    },
+                    effects: vec![],
+                };
+            }
+            Err(e) => unreachable!("Unexpected error formatting comment: {:?}", e),
+        }
+    } else {
+        vec![]
+    };
 
     StepResult {
         train: train.clone(),
@@ -800,12 +870,31 @@ fn transition_to_squash_pending(
 
     // Add status comment update for recovery (if we have a comment ID)
     if let Some(comment_id) = train.status_comment_id {
-        result
-            .effects
-            .push(Effect::GitHub(GitHubEffect::UpdateComment {
-                comment_id,
-                body: format_phase_comment(&result.train).expect("Status comment oversize - bug"),
-            }));
+        match format_phase_comment(&result.train) {
+            Ok(body) => {
+                result
+                    .effects
+                    .push(Effect::GitHub(GitHubEffect::UpdateComment {
+                        comment_id,
+                        body,
+                    }));
+            }
+            Err(CascadeError::StatusCommentOversize { .. }) => {
+                result.train.abort(TrainError::new(
+                    "status_comment_oversize",
+                    "Status comment exceeds size limit",
+                ));
+                return StepResult {
+                    train: result.train,
+                    outcome: CascadeStepOutcome::Aborted {
+                        pr_number: train.current_pr,
+                        reason: AbortReason::StatusCommentTooLarge,
+                    },
+                    effects: vec![],
+                };
+            }
+            Err(e) => unreachable!("Unexpected error formatting comment: {:?}", e),
+        }
     }
 
     result
@@ -847,12 +936,31 @@ fn transition_to_catching_up(
 
     // Add status comment update for recovery (if we have a comment ID)
     if let Some(comment_id) = train.status_comment_id {
-        result
-            .effects
-            .push(Effect::GitHub(GitHubEffect::UpdateComment {
-                comment_id,
-                body: format_phase_comment(&result.train).expect("Status comment oversize - bug"),
-            }));
+        match format_phase_comment(&result.train) {
+            Ok(body) => {
+                result
+                    .effects
+                    .push(Effect::GitHub(GitHubEffect::UpdateComment {
+                        comment_id,
+                        body,
+                    }));
+            }
+            Err(CascadeError::StatusCommentOversize { .. }) => {
+                result.train.abort(TrainError::new(
+                    "status_comment_oversize",
+                    "Status comment exceeds size limit",
+                ));
+                return StepResult {
+                    train: result.train,
+                    outcome: CascadeStepOutcome::Aborted {
+                        pr_number: train.current_pr,
+                        reason: AbortReason::StatusCommentTooLarge,
+                    },
+                    effects: vec![],
+                };
+            }
+            Err(e) => unreachable!("Unexpected error formatting comment: {:?}", e),
+        }
     }
 
     result
@@ -894,12 +1002,31 @@ fn transition_to_retargeting(
 
     // Add status comment update for recovery (if we have a comment ID)
     if let Some(comment_id) = train.status_comment_id {
-        result
-            .effects
-            .push(Effect::GitHub(GitHubEffect::UpdateComment {
-                comment_id,
-                body: format_phase_comment(&result.train).expect("Status comment oversize - bug"),
-            }));
+        match format_phase_comment(&result.train) {
+            Ok(body) => {
+                result
+                    .effects
+                    .push(Effect::GitHub(GitHubEffect::UpdateComment {
+                        comment_id,
+                        body,
+                    }));
+            }
+            Err(CascadeError::StatusCommentOversize { .. }) => {
+                result.train.abort(TrainError::new(
+                    "status_comment_oversize",
+                    "Status comment exceeds size limit",
+                ));
+                return StepResult {
+                    train: result.train,
+                    outcome: CascadeStepOutcome::Aborted {
+                        pr_number: train.current_pr,
+                        reason: AbortReason::StatusCommentTooLarge,
+                    },
+                    effects: vec![],
+                };
+            }
+            Err(e) => unreachable!("Unexpected error formatting comment: {:?}", e),
+        }
     }
 
     result
@@ -921,13 +1048,37 @@ fn complete_cascade(train: &mut TrainRecord, progress: DescendantProgress) -> St
     // Get descendants that were successfully processed (not skipped)
     let completed: Vec<PrNumber> = progress.completed.iter().copied().collect();
 
+    // Helper to abort on oversize comment
+    let abort_oversize = |train: &mut TrainRecord| -> StepResult {
+        train.abort(TrainError::new(
+            "status_comment_oversize",
+            "Status comment exceeds size limit",
+        ));
+        StepResult {
+            train: train.clone(),
+            outcome: CascadeStepOutcome::Aborted {
+                pr_number: train.current_pr,
+                reason: AbortReason::StatusCommentTooLarge,
+            },
+            effects: vec![],
+        }
+    };
+
     // Build status comment update effect if we have a comment ID
-    let status_update_effect = train.status_comment_id.map(|comment_id| {
-        Effect::GitHub(GitHubEffect::UpdateComment {
-            comment_id,
-            body: format_phase_comment(train).expect("Status comment oversize - bug"),
-        })
-    });
+    let status_update_effect = if let Some(comment_id) = train.status_comment_id {
+        match format_phase_comment(train) {
+            Ok(body) => Some(Effect::GitHub(GitHubEffect::UpdateComment {
+                comment_id,
+                body,
+            })),
+            Err(CascadeError::StatusCommentOversize { .. }) => {
+                return abort_oversize(train);
+            }
+            Err(e) => unreachable!("Unexpected error formatting comment: {:?}", e),
+        }
+    } else {
+        None
+    };
 
     match completed.len() {
         0 => {
@@ -944,16 +1095,22 @@ fn complete_cascade(train: &mut TrainRecord, progress: DescendantProgress) -> St
             train.increment_seq();
 
             // Update status comment again after advancing current_pr
-            let effects = train
-                .status_comment_id
-                .map(|comment_id| {
-                    Effect::GitHub(GitHubEffect::UpdateComment {
-                        comment_id,
-                        body: format_phase_comment(train).expect("Status comment oversize - bug"),
-                    })
-                })
-                .into_iter()
-                .collect();
+            let effects = if let Some(comment_id) = train.status_comment_id {
+                match format_phase_comment(train) {
+                    Ok(body) => {
+                        vec![Effect::GitHub(GitHubEffect::UpdateComment {
+                            comment_id,
+                            body,
+                        })]
+                    }
+                    Err(CascadeError::StatusCommentOversize { .. }) => {
+                        return abort_oversize(train);
+                    }
+                    Err(e) => unreachable!("Unexpected error formatting comment: {:?}", e),
+                }
+            } else {
+                vec![]
+            };
 
             // Update train state to WaitingCi for consistency.
             train.wait_for_ci();
@@ -1036,9 +1193,8 @@ fn compute_all_descendants(pr: PrNumber, prs: &HashMap<PrNumber, CachedPr>) -> V
 /// Compute DIRECT (immediate) open descendants of a PR.
 ///
 /// Returns only PRs whose predecessor field points directly to the given PR.
-/// This is used for the frozen set during cascade, since we only prepare
-/// direct children - transitive descendants are handled when their
-/// immediate predecessor becomes the current PR.
+/// Used for the frozen set during cascade, since we only prepare direct children.
+/// Transitive descendants are handled when their predecessor becomes the current PR.
 ///
 /// For example, if main <- #1 <- #2 <- #3, compute_direct_descendants(#1)
 /// returns only [#2], not [#2, #3].
@@ -1125,10 +1281,29 @@ pub fn process_operation_result(
             // Reconciling phase, preventing re-squash or recovery failures if the
             // bot crashes before the next phase transition.
             let effects = if let Some(comment_id) = train.status_comment_id {
-                vec![Effect::GitHub(GitHubEffect::UpdateComment {
-                    comment_id,
-                    body: format_phase_comment(&train).expect("Status comment oversize - bug"),
-                })]
+                match format_phase_comment(&train) {
+                    Ok(body) => {
+                        vec![Effect::GitHub(GitHubEffect::UpdateComment {
+                            comment_id,
+                            body,
+                        })]
+                    }
+                    Err(CascadeError::StatusCommentOversize { .. }) => {
+                        train.abort(TrainError::new(
+                            "status_comment_oversize",
+                            "Status comment exceeds size limit",
+                        ));
+                        return (
+                            train,
+                            Some(CascadeStepOutcome::Aborted {
+                                pr_number: pr,
+                                reason: AbortReason::StatusCommentTooLarge,
+                            }),
+                            vec![],
+                        );
+                    }
+                    Err(e) => unreachable!("Unexpected error formatting comment: {:?}", e),
+                }
             } else {
                 vec![]
             };
@@ -1519,13 +1694,18 @@ mod tests {
                     }
                 }
 
-                // For non-empty descendants, we should see all phases
+                // For non-empty descendants, we should see ALL required phases
+                // (not just preparing). This ensures the cascade doesn't skip any phase.
                 if !descendants.is_empty() {
-                    prop_assert!(
-                        phase_sequence.contains(&"preparing".to_string()),
-                        "With descendants, should have visited Preparing phase. Sequence: {:?}",
-                        phase_sequence
-                    );
+                    let required_phases = ["preparing", "squash_pending", "reconciling", "catching_up", "retargeting"];
+                    for required_phase in required_phases {
+                        prop_assert!(
+                            phase_sequence.contains(&required_phase.to_string()),
+                            "With descendants, should have visited {} phase. Sequence: {:?}",
+                            required_phase,
+                            phase_sequence
+                        );
+                    }
                 }
             }
 
@@ -2095,71 +2275,79 @@ mod tests {
                     }
                 }
 
-                // If we got a fan-out, verify we can start independent trains
-                if let Some(fan_out) = fan_out_descendants {
+                // Fan-out MUST occur for this topology (multiple direct descendants of root).
+                // This prevents the test from passing vacuously if the cascade exits early.
+                prop_assert!(
+                    fan_out_descendants.is_some(),
+                    "Fan-out should occur with multiple direct descendants. \
+                     Test topology has {} descendants all pointing to root.",
+                    descendants.len()
+                );
+
+                // Verify fan-out contains all descendants
+                let fan_out = fan_out_descendants.unwrap();
+                prop_assert!(
+                    fan_out.len() >= 2,
+                    "Fan-out should have at least 2 descendants, got: {:?}",
+                    fan_out
+                );
+
+                // Try to start independent trains for each descendant
+                let mut independent_trains = Vec::new();
+                let mut active_trains = HashMap::new();
+
+                // After fan-out, the original root is merged. Update the prs map to reflect this.
+                // is_root requires: targets default_branch AND (no predecessor OR merged predecessor
+                // with predecessor_squash_reconciled set).
+                let mut merged_root = prs.get(&PrNumber(1)).unwrap().clone();
+                merged_root.state = crate::types::PrState::Merged {
+                    merge_commit_sha: sha.clone(),
+                };
+                prs.insert(PrNumber(1), merged_root);
+
+                for &desc_pr in &fan_out {
+                    // Update the PR to be a root:
+                    // 1. Retarget to main (simulating GitHub retarget API call)
+                    // 2. Set predecessor_squash_reconciled (marking reconciliation complete)
+                    // Note: predecessor is NOT cleared - is_root checks if predecessor is merged
+                    // and predecessor_squash_reconciled is set.
+                    let mut updated_desc = prs.get(&desc_pr).unwrap().clone();
+                    updated_desc.base_ref = "main".to_string();
+                    updated_desc.predecessor_squash_reconciled = Some(sha.clone());
+                    prs.insert(desc_pr, updated_desc);
+
+                    // Try to start a train
+                    let result = engine.start_train(desc_pr, &prs, &active_trains);
+
                     prop_assert!(
-                        fan_out.len() >= 2,
-                        "Fan-out should have at least 2 descendants, got: {:?}",
-                        fan_out
+                        result.is_ok(),
+                        "Should be able to start independent train for {}, got error: {:?}",
+                        desc_pr,
+                        result.err()
                     );
 
-                    // Try to start independent trains for each descendant
-                    let mut independent_trains = Vec::new();
-                    let mut active_trains = HashMap::new();
-
-                    // After fan-out, the original root is merged. Update the prs map to reflect this.
-                    // is_root requires: targets default_branch AND (no predecessor OR merged predecessor
-                    // with predecessor_squash_reconciled set).
-                    let mut merged_root = prs.get(&PrNumber(1)).unwrap().clone();
-                    merged_root.state = crate::types::PrState::Merged {
-                        merge_commit_sha: sha.clone(),
-                    };
-                    prs.insert(PrNumber(1), merged_root);
-
-                    for &desc_pr in &fan_out {
-                        // Update the PR to be a root:
-                        // 1. Retarget to main (simulating GitHub retarget API call)
-                        // 2. Set predecessor_squash_reconciled (marking reconciliation complete)
-                        // Note: predecessor is NOT cleared - is_root checks if predecessor is merged
-                        // and predecessor_squash_reconciled is set.
-                        let mut updated_desc = prs.get(&desc_pr).unwrap().clone();
-                        updated_desc.base_ref = "main".to_string();
-                        updated_desc.predecessor_squash_reconciled = Some(sha.clone());
-                        prs.insert(desc_pr, updated_desc);
-
-                        // Try to start a train
-                        let result = engine.start_train(desc_pr, &prs, &active_trains);
-
-                        prop_assert!(
-                            result.is_ok(),
-                            "Should be able to start independent train for {}, got error: {:?}",
-                            desc_pr,
-                            result.err()
-                        );
-
-                        let start_result = result.unwrap();
-                        prop_assert_eq!(
-                            start_result.train.original_root_pr, desc_pr,
-                            "New train should have {} as root",
-                            desc_pr
-                        );
-
-                        // Add to active trains to prevent duplicates
-                        active_trains.insert(desc_pr, start_result.train.clone());
-                        independent_trains.push(start_result.train);
-                    }
-
-                    // Verify all trains are independent (different root PRs)
-                    let roots: std::collections::HashSet<PrNumber> = independent_trains
-                        .iter()
-                        .map(|t| t.original_root_pr)
-                        .collect();
+                    let start_result = result.unwrap();
                     prop_assert_eq!(
-                        roots.len(),
-                        independent_trains.len(),
-                        "Each train should have a unique root PR"
+                        start_result.train.original_root_pr, desc_pr,
+                        "New train should have {} as root",
+                        desc_pr
                     );
+
+                    // Add to active trains to prevent duplicates
+                    active_trains.insert(desc_pr, start_result.train.clone());
+                    independent_trains.push(start_result.train);
                 }
+
+                // Verify all trains are independent (different root PRs)
+                let roots: std::collections::HashSet<PrNumber> = independent_trains
+                    .iter()
+                    .map(|t| t.original_root_pr)
+                    .collect();
+                prop_assert_eq!(
+                    roots.len(),
+                    independent_trains.len(),
+                    "Each train should have a unique root PR"
+                );
             }
 
             /// Property: End-to-end cascade completes successfully.
