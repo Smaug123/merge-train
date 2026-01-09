@@ -203,14 +203,30 @@ pub fn compute_recovery_plan(
                 }));
 
                 // Add status comment update for GitHub-based recovery.
-                // Use expect() here because per DESIGN.md, oversize should never happen
-                // with proper size limits. If it does, it's a bug that needs immediate attention.
+                // If comment formatting fails (e.g., oversize), abort gracefully instead of panicking.
                 if let Some(comment_id) = plan_train.status_comment_id {
-                    effects.push(Effect::GitHub(GitHubEffect::UpdateComment {
-                        comment_id,
-                        body: format_phase_comment(&plan_train)
-                            .expect("Status comment oversize during recovery - this is a bug"),
-                    }));
+                    match format_phase_comment(&plan_train) {
+                        Ok(body) => {
+                            effects.push(Effect::GitHub(GitHubEffect::UpdateComment {
+                                comment_id,
+                                body,
+                            }));
+                        }
+                        Err(e) => {
+                            // Comment formatting failed - abort gracefully
+                            actions.push(RecoveryAction::NeedsManualReview {
+                                reason: format!(
+                                    "Failed to format status comment during recovery: {}",
+                                    e
+                                ),
+                            });
+                            return RecoveryPlan {
+                                train: plan_train,
+                                actions,
+                                effects,
+                            };
+                        }
+                    }
                 }
 
                 actions.push(RecoveryAction::ResumeClean);
@@ -268,15 +284,30 @@ pub fn compute_recovery_plan(
 
                         // Add status comment update for GitHub-based recovery.
                         // This ensures a second crash can see the Reconciling phase and squash SHA.
-                        // Use expect() here because per DESIGN.md, oversize should never happen
-                        // with proper size limits. If it does, it's a bug that needs immediate attention.
+                        // If comment formatting fails (e.g., oversize), abort gracefully instead of panicking.
                         if let Some(comment_id) = plan_train.status_comment_id {
-                            effects.push(Effect::GitHub(GitHubEffect::UpdateComment {
-                                comment_id,
-                                body: format_phase_comment(&plan_train).expect(
-                                    "Status comment oversize during recovery - this is a bug",
-                                ),
-                            }));
+                            match format_phase_comment(&plan_train) {
+                                Ok(body) => {
+                                    effects.push(Effect::GitHub(GitHubEffect::UpdateComment {
+                                        comment_id,
+                                        body,
+                                    }));
+                                }
+                                Err(e) => {
+                                    // Comment formatting failed - abort gracefully
+                                    actions.push(RecoveryAction::NeedsManualReview {
+                                        reason: format!(
+                                            "Failed to format status comment during recovery: {}",
+                                            e
+                                        ),
+                                    });
+                                    return RecoveryPlan {
+                                        train: plan_train,
+                                        actions,
+                                        effects,
+                                    };
+                                }
+                            }
                         }
 
                         actions.push(RecoveryAction::ResumeClean);

@@ -912,6 +912,168 @@ fn recovery_uses_frozen_descendants() {
     );
 }
 
+/// Property 8: Fan-out worktree ordering.
+///
+/// When a PR with multiple descendants completes (fan-out), the old worktree
+/// should be cleaned up and new worktrees created for each descendant that becomes
+/// a new root. This test verifies:
+/// 1. The old root's worktree can be removed after cascade completion
+/// 2. New worktrees can be created for fan-out descendants
+/// 3. The cleanup/creation ordering is correct (remove before create to avoid conflicts)
+#[test]
+fn fanout_worktree_ordering() {
+    let (_temp_dir, config) = create_test_repo();
+
+    // Create a root PR that will fan out to multiple descendants
+    let root_sha = create_branch_with_file(&config, "pr-100", "root.txt", "root", "main");
+    create_pr_ref(&config, 100, &root_sha);
+
+    // Create multiple descendants from the root (fan-out scenario)
+    let desc1_sha = create_branch_with_file(&config, "pr-101", "desc1.txt", "desc1", "pr-100");
+    let desc2_sha = create_branch_with_file(&config, "pr-102", "desc2.txt", "desc2", "pr-100");
+    let desc3_sha = create_branch_with_file(&config, "pr-103", "desc3.txt", "desc3", "pr-100");
+
+    // Get the root worktree
+    let root_worktree = worktree_for_stack(&config, PrNumber(100)).unwrap();
+    assert!(root_worktree.exists(), "Root worktree should exist");
+
+    // Record root worktree path for later verification
+    let root_worktree_path = root_worktree.clone();
+
+    // Prepare all descendants in the root's worktree
+    create_pr_ref(&config, 101, &desc1_sha);
+    create_pr_ref(&config, 102, &desc2_sha);
+    create_pr_ref(&config, 103, &desc3_sha);
+
+    for pr in [101, 102, 103] {
+        let branch = format!("pr-{}", pr);
+        prepare_descendant(&root_worktree, &branch, 100, &test_identity()).unwrap();
+        run_git_sync(
+            &root_worktree,
+            &[
+                "push",
+                "origin",
+                &format!("HEAD:refs/heads/{}", branch),
+                "--force",
+            ],
+        )
+        .unwrap();
+    }
+
+    // Squash merge the root
+    let squash = squash_merge_to_main(&config, &root_sha);
+
+    // Reconcile all descendants
+    for pr in [101, 102, 103] {
+        let branch = format!("pr-{}", pr);
+        reconcile_descendant(
+            &root_worktree,
+            &branch,
+            &squash.squash_sha,
+            &squash.prior_main_head,
+            "main",
+            &test_identity(),
+        )
+        .unwrap();
+        run_git_sync(
+            &root_worktree,
+            &[
+                "push",
+                "origin",
+                &format!("HEAD:refs/heads/{}", branch),
+                "--force",
+            ],
+        )
+        .unwrap();
+    }
+
+    // Verify initial worktree list contains root
+    let initial_worktrees = list_worktrees(&config).unwrap();
+    let initial_prs: HashSet<PrNumber> = initial_worktrees.iter().map(|(pr, _)| *pr).collect();
+    assert!(
+        initial_prs.contains(&PrNumber(100)),
+        "Root worktree (pr-100) should exist before cleanup"
+    );
+
+    // === KEY TEST: Remove the old root worktree ===
+    // After fan-out completion, the root PR is merged and its worktree should be cleaned up.
+    // This simulates the cleanup that happens when a train completes.
+
+    // Mark only the fan-out descendants as active (the root is no longer active)
+    let active_after_fanout: HashSet<PrNumber> = [PrNumber(101), PrNumber(102), PrNumber(103)]
+        .into_iter()
+        .collect();
+
+    // Use zero max_age to ensure the old root worktree is considered stale
+    let mut config_cleanup = config.clone();
+    config_cleanup.worktree_max_age = Duration::ZERO;
+
+    // Cleanup stale worktrees (the root)
+    let removed = cleanup_stale_worktrees(&config_cleanup, &active_after_fanout).unwrap();
+
+    // Verify root worktree was removed
+    assert!(
+        removed.contains(&PrNumber(100)),
+        "Root worktree (pr-100) should be removed during fan-out cleanup"
+    );
+    assert!(
+        !root_worktree_path.exists(),
+        "Root worktree directory should no longer exist after cleanup"
+    );
+
+    // Verify worktree list no longer contains root
+    let after_cleanup_worktrees = list_worktrees(&config).unwrap();
+    let after_cleanup_prs: HashSet<PrNumber> =
+        after_cleanup_worktrees.iter().map(|(pr, _)| *pr).collect();
+    assert!(
+        !after_cleanup_prs.contains(&PrNumber(100)),
+        "Root worktree should not be in list after cleanup"
+    );
+
+    // === Now create worktrees for the fan-out descendants (new roots) ===
+    // After cleanup, each descendant can become a new root with its own worktree.
+
+    let desc_worktrees: Vec<PathBuf> = [101, 102, 103]
+        .iter()
+        .map(|&pr| worktree_for_stack(&config, PrNumber(pr)).unwrap())
+        .collect();
+
+    // All new worktrees should exist
+    for (i, worktree) in desc_worktrees.iter().enumerate() {
+        assert!(
+            worktree.exists(),
+            "Fan-out worktree {} should exist",
+            101 + i
+        );
+    }
+
+    // Verify each descendant worktree can checkout its branch
+    for (i, worktree) in desc_worktrees.iter().enumerate() {
+        let branch = format!("pr-{}", 101 + i);
+        run_git_sync(worktree, &["fetch", "origin", &branch]).unwrap();
+        let result = run_git_sync(
+            worktree,
+            &["checkout", "--detach", &format!("origin/{}", branch)],
+        );
+        assert!(
+            result.is_ok(),
+            "Worktree {} should be able to checkout its branch",
+            101 + i
+        );
+    }
+
+    // Verify final worktree list contains all fan-out descendants
+    let final_worktrees = list_worktrees(&config).unwrap();
+    let final_prs: HashSet<PrNumber> = final_worktrees.iter().map(|(pr, _)| *pr).collect();
+    for pr in [101, 102, 103] {
+        assert!(
+            final_prs.contains(&PrNumber(pr)),
+            "Fan-out descendant pr-{} should have a worktree",
+            pr
+        );
+    }
+}
+
 /// Worktree cleanup leaves no orphans.
 ///
 /// After cleanup, there should be no worktrees that are:
