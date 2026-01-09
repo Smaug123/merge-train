@@ -271,11 +271,37 @@ mod tests {
     }
 
     fn arb_git_effect() -> impl Strategy<Value = GitEffect> {
+        // COMPILE-TIME EXHAUSTIVENESS CHECK
+        // When you add a new GitEffect variant, this match will fail to compile,
+        // reminding you to add a corresponding generator to prop_oneof! below.
+        // Keep the match arms in the same order as the prop_oneof! branches.
+        #[allow(dead_code, unreachable_code)]
+        fn _assert_all_variants_covered(e: GitEffect) {
+            match e {
+                GitEffect::Fetch { .. } => {}
+                GitEffect::Checkout { .. } => {}
+                GitEffect::Merge { .. } => {}
+                GitEffect::MergeReconcile { .. } => {}
+                GitEffect::ValidateSquashCommit { .. } => {}
+                GitEffect::Push { .. } => {}
+                GitEffect::IsAncestor { .. } => {}
+                GitEffect::RevParse { .. } => {}
+                GitEffect::CreateWorktree { .. } => {}
+                GitEffect::RemoveWorktree { .. } => {}
+                GitEffect::MergeAbort => {}
+                GitEffect::ResetHard { .. } => {}
+                GitEffect::Clean { .. } => {}
+            }
+        }
+
         prop_oneof![
+            // Fetch
             prop::collection::vec(arb_refspec(), 1..5)
                 .prop_map(|refspecs| GitEffect::Fetch { refspecs }),
+            // Checkout
             (arb_target(), any::<bool>())
                 .prop_map(|(target, detach)| GitEffect::Checkout { target, detach }),
+            // Merge
             (arb_target(), arb_merge_strategy(), arb_message()).prop_map(
                 |(target, strategy, message)| GitEffect::Merge {
                     target,
@@ -283,6 +309,7 @@ mod tests {
                     message
                 }
             ),
+            // MergeReconcile
             (
                 arb_sha(),
                 proptest::option::of(arb_sha()),
@@ -299,19 +326,34 @@ mod tests {
                         }
                     },
                 ),
+            // ValidateSquashCommit
+            (arb_sha(), arb_target()).prop_map(|(squash_sha, default_branch)| {
+                GitEffect::ValidateSquashCommit {
+                    squash_sha,
+                    default_branch,
+                }
+            }),
+            // Push
             (arb_refspec(), any::<bool>())
                 .prop_map(|(refspec, force)| GitEffect::Push { refspec, force }),
+            // IsAncestor
             (arb_sha(), arb_sha()).prop_map(|(potential_ancestor, descendant)| {
                 GitEffect::IsAncestor {
                     potential_ancestor,
                     descendant,
                 }
             }),
+            // RevParse
             arb_target().prop_map(|rev| GitEffect::RevParse { rev }),
+            // CreateWorktree
             arb_worktree_name().prop_map(|name| GitEffect::CreateWorktree { name }),
+            // RemoveWorktree
             arb_worktree_name().prop_map(|name| GitEffect::RemoveWorktree { name }),
+            // MergeAbort
             Just(GitEffect::MergeAbort),
+            // ResetHard
             arb_target().prop_map(|target| GitEffect::ResetHard { target }),
+            // Clean
             (any::<bool>(), any::<bool>())
                 .prop_map(|(directories, force)| GitEffect::Clean { directories, force }),
         ]
