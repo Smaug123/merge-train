@@ -336,9 +336,16 @@ fn execute_preparing(
         };
     }
 
-    // Store predecessor info for recovery
+    // Store predecessor info for recovery (only on first preparation).
+    // CRITICAL: Do NOT overwrite predecessor_head_sha on subsequent preparations.
+    // The squash-time guard (line 406) must compare against the head SHA from
+    // cascade START, not from the most recent preparation. Otherwise, if the root
+    // PR is pushed between preparing descendants, the guard would compare the new
+    // SHA against itself and incorrectly pass.
     train.predecessor_pr = Some(train.current_pr);
-    train.predecessor_head_sha = Some(current_pr.head_sha.clone());
+    if train.predecessor_head_sha.is_none() {
+        train.predecessor_head_sha = Some(current_pr.head_sha.clone());
+    }
     train.increment_seq();
 
     // Generate effects for preparation
@@ -2572,7 +2579,7 @@ mod tests {
 
     mod bug_regression_tests {
         use super::*;
-        use crate::types::CommentId;
+        use crate::types::{CommentId, TrainState};
 
         fn make_sha(n: u64) -> Sha {
             Sha::parse(format!("{:0>40x}", n)).unwrap()
@@ -2925,6 +2932,95 @@ mod tests {
                  Outcome: {:?}, Effects: {:?}",
                 result.outcome,
                 result.effects
+            );
+        }
+
+        /// Regression test: predecessor_head_sha must NOT be overwritten when preparing
+        /// subsequent descendants. The squash-time guard (line 406) must compare against
+        /// the head SHA from cascade START, not from the most recent preparation.
+        ///
+        /// Bug scenario:
+        /// 1. Start cascade with root PR at SHA_A, prepare descendant #2 → stores SHA_A
+        /// 2. External push changes root PR to SHA_B
+        /// 3. Prepare descendant #3 → INCORRECTLY overwrites predecessor_head_sha to SHA_B
+        /// 4. Squash guard compares SHA_B vs SHA_B → passes (should fail!)
+        /// 5. Result: Descendant #2 was prepared with SHA_A but squash includes SHA_B content
+        #[test]
+        fn predecessor_head_sha_not_overwritten_on_subsequent_preparations() {
+            let original_sha = make_sha(0x111);
+            let new_sha = make_sha(0x222);
+
+            // Setup: train with 2 DIRECT descendants of PR#1 (both based on branch-1)
+            // This is the key setup - both descendants have the same predecessor
+            let mut train = TrainRecord::new(PrNumber(1));
+            train.cascade_phase = CascadePhase::Preparing {
+                progress: DescendantProgress::new(vec![PrNumber(2), PrNumber(3)]),
+            };
+
+            // PR map with root PR at original SHA
+            let mut pr1 = make_open_pr(1, "main", None);
+            pr1.head_sha = original_sha.clone();
+            // Both PR#2 and PR#3 are direct descendants of PR#1 (base_ref = "branch-1")
+            let mut pr2 = make_open_pr(2, "branch-1", Some(1));
+            pr2.head_ref = "branch-2".to_string();
+            let mut pr3 = make_open_pr(3, "branch-1", Some(1)); // Direct child of PR#1
+            pr3.head_ref = "branch-3".to_string();
+
+            let prs = HashMap::from([
+                (PrNumber(1), pr1.clone()),
+                (PrNumber(2), pr2),
+                (PrNumber(3), pr3),
+            ]);
+            let ctx = StepContext::new("main");
+
+            // Step 1: Prepare first descendant (#2)
+            let result = execute_cascade_step(train, &prs, &ctx);
+            assert_eq!(
+                result.train.predecessor_head_sha,
+                Some(original_sha.clone()),
+                "First preparation should record original SHA"
+            );
+
+            // Step 2: Mark first descendant completed, resume train
+            let mut train = result.train;
+            if let CascadePhase::Preparing { ref mut progress } = train.cascade_phase {
+                progress.mark_completed(PrNumber(2));
+            }
+            train.state = TrainState::Running; // Resume after CI
+
+            // Step 3: Simulate root PR head change (external push)
+            let mut pr1_updated = pr1.clone();
+            pr1_updated.head_sha = new_sha.clone();
+            let mut pr2_updated = make_open_pr(2, "branch-1", Some(1));
+            pr2_updated.head_ref = "branch-2".to_string();
+            let mut pr3_updated = make_open_pr(3, "branch-1", Some(1));
+            pr3_updated.head_ref = "branch-3".to_string();
+            let prs_updated = HashMap::from([
+                (PrNumber(1), pr1_updated),
+                (PrNumber(2), pr2_updated),
+                (PrNumber(3), pr3_updated),
+            ]);
+
+            // Step 4: Prepare second descendant (#3) - BUG: overwrites predecessor_head_sha
+            let result = execute_cascade_step(train, &prs_updated, &ctx);
+
+            // CRITICAL ASSERTION (currently fails due to bug):
+            // predecessor_head_sha should STILL be original_sha, not new_sha
+            assert_eq!(
+                result.train.predecessor_head_sha,
+                Some(original_sha.clone()),
+                "predecessor_head_sha must NOT be overwritten on subsequent preparations. \
+                 Was {}, expected {} (original). Bug: squash guard would compare {} vs {} \
+                 and incorrectly pass, allowing unprepared commits to be squashed.",
+                result
+                    .train
+                    .predecessor_head_sha
+                    .as_ref()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default(),
+                original_sha,
+                new_sha,
+                new_sha
             );
         }
 
