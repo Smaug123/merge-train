@@ -330,9 +330,11 @@ fn pattern_matches(branch_ref: &str, pattern: &str, branch_name: &str) -> bool {
     }
 
     // Wildcard match: pattern ends with /*
-    if let Some(prefix) = normalized_pattern.strip_suffix("/*")
+    // Strip only the `*` to keep the trailing `/` in the prefix,
+    // ensuring we don't match e.g. `release-1` against `release/*`
+    if let Some(prefix) = normalized_pattern.strip_suffix('*')
+        && prefix.ends_with('/')
         && branch_ref.starts_with(prefix)
-        && branch_ref.len() > prefix.len()
     {
         return true;
     }
@@ -615,6 +617,23 @@ mod tests {
             "refs/heads/main",
             "refs/heads/feature/*",
             "main"
+        ));
+    }
+
+    #[test]
+    fn pattern_matches_prefix_wildcard_respects_slash_boundary() {
+        // Regression test: `release/*` should NOT match `release-1`
+        // because the `/` boundary must be respected
+        assert!(!pattern_matches(
+            "refs/heads/release-1",
+            "refs/heads/release/*",
+            "release-1"
+        ));
+        // But it SHOULD match `release/v1`
+        assert!(pattern_matches(
+            "refs/heads/release/v1",
+            "refs/heads/release/*",
+            "release/v1"
         ));
     }
 
