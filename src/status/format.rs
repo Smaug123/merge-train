@@ -41,32 +41,39 @@ pub const STATUS_COMMENT_END: &str = "\n-->";
 /// The `status_comment_id` field is excluded from the JSON (it would be redundant
 /// and confusing since the comment ID is the comment itself).
 ///
+/// The human_message will be truncated if necessary to ensure the total comment
+/// size stays within GitHub's 65536 character limit.
+///
 /// # Panics
 ///
-/// Panics if the train cannot be serialized even after aggressive truncation.
-/// This indicates a bug in size estimation (the 50 PR limit should always fit).
+/// Panics if the JSON portion exceeds `MAX_JSON_SIZE` (60KB) even after aggressive
+/// truncation of error fields. This indicates a bug in size estimation (the 50 PR
+/// limit should always fit within this budget).
 pub fn format_status_comment(train: &TrainRecord, human_message: &str) -> String {
     // First try with normal truncation
     let truncated = truncate_for_size_limit(train.clone());
     let json = format_train_json(&truncated);
+    let json = escape_html_comment_terminator(&json);
 
     if json.len() <= MAX_JSON_SIZE {
-        return format_comment_body(&json, human_message);
+        return format_comment_body_with_limit(&json, human_message);
     }
 
     // Try aggressive truncation
     let aggressive = truncate_aggressively(truncated);
     let json = format_train_json(&aggressive);
+    let json = escape_html_comment_terminator(&json);
 
     if json.len() <= MAX_JSON_SIZE {
-        return format_comment_body(&json, human_message);
+        return format_comment_body_with_limit(&json, human_message);
     }
 
     // This should never happen with the 50 PR limit
     panic!(
-        "Status comment size limit exceeded unexpectedly after aggressive truncation. \
-         JSON size: {} bytes. This is a bug — please report it with the train configuration.",
-        json.len()
+        "JSON portion of status comment exceeds size limit after aggressive truncation. \
+         JSON size: {} bytes, limit: {} bytes. This is a bug — please report it.",
+        json.len(),
+        MAX_JSON_SIZE
     );
 }
 
@@ -79,12 +86,36 @@ fn format_train_json(train: &TrainRecord) -> String {
         .expect("TrainRecord serialization should not fail")
 }
 
+/// Fixed overhead for the comment structure (markers + title).
+/// `<!-- merge-train-state\n` + `\n-->` + `\n**Merge Train Status**\n\n`
+const COMMENT_OVERHEAD: usize =
+    STATUS_COMMENT_START.len() + STATUS_COMMENT_END.len() + "\n**Merge Train Status**\n\n".len();
+
 /// Formats the complete comment body with JSON and human message.
-fn format_comment_body(json: &str, human_message: &str) -> String {
+///
+/// Truncates `human_message` if necessary to stay within GitHub's comment size limit.
+fn format_comment_body_with_limit(json: &str, human_message: &str) -> String {
+    let used = COMMENT_OVERHEAD + json.len();
+    let max_human_len = GITHUB_COMMENT_SIZE_LIMIT.saturating_sub(used);
+
+    let human = if human_message.len() > max_human_len {
+        truncate_with_suffix(human_message, max_human_len)
+    } else {
+        human_message.to_string()
+    };
+
     format!(
         "{}{}{}\n**Merge Train Status**\n\n{}",
-        STATUS_COMMENT_START, json, STATUS_COMMENT_END, human_message
+        STATUS_COMMENT_START, json, STATUS_COMMENT_END, human
     )
+}
+
+/// Escapes the HTML comment terminator `-->` in JSON to prevent breaking the comment.
+///
+/// Replaces `-->` with `--\u003e` which is a valid JSON escape for `>`.
+/// JSON parsers automatically decode this during deserialization.
+fn escape_html_comment_terminator(json: &str) -> String {
+    json.replace("-->", r"--\u003e")
 }
 
 /// Truncates variable-length fields to ensure the status comment fits within size limits.
@@ -392,19 +423,78 @@ mod tests {
             assert!(!comment.contains("12345"));
         }
 
+        #[test]
+        fn large_human_message_is_truncated() {
+            let train = TrainRecord::new(1.into());
+            // Create a human message larger than the remaining space
+            let huge_message = "x".repeat(70000);
+
+            let comment = format_status_comment(&train, &huge_message);
+
+            assert!(
+                comment.len() <= GITHUB_COMMENT_SIZE_LIMIT,
+                "Comment length {} exceeds GitHub limit {}",
+                comment.len(),
+                GITHUB_COMMENT_SIZE_LIMIT
+            );
+            assert!(
+                comment.contains("... [truncated]"),
+                "Large human message should be truncated"
+            );
+        }
+
+        #[test]
+        fn html_comment_terminator_is_escaped() {
+            use crate::types::train::TrainError;
+
+            let mut train = TrainRecord::new(1.into());
+            // Error message containing the HTML comment terminator
+            train.error = Some(TrainError::new("test", "error --> happened"));
+
+            let comment = format_status_comment(&train, "status");
+
+            // The literal --> should not appear in the JSON portion
+            // (it would prematurely close the HTML comment)
+            let json_start = comment.find(STATUS_COMMENT_START).unwrap();
+            let json_end = comment.find(STATUS_COMMENT_END).unwrap();
+            let json_portion = &comment[json_start..json_end];
+
+            assert!(
+                !json_portion.contains("-->"),
+                "JSON should not contain literal '-->' which would break HTML comment"
+            );
+            // The escaped version should be present
+            assert!(
+                json_portion.contains(r"--\u003e"),
+                "JSON should contain escaped form"
+            );
+        }
+
         proptest! {
             #[test]
             fn format_under_github_limit(train in arb_train_record()) {
                 let comment = format_status_comment(&train, "Status message");
-                prop_assert!(comment.len() < GITHUB_COMMENT_SIZE_LIMIT,
+                prop_assert!(comment.len() <= GITHUB_COMMENT_SIZE_LIMIT,
                     "Comment length {} exceeds GitHub limit {}", comment.len(), GITHUB_COMMENT_SIZE_LIMIT);
             }
 
             #[test]
             fn large_trains_under_github_limit(train in arb_large_train()) {
                 let comment = format_status_comment(&train, "Status message for a large train with many descendants");
-                prop_assert!(comment.len() < GITHUB_COMMENT_SIZE_LIMIT,
+                prop_assert!(comment.len() <= GITHUB_COMMENT_SIZE_LIMIT,
                     "Large train comment length {} exceeds GitHub limit {}", comment.len(), GITHUB_COMMENT_SIZE_LIMIT);
+            }
+
+            #[test]
+            fn large_human_message_stays_under_limit(
+                train in arb_train_record(),
+                human_len in 0usize..100000
+            ) {
+                let human_message = "x".repeat(human_len);
+                let comment = format_status_comment(&train, &human_message);
+                prop_assert!(comment.len() <= GITHUB_COMMENT_SIZE_LIMIT,
+                    "Comment length {} exceeds GitHub limit {} with human_len {}",
+                    comment.len(), GITHUB_COMMENT_SIZE_LIMIT, human_len);
             }
         }
     }
