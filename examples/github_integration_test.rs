@@ -200,9 +200,7 @@ async fn main() -> anyhow::Result<()> {
     // Mutating operations require explicit opt-in
     let enable_mutations = env::var("ENABLE_MUTATIONS").is_ok();
 
-    if enable_mutations && test_pr.is_some() {
-        let pr = test_pr.unwrap();
-
+    if let Some(pr) = test_pr.filter(|_| enable_mutations) {
         // Post a comment, then update it, then add a reaction
         match test_comment_operations(&client, pr).await {
             Ok(comment_id) => {

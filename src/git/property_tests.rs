@@ -13,7 +13,7 @@
 use proptest::prelude::*;
 use proptest::test_runner::Config as ProptestConfig;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -212,7 +212,7 @@ fn add_commit_to_main(config: &GitConfig, filename: &str, content: &str) -> Sha 
 }
 
 /// Read file content from a worktree.
-fn read_file(worktree: &PathBuf, filename: &str) -> Option<String> {
+fn read_file(worktree: &Path, filename: &str) -> Option<String> {
     std::fs::read_to_string(worktree.join(filename)).ok()
 }
 
@@ -349,7 +349,7 @@ proptest! {
         run_git_sync(&clone_dir, &["update-ref", "refs/pull/123/head", pred_sha.as_str()]).unwrap();
 
         // Create descendant from predecessor with MULTIPLE files
-        run_git_sync(&temp_work, &["checkout", "--detach", &pred_sha.as_str()]).unwrap();
+        run_git_sync(&temp_work, &["checkout", "--detach", pred_sha.as_str()]).unwrap();
 
         // Descendant commit 1
         std::fs::write(temp_work.join("desc1.txt"), &desc_content1).unwrap();
@@ -807,7 +807,7 @@ fn recovery_uses_frozen_descendants() {
             CachedPr {
                 number: PrNumber(pr),
                 predecessor: Some(PrNumber(100)), // All are descendants of pr-100
-                head_sha: Sha::parse(&"a".repeat(40)).unwrap(),
+                head_sha: Sha::parse("a".repeat(40)).unwrap(),
                 head_ref: format!("pr-{}", pr),
                 base_ref: "pr-100".to_string(),
                 state: PrState::Open,

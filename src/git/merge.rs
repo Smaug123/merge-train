@@ -789,7 +789,7 @@ mod tests {
         run_git_sync(&temp_work, &["config", "user.name", "Test"]).unwrap();
 
         // Squash merge (simulate what GitHub does)
-        run_git_sync(&temp_work, &["merge", "--squash", &pred_sha.as_str()]).unwrap();
+        run_git_sync(&temp_work, &["merge", "--squash", pred_sha.as_str()]).unwrap();
         run_git_sync(&temp_work, &["commit", "-m", "Squash: Add pred.txt"]).unwrap();
 
         let squash_sha_str = run_git_stdout(&temp_work, &["rev-parse", "HEAD"]).unwrap();
@@ -890,7 +890,7 @@ mod tests {
             &[
                 "merge",
                 "--no-ff",
-                &pred_sha.as_str(),
+                pred_sha.as_str(),
                 "-m",
                 "Merge: Add pred.txt",
             ],
@@ -1037,7 +1037,7 @@ mod tests {
             .unwrap();
             run_git_sync(&temp_work, &["config", "user.email", "test@test.com"]).unwrap();
             run_git_sync(&temp_work, &["config", "user.name", "Test"]).unwrap();
-            run_git_sync(&temp_work, &["merge", "--squash", &pred_sha.as_str()]).unwrap();
+            run_git_sync(&temp_work, &["merge", "--squash", pred_sha.as_str()]).unwrap();
             run_git_sync(&temp_work, &["commit", "-m", "Squash merge"]).unwrap();
             let sha = run_git_stdout(&temp_work, &["rev-parse", "HEAD"]).unwrap();
             run_git_sync(&temp_work, &["push", "origin", "HEAD:refs/heads/main"]).unwrap();
@@ -1155,7 +1155,7 @@ mod tests {
         .unwrap();
         run_git_sync(&temp_work, &["config", "user.email", "test@test.com"]).unwrap();
         run_git_sync(&temp_work, &["config", "user.name", "Test"]).unwrap();
-        run_git_sync(&temp_work, &["merge", "--squash", &branch_sha.as_str()]).unwrap();
+        run_git_sync(&temp_work, &["merge", "--squash", branch_sha.as_str()]).unwrap();
         run_git_sync(&temp_work, &["commit", "-m", "Squash merge feature"]).unwrap();
 
         let squash_sha = run_git_stdout(&temp_work, &["rev-parse", "HEAD"]).unwrap();
@@ -1209,7 +1209,7 @@ mod tests {
             &[
                 "merge",
                 "--no-ff",
-                &branch_sha.as_str(),
+                branch_sha.as_str(),
                 "-m",
                 "Merge commit",
             ],
@@ -1290,7 +1290,7 @@ mod tests {
             &[
                 "merge-base",
                 "--is-ancestor",
-                &first_commit_parent.as_str(),
+                first_commit_parent.as_str(),
                 &main_sha,
             ],
         );
