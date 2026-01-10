@@ -372,9 +372,8 @@ impl CascadeEngine {
             };
         }
 
-        // Check if PR is a draft. CRITICAL: GitHub's mergeStateStatus can be CLEAN
-        // for a draft PR (if CI passes), but the merge API will reject it with
-        // "Pull request is in draft state." We must check is_draft explicitly.
+        // Check if PR is a draft. GitHub's mergeStateStatus can be CLEAN for a draft
+        // PR (if CI passes), but the merge API will reject it. Check is_draft explicitly.
         if current_pr.is_draft {
             return TrainAction::Block {
                 reason: BlockReason::Draft,
@@ -474,9 +473,9 @@ impl CascadeEngine {
 
     /// Creates the outcome for the current cascade step.
     ///
-    /// CRITICAL: Uses frozen progress from the current phase when available.
-    /// This prevents late additions from leaking into outcomes. Only compute
-    /// descendants fresh when in Idle phase (no frozen set yet).
+    /// Uses frozen progress from the current phase when available. This prevents
+    /// late additions from leaking into outcomes. Only computes descendants fresh
+    /// when in Idle phase (no frozen set yet).
     pub fn create_step_outcome(
         &self,
         train: &TrainRecord,
@@ -526,8 +525,8 @@ pub enum TrainAction {
 
 /// Format the initial status comment when starting a train.
 ///
-/// CRITICAL: Includes machine-readable JSON payload in HTML comment for
-/// GitHub-based recovery. See DESIGN.md "Status comments" section.
+/// Includes machine-readable JSON payload in HTML comment for GitHub-based
+/// recovery. See DESIGN.md "Status comments" section.
 ///
 /// Returns an error if the status comment would exceed size limits, which
 /// should cause the caller to abort the train.
@@ -566,8 +565,8 @@ fn format_start_comment(train: &TrainRecord, stack: &MergeStack) -> Result<Strin
 
 /// Format the status comment when a train is stopped.
 ///
-/// CRITICAL: Includes machine-readable JSON payload in HTML comment for
-/// GitHub-based recovery. See DESIGN.md "Status comments" section.
+/// Includes machine-readable JSON payload in HTML comment for GitHub-based
+/// recovery. See DESIGN.md "Status comments" section.
 ///
 /// Returns an error if the status comment would exceed size limits, which
 /// should cause the caller to abort the train.
@@ -595,9 +594,9 @@ fn format_stop_comment(train: &TrainRecord) -> Result<String, CascadeError> {
 
 /// Format the status comment for a phase update.
 ///
-/// CRITICAL: Includes machine-readable JSON payload in HTML comment for
-/// GitHub-based recovery. This should be called when transitioning between
-/// phases to keep the recovery state in sync.
+/// Includes machine-readable JSON payload in HTML comment for GitHub-based
+/// recovery. Called when transitioning between phases to keep the recovery
+/// state in sync.
 ///
 /// Returns an error if the status comment would exceed size limits. Per DESIGN.md,
 /// callers MUST abort the train in this case to prevent recovery data loss.
@@ -1106,8 +1105,8 @@ mod tests {
                     prs.insert(desc, pr);
                 }
 
-                // CRITICAL FIX: Transition trains to Preparing phase so frozen_descendants
-                // gets populated. Without this, trains stay in Idle and progress() returns None.
+                // Transition trains to Preparing phase so frozen_descendants gets populated.
+                // Without this, trains stay in Idle and progress() returns None.
                 for (&root, train) in active_trains.iter_mut() {
                     // Collect descendants for this root
                     let descendants: Vec<PrNumber> = extra_descendants
@@ -1267,8 +1266,8 @@ mod tests {
                 prop_assert!(result1.is_ok(), "Should be able to start train for #1");
                 let mut train1 = result1.unwrap().train;
 
-                // CRITICAL FIX: Transition train #1 to Preparing phase so frozen_descendants
-                // is populated. Without this, the train stays in Idle and progress() returns None.
+                // Transition train #1 to Preparing phase so frozen_descendants is populated.
+                // Without this, the train stays in Idle and progress() returns None.
                 train1.cascade_phase = CascadePhase::Preparing {
                     progress: DescendantProgress::new(vec![PrNumber(2)]),
                 };
@@ -1306,10 +1305,7 @@ mod tests {
         }
     }
 
-    // ─── Bug Regression Tests ─────────────────────────────────────────────────
-    //
-    // These tests expose specific bugs from review comments. Each test should
-    // FAIL before the corresponding fix is applied and PASS after.
+    // ─── Regression Tests ─────────────────────────────────────────────────────
 
     mod bug_regression_tests {
         use super::*;
@@ -1441,14 +1437,14 @@ mod tests {
         }
 
         // ─────────────────────────────────────────────────────────────────────────────
-        // Property-based tests that would have caught review comment bugs
+        // Property-based invariant tests
         // ─────────────────────────────────────────────────────────────────────────────
 
         mod property_based_bug_detection {
             use super::*;
             use proptest::prelude::*;
 
-            /// BUG #5: truncate_string can panic on non-ASCII boundaries.
+            /// truncate_string handles non-ASCII boundaries safely.
             ///
             /// Property: truncate_string NEVER panics, regardless of input string
             /// content or max_len value. The output is always valid UTF-8.
@@ -1510,7 +1506,7 @@ mod tests {
                 }
             }
 
-            /// BUG #4: Status comment size enforcement is only debug_assert.
+            /// Status comment size is enforced in release builds.
             ///
             /// Property: format_train_json ALWAYS returns a string under 60KB,
             /// even in release builds, even with pathologically large input.

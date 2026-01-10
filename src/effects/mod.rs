@@ -36,11 +36,9 @@ pub enum Effect {
     GitHub(GitHubEffect),
     /// Record that a PR has been reconciled with its predecessor's squash commit.
     ///
-    /// This updates `predecessor_squash_reconciled` on the PR, which is CRITICAL
+    /// This updates `predecessor_squash_reconciled` on the PR, which is required
     /// for `is_root()` to recognize retargeted descendants as valid new roots.
     /// Without this, fan-out descendants cannot start new trains after cascade.
-    ///
-    /// DESIGN.md: "Record that reconciliation completed — CRITICAL for is_root() to return true"
     RecordReconciliation {
         /// The PR that was reconciled.
         pr: PrNumber,

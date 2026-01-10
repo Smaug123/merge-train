@@ -290,9 +290,8 @@ pub fn action_to_effects(action: &PhaseAction) -> Vec<Effect> {
             // (which builds effects directly with Fetch/Checkout). If used in
             // the future, callers must prepend Fetch and Checkout effects.
             //
-            // CRITICAL: The interpreter MUST validate squash_sha even though
-            // expected_squash_parent is None. See MergeReconcile docs for validation
-            // requirements (single parent check, default branch ancestry).
+            // The interpreter must validate squash_sha even though expected_squash_parent
+            // is None. See MergeReconcile docs for validation requirements.
             vec![
                 Effect::Git(GitEffect::MergeReconcile {
                     squash_sha: squash_sha.clone(),

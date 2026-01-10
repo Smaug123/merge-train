@@ -153,7 +153,7 @@ pub fn compute_recovery_plan(
         }
 
         CascadePhase::Preparing { progress } => {
-            // CRITICAL: Check if the current PR was merged externally during the crash.
+            // Check if the current PR was merged externally during the crash.
             // If so, we need to handle it like handle_external_merge does in step.rs.
             if let Some(current_pr) = prs.get(&train.current_pr)
                 && let PrState::Merged { merge_commit_sha } = &current_pr.state
@@ -257,7 +257,7 @@ pub fn compute_recovery_plan(
             }
 
             // Normal case: PR not merged, continue with preparation recovery.
-            // CRITICAL: Use frozen_descendants, not current descendants
+            // Use frozen_descendants, not current descendants.
             recover_multi_descendant_phase(&mut actions, &mut effects, progress, prs, |desc_pr| {
                 if let Some(pred_sha) = &train.predecessor_head_sha {
                     RecoveryAction::RetryMerge {
@@ -279,11 +279,11 @@ pub fn compute_recovery_plan(
                 match &current_pr.state {
                     PrState::Merged { merge_commit_sha } => {
                         // Already merged - transition to Reconciling phase with the merge SHA.
-                        // CRITICAL: Reset progress.completed because it tracks PREPARATION, not
-                        // reconciliation. Preserve skipped (closed PRs stay skipped).
+                        // Reset progress.completed because it tracks PREPARATION, not reconciliation.
+                        // Preserve skipped (closed PRs stay skipped).
                         //
-                        // CRITICAL: We need to validate the merge was a squash before proceeding.
-                        // The validation effect will run before any reconciliation effects.
+                        // Validate the merge was a squash before proceeding. The validation effect
+                        // will run before any reconciliation effects.
                         let mut reset_progress =
                             DescendantProgress::new(progress.frozen_descendants.clone());
                         reset_progress.skipped = progress.skipped.clone();
@@ -351,10 +351,10 @@ pub fn compute_recovery_plan(
                         actions.push(RecoveryAction::ResumeClean);
                     }
                     PrState::Open => {
-                        // CRITICAL: Verify the PR head hasn't changed since preparation.
-                        // Same guard as execute_squash_pending in step.rs:416-439.
-                        // If someone pushed new commits after preparation, those commits
-                        // would be squashed without proper preparation of descendants.
+                        // Verify the PR head hasn't changed since preparation. Same guard as
+                        // execute_squash_pending in step.rs. If someone pushed new commits after
+                        // preparation, those commits would be squashed without proper preparation
+                        // of descendants.
                         if let Some(recorded_sha) = &train.predecessor_head_sha
                             && current_pr.head_sha != *recorded_sha
                         {
@@ -406,9 +406,9 @@ pub fn compute_recovery_plan(
             progress,
             squash_sha,
         } => {
-            // CRITICAL: Per DESIGN.md "Verifying preparation before reconciliation",
-            // verify each remaining descendant was prepared before the squash.
-            // This prevents data loss if the PR was merged externally mid-prepare.
+            // Per DESIGN.md "Verifying preparation before reconciliation", verify each
+            // remaining descendant was prepared before the squash. This prevents data
+            // loss if the PR was merged externally mid-prepare.
             let remaining_descendants: Vec<_> = progress
                 .remaining()
                 .filter_map(|pr_num| {
@@ -732,9 +732,9 @@ pub fn verify_descendants_prepared(
         }
     };
 
-    // CRITICAL: Fetch descendant PR refs before verification.
-    // Without this, git merge-base may fail if objects aren't local, returning
-    // non-zero (same as "not ancestor") and causing false negatives.
+    // Fetch descendant PR refs before verification. Without this, git merge-base
+    // may fail if objects aren't local, returning non-zero (same as "not ancestor")
+    // and causing false negatives.
     let refspecs: Vec<String> = descendants
         .iter()
         .map(|(pr_num, _)| format!("+refs/pull/{}/head", pr_num.0))
@@ -962,7 +962,7 @@ mod tests {
                 .any(|a| matches!(a, RecoveryAction::ResumeClean))
         );
 
-        // CRITICAL: Must emit ValidateSquashCommit effect
+        // Must emit ValidateSquashCommit effect
         assert!(
             plan.effects
                 .iter()
@@ -1381,16 +1381,13 @@ mod tests {
                 }
             }
 
-            // ─── Bug Fix Tests ───────────────────────────────────────────────────────
-            //
-            // These tests expose bugs described in review comments.
+            // ─── Recovery Phase Transition Tests ─────────────────────────────────────────
 
             /// Property: Recovery for SquashPending with merged PR captures merge_commit_sha
             /// and transitions train to Reconciling.
             ///
-            /// BUG: When the train is in SquashPending and the PR was merged externally,
-            /// recovery returns ResumeClean without capturing merge_commit_sha or
-            /// transitioning the train to Reconciling phase.
+            /// Verifies that when a train is in SquashPending and the PR was merged externally,
+            /// recovery captures the merge_commit_sha and transitions to Reconciling phase.
             #[test]
             fn recovery_squash_pending_with_merged_pr_transitions_to_reconciling(
                 frozen_descendants in arb_unique_descendants(1, 3),
@@ -1517,8 +1514,8 @@ mod tests {
                 );
             }
 
-            /// Review Comment #1 fix: Recovery from Preparing with externally merged PR
-            /// must abort if descendants are unprepared.
+            /// Recovery from Preparing with externally merged PR must abort
+            /// if descendants are unprepared.
             ///
             /// Property: When train is in Preparing phase and root PR was merged externally
             /// with unprepared descendants remaining, recovery MUST produce NeedsManualReview.
@@ -1554,16 +1551,15 @@ mod tests {
                 });
                 prop_assert!(
                     has_manual_review,
-                    "BUG (Review Comment #1): Recovery from Preparing with externally merged PR \
-                     and unprepared descendants MUST abort with NeedsManualReview. \
-                     Unprepared: {:?}, Actions: {:?}",
+                    "Recovery from Preparing with externally merged PR and unprepared descendants \
+                     MUST abort with NeedsManualReview. Unprepared: {:?}, Actions: {:?}",
                     frozen_descendants,
                     plan.actions
                 );
             }
 
-            /// Review Comment #1 fix (continued): Recovery from Preparing with ALL descendants
-            /// prepared should transition to Reconciling (not abort).
+            /// Recovery from Preparing with all descendants prepared transitions
+            /// to Reconciling (not abort).
             ///
             /// Property: When all descendants are prepared, external merge in Preparing should
             /// successfully transition to Reconciling with reset progress.
@@ -1614,7 +1610,7 @@ mod tests {
                     plan.train.cascade_phase
                 );
 
-                // CRITICAL: The completed set should be RESET (prepared != reconciled)
+                // The completed set should be RESET (prepared != reconciled)
                 if let CascadePhase::Reconciling { progress, .. } = &plan.train.cascade_phase {
                     prop_assert!(
                         progress.completed.is_empty(),

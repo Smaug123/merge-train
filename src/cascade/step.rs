@@ -244,9 +244,9 @@ fn execute_from_idle(
         _ => unreachable!("start_preparing only returns Preparing or SquashPending"),
     };
 
-    // CRITICAL: Emit status comment update for Idle → Preparing/SquashPending transition.
-    // This ensures GitHub-based recovery can see the phase transition and frozen descendants
-    // immediately, not just after the first descendant is processed.
+    // Emit status comment update for Idle → Preparing/SquashPending transition. This ensures
+    // GitHub-based recovery can see the phase transition and frozen descendants immediately,
+    // not just after the first descendant is processed.
     //
     // CRASH SAFETY: Prepend (insert at 0) rather than append. If the executor crashes
     // between executing effects, the comment should already reflect the new phase.
@@ -343,10 +343,9 @@ fn execute_preparing(
         };
     }
 
-    // CRITICAL: Base-branch revalidation before preparing.
-    // DESIGN.md requires verifying that descendant.base_ref matches the predecessor's
-    // head branch. This prevents merging unrelated stacks if someone retargets a PR
-    // between declaration and cascade time.
+    // Base-branch revalidation before preparing. DESIGN.md requires verifying that
+    // descendant.base_ref matches the predecessor's head branch. This prevents merging
+    // unrelated stacks if someone retargets a PR between declaration and cascade time.
     //
     // ABORT rather than skip: skipping can silently drop retargeted descendants,
     // leading to incomplete cascades. Aborting makes the issue visible so the user
@@ -375,22 +374,19 @@ fn execute_preparing(
     }
 
     // Store predecessor info for recovery (only on first preparation).
-    // CRITICAL: Do NOT overwrite predecessor_head_sha on subsequent preparations.
-    // The squash-time guard (line 406) must compare against the head SHA from
-    // cascade START, not from the most recent preparation. Otherwise, if the root
-    // PR is pushed between preparing descendants, the guard would compare the new
-    // SHA against itself and incorrectly pass.
+    // Do NOT overwrite predecessor_head_sha on subsequent preparations. The squash-time
+    // guard must compare against the head SHA from cascade START, not from the most
+    // recent preparation. Otherwise, if the root PR is pushed between preparing
+    // descendants, the guard would compare the new SHA against itself and incorrectly pass.
     train.predecessor_pr = Some(train.current_pr);
     if train.predecessor_head_sha.is_none() {
         train.predecessor_head_sha = Some(current_pr.head_sha.clone());
     }
     train.increment_seq();
 
-    // Generate effects for preparation
-    // Fetch via PR refs to ensure we have the latest state
-    // CRITICAL: We must checkout the fetched PR ref (detached), not the local branch name.
-    // The local branch may be stale if the remote advanced. Checking out the fetched ref
-    // ensures we start from the latest state on GitHub.
+    // Generate effects for preparation. Fetch via PR refs to ensure we have the latest state.
+    // Checkout the fetched PR ref (detached), not the local branch name. The local branch
+    // may be stale if the remote advanced.
     let effects = vec![
         // Fetch both the predecessor and descendant PR refs
         Effect::Git(GitEffect::Fetch {
@@ -448,9 +444,9 @@ fn execute_squash_pending(
     current_pr: &CachedPr,
     _ctx: &StepContext,
 ) -> StepResult {
-    // CRITICAL: Verify the PR head hasn't changed since preparation.
-    // If someone pushed new commits after we prepared descendants, those commits
-    // would be squashed without proper preparation of descendants (data loss risk).
+    // Verify the PR head hasn't changed since preparation. If someone pushed new
+    // commits after we prepared descendants, those commits would be squashed without
+    // proper preparation of descendants (data loss risk).
     if let Some(recorded_sha) = train.predecessor_head_sha.clone()
         && current_pr.head_sha != recorded_sha
     {
@@ -542,9 +538,8 @@ fn execute_reconciling(
         };
     }
 
-    // Generate reconciliation effects
-    // CRITICAL: Must fetch and checkout the descendant branch before merging.
-    // The worktree may still be on a different branch from a prior operation.
+    // Generate reconciliation effects. Must fetch and checkout the descendant branch
+    // before merging. The worktree may still be on a different branch from a prior operation.
     let effects = vec![
         // Fetch the descendant's latest state and the default branch
         // (default branch needed to ensure squash_sha is available locally)
@@ -562,11 +557,8 @@ fn execute_reconciling(
             target: format!("refs/remotes/origin/pr/{}", next_descendant),
             detach: true,
         }),
-        // Perform the two-step reconciliation merge.
-        // CRITICAL: The interpreter MUST validate squash_sha even though
-        // expected_squash_parent is None. See MergeReconcile docs for requirements:
-        // 1. Verify squash_sha has exactly one parent (is actually a squash)
-        // 2. Verify that parent is on origin/{default_branch} history
+        // Perform the two-step reconciliation merge. The interpreter must validate
+        // squash_sha even though expected_squash_parent is None. See MergeReconcile docs.
         Effect::Git(GitEffect::MergeReconcile {
             squash_sha: squash_sha.clone(),
             // Note: expected_squash_parent is None because we don't have the parent
@@ -645,8 +637,7 @@ fn execute_catching_up(
     }
 
     // Generate catch-up effects
-    // CRITICAL: Must fetch and checkout the descendant branch before merging.
-    // The worktree may still be on a different branch from a prior operation.
+    // Must fetch and checkout the descendant branch before merging.
     let effects = vec![
         // Fetch the descendant's latest state and the default branch
         Effect::Git(GitEffect::Fetch {
@@ -658,7 +649,7 @@ fn execute_catching_up(
                 ctx.default_branch.clone(),
             ],
         }),
-        // Checkout the descendant's PR ref (fetched state)
+        // Checkout the descendant's PR ref
         Effect::Git(GitEffect::Checkout {
             target: format!("refs/remotes/origin/pr/{}", next_descendant),
             detach: true,
@@ -760,9 +751,9 @@ fn execute_retargeting(
 
 /// Handle the case where a PR was merged externally (not by us).
 ///
-/// CRITICAL: External merges bypass our controlled cascade flow and can drop
-/// predecessor content if descendants weren't prepared. This function handles
-/// all phases, aborting when necessary to prevent data loss.
+/// External merges bypass our controlled cascade flow and can drop predecessor
+/// content if descendants weren't prepared. This function handles all phases,
+/// aborting when necessary to prevent data loss.
 ///
 /// Phase-specific handling:
 /// - **Idle**: Has unprepared descendants (none were promised yet). Must abort
@@ -785,9 +776,8 @@ fn handle_external_merge(
     // Store the squash SHA
     train.last_squash_sha = Some(merge_sha.clone());
 
-    // CRITICAL: Handle each phase appropriately.
-    // Idle and SquashPending are problematic because descendants weren't
-    // prepared yet OR the completed set doesn't apply to reconciliation.
+    // Handle each phase appropriately. Idle and SquashPending are problematic because
+    // descendants weren't prepared yet OR the completed set doesn't apply to reconciliation.
     let (progress, needs_abort) = match &train.cascade_phase {
         CascadePhase::Idle => {
             // External merge in Idle = preparation was never started.
@@ -813,8 +803,7 @@ fn handle_external_merge(
                 (progress.clone(), true)
             } else {
                 // All prepared - reset for reconciliation (same logic as SquashPending).
-                // CRITICAL: Preserve skipped set - closed/failed descendants should remain
-                // skipped through subsequent phases.
+                // Preserve skipped set - closed/failed descendants should remain skipped.
                 let mut fresh_progress =
                     DescendantProgress::new(progress.frozen_descendants.clone());
                 fresh_progress.skipped = progress.skipped.clone();
@@ -825,8 +814,7 @@ fn handle_external_merge(
             // External merge in SquashPending = squash bypassed our control.
             // The `completed` set tracks which descendants were PREPARED, but
             // reconciliation needs a fresh start (none are reconciled yet).
-            // CRITICAL: Preserve skipped set - closed/failed descendants should remain
-            // skipped through subsequent phases (not reintroduced for reconciliation).
+            // Preserve skipped set - closed/failed descendants should remain skipped.
             let mut fresh_progress = DescendantProgress::new(progress.frozen_descendants.clone());
             fresh_progress.skipped = progress.skipped.clone();
             (fresh_progress, false)
@@ -839,9 +827,8 @@ fn handle_external_merge(
         }
     };
 
-    // CRITICAL: If we have unprepared descendants, abort.
-    // These descendants don't have the predecessor's content merged into them,
-    // so reconciliation would drop changes.
+    // If we have unprepared descendants, abort. These descendants don't have the
+    // predecessor's content merged into them, so reconciliation would drop changes.
     if needs_abort {
         let unprepared: Vec<PrNumber> = progress.remaining().copied().collect();
         let reason = AbortReason::PreparationIncomplete {
@@ -883,9 +870,9 @@ fn handle_external_merge(
     let remaining: Vec<PrNumber> = progress.remaining().copied().collect();
 
     if remaining.is_empty() {
-        // No descendants to process - cascade complete.
-        // CRITICAL: Still validate the squash commit to enforce squash-only requirement.
-        // Even with no descendants, a non-squash merge violates linear history.
+        // No descendants to process - cascade complete. Still validate the squash commit
+        // to enforce squash-only requirement. Even with no descendants, a non-squash
+        // merge violates linear history.
         let mut result = complete_cascade(train, progress);
 
         // Add validation effect to ensure the external merge was a squash
@@ -906,8 +893,8 @@ fn handle_external_merge(
     };
     train.increment_seq();
 
-    // CRITICAL: Emit status comment update to record last_squash_sha and
-    // Reconciling phase for GitHub-based recovery
+    // Emit status comment update to record last_squash_sha and Reconciling phase
+    // for GitHub-based recovery.
     let effects = if let Some(comment_id) = train.status_comment_id {
         match format_phase_comment(train) {
             Ok(body) => {
@@ -1142,8 +1129,8 @@ fn transition_to_retargeting(
 /// - If one descendant was processed, advance `current_pr` and continue
 /// - If multiple descendants were processed, emit FanOut for parallel trains
 ///
-/// CRITICAL: Always emits a status comment update to ensure GitHub-based recovery
-/// can see the new current_pr or completion state.
+/// Always emits a status comment update to ensure GitHub-based recovery can see
+/// the new current_pr or completion state.
 fn complete_cascade(train: &mut TrainRecord, progress: DescendantProgress) -> StepResult {
     train.cascade_phase = CascadePhase::Idle;
     train.predecessor_head_sha = None; // Clear stale SHA from previous cascade cycle
@@ -1352,10 +1339,9 @@ pub fn process_operation_result(
             }
             train.increment_seq();
 
-            // CRITICAL: Emit RecordReconciliation effect so is_root() will recognize
-            // this descendant as a valid new root after the cascade completes.
-            // Without this, fan-out descendants cannot start new trains.
-            // DESIGN.md: "Record that reconciliation completed — CRITICAL for is_root()"
+            // Emit RecordReconciliation effect so is_root() will recognize this
+            // descendant as a valid new root after the cascade completes. Without this,
+            // fan-out descendants cannot start new trains.
             let effects = if let Some(squash_sha) = train.last_squash_sha.clone() {
                 vec![Effect::RecordReconciliation { pr, squash_sha }]
             } else {
@@ -1404,10 +1390,8 @@ pub fn process_operation_result(
             }
             train.increment_seq();
 
-            // CRITICAL: Emit status comment update after squash transition.
-            // This ensures GitHub-based recovery can see `last_squash_sha` and the
-            // Reconciling phase, preventing re-squash or recovery failures if the
-            // bot crashes before the next phase transition.
+            // Emit status comment update after squash transition. This ensures GitHub-based
+            // recovery can see `last_squash_sha` and the Reconciling phase.
             let effects = if let Some(comment_id) = train.status_comment_id {
                 match format_phase_comment(&train) {
                     Ok(body) => {
@@ -1976,7 +1960,7 @@ mod tests {
                     phase_sequence.last()
                 );
 
-                // CRITICAL ASSERTION: The late addition should NEVER have been processed
+                // The late addition should NEVER have been processed
                 prop_assert!(
                     !processed_prs.contains(&late_addition),
                     "Late addition {} was processed but should have been ignored! Processed: {:?}, Frozen: {:?}",
@@ -2111,16 +2095,12 @@ mod tests {
                 );
             }
 
-            // ─── Bug Fix Tests ───────────────────────────────────────────────────────
-            //
-            // These tests expose bugs described in review comments. They should FAIL
-            // before the fix is applied and PASS after.
+            // ─── Cascade Completion Tests ───────────────────────────────────────────────
 
             /// Property: After completing Retargeting, cascade advances current_pr or emits FanOut.
             ///
-            /// BUG: complete_cascade just sets Idle and returns Complete, never advancing
-            /// current_pr or emitting FanOut. The train stops at the root and never
-            /// processes descendants.
+            /// Verifies that complete_cascade advances current_pr or emits FanOut
+            /// to process descendants, rather than stopping at the root.
             #[test]
             fn complete_cascade_advances_or_fans_out(
                 frozen_descendants in arb_unique_descendants(1, 4),
@@ -2720,10 +2700,7 @@ mod tests {
         }
     }
 
-    // ─── Bug Regression Tests ─────────────────────────────────────────────────
-    //
-    // These tests expose specific bugs from review comments. Each test should
-    // FAIL before the corresponding fix is applied and PASS after.
+    // ─── Regression Tests ─────────────────────────────────────────────────────
 
     mod bug_regression_tests {
         use super::*;
@@ -2756,7 +2733,7 @@ mod tests {
             train.cascade_phase = CascadePhase::SquashPending {
                 progress: DescendantProgress::new(vec![PrNumber(2)]),
             };
-            // CRITICAL: Train has a status comment ID
+            // Train has a status comment ID
             train.status_comment_id = Some(CommentId(12345));
 
             let squash_sha = make_sha(0xabc);
@@ -2835,7 +2812,7 @@ mod tests {
         /// Regression test: handle_external_merge must emit a status comment update
         /// when changing phase to Reconciling and storing squash_sha.
         ///
-        /// CRITICAL: External merge in Preparing with all descendants prepared must
+        /// External merge in Preparing with all descendants prepared must
         /// transition to Reconciling (not complete the cascade). The "completed" set
         /// in Preparing tracks "prepared" not "reconciled" - all descendants still
         /// need reconciliation.
@@ -2867,7 +2844,7 @@ mod tests {
             // Execute cascade step - should transition to Reconciling with reset progress
             let result = execute_cascade_step(train, &prs, &ctx);
 
-            // CRITICAL: Must transition to Reconciling (not complete cascade).
+            // Must transition to Reconciling (not complete cascade).
             // Current PR stays at #1 because we're reconciling, not advancing.
             assert_eq!(result.train.current_pr, PrNumber(1));
             assert_eq!(result.train.last_squash_sha, Some(merge_sha.clone()));
@@ -2985,7 +2962,7 @@ mod tests {
                 result.outcome
             );
 
-            // CRITICAL: Must emit ValidateSquashCommit effect
+            // Must emit ValidateSquashCommit effect
             let has_validation = result.effects.iter().any(|e| {
                 matches!(
                     e,
@@ -3152,7 +3129,7 @@ mod tests {
             // Step 4: Prepare second descendant (#3) - BUG: overwrites predecessor_head_sha
             let result = execute_cascade_step(train, &prs_updated, &ctx);
 
-            // CRITICAL ASSERTION (currently fails due to bug):
+            // Assertion:
             // predecessor_head_sha should STILL be original_sha, not new_sha
             assert_eq!(
                 result.train.predecessor_head_sha,
@@ -3214,7 +3191,7 @@ mod tests {
                 result.train.cascade_phase
             );
 
-            // CRITICAL: predecessor_head_sha must be recorded
+            // predecessor_head_sha must be recorded
             assert_eq!(
                 result.train.predecessor_head_sha,
                 Some(original_sha.clone()),
@@ -3230,9 +3207,9 @@ mod tests {
             );
         }
 
-        /// Regression test: trains with NO descendants must abort on head SHA change.
+        /// Trains with no descendants must abort on head SHA change.
         ///
-        /// This verifies the guard actually fires for no-descendant trains after the fix.
+        /// Verifies the guard fires for trains with empty descendant lists.
         #[test]
         fn no_descendants_train_aborts_on_head_change() {
             let original_sha = make_sha(0x111);
@@ -3330,7 +3307,7 @@ mod tests {
             // Phase must be Reconciling
             match &result.train.cascade_phase {
                 CascadePhase::Reconciling { progress, .. } => {
-                    // CRITICAL: Skipped set must be preserved
+                    // Skipped set must be preserved
                     assert!(
                         progress.skipped.contains(&PrNumber(2)),
                         "BUG: Skipped descendant #2 was dropped during external merge handling. \
@@ -3362,7 +3339,7 @@ mod tests {
         }
 
         // ─────────────────────────────────────────────────────────────────────────────
-        // Property-based tests that would have caught review comment bugs
+        // Property-based invariant tests
         // ─────────────────────────────────────────────────────────────────────────────
 
         mod property_based_bug_detection {
@@ -3386,8 +3363,7 @@ mod tests {
                     .prop_map(|set| set.into_iter().collect())
             }
 
-            /// BUG #1: handle_external_merge only aborts when phase is Preparing.
-            /// External merge in Idle or SquashPending can skip preparation entirely.
+            /// External merge in any phase with unprepared descendants must abort.
             ///
             /// Property: For ANY phase with unprepared direct descendants, an external
             /// merge MUST abort (not silently proceed to Reconciling).
@@ -3507,7 +3483,7 @@ mod tests {
                         result.train.cascade_phase
                     );
 
-                    // CRITICAL: The completed set must be RESET, not carried over
+                    // The completed set must be RESET, not carried over
                     if let CascadePhase::Reconciling { progress, .. } = &result.train.cascade_phase {
                         prop_assert!(
                             progress.completed.is_empty(),
@@ -3573,7 +3549,7 @@ mod tests {
                     let ctx = StepContext::new("main");
                     let result = execute_cascade_step(train, &prs, &ctx);
 
-                    // CRITICAL: Must transition to Reconciling (not Idle/complete)
+                    // Must transition to Reconciling (not Idle/complete)
                     prop_assert!(
                         matches!(result.train.cascade_phase, CascadePhase::Reconciling { .. }),
                         "External merge in Preparing (all prepared) must transition to Reconciling. \
@@ -3598,8 +3574,7 @@ mod tests {
                 });
             }
 
-            /// BUG #2: External merges with NO descendants don't validate squash semantics.
-            /// Non-squash merges (merge commits, rebase) violate the squash-only requirement.
+            /// External merges with no descendants must validate squash semantics.
             ///
             /// Property: External merge with NO descendants must emit ValidateSquashCommit.
             /// (With descendants, validation happens during reconciliation in the next step.)
@@ -3708,7 +3683,7 @@ mod tests {
                 });
             }
 
-            /// BUG #3: Idle → Preparing/SquashPending transitions don't update status comment.
+            /// Phase transitions from Idle update status comment.
             ///
             /// Property: Every phase transition MUST emit a status comment update
             /// (when status_comment_id is set).
@@ -3771,11 +3746,11 @@ mod tests {
                 });
             }
 
-            /// BUG #6: Late-addition size check only counts direct descendants.
-            /// Deep chains can exceed the 50-PR limit without triggering abort.
+            /// Train size check counts transitive descendants.
             ///
             /// Property: Train size check must count ALL transitive descendants,
-            /// not just immediate children.
+            /// not just immediate children. Deep chains exceeding the 50-PR limit
+            /// must trigger abort.
             #[test]
             fn train_size_check_counts_transitive_descendants() {
                 // Create a deep linear chain that exceeds limit
@@ -3903,10 +3878,10 @@ mod tests {
             }
 
             // ─────────────────────────────────────────────────────────────────────────────
-            // Tests for review comment fixes (WaitingOnCi state, RecordReconciliation)
+            // State consistency tests
             // ─────────────────────────────────────────────────────────────────────────────
 
-            /// Review Comment #6 fix: WaitingOnCi outcomes MUST set train.state to WaitingCi.
+            /// WaitingOnCi outcomes MUST set train.state to WaitingCi.
             ///
             /// Property: Whenever execute_cascade_step returns CascadeStepOutcome::WaitingOnCi,
             /// the returned train.state MUST be TrainState::WaitingCi.
@@ -3960,8 +3935,7 @@ mod tests {
                     if matches!(result.outcome, CascadeStepOutcome::WaitingOnCi { .. }) {
                         prop_assert!(
                             matches!(result.train.state, TrainState::WaitingCi),
-                            "BUG (Review Comment #6): WaitingOnCi outcome returned but \
-                             train.state is {:?}, not WaitingCi. \
+                            "WaitingOnCi outcome returned but train.state is {:?}, not WaitingCi. \
                              Outcome: {:?}",
                             result.train.state,
                             result.outcome
@@ -3970,7 +3944,7 @@ mod tests {
                 });
             }
 
-            /// Review Comment #2 fix: DescendantRetargeted MUST emit RecordReconciliation.
+            /// DescendantRetargeted MUST emit RecordReconciliation.
             ///
             /// Property: When processing OperationResult::DescendantRetargeted with
             /// last_squash_sha set, the step MUST emit Effect::RecordReconciliation.
@@ -4032,8 +4006,7 @@ mod tests {
 
                     prop_assert!(
                         has_record_reconciliation,
-                        "BUG (Review Comment #2): DescendantRetargeted with last_squash_sha \
-                         MUST emit RecordReconciliation. \
+                        "DescendantRetargeted with last_squash_sha MUST emit RecordReconciliation. \
                          descendant_pr: {:?}, last_squash_sha: {:?}, effects: {:?}",
                         descendant_pr,
                         train.last_squash_sha,
@@ -4050,7 +4023,7 @@ mod tests {
                 });
             }
 
-            /// Review Comment #2 (continued): Abort on missing last_squash_sha.
+            /// DescendantRetargeted aborts on missing last_squash_sha.
             ///
             /// Property: When last_squash_sha is None, DescendantRetargeted MUST abort
             /// with InternalInvariantViolation. This prevents silent fan-out breakage.
@@ -4283,7 +4256,7 @@ mod tests {
 
                 let sha = Sha::parse("abcd1234abcd1234abcd1234abcd1234abcd1234").unwrap();
                 let mut train = TrainRecord::new(PrNumber(1));
-                // CRITICAL: Set status_comment_id to test comment update
+                // Set status_comment_id to test comment update
                 train.status_comment_id = Some(CommentId(12345));
 
                 // Build a deep chain

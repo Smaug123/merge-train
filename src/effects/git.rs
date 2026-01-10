@@ -88,8 +88,8 @@ pub enum GitEffect {
     ///
     /// # Interpreter Validation Requirements
     ///
-    /// **CRITICAL**: The interpreter MUST validate the squash commit before
-    /// reconciliation, regardless of whether `expected_squash_parent` is provided:
+    /// The interpreter must validate the squash commit before reconciliation,
+    /// regardless of whether `expected_squash_parent` is provided:
     ///
     /// 1. **Single parent check**: Verify `squash_sha` has exactly one parent.
     ///    If it has multiple parents, it's a regular merge commit, not a squash.
@@ -444,16 +444,13 @@ mod tests {
         }
     }
 
-    // ─── Bug Regression Tests ─────────────────────────────────────────────────
-    //
-    // These tests expose specific bugs from review comments. Each test should
-    // FAIL before the corresponding fix is applied and PASS after.
+    // ─── Regression Tests ─────────────────────────────────────────────────────
 
     mod bug_regression_tests {
         use super::*;
 
-        /// BUG: GitEffect::MergeReconcile omits expected_squash_parent and default_branch
-        /// needed by the existing git::reconcile_descendant validation.
+        /// GitEffect::MergeReconcile includes expected_squash_parent and default_branch
+        /// needed for reconciliation validation.
         ///
         /// From DESIGN.md: "Reconciliation assumes all descendants were prepared...
         /// the bot MUST verify for each descendant not in `completed`:
