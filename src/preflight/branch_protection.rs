@@ -58,13 +58,15 @@ impl PreflightWarning {
     pub fn format_comment(&self) -> String {
         match self {
             PreflightWarning::DismissStaleApprovalsEnabled { source } => {
-                let source_desc = match source {
-                    DismissStaleSource::BranchProtection => {
-                        "in branch protection settings".to_string()
-                    }
-                    DismissStaleSource::Ruleset { ruleset_name } => {
-                        format!("in ruleset \"{}\"", ruleset_name)
-                    }
+                let (source_desc, remediation) = match source {
+                    DismissStaleSource::BranchProtection => (
+                        "in branch protection settings".to_string(),
+                        "Disabling \"Dismiss stale pull request approvals\" in branch protection settings".to_string(),
+                    ),
+                    DismissStaleSource::Ruleset { ruleset_name } => (
+                        format!("in ruleset \"{}\"", ruleset_name),
+                        format!("Disabling \"Dismiss stale pull request approvals on push\" in the \"{}\" ruleset", ruleset_name),
+                    ),
                 };
 
                 format!(
@@ -74,13 +76,13 @@ The merge train bot pushes merge commits to PR branches during cascade operation
 
 To avoid mid-cascade aborts, consider either:
 
-1. Disabling "Dismiss stale pull request approvals" in branch protection settings, OR
+1. {}, OR
 2. Using a different workflow for stacked PRs in this repository
 
 See: https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches#require-pull-request-reviews-before-merging
 
 Proceeding with train start..."#,
-                    source_desc
+                    source_desc, remediation
                 )
             }
             PreflightWarning::DismissStaleApprovalsUnknown { reason } => {
@@ -687,8 +689,19 @@ mod tests {
         };
         let msg = warning.format_comment();
         assert!(
-            msg.contains("my-ruleset"),
-            "Should mention ruleset name: {}",
+            msg.contains("in ruleset \"my-ruleset\""),
+            "Should mention ruleset name in source: {}",
+            msg
+        );
+        // Verify remediation also mentions the ruleset, not branch protection
+        assert!(
+            msg.contains("in the \"my-ruleset\" ruleset"),
+            "Remediation should mention the specific ruleset: {}",
+            msg
+        );
+        assert!(
+            !msg.contains("1. Disabling \"Dismiss stale pull request approvals\" in branch protection settings"),
+            "Remediation should NOT mention branch protection for ruleset-sourced warnings: {}",
             msg
         );
     }
