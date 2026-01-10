@@ -14,8 +14,8 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// Parses a GitHub signature header (e.g., "sha256=abc123...") into raw bytes.
 ///
-/// Returns `None` for malformed headers (missing prefix, invalid hex, etc.).
-/// Never panics.
+/// Returns `None` for malformed headers (missing prefix, invalid hex, empty
+/// signature, etc.). Never panics.
 ///
 /// # Examples
 ///
@@ -34,10 +34,18 @@ type HmacSha256 = Hmac<Sha256>;
 ///
 /// // Invalid: bad hex
 /// assert!(parse_signature_header("sha256=xyz").is_none());
+///
+/// // Invalid: empty signature
+/// assert!(parse_signature_header("sha256=").is_none());
 /// ```
 pub fn parse_signature_header(header: &str) -> Option<Vec<u8>> {
     // GitHub uses "sha256=" prefix
     let hex_sig = header.strip_prefix("sha256=")?;
+
+    // Empty signature is malformed
+    if hex_sig.is_empty() {
+        return None;
+    }
 
     // Decode hex to bytes
     hex::decode(hex_sig).ok()
@@ -154,8 +162,8 @@ mod tests {
 
     #[test]
     fn test_parse_signature_header_just_prefix() {
-        // "sha256=" with no hex
-        assert_eq!(parse_signature_header("sha256="), Some(vec![]));
+        // "sha256=" with no hex is malformed
+        assert_eq!(parse_signature_header("sha256="), None);
     }
 
     #[test]
@@ -182,11 +190,20 @@ mod tests {
         let payload = b"Hello, World!";
         let secret = b"It's a Secret to Everybody";
 
-        // Expected signature (computed independently)
-        let expected_sig = compute_signature(payload, secret);
-        let header = format_signature_header(&expected_sig);
+        // Expected signature computed independently via Python:
+        // hmac.new(b"It's a Secret to Everybody", b"Hello, World!", hashlib.sha256).hexdigest()
+        let expected_header =
+            "sha256=757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e17";
 
-        assert!(verify_signature(payload, &header, secret));
+        // Verify against the known-good signature
+        assert!(verify_signature(payload, expected_header, secret));
+
+        // Also verify our compute_signature produces the same result
+        let computed = compute_signature(payload, secret);
+        assert_eq!(
+            hex::encode(&computed),
+            "757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e17"
+        );
     }
 
     #[test]
