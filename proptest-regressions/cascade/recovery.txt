@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 3f0cd71d7f909f21f24540d9bb6b3d0d181248366987469f0e4705b6de1042a4 # shrinks to frozen_descendants = [PrNumber(2)], merge_sha = Sha("aa00a00aa000000aa00000a00a0aa00aa0aa0aaa"), pr_sha = Sha("00aa0aaaa0000000a0000aaa00a0aaa00aaa00a0")

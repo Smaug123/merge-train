@@ -830,8 +830,8 @@ fn recovery_uses_frozen_descendants() {
     );
     assert!(current_descendants.contains(&PrNumber(103)));
 
-    // CRITICAL INVARIANT: remaining_descendants still returns only the frozen set
-    // It does NOT use the descendants_index, so pr-103 is NOT included
+    // remaining_descendants still returns only the frozen set.
+    // It does NOT use the descendants_index, so pr-103 is NOT included.
     let remaining_after_late_addition = remaining_descendants(&phase);
     assert_eq!(
         remaining_after_late_addition.len(),

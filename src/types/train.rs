@@ -58,8 +58,8 @@ pub struct DescendantProgress {
     pub skipped: HashSet<PrNumber>,
 
     /// The descendant set captured when entering `Preparing`.
-    /// This is frozen and carried through ALL subsequent phases.
-    /// CRITICAL: Recovery MUST use this, not re-query the descendants index.
+    /// Frozen and carried through all subsequent phases.
+    /// Recovery must use this, not re-query the descendants index.
     pub frozen_descendants: Vec<PrNumber>,
 }
 
@@ -330,6 +330,12 @@ pub struct TrainRecord {
 
     /// The ID of the status comment on the original root PR.
     /// Used to update the comment as the train progresses.
+    ///
+    /// Note: This is local-only data and is excluded from the status comment
+    /// JSON via format_train_json() (which sets it to None) to avoid including
+    /// redundant/confusing info. The skip_serializing_if ensures it doesn't
+    /// appear as "null" in the JSON when set to None.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub status_comment_id: Option<CommentId>,
 }
 

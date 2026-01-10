@@ -18,6 +18,9 @@ pub mod worktree;
 #[cfg(test)]
 mod property_tests;
 
+// Re-export commonly used types from submodules
+pub use push::{PushIntent, PushResult, is_push_completed};
+
 use std::path::{Path, PathBuf};
 use std::process::Output;
 

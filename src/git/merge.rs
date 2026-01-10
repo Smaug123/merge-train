@@ -15,9 +15,8 @@
 //!
 //! All operations are performed in detached HEAD mode to avoid branch locking issues.
 //!
-//! **CRITICAL**: Do NOT merge main during preparation! The $SQUASH_SHA^ ordering is
-//! essential to prevent lost commits. See "Why merging $SQUASH_SHA^ is essential" in
-//! DESIGN.md.
+//! Note: Do NOT merge main during preparation. The $SQUASH_SHA^ ordering prevents
+//! lost commits. See "Why merging $SQUASH_SHA^ is essential" in DESIGN.md.
 
 use std::path::Path;
 
@@ -34,9 +33,9 @@ use super::{
 /// This is called BEFORE the predecessor is squash-merged. It ensures the
 /// descendant has all of the predecessor's final content.
 ///
-/// **CRITICAL**: This function does NOT merge main. That happens during
-/// reconciliation after the squash, using `$SQUASH_SHA^`. Merging main here
-/// would cause lost commits.
+/// Note: This function does NOT merge main. That happens during reconciliation
+/// after the squash, using `$SQUASH_SHA^`. Merging main here would cause lost
+/// commits.
 ///
 /// # Arguments
 ///

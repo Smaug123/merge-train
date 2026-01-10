@@ -58,7 +58,7 @@ impl MergeStack {
 /// IMPORTANT: We always require base_ref == default_branch. A PR whose
 /// predecessor merged but which hasn't been retargeted yet is NOT a root.
 ///
-/// CRITICAL: For the merged-predecessor case, we require `predecessor_squash_reconciled`
+/// For the merged-predecessor case, we require `predecessor_squash_reconciled`
 /// to be set. This prevents races where someone manually retargets a late descendant
 /// to main before the bot's reconciliation runs.
 pub fn is_root(pr: &CachedPr, default_branch: &str, prs: &HashMap<PrNumber, CachedPr>) -> bool {

@@ -23,7 +23,7 @@ pub fn fsync_file(file: &File) -> io::Result<()> {
 
 /// Syncs a directory to disk, ensuring directory entries are durable.
 ///
-/// This is CRITICAL for crash safety. Without this:
+/// Required for crash safety. Without this:
 /// - A newly created file might be lost (directory entry not persisted)
 /// - A renamed file might revert to its old name
 /// - A deleted file might reappear

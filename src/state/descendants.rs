@@ -33,9 +33,9 @@ pub fn build_descendants_index(
 ///
 /// This is computed as: frozen_descendants - completed - skipped
 ///
-/// CRITICAL: This uses the frozen_descendants from the phase, NOT the current
-/// descendants index. Late additions (PRs added after the freeze point) are
-/// not included and will be handled when their predecessor becomes a new root.
+/// Uses frozen_descendants from the phase, NOT the current descendants index.
+/// Late additions (PRs added after the freeze point) are not included and will
+/// be handled when their predecessor becomes a new root.
 pub fn remaining_descendants(phase: &CascadePhase) -> Vec<PrNumber> {
     match phase.progress() {
         Some(progress) => progress.remaining().copied().collect(),
