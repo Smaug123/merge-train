@@ -389,6 +389,24 @@ Train aborted due to merge conflict.
                 _ => panic!("Wrong phase"),
             }
         }
+
+        #[test]
+        fn roundtrip_with_html_comment_terminator_in_error() {
+            use crate::types::train::TrainError;
+
+            let mut train = TrainRecord::new(PrNumber(1));
+            // Error message containing the HTML comment terminator sequence
+            let dangerous_message = "error --> happened\nwith --> multiple --> arrows";
+            train.error = Some(TrainError::new("test_error", dangerous_message));
+
+            let comment = format_status_comment(&train, "Test");
+            let parsed = parse_status_comment(&comment).expect("Failed to parse comment with -->");
+
+            let parsed_error = parsed.error.expect("Error should be preserved");
+            assert_eq!(parsed_error.error_type, "test_error");
+            // The message should be unescaped back to original
+            assert_eq!(parsed_error.message, dangerous_message);
+        }
     }
 
     mod extract_json {
