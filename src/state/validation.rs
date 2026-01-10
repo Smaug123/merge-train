@@ -834,7 +834,7 @@ mod tests {
                 sha in "[0-9a-f]{40}",
                 parent in "[0-9a-f]{40}"
             ) {
-                let result = validate_squash_commit(&sha, &[parent.clone()], &parent);
+                let result = validate_squash_commit(&sha, std::slice::from_ref(&parent), &parent);
                 prop_assert!(result.is_ok());
             }
 

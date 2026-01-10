@@ -209,7 +209,7 @@ mod tests {
             assert_eq!(index.len(), 2);
             assert!(index.get(&PrNumber(1)).unwrap().contains(&PrNumber(2)));
             assert!(index.get(&PrNumber(2)).unwrap().contains(&PrNumber(3)));
-            assert!(index.get(&PrNumber(3)).is_none());
+            assert!(!index.contains_key(&PrNumber(3)));
         }
     }
 

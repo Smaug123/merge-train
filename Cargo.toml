@@ -33,6 +33,11 @@ anyhow = "1"
 # URL encoding
 urlencoding = "2"
 
+# Cryptography (for webhook signature verification)
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"

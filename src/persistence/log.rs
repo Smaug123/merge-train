@@ -1071,7 +1071,7 @@ mod tests {
             // After the test suite, verify distribution (on drop would be better but this is simpler)
             // We check periodically rather than at the end
             let total = TOTAL_COUNT.load(Ordering::Relaxed);
-            if total > 0 && total % 100 == 0 {
+            if total > 0 && total.is_multiple_of(100) {
                 let invalid_count = INVALID_UTF8_COUNT.load(Ordering::Relaxed);
                 let invalid_ratio = invalid_count as f64 / total as f64;
                 // Random bytes should produce invalid UTF-8 most of the time
