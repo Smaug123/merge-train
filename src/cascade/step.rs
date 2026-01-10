@@ -183,6 +183,16 @@ fn execute_from_idle(
                 MAX_TRAIN_SIZE
             ),
         ));
+        // Try to update status comment (don't fail if oversize - we're already aborting)
+        let effects = train
+            .status_comment_id
+            .and_then(|comment_id| {
+                format_phase_comment(train)
+                    .ok()
+                    .map(|body| Effect::GitHub(GitHubEffect::UpdateComment { comment_id, body }))
+            })
+            .into_iter()
+            .collect();
         return StepResult {
             train: train.clone(),
             outcome: CascadeStepOutcome::Aborted {
@@ -192,7 +202,7 @@ fn execute_from_idle(
                     max_allowed: MAX_TRAIN_SIZE,
                 },
             },
-            effects: vec![],
+            effects,
         };
     }
 
@@ -1349,9 +1359,30 @@ pub fn process_operation_result(
             let effects = if let Some(squash_sha) = train.last_squash_sha.clone() {
                 vec![Effect::RecordReconciliation { pr, squash_sha }]
             } else {
-                // This shouldn't happen in normal operation - retargeting only occurs
-                // after squash merge. Log for debugging if it does.
-                vec![]
+                // INVARIANT VIOLATION: Retargeting should only occur after squash merge.
+                // If last_squash_sha is None here, something has gone wrong.
+                // Abort to prevent silent fan-out breakage.
+                train.abort(TrainError::new(
+                    "internal_invariant_violation",
+                    format!(
+                        "DescendantRetargeted for PR #{} but last_squash_sha is None. \
+                         This indicates a bug - retargeting should only occur after squash merge.",
+                        pr
+                    ),
+                ));
+                return (
+                    train,
+                    Some(CascadeStepOutcome::Aborted {
+                        pr_number: pr,
+                        reason: AbortReason::InternalInvariantViolation {
+                            details: format!(
+                                "DescendantRetargeted without last_squash_sha for PR #{}",
+                                pr
+                            ),
+                        },
+                    }),
+                    vec![],
+                );
             };
 
             (train, None, effects)
@@ -4019,12 +4050,12 @@ mod tests {
                 });
             }
 
-            /// Review Comment #2 (continued): No RecordReconciliation without last_squash_sha.
+            /// Review Comment #2 (continued): Abort on missing last_squash_sha.
             ///
-            /// Property: When last_squash_sha is None, DescendantRetargeted should NOT
-            /// emit RecordReconciliation (nothing to record).
+            /// Property: When last_squash_sha is None, DescendantRetargeted MUST abort
+            /// with InternalInvariantViolation. This prevents silent fan-out breakage.
             #[test]
-            fn descendant_retargeted_no_effect_without_squash_sha() {
+            fn descendant_retargeted_aborts_without_squash_sha() {
                 proptest!(|(
                     descendant_pr in arb_pr_number(),
                     head_sha in arb_sha()
@@ -4042,17 +4073,39 @@ mod tests {
 
                     // Simulate retarget completion
                     let op_result = OperationResult::DescendantRetargeted { pr: descendant_pr };
-                    let (_, _, effects) = process_operation_result(train, op_result);
+                    let (updated_train, outcome, effects) = process_operation_result(train, op_result);
 
-                    // Should NOT emit RecordReconciliation (no last_squash_sha on train)
+                    // MUST abort with InternalInvariantViolation
+                    let is_invariant_violation_abort = matches!(
+                        &outcome,
+                        Some(CascadeStepOutcome::Aborted {
+                            reason: AbortReason::InternalInvariantViolation { .. },
+                            ..
+                        })
+                    );
+
+                    prop_assert!(
+                        is_invariant_violation_abort,
+                        "DescendantRetargeted WITHOUT train.last_squash_sha MUST abort with \
+                         InternalInvariantViolation. Got outcome: {:?}",
+                        outcome
+                    );
+
+                    // Train should be aborted
+                    prop_assert!(
+                        updated_train.state == TrainState::Aborted,
+                        "Train state should be Aborted, got: {:?}",
+                        updated_train.state
+                    );
+
+                    // Should NOT emit RecordReconciliation (we're aborting, not continuing)
                     let has_record_reconciliation = effects.iter().any(|e| {
                         matches!(e, Effect::RecordReconciliation { .. })
                     });
 
                     prop_assert!(
                         !has_record_reconciliation,
-                        "DescendantRetargeted WITHOUT train.last_squash_sha should NOT emit \
-                         RecordReconciliation. Effects: {:?}",
+                        "Aborting train should NOT emit RecordReconciliation. Effects: {:?}",
                         effects
                     );
                 });
@@ -4217,6 +4270,148 @@ mod tests {
                         result.train.state
                     );
                 });
+            }
+
+            /// TrainTooLarge abort MUST emit status comment update effect.
+            ///
+            /// Property: When aborting due to TrainTooLarge, if status_comment_id is set,
+            /// the effects MUST include an UpdateComment to inform GitHub-based recovery.
+            #[test]
+            fn train_too_large_emits_status_comment_update() {
+                // Create a chain exceeding the limit (needs >50 PRs for MAX_TRAIN_SIZE)
+                const CHAIN_LENGTH: usize = 55;
+
+                let sha = Sha::parse("abcd1234abcd1234abcd1234abcd1234abcd1234").unwrap();
+                let mut train = TrainRecord::new(PrNumber(1));
+                // CRITICAL: Set status_comment_id to test comment update
+                train.status_comment_id = Some(CommentId(12345));
+
+                // Build a deep chain
+                let mut prs = HashMap::new();
+                let pr1 = CachedPr::new(
+                    PrNumber(1),
+                    sha.clone(),
+                    "branch-1".to_string(),
+                    "main".to_string(),
+                    None,
+                    PrState::Open,
+                    MergeStateStatus::Clean,
+                    false,
+                );
+                prs.insert(PrNumber(1), pr1);
+
+                for i in 2..=(CHAIN_LENGTH as u64) {
+                    let pr = CachedPr::new(
+                        PrNumber(i),
+                        sha.clone(),
+                        format!("branch-{}", i),
+                        format!("branch-{}", i - 1),
+                        Some(PrNumber(i - 1)),
+                        PrState::Open,
+                        MergeStateStatus::Clean,
+                        false,
+                    );
+                    prs.insert(PrNumber(i), pr);
+                }
+
+                let ctx = StepContext::new("main");
+                let result = execute_cascade_step(train, &prs, &ctx);
+
+                // Should abort due to TrainTooLarge
+                assert!(
+                    matches!(
+                        result.outcome,
+                        CascadeStepOutcome::Aborted {
+                            reason: AbortReason::TrainTooLarge { .. },
+                            ..
+                        }
+                    ),
+                    "Should abort with TrainTooLarge, got: {:?}",
+                    result.outcome
+                );
+
+                // MUST emit status comment update
+                let has_update_comment = result
+                    .effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::GitHub(GitHubEffect::UpdateComment { .. })));
+
+                assert!(
+                    has_update_comment,
+                    "TrainTooLarge abort with status_comment_id MUST emit UpdateComment effect. \
+                     Effects: {:?}",
+                    result.effects
+                );
+            }
+
+            /// TrainTooLarge abort without status_comment_id should NOT emit update effect.
+            ///
+            /// Property: When aborting due to TrainTooLarge without a status comment,
+            /// no UpdateComment effect should be emitted (nothing to update).
+            #[test]
+            fn train_too_large_no_update_without_comment_id() {
+                const CHAIN_LENGTH: usize = 55;
+
+                let sha = Sha::parse("abcd1234abcd1234abcd1234abcd1234abcd1234").unwrap();
+                let mut train = TrainRecord::new(PrNumber(1));
+                // NO status_comment_id set
+                train.status_comment_id = None;
+
+                let mut prs = HashMap::new();
+                let pr1 = CachedPr::new(
+                    PrNumber(1),
+                    sha.clone(),
+                    "branch-1".to_string(),
+                    "main".to_string(),
+                    None,
+                    PrState::Open,
+                    MergeStateStatus::Clean,
+                    false,
+                );
+                prs.insert(PrNumber(1), pr1);
+
+                for i in 2..=(CHAIN_LENGTH as u64) {
+                    let pr = CachedPr::new(
+                        PrNumber(i),
+                        sha.clone(),
+                        format!("branch-{}", i),
+                        format!("branch-{}", i - 1),
+                        Some(PrNumber(i - 1)),
+                        PrState::Open,
+                        MergeStateStatus::Clean,
+                        false,
+                    );
+                    prs.insert(PrNumber(i), pr);
+                }
+
+                let ctx = StepContext::new("main");
+                let result = execute_cascade_step(train, &prs, &ctx);
+
+                // Should abort due to TrainTooLarge
+                assert!(
+                    matches!(
+                        result.outcome,
+                        CascadeStepOutcome::Aborted {
+                            reason: AbortReason::TrainTooLarge { .. },
+                            ..
+                        }
+                    ),
+                    "Should abort with TrainTooLarge, got: {:?}",
+                    result.outcome
+                );
+
+                // Should NOT emit any UpdateComment (no comment to update)
+                let has_update_comment = result
+                    .effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::GitHub(GitHubEffect::UpdateComment { .. })));
+
+                assert!(
+                    !has_update_comment,
+                    "TrainTooLarge abort WITHOUT status_comment_id should NOT emit UpdateComment. \
+                     Effects: {:?}",
+                    result.effects
+                );
             }
         }
     }

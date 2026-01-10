@@ -169,6 +169,15 @@ pub enum AbortReason {
         /// Current SHA on the PR.
         actual: Sha,
     },
+
+    /// Internal invariant was violated (indicates a bug in the cascade logic).
+    ///
+    /// This should never occur in normal operation. If triggered, it indicates
+    /// a bug in the cascade state machine that needs investigation.
+    InternalInvariantViolation {
+        /// Description of what invariant was violated.
+        details: String,
+    },
 }
 
 impl AbortReason {
@@ -192,6 +201,7 @@ impl AbortReason {
             AbortReason::MergeHooksEnabled => "merge_hooks_enabled",
             AbortReason::BaseBranchMismatch { .. } => "base_branch_mismatch",
             AbortReason::HeadShaChanged { .. } => "head_sha_changed",
+            AbortReason::InternalInvariantViolation { .. } => "internal_invariant_violation",
         }
     }
 
@@ -265,6 +275,13 @@ impl AbortReason {
                     "PR head changed after preparation (was {}, now {}). \
                      New commits must be reviewed before merging.",
                     expected, actual
+                )
+            }
+            AbortReason::InternalInvariantViolation { details } => {
+                format!(
+                    "Internal invariant violation (bug): {}. \
+                     Please report this issue.",
+                    details
                 )
             }
         }
