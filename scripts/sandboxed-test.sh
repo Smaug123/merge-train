@@ -34,20 +34,31 @@ for arg in "$@"; do
 done
 
 echo "=== Compiling tests (outside sandbox) ===" >&2
-cargo test --no-run "${CARGO_ARGS[@]}"
 
-# Find the test binary - cargo test --no-run prints paths like:
-#   Executable unittests src/lib.rs (target/debug/deps/merge_train_bot-abc123)
-# It does this to stderr.
-TEST_BINARY=$(cargo test --no-run "${CARGO_ARGS[@]}" 2>&1 | grep -o 'target/[^)]*' | head -1)
+# Use --message-format=json to reliably get all test executable paths.
+# This handles multiple test binaries (lib tests, integration tests, etc.)
+TEST_BINARIES=()
+while IFS= read -r line; do
+    # Filter for "compiler-artifact" messages that are tests
+    executable=$(echo "$line" | jq -r '
+        select(.reason == "compiler-artifact")
+        | select(.profile.test == true)
+        | .executable // empty
+    ' 2>/dev/null)
+    if [[ -n "$executable" ]]; then
+        TEST_BINARIES+=("$executable")
+    fi
+done < <(cargo test --no-run --message-format=json "${CARGO_ARGS[@]}" 2>/dev/null)
 
-if [[ -z "$TEST_BINARY" ]]; then
-    echo "Error: Could not find test binary" >&2
+if [[ ${#TEST_BINARIES[@]} -eq 0 ]]; then
+    echo "Error: Could not find any test binaries" >&2
     exit 1
 fi
 
-TEST_BINARY="$PROJECT_DIR/$TEST_BINARY"
-echo "Test binary: $TEST_BINARY" >&2
+echo "Found ${#TEST_BINARIES[@]} test binary(ies):" >&2
+for bin in "${TEST_BINARIES[@]}"; do
+    echo "  $bin" >&2
+done
 
 # Create a dedicated temp directory for the test run
 TEST_TMPDIR="$(mktemp -d)"
@@ -57,6 +68,10 @@ echo "" >&2
 echo "=== Running tests (inside sandbox) ===" >&2
 
 run_linux() {
+    local test_binary="$1"
+    shift
+    local test_args=("$@")
+
     if ! command -v bwrap &>/dev/null; then
         echo "Error: bubblewrap (bwrap) not found. Install it with:" >&2
         echo "  nix-shell -p bubblewrap" >&2
@@ -99,21 +114,13 @@ run_linux() {
         --chdir "$PROJECT_DIR"
     )
 
-    echo "  Sandbox: bubblewrap" >&2
-    echo "  Temp dir: $TEST_TMPDIR" >&2
-    echo "  Network: disabled" >&2
-    echo "  Filesystem: read-only except $TEST_TMPDIR" >&2
-    echo "" >&2
-
-    bwrap "${bwrap_args[@]}" "$TEST_BINARY" "${TEST_ARGS[@]}"
+    bwrap "${bwrap_args[@]}" "$test_binary" "${test_args[@]}"
 }
 
 run_macos() {
-    echo "  Sandbox: seatbelt" >&2
-    echo "  Temp dir: $TEST_TMPDIR" >&2
-    echo "  Network: disabled" >&2
-    echo "  Filesystem: read-only except temp directories" >&2
-    echo "" >&2
+    local test_binary="$1"
+    shift
+    local test_args=("$@")
 
     TMPDIR="$TEST_TMPDIR" \
     HOME="$TEST_TMPDIR" \
@@ -142,18 +149,41 @@ run_macos() {
     (literal \"/dev/tty\")
 )
 " \
-    "$TEST_BINARY" "${TEST_ARGS[@]}"
+    "$test_binary" "${test_args[@]}"
 }
 
-case "$(uname -s)" in
+OS="$(uname -s)"
+
+case "$OS" in
     Linux)
-        run_linux
+        echo "  Sandbox: bubblewrap" >&2
         ;;
     Darwin)
-        run_macos
+        echo "  Sandbox: seatbelt" >&2
         ;;
     *)
-        echo "Error: Unsupported OS: $(uname -s)" >&2
+        echo "Error: Unsupported OS: $OS" >&2
         exit 1
         ;;
 esac
+
+echo "  Temp dir: $TEST_TMPDIR" >&2
+echo "  Network: disabled" >&2
+echo "  Filesystem: read-only except temp directories" >&2
+echo "" >&2
+
+# Run all test binaries
+for test_binary in "${TEST_BINARIES[@]}"; do
+    echo "--- Running: $(basename "$test_binary") ---" >&2
+    case "$OS" in
+        Linux)
+            run_linux "$test_binary" "${TEST_ARGS[@]}"
+            ;;
+        Darwin)
+            run_macos "$test_binary" "${TEST_ARGS[@]}"
+            ;;
+    esac
+done
+
+echo "" >&2
+echo "=== All ${#TEST_BINARIES[@]} test binary(ies) passed ===" >&2
