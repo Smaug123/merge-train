@@ -29,9 +29,11 @@
 
 pub mod engine;
 pub mod phases;
+pub mod recovery;
 pub mod step;
 
 // Re-export commonly used types
 pub use engine::{CascadeEngine, CascadeError, StartTrainResult, StopTrainResult};
 pub use phases::{PhaseAction, PhaseExecutionResult};
+pub use recovery::RecoveryPlan;
 pub use step::{StepContext, StepResult};
