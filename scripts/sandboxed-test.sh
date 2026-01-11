@@ -47,6 +47,10 @@ trap 'rm -rf "$TEST_TMPDIR"' EXIT
 CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
 
+# Use temp directory for build output. This keeps the project tree fully read-only,
+# eliminating symlink escape attacks (if $PROJECT_DIR/target were a symlink).
+CARGO_TARGET_DIR="$TEST_TMPDIR/target"
+
 # On macOS, SDKROOT should be set by the Nix devshell
 if [[ "$(uname -s)" == "Darwin" && -z "${SDKROOT:-}" ]]; then
     echo "Warning: SDKROOT not set. Linking may fail inside sandbox." >&2
@@ -55,9 +59,6 @@ fi
 
 # Run tests inside Linux sandbox
 run_linux() {
-    # Ensure target directory exists for bind mount
-    mkdir -p "$PROJECT_DIR/target"
-
     if ! command -v bwrap &>/dev/null; then
         echo "Error: bubblewrap (bwrap) not found. Install it with:" >&2
         echo "  nix-shell -p bubblewrap" >&2
@@ -87,13 +88,10 @@ run_linux() {
         --ro-bind-try "$CARGO_HOME" "$CARGO_HOME"
         --ro-bind-try "$RUSTUP_HOME" "$RUSTUP_HOME"
 
-        # Read-only access to project source
+        # Read-only access to project source (entire tree, including any target dir)
         --ro-bind "$PROJECT_DIR" "$PROJECT_DIR"
 
-        # Writable target directory (for compilation output)
-        --bind "$PROJECT_DIR/target" "$PROJECT_DIR/target"
-
-        # Writable temp directory
+        # Writable temp directory (includes CARGO_TARGET_DIR)
         --bind "$TEST_TMPDIR" "$TEST_TMPDIR"
 
         # /dev and /proc
@@ -107,6 +105,7 @@ run_linux() {
         --setenv TMPDIR "$TEST_TMPDIR"
         --setenv CARGO_HOME "$CARGO_HOME"
         --setenv RUSTUP_HOME "$RUSTUP_HOME"
+        --setenv CARGO_TARGET_DIR "$CARGO_TARGET_DIR"
         --setenv USER sandbox
         --setenv RUST_BACKTRACE 1
 
@@ -151,10 +150,10 @@ run_macos() {
 ; Allow reading almost everything (we only care about restricting writes and network)
 (allow file-read*)
 
-; === File writes - restricted to specific paths ===
+; === File writes - restricted to temp directory only ===
+; CARGO_TARGET_DIR is inside TEST_TMPDIR, so project tree is fully read-only.
 (allow file-write*
     (subpath \"$TEST_TMPDIR\")
-    (subpath \"$PROJECT_DIR/target\")
     (literal \"/dev/null\")
     (literal \"/dev/tty\")
 )
@@ -202,6 +201,7 @@ run_macos() {
         TMPDIR="$TEST_TMPDIR" \
         CARGO_HOME="$CARGO_HOME" \
         RUSTUP_HOME="$RUSTUP_HOME" \
+        CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
         SDKROOT="${SDKROOT:-}" \
         RUSTFLAGS="$rust_link_args" \
         NIX_CC="${NIX_CC:-}" \
@@ -234,8 +234,9 @@ case "$OS" in
 esac
 
 echo "  Temp dir: $TEST_TMPDIR" >&2
+echo "  Target dir: $CARGO_TARGET_DIR" >&2
 echo "  Network: disabled" >&2
-echo "  Filesystem: read-only except temp and target directories" >&2
+echo "  Filesystem: project read-only, writes only to temp dir" >&2
 echo "" >&2
 
 case "$OS" in
