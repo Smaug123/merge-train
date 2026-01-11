@@ -222,26 +222,33 @@ fn parse_pull_request(payload: &[u8]) -> Result<Option<PullRequestEvent>, ParseE
             value: raw.pull_request.head.sha.clone(),
         })?;
 
-    let merge_commit_sha = raw
-        .pull_request
-        .merge_commit_sha
-        .as_ref()
-        .map(Sha::parse)
-        .transpose()
-        .map_err(|_| ParseError::InvalidField {
-            field: "pull_request.merge_commit_sha",
-            value: raw
-                .pull_request
-                .merge_commit_sha
-                .clone()
-                .unwrap_or_default(),
-        })?;
+    // Only populate merge_commit_sha if the PR was actually merged.
+    // GitHub may populate this field speculatively before merge, but we only
+    // care about it when merged=true.
+    let merged = raw.pull_request.merged.unwrap_or(false);
+    let merge_commit_sha = if merged {
+        raw.pull_request
+            .merge_commit_sha
+            .as_ref()
+            .map(Sha::parse)
+            .transpose()
+            .map_err(|_| ParseError::InvalidField {
+                field: "pull_request.merge_commit_sha",
+                value: raw
+                    .pull_request
+                    .merge_commit_sha
+                    .clone()
+                    .unwrap_or_default(),
+            })?
+    } else {
+        None
+    };
 
     Ok(Some(PullRequestEvent {
         repo: RepoId::new(raw.repository.owner.login, raw.repository.name),
         action,
         pr_number: PrNumber(raw.pull_request.number),
-        merged: raw.pull_request.merged.unwrap_or(false),
+        merged,
         merge_commit_sha,
         head_sha,
         base_branch: raw.pull_request.base.ref_name,

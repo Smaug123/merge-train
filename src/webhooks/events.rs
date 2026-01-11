@@ -142,7 +142,9 @@ pub struct PullRequestEvent {
     /// Whether the PR was merged (only meaningful for `closed` action).
     pub merged: bool,
 
-    /// The merge commit SHA (only set if merged).
+    /// The merge commit SHA.
+    ///
+    /// Only set when `merged` is true. The parser enforces this invariant.
     pub merge_commit_sha: Option<Sha>,
 
     /// The current head SHA of the PR branch.
@@ -694,7 +696,10 @@ mod tests {
 
     #[test]
     fn review_state_json_format() {
-        // Verify SCREAMING_SNAKE_CASE serialization (GitHub's format)
+        // Verify SCREAMING_SNAKE_CASE serialization for our internal format.
+        // Note: GitHub webhooks send lowercase (e.g., "approved"), but the parser
+        // normalizes to uppercase. We serialize in SCREAMING_SNAKE_CASE to match
+        // GitHub's GraphQL API format.
         assert_eq!(
             serde_json::to_string(&ReviewState::Approved).unwrap(),
             "\"APPROVED\""

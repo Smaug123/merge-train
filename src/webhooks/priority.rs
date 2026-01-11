@@ -90,6 +90,12 @@ pub fn classify_priority_with_bot_name(event: &GitHubEvent, bot_name: &str) -> E
 
 /// Checks if an issue comment contains a stop command.
 fn classify_comment_priority(comment: &IssueCommentEvent, bot_name: &str) -> EventPriority {
+    // Commands are only valid on PRs, not regular issues.
+    // Don't elevate priority for comments on non-PR issues.
+    if comment.pr_number.is_none() {
+        return EventPriority::Normal;
+    }
+
     // Only check created/edited comments for commands
     // Deleted comments can't contain commands (body is empty)
     match comment.action {
@@ -248,6 +254,21 @@ mod tests {
         assert_eq!(classify_priority(&event), EventPriority::Normal);
     }
 
+    #[test]
+    fn stop_command_on_issue_not_pr_is_normal_priority() {
+        // Commands are only valid on PRs, not regular issues
+        let event = GitHubEvent::IssueComment(IssueCommentEvent {
+            repo: RepoId::new("owner", "repo"),
+            action: CommentAction::Created,
+            pr_number: None, // Not a PR
+            comment_id: CommentId(123),
+            body: "@merge-train stop".to_string(),
+            author_id: 1,
+            author_login: "user".to_string(),
+        });
+        assert_eq!(classify_priority(&event), EventPriority::Normal);
+    }
+
     // ========================================================================
     // All other event types should be Normal priority
     // ========================================================================
@@ -348,13 +369,13 @@ mod tests {
             force in proptest::bool::ANY,
         ) {
             let stop_cmd = if force { "stop --force" } else { "stop" };
-            let body = format!("{}@merge-train {}{}", prefix, stop_cmd, suffix);
 
             // Need to ensure there's a word boundary before @
+            // If prefix ends with alphanumeric, insert a space before the command
             let body = if prefix.chars().last().is_none_or(|c| !c.is_alphanumeric()) {
-                body
+                format!("{}@merge-train {}{}", prefix, stop_cmd, suffix)
             } else {
-                format!(" @merge-train {}{}", stop_cmd, suffix)
+                format!("{} @merge-train {}{}", prefix, stop_cmd, suffix)
             };
 
             let event = make_comment(&body, CommentAction::Created);
