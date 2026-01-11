@@ -14,6 +14,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use thiserror::Error;
+
 pub mod health;
 pub mod state;
 pub mod webhook;
@@ -21,6 +25,50 @@ pub mod webhook;
 pub use health::health_handler;
 pub use state::state_handler;
 pub use webhook::webhook_handler;
+
+/// Error returned when a path component is invalid (e.g., contains path traversal sequences).
+#[derive(Debug, Error, PartialEq, Eq)]
+#[error("invalid path component: {reason}")]
+pub struct InvalidPathComponent {
+    reason: &'static str,
+}
+
+impl IntoResponse for InvalidPathComponent {
+    fn into_response(self) -> Response {
+        (StatusCode::BAD_REQUEST, self.to_string()).into_response()
+    }
+}
+
+/// Validates that a string is safe to use as a path component.
+///
+/// Rejects:
+/// - Empty strings
+/// - `.` and `..` (directory traversal)
+/// - Strings containing `/`, `\`, or null bytes
+///
+/// This prevents path traversal attacks when building filesystem paths from
+/// untrusted input (e.g., URL segments or webhook payload data).
+pub fn validate_path_component(s: &str) -> Result<(), InvalidPathComponent> {
+    if s.is_empty() {
+        return Err(InvalidPathComponent {
+            reason: "empty string",
+        });
+    }
+
+    if s == "." || s == ".." {
+        return Err(InvalidPathComponent {
+            reason: "directory traversal",
+        });
+    }
+
+    if s.contains('/') || s.contains('\\') || s.contains('\0') {
+        return Err(InvalidPathComponent {
+            reason: "contains path separator or null byte",
+        });
+    }
+
+    Ok(())
+}
 
 /// Shared application state.
 ///
@@ -120,6 +168,81 @@ mod tests {
         let cloned = state.clone();
 
         assert_eq!(state.spool_dir(), cloned.spool_dir());
+    }
+
+    #[test]
+    fn validate_path_component_accepts_valid() {
+        assert!(validate_path_component("octocat").is_ok());
+        assert!(validate_path_component("hello-world").is_ok());
+        assert!(validate_path_component("my_repo").is_ok());
+        assert!(validate_path_component("repo.name").is_ok());
+        assert!(validate_path_component("123").is_ok());
+    }
+
+    #[test]
+    fn validate_path_component_rejects_empty() {
+        assert_eq!(
+            validate_path_component(""),
+            Err(InvalidPathComponent {
+                reason: "empty string"
+            })
+        );
+    }
+
+    #[test]
+    fn validate_path_component_rejects_dot() {
+        assert_eq!(
+            validate_path_component("."),
+            Err(InvalidPathComponent {
+                reason: "directory traversal"
+            })
+        );
+    }
+
+    #[test]
+    fn validate_path_component_rejects_dotdot() {
+        assert_eq!(
+            validate_path_component(".."),
+            Err(InvalidPathComponent {
+                reason: "directory traversal"
+            })
+        );
+    }
+
+    #[test]
+    fn validate_path_component_rejects_forward_slash() {
+        assert_eq!(
+            validate_path_component("foo/bar"),
+            Err(InvalidPathComponent {
+                reason: "contains path separator or null byte"
+            })
+        );
+        assert_eq!(
+            validate_path_component("../etc/passwd"),
+            Err(InvalidPathComponent {
+                reason: "contains path separator or null byte"
+            })
+        );
+    }
+
+    #[test]
+    fn validate_path_component_rejects_backslash() {
+        assert_eq!(
+            validate_path_component("foo\\bar"),
+            Err(InvalidPathComponent {
+                reason: "contains path separator or null byte"
+            })
+        );
+    }
+
+    #[test]
+    fn validate_path_component_rejects_null_byte() {
+        assert_eq!(
+            validate_path_component("foo\0bar"),
+            Err(InvalidPathComponent {
+                reason: "contains path separator or null byte"
+            })
+        );
     }
 }
 
@@ -416,5 +539,111 @@ mod integration_tests {
         // Should return the latest generation (1) with "main" branch
         assert_eq!(parsed.default_branch, "main");
         assert_eq!(parsed.log_generation, 1);
+    }
+
+    // ─── Path traversal protection tests ───
+
+    #[tokio::test]
+    async fn state_rejects_path_traversal_in_owner() {
+        let (state, _spool, _state_dir) = test_app_state(b"secret");
+        let app = build_router(state);
+
+        // Attempt path traversal in owner segment
+        let request = Request::builder()
+            .uri("/api/v1/repos/../hello-world/state")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn state_rejects_path_traversal_in_repo() {
+        let (state, _spool, _state_dir) = test_app_state(b"secret");
+        let app = build_router(state);
+
+        // Attempt path traversal in repo segment
+        let request = Request::builder()
+            .uri("/api/v1/repos/octocat/../state")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_path_traversal_in_owner() {
+        let secret = b"test-secret";
+        let (state, spool_dir, _state_dir) = test_app_state(secret);
+        let app = build_router(state);
+
+        // Payload with path traversal in owner
+        let body = serde_json::json!({
+            "action": "opened",
+            "repository": {
+                "name": "hello-world",
+                "owner": {
+                    "login": "../etc"
+                }
+            }
+        });
+
+        let request = create_webhook_request(
+            secret,
+            "pull_request",
+            "550e8400-e29b-41d4-a716-446655440010",
+            &body,
+        );
+
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Verify nothing was spooled
+        let bad_path = spool_dir.path().join("../etc").join("hello-world");
+        assert!(
+            !bad_path.exists(),
+            "Should not create directory with path traversal"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_path_traversal_in_repo() {
+        let secret = b"test-secret";
+        let (state, spool_dir, _state_dir) = test_app_state(secret);
+        let app = build_router(state);
+
+        // Payload with path traversal in repo name
+        let body = serde_json::json!({
+            "action": "opened",
+            "repository": {
+                "name": "../../secrets",
+                "owner": {
+                    "login": "octocat"
+                }
+            }
+        });
+
+        let request = create_webhook_request(
+            secret,
+            "pull_request",
+            "550e8400-e29b-41d4-a716-446655440011",
+            &body,
+        );
+
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Verify nothing was spooled
+        let bad_path = spool_dir.path().join("octocat").join("../../secrets");
+        assert!(
+            !bad_path.exists(),
+            "Should not create directory with path traversal"
+        );
     }
 }

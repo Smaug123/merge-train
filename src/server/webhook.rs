@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
-use super::AppState;
+use super::{AppState, InvalidPathComponent, validate_path_component};
 use crate::spool::delivery::{SpoolError, WebhookEnvelope, spool_webhook};
 use crate::types::DeliveryId;
 use crate::webhooks::verify_signature;
@@ -43,6 +43,10 @@ pub enum WebhookError {
     #[error("missing repository information in payload")]
     MissingRepository,
 
+    /// Invalid path component (e.g., path traversal attempt).
+    #[error("{0}")]
+    InvalidPath(#[from] InvalidPathComponent),
+
     /// Spool error.
     #[error("spool error: {0}")]
     Spool(#[from] SpoolError),
@@ -55,6 +59,7 @@ impl IntoResponse for WebhookError {
             WebhookError::InvalidSignature => (StatusCode::UNAUTHORIZED, self.to_string()),
             WebhookError::InvalidJson(_) => (StatusCode::BAD_REQUEST, self.to_string()),
             WebhookError::MissingRepository => (StatusCode::BAD_REQUEST, self.to_string()),
+            WebhookError::InvalidPath(_) => (StatusCode::BAD_REQUEST, self.to_string()),
             WebhookError::Spool(SpoolError::DuplicateDelivery(_)) => {
                 // Duplicates are handled idempotently - return 202
                 return (StatusCode::ACCEPTED, "Accepted (duplicate)").into_response();
@@ -131,6 +136,10 @@ pub async fn webhook_handler(
     // Extract repository owner and name from the payload.
     // Most GitHub webhook events include a "repository" object.
     let (owner, repo) = extract_repository(&body_json)?;
+
+    // Validate path components to prevent path traversal attacks.
+    validate_path_component(&owner)?;
+    validate_path_component(&repo)?;
 
     debug!(
         delivery_id = %delivery_id,
@@ -308,12 +317,22 @@ mod tests {
 
     #[test]
     fn extract_headers_filters_invalid_utf8() {
+        use axum::http::HeaderValue;
+
         let mut headers = HeaderMap::new();
         headers.insert("valid-header", "valid-value".parse().unwrap());
-        // Note: HeaderMap doesn't actually allow invalid UTF-8 values,
-        // so this test just verifies the basic case works.
+
+        // Create a header value with invalid UTF-8 using from_bytes.
+        // Bytes 0x80-0xFF are invalid as standalone UTF-8 bytes.
+        let invalid_utf8_value = HeaderValue::from_bytes(&[0x80, 0x81, 0x82]).unwrap();
+        headers.insert("invalid-header", invalid_utf8_value);
 
         let result = extract_headers(&headers);
+
+        // Valid header should be present
         assert_eq!(result.get("valid-header"), Some(&"valid-value".to_string()));
+
+        // Invalid UTF-8 header should be filtered out
+        assert!(result.get("invalid-header").is_none());
     }
 }

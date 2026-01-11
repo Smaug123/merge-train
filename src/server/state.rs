@@ -9,7 +9,7 @@ use axum::response::{IntoResponse, Response};
 use std::fs;
 use thiserror::Error;
 
-use super::AppState;
+use super::{AppState, InvalidPathComponent, validate_path_component};
 use crate::persistence::snapshot::{PersistedRepoSnapshot, SnapshotError, try_load_snapshot};
 
 /// Errors that can occur when fetching state.
@@ -26,6 +26,10 @@ pub enum StateError {
     /// Snapshot loading error.
     #[error("snapshot error: {0}")]
     Snapshot(#[from] SnapshotError),
+
+    /// Invalid path component (e.g., path traversal attempt).
+    #[error("{0}")]
+    InvalidPath(#[from] InvalidPathComponent),
 }
 
 impl IntoResponse for StateError {
@@ -34,6 +38,7 @@ impl IntoResponse for StateError {
             StateError::NotFound { .. } => (StatusCode::NOT_FOUND, self.to_string()),
             StateError::Io(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
             StateError::Snapshot(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
+            StateError::InvalidPath(_) => (StatusCode::BAD_REQUEST, self.to_string()),
         };
 
         (status, message).into_response()
@@ -74,6 +79,10 @@ pub async fn state_handler(
     State(app_state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
 ) -> Result<Json<PersistedRepoSnapshot>, StateError> {
+    // Validate path components to prevent path traversal attacks.
+    validate_path_component(&owner)?;
+    validate_path_component(&repo)?;
+
     // Construct the path to the repository's state directory.
     // Structure: <state_dir>/<owner>/<repo>/
     let repo_state_dir = app_state.state_dir().join(&owner).join(&repo);
