@@ -114,29 +114,38 @@ run_macos() {
     local sandbox_policy="
 (version 1)
 
-(allow default)
+; Deny by default
+(deny default)
 
-; DENY network access
-(deny network*)
+; === Process execution ===
+(allow process-exec*)
+(allow process-fork)
+(allow signal (target self))
 
-; DENY writes everywhere except allowed paths
-(deny file-write*)
+; === File reads ===
+; Allow reading almost everything (we only care about restricting writes and network)
+(allow file-read*)
 
-; Allow writes to test temp directory
+; === File writes - restricted to specific paths ===
 (allow file-write*
     (subpath \"$TEST_TMPDIR\")
-)
-
-; Allow writes to target directory (for compilation output)
-(allow file-write*
     (subpath \"$PROJECT_DIR/target\")
-)
-
-; Allow /dev/null and /dev/tty (needed by git and other tools)
-(allow file-write*
     (literal \"/dev/null\")
     (literal \"/dev/tty\")
 )
+
+; === Mach IPC (required for basic macOS functionality) ===
+(allow mach-lookup)
+(allow mach-register)
+
+; === System operations ===
+(allow sysctl-read)
+(allow file-ioctl)
+(allow process-info-codesignature)
+(allow process-info-pidinfo (target self))
+
+; === Pseudo-terminals (cargo test may use these) ===
+(allow pseudo-tty)
 "
 
     # Smoke test: verify sandbox prevents writes outside allowed directories.
