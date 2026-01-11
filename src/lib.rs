@@ -11,6 +11,7 @@ pub mod effects;
 pub mod git;
 pub mod github;
 pub mod persistence;
+pub mod preflight;
 pub mod spool;
 pub mod state;
 pub mod types;
