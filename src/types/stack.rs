@@ -130,6 +130,13 @@ pub enum AbortReason {
         descendant: PrNumber,
     },
 
+    /// Repository has merge hooks or merge queue enabled (incompatible config).
+    ///
+    /// This occurs when GitHub reports `HAS_HOOKS` status, indicating either
+    /// GitHub Enterprise pre-receive hooks or GitHub's merge queue is enabled.
+    /// Both are incompatible with merge-train (see DESIGN.md non-goals).
+    MergeHooksEnabled,
+
     /// External merge occurred before preparation completed.
     /// Multiple descendants were not prepared, violating the "prepare before
     /// squash" invariant.
@@ -137,13 +144,6 @@ pub enum AbortReason {
         /// The descendants that weren't prepared.
         unprepared_descendants: Vec<PrNumber>,
     },
-
-    /// Repository has merge hooks or merge queue enabled (incompatible config).
-    ///
-    /// This occurs when GitHub reports `HAS_HOOKS` status, indicating either
-    /// GitHub Enterprise pre-receive hooks or GitHub's merge queue is enabled.
-    /// Both are incompatible with merge-train (see DESIGN.md non-goals).
-    MergeHooksEnabled,
 
     /// PR base branch doesn't match predecessor's head branch.
     ///
@@ -197,8 +197,8 @@ impl AbortReason {
             AbortReason::StatusCommentTooLarge => "status_comment_too_large",
             AbortReason::TrainTooLarge { .. } => "train_too_large",
             AbortReason::PreparationMissing { .. } => "preparation_missing",
-            AbortReason::PreparationIncomplete { .. } => "preparation_incomplete",
             AbortReason::MergeHooksEnabled => "merge_hooks_enabled",
+            AbortReason::PreparationIncomplete { .. } => "preparation_incomplete",
             AbortReason::BaseBranchMismatch { .. } => "base_branch_mismatch",
             AbortReason::HeadShaChanged { .. } => "head_sha_changed",
             AbortReason::InternalInvariantViolation { .. } => "internal_invariant_violation",
@@ -247,6 +247,9 @@ impl AbortReason {
             AbortReason::PreparationMissing { descendant } => {
                 format!("Descendant {} was not prepared before squash", descendant)
             }
+            AbortReason::MergeHooksEnabled => {
+                "Repository has merge hooks or merge queue enabled, which is incompatible with merge-train".to_string()
+            }
             AbortReason::PreparationIncomplete {
                 unprepared_descendants,
             } => {
@@ -256,9 +259,6 @@ impl AbortReason {
                     unprepared_descendants.len(),
                     unprepared_descendants
                 )
-            }
-            AbortReason::MergeHooksEnabled => {
-                "Repository has merge hooks or merge queue enabled, which is incompatible with merge-train".to_string()
             }
             AbortReason::BaseBranchMismatch {
                 pr,
