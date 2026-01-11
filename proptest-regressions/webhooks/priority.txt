@@ -4,4 +4,11 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
-cc 089aac9c3adb0720dd9471d2b566535b7f55a46d1b787fa7e67b096910591032 # shrinks to prefix = "", suffix = ".", force = false
+#
+# Historical note: The entry below originally failed when the suffix generator
+# could produce punctuation without leading whitespace. The shrunk case was
+# `suffix = "."`, producing `@merge-train stop.` which is NOT a valid command
+# (the parser extracts "stop." as the command word). The generator was
+# subsequently constrained to require leading whitespace in suffixes, so this
+# seed now produces a different (valid) test case.
+cc 089aac9c3adb0720dd9471d2b566535b7f55a46d1b787fa7e67b096910591032

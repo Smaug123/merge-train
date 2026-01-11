@@ -409,7 +409,8 @@ fn parse_pull_request_review(payload: &[u8]) -> Result<PullRequestReviewEvent, P
         }
     };
 
-    // GitHub uses SCREAMING_SNAKE_CASE for review states
+    // GitHub webhooks send review states in lowercase/snake_case (e.g., "approved",
+    // "changes_requested"). We normalize to uppercase for matching.
     let state = match raw.review.state.to_uppercase().as_str() {
         "APPROVED" => ReviewState::Approved,
         "CHANGES_REQUESTED" => ReviewState::ChangesRequested,

@@ -360,11 +360,17 @@ mod tests {
     // ========================================================================
 
     proptest! {
-        /// Stop commands always get High priority.
+        /// Valid stop commands always get High priority.
+        ///
+        /// Note: Commands are only recognized when the command word is followed by
+        /// whitespace or end-of-string. Text like `@merge-train stop.` (punctuation
+        /// immediately after the command) is NOT a valid command—the parser extracts
+        /// `stop.` as the command word, which doesn't match `"stop"`.
         #[test]
         fn prop_stop_commands_are_high_priority(
             prefix in "[a-zA-Z0-9 !?.,:;]{0,50}",
-            // Suffix must start with whitespace (if non-empty) to not interfere with command parsing
+            // Suffix must start with whitespace (if non-empty) to produce valid commands.
+            // Punctuation immediately after the command (e.g., "stop.") is invalid.
             suffix in "( [a-zA-Z0-9!?.,:;]{0,49})?",
             force in proptest::bool::ANY,
         ) {
