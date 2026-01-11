@@ -80,6 +80,9 @@
           ]
           ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
             pkgs.bubblewrap
+          ]
+          ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
+            pkgs.apple-sdk
           ];
 
         RUST_BACKTRACE = "1";
