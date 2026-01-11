@@ -79,12 +79,14 @@ pub enum GitEffect {
     ///
     /// This performs the reconciliation protocol from DESIGN.md:
     /// 1. `git merge $SQUASH_SHA^` - Merge the parent of the squash commit
-    ///    (the final state of the predecessor's head branch before squash)
+    ///    (the default branch HEAD at the time of the squash)
     /// 2. `git merge -s ours $SQUASH_SHA` - Create a merge commit marking the
     ///    squash as an ancestor without changing the tree
     ///
-    /// This ensures the descendant branch contains all the predecessor's changes
-    /// and is properly marked as containing the squash commit.
+    /// Step 1 brings in any commits that landed on the default branch between
+    /// preparation and squash. Step 2 marks the squash commit as an ancestor
+    /// without changing the tree (since the descendant was already prepared
+    /// with the predecessor's content before the squash).
     ///
     /// # Interpreter Validation Requirements
     ///
