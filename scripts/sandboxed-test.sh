@@ -55,6 +55,9 @@ fi
 
 # Run tests inside Linux sandbox
 run_linux() {
+    # Ensure target directory exists for bind mount
+    mkdir -p "$PROJECT_DIR/target"
+
     if ! command -v bwrap &>/dev/null; then
         echo "Error: bubblewrap (bwrap) not found. Install it with:" >&2
         echo "  nix-shell -p bubblewrap" >&2
@@ -65,7 +68,8 @@ run_linux() {
     local -a bwrap_args=(
         --die-with-parent
         --new-session          # Prevent TIOCSTI terminal injection
-        --unshare-all          # Isolate all namespaces (net, pid, ipc, uts, cgroup, user)
+        --unshare-user         # Create new user namespace (required for --disable-userns)
+        --unshare-all          # Isolate all namespaces (net, pid, ipc, uts, cgroup)
         --disable-userns       # Prevent creating nested user namespaces
 
         # Fresh /tmp for the test
@@ -210,6 +214,10 @@ run_macos() {
 }
 
 OS="$(uname -s)"
+
+# Fetch dependencies before entering sandbox (network is disabled inside)
+echo "=== Fetching dependencies ===" >&2
+cargo fetch --quiet
 
 echo "=== Running tests in sandbox ===" >&2
 case "$OS" in
