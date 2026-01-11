@@ -74,6 +74,7 @@
           pkgs.claude-code
           pkgs.codex
           pkgs.alejandra
+          pkgs.shellcheck
         ];
 
         RUST_BACKTRACE = "1";
