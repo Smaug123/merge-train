@@ -80,7 +80,7 @@ impl IntoResponse for WebhookError {
 /// - Method: POST
 /// - Required headers:
 ///   - `X-GitHub-Event`: Event type (e.g., "pull_request", "issue_comment")
-///   - `X-GitHub-Delivery`: Unique delivery ID (UUID format)
+///   - `X-GitHub-Delivery`: Unique delivery ID (validated for path safety, not UUID format)
 ///   - `X-Hub-Signature-256`: HMAC-SHA256 signature of the payload
 /// - Body: JSON webhook payload
 ///

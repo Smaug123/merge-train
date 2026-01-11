@@ -10,6 +10,14 @@
 //! - `POST /webhook` - Accepts GitHub webhook deliveries (returns 202 Accepted)
 //! - `GET /api/v1/repos/{owner}/{repo}/state` - Returns repository state as JSON
 //! - `GET /health` - Returns 200 if server is running
+//!
+//! # Platform Support
+//!
+//! This module is Unix-only. The path traversal protection in [`validate_path_component`]
+//! does not handle Windows-specific path semantics (e.g., drive letters like `C:`).
+
+#[cfg(windows)]
+compile_error!("This crate is Unix-only. Windows is not supported.");
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -605,9 +613,8 @@ mod integration_tests {
 
         // Verify nothing was created in the spool directory
         let entries: Vec<_> = std::fs::read_dir(spool_dir.path())
-            .into_iter()
-            .flatten()
-            .flatten()
+            .unwrap()
+            .map(|e| e.unwrap())
             .collect();
         assert!(
             entries.is_empty(),
@@ -646,9 +653,8 @@ mod integration_tests {
 
         // Verify nothing was created in the spool directory
         let entries: Vec<_> = std::fs::read_dir(spool_dir.path())
-            .into_iter()
-            .flatten()
-            .flatten()
+            .unwrap()
+            .map(|e| e.unwrap())
             .collect();
         assert!(
             entries.is_empty(),
@@ -687,9 +693,8 @@ mod integration_tests {
 
         // Verify nothing was created in the spool directory
         let entries: Vec<_> = std::fs::read_dir(spool_dir.path())
-            .into_iter()
-            .flatten()
-            .flatten()
+            .unwrap()
+            .map(|e| e.unwrap())
             .collect();
         assert!(
             entries.is_empty(),
