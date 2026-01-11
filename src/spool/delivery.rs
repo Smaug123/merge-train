@@ -517,13 +517,12 @@ fn create_marker_file(path: &Path, spool_dir: &Path) -> Result<()> {
 /// a dangerous state where the payload exists but markers are deleted, which
 /// would cause `is_pending()` to return true for an already-processed delivery.
 pub fn remove_delivery(delivery: &SpooledDelivery) -> Result<()> {
-    // CRITICAL: Delete payload FIRST to prevent reprocessing on crash.
-    // If we crash after this, the delivery cannot become pending again because
-    // is_pending() requires the payload file to exist.
+    // Delete payload FIRST to prevent reprocessing on crash. If we crash after
+    // this, the delivery cannot become pending again because is_pending() requires
+    // the payload file to exist.
     //
-    // CRITICAL: We must NOT ignore errors here! If payload deletion fails but
-    // we proceed to delete markers, we leave the system in a dangerous state
-    // where is_pending() returns true for an already-processed delivery.
+    // We must NOT ignore errors here. If payload deletion fails but we proceed to
+    // delete markers, is_pending() returns true for an already-processed delivery.
     match std::fs::remove_file(&delivery.payload_path) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -770,7 +769,7 @@ mod tests {
             let result = spool_delivery(spool_dir, &delivery_id, &payload2);
             prop_assert!(matches!(result, Err(SpoolError::DuplicateDelivery(_))));
 
-            // CRITICAL: First payload is preserved, not overwritten
+            // First payload is preserved, not overwritten
             let read_payload = delivery.read_payload_bytes().unwrap();
             prop_assert_eq!(payload1, read_payload, "First payload must be preserved");
 
@@ -1213,7 +1212,7 @@ mod tests {
             // Run recovery
             cleanup_interrupted_processing(spool_dir).unwrap();
 
-            // CRITICAL: Not pending because payload doesn't exist
+            // Not pending because payload doesn't exist
             prop_assert!(
                 !delivery.is_pending(),
                 "Delivery must not be pending after payload deletion. \
@@ -1255,7 +1254,7 @@ mod tests {
             // Run recovery
             cleanup_interrupted_processing(spool_dir).unwrap();
 
-            // CRITICAL: Not pending because payload doesn't exist
+            // Not pending because payload doesn't exist
             prop_assert!(
                 !delivery.is_pending(),
                 "Delivery must not be pending - no payload. \
@@ -1266,10 +1265,10 @@ mod tests {
             );
         }
 
-        /// CRITICAL: If payload deletion FAILS (not crashes), markers must NOT be deleted.
+        /// If payload deletion fails (not crashes), markers must NOT be deleted.
         ///
-        /// Bug discovered by review: The code uses `let _ = remove_file(payload)` which
-        /// ignores errors. If payload deletion fails (e.g., permissions, locked file),
+        /// The code must not use `let _ = remove_file(payload)` which ignores errors.
+        /// If payload deletion fails (e.g., permissions, locked file),
         /// the code proceeds to delete markers anyway. This leaves:
         /// - Payload: EXISTS (deletion failed)
         /// - .done marker: DELETED
@@ -1315,7 +1314,7 @@ mod tests {
             // Restore permissions before assertions (so tempdir cleanup works)
             std::fs::set_permissions(spool_dir, original_perms).unwrap();
 
-            // CRITICAL INVARIANT: If payload still exists, markers must also exist!
+            // If payload still exists, markers must also exist.
             // If payload deletion failed, we must NOT have deleted the markers.
             if delivery.payload_path.exists() {
                 prop_assert!(
