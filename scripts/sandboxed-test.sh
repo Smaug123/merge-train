@@ -6,20 +6,27 @@
 # Uses bubblewrap on Linux, sandbox-exec (seatbelt) on macOS.
 #
 # Usage:
-#   ./scripts/sandboxed-test.sh [cargo test args...]
+#   ./scripts/sandboxed-test.sh [cargo flags...] [filter] [-- test args...]
 #
 # Examples:
 #   ./scripts/sandboxed-test.sh
 #   ./scripts/sandboxed-test.sh --release
-#   ./scripts/sandboxed-test.sh -- --test-threads=1
+#   ./scripts/sandboxed-test.sh test_name_filter
+#   ./scripts/sandboxed-test.sh --release my_test -- --test-threads=1
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# Parse arguments to separate cargo build args from test args
+# Parse arguments to separate cargo flags, test filters, and test args.
+# Mirrors cargo test behavior:
+#   ./scripts/sandboxed-test.sh --release filter_name -- --test-threads=1
+#   CARGO_ARGS=(--release)   - flags passed to cargo build
+#   FILTER_ARGS=(filter_name) - test name filter passed to test binary
+#   TEST_ARGS=(--test-threads=1) - args passed to test binary after --
 CARGO_ARGS=()
+FILTER_ARGS=()
 TEST_ARGS=()
 seen_separator=false
 
@@ -28,8 +35,10 @@ for arg in "$@"; do
         seen_separator=true
     elif $seen_separator; then
         TEST_ARGS+=("$arg")
-    else
+    elif [[ "$arg" == -* ]]; then
         CARGO_ARGS+=("$arg")
+    else
+        FILTER_ARGS+=("$arg")
     fi
 done
 
@@ -48,7 +57,7 @@ while IFS= read -r line; do
     if [[ -n "$executable" ]]; then
         TEST_BINARIES+=("$executable")
     fi
-done < <(cargo test --no-run --message-format=json "${CARGO_ARGS[@]}" 2>/dev/null)
+done < <(cargo test --no-run --message-format=json "${CARGO_ARGS[@]}")
 
 if [[ ${#TEST_BINARIES[@]} -eq 0 ]]; then
     echo "Error: Could not find any test binaries" >&2
@@ -213,10 +222,10 @@ for test_binary in "${TEST_BINARIES[@]}"; do
     echo "--- Running: $(basename "$test_binary") ---" >&2
     case "$OS" in
         Linux)
-            run_linux "$test_binary" "${TEST_ARGS[@]}" || any_failed=1
+            run_linux "$test_binary" "${FILTER_ARGS[@]}" "${TEST_ARGS[@]}" || any_failed=1
             ;;
         Darwin)
-            run_macos "$test_binary" "${TEST_ARGS[@]}" || any_failed=1
+            run_macos "$test_binary" "${FILTER_ARGS[@]}" "${TEST_ARGS[@]}" || any_failed=1
             ;;
     esac
 done
