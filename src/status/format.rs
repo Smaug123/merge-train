@@ -155,7 +155,10 @@ fn truncate_aggressively(mut train: TrainRecord) -> TrainRecord {
     train
 }
 
-/// Truncates a string to the given length with a "... [truncated]" suffix.
+/// Truncates a string to at most `max_len` bytes with a "... [truncated]" suffix.
+///
+/// If `max_len` is too small to fit the suffix, truncates to `max_len` bytes
+/// at a valid UTF-8 boundary without the suffix.
 fn truncate_with_suffix(s: &str, max_len: usize) -> String {
     const SUFFIX: &str = "... [truncated]";
 
@@ -163,8 +166,17 @@ fn truncate_with_suffix(s: &str, max_len: usize) -> String {
         return s.to_string();
     }
 
+    // If max_len is too small to fit the suffix, just truncate without it
+    if max_len < SUFFIX.len() {
+        let mut end = max_len;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        return s[..end].to_string();
+    }
+
     // Ensure we have room for the suffix
-    let content_len = max_len.saturating_sub(SUFFIX.len());
+    let content_len = max_len - SUFFIX.len();
 
     // Find a valid UTF-8 boundary
     let mut end = content_len;
@@ -319,12 +331,37 @@ mod tests {
 
         #[test]
         fn truncate_with_suffix_handles_utf8() {
-            // Multi-byte UTF-8 characters
-            let s = "🚂".repeat(100);
+            // Multi-byte UTF-8 characters: 🚂 is 4 bytes
+            let s = "🚂".repeat(100); // 400 bytes total
             let truncated = truncate_with_suffix(&s, 50);
             // Should not panic and should be valid UTF-8
             assert!(truncated.len() <= 50);
-            assert!(truncated.is_char_boundary(truncated.len()));
+
+            // The suffix is 15 bytes, so content gets 35 bytes max.
+            // 35 is not a valid char boundary (🚂 is 4 bytes), so it backs up to 32.
+            // 32 bytes = 8 emoji characters, plus 15 byte suffix = 47 bytes total.
+            assert_eq!(truncated.len(), 47);
+            assert_eq!(&truncated[..32], "🚂🚂🚂🚂🚂🚂🚂🚂");
+            assert!(truncated.ends_with("... [truncated]"));
+        }
+
+        #[test]
+        fn truncate_with_suffix_handles_small_max_len() {
+            // When max_len is smaller than the suffix, truncate without suffix
+            let s = "hello world";
+            let truncated = truncate_with_suffix(s, 5);
+            assert_eq!(truncated, "hello");
+            assert_eq!(truncated.len(), 5);
+
+            // Edge case: max_len of 0
+            let truncated = truncate_with_suffix(s, 0);
+            assert_eq!(truncated, "");
+
+            // Edge case: max_len cuts into multi-byte char
+            let s = "🚂hello";
+            let truncated = truncate_with_suffix(s, 2);
+            // 🚂 is 4 bytes, so we can't fit any of it in 2 bytes
+            assert_eq!(truncated, "");
         }
 
         #[test]
