@@ -109,7 +109,9 @@ run_linux() {
         --dev /dev
         --proc /proc
 
-        # Environment
+        # Clear environment to prevent secret leakage, then set minimal env
+        --clearenv
+        --setenv PATH "/usr/bin:/bin"
         --setenv HOME "$TEST_TMPDIR"
         --setenv TMPDIR "$TEST_TMPDIR"
         --setenv RUST_BACKTRACE 1
@@ -166,10 +168,13 @@ run_macos() {
         exit 1
     fi
 
-    TMPDIR="$TEST_TMPDIR" \
-    HOME="$TEST_TMPDIR" \
-    RUST_BACKTRACE=1 \
-    sandbox-exec -p "$sandbox_policy" "$test_binary" "${test_args[@]}"
+    # Clear environment to prevent secret leakage, then set minimal env
+    env -i \
+        PATH="/usr/bin:/bin" \
+        HOME="$TEST_TMPDIR" \
+        TMPDIR="$TEST_TMPDIR" \
+        RUST_BACKTRACE=1 \
+        sandbox-exec -p "$sandbox_policy" "$test_binary" "${test_args[@]}"
 }
 
 OS="$(uname -s)"
@@ -190,6 +195,7 @@ esac
 echo "  Temp dir: $TEST_TMPDIR" >&2
 echo "  Network: disabled" >&2
 echo "  Filesystem: read-only except temp directories" >&2
+echo "  Environment: cleared (minimal PATH, HOME, TMPDIR only)" >&2
 echo "" >&2
 
 # Run all test binaries, collecting failures
