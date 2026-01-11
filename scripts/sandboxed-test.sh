@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 #
 # Compile tests normally, then run them in a sandbox to prevent filesystem/network escape.
+# The purpose is to run mutation tests safely, although
+# that is not yet implemented.
 # Uses bubblewrap on Linux, sandbox-exec (seatbelt) on macOS.
 #
 # Usage:
@@ -32,10 +34,11 @@ for arg in "$@"; do
 done
 
 echo "=== Compiling tests (outside sandbox) ===" >&2
-cargo test --no-run "${CARGO_ARGS[@]}" 2>&1
+cargo test --no-run "${CARGO_ARGS[@]}"
 
 # Find the test binary - cargo test --no-run prints paths like:
 #   Executable unittests src/lib.rs (target/debug/deps/merge_train_bot-abc123)
+# It does this to stderr.
 TEST_BINARY=$(cargo test --no-run "${CARGO_ARGS[@]}" 2>&1 | grep -o 'target/[^)]*' | head -1)
 
 if [[ -z "$TEST_BINARY" ]]; then
