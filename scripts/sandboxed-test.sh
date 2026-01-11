@@ -33,7 +33,8 @@ sbpl_assert_safe_path() {
 }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# Canonicalize to resolve symlinks - seatbelt evaluates real paths, so policy must match.
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 cd "$PROJECT_DIR"
 
 # Create a dedicated temp directory for the test run.
