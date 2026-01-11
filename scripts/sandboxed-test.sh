@@ -60,8 +60,11 @@ for bin in "${TEST_BINARIES[@]}"; do
     echo "  $bin" >&2
 done
 
-# Create a dedicated temp directory for the test run
-TEST_TMPDIR="$(mktemp -d)"
+# Create a dedicated temp directory for the test run.
+# IMPORTANT: Canonicalize with realpath to resolve symlinks (e.g., /var -> /private/var on macOS).
+# This allows us to grant write permissions to only this specific directory, rather than
+# broad paths like /private/var/folders which would expose other applications' temp files.
+TEST_TMPDIR="$(realpath "$(mktemp -d)")"
 trap 'rm -rf "$TEST_TMPDIR"' EXIT
 
 echo "" >&2
@@ -136,11 +139,9 @@ run_macos() {
 ; DENY writes everywhere except temp
 (deny file-write*)
 
-; Allow writes to temp directories only
+; Allow writes to our specific temp directory only (path is canonicalized above)
 (allow file-write*
     (subpath \"$TEST_TMPDIR\")
-    (subpath \"/private/tmp\")
-    (subpath \"/private/var/folders\")
 )
 
 ; Allow /dev/null and /dev/tty (needed by git and other tools)
@@ -172,18 +173,23 @@ echo "  Network: disabled" >&2
 echo "  Filesystem: read-only except temp directories" >&2
 echo "" >&2
 
-# Run all test binaries
+# Run all test binaries, collecting failures
+any_failed=0
 for test_binary in "${TEST_BINARIES[@]}"; do
     echo "--- Running: $(basename "$test_binary") ---" >&2
     case "$OS" in
         Linux)
-            run_linux "$test_binary" "${TEST_ARGS[@]}"
+            run_linux "$test_binary" "${TEST_ARGS[@]}" || any_failed=1
             ;;
         Darwin)
-            run_macos "$test_binary" "${TEST_ARGS[@]}"
+            run_macos "$test_binary" "${TEST_ARGS[@]}" || any_failed=1
             ;;
     esac
 done
 
 echo "" >&2
+if [[ $any_failed -ne 0 ]]; then
+    echo "=== Some test binary(ies) failed ===" >&2
+    exit 1
+fi
 echo "=== All ${#TEST_BINARIES[@]} test binary(ies) passed ===" >&2
