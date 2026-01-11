@@ -422,6 +422,11 @@ mod tests {
             }),
             arb_pr_number().prop_map(|descendant| AbortReason::PreparationMissing { descendant }),
             Just(AbortReason::MergeHooksEnabled),
+            prop::collection::vec(arb_pr_number(), 1..5).prop_map(|unprepared_descendants| {
+                AbortReason::PreparationIncomplete {
+                    unprepared_descendants,
+                }
+            }),
             (
                 arb_pr_number(),
                 "[a-zA-Z0-9_/-]{1,30}",
@@ -437,6 +442,8 @@ mod tests {
             (arb_sha(), arb_sha()).prop_map(|(expected, actual)| {
                 AbortReason::HeadShaChanged { expected, actual }
             }),
+            "[a-zA-Z0-9 ]{1,100}"
+                .prop_map(|details| { AbortReason::InternalInvariantViolation { details } }),
         ]
     }
 
@@ -557,14 +564,20 @@ mod tests {
                     descendant: PrNumber(2),
                 },
                 AbortReason::MergeHooksEnabled,
+                AbortReason::PreparationIncomplete {
+                    unprepared_descendants: vec![PrNumber(3), PrNumber(4)],
+                },
                 AbortReason::BaseBranchMismatch {
-                    pr: PrNumber(3),
-                    expected_base: "feature-1".into(),
+                    pr: PrNumber(5),
+                    expected_base: "feature".into(),
                     actual_base: "main".into(),
                 },
                 AbortReason::HeadShaChanged {
-                    expected: Sha::parse("a".repeat(40)).unwrap(),
-                    actual: Sha::parse("b".repeat(40)).unwrap(),
+                    expected: Sha::parse("0000000000000000000000000000000000000000").unwrap(),
+                    actual: Sha::parse("1111111111111111111111111111111111111111").unwrap(),
+                },
+                AbortReason::InternalInvariantViolation {
+                    details: "test".into(),
                 },
             ];
 
