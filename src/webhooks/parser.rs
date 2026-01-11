@@ -30,19 +30,11 @@ use super::events::{
 /// Error type for webhook parsing failures.
 #[derive(Debug, Error)]
 pub enum ParseError {
-    /// The event type header is missing.
-    #[error("missing X-GitHub-Event header")]
-    MissingEventType,
-
-    /// JSON deserialization failed.
+    /// JSON deserialization failed (includes missing required fields).
     #[error("JSON parse error: {0}")]
     JsonError(#[from] serde_json::Error),
 
-    /// Required field is missing from payload.
-    #[error("missing required field: {0}")]
-    MissingField(&'static str),
-
-    /// Field has invalid value.
+    /// Field has invalid value (e.g., malformed SHA, unknown state).
     #[error("invalid field value for {field}: {value}")]
     InvalidField { field: &'static str, value: String },
 }
@@ -88,7 +80,7 @@ pub enum ParseError {
 pub fn parse_webhook(event_type: &str, payload: &[u8]) -> Result<Option<GitHubEvent>, ParseError> {
     match event_type {
         "issue_comment" => parse_issue_comment(payload).map(|e| Some(GitHubEvent::IssueComment(e))),
-        "pull_request" => parse_pull_request(payload).map(|e| Some(GitHubEvent::PullRequest(e))),
+        "pull_request" => parse_pull_request(payload).map(|opt| opt.map(GitHubEvent::PullRequest)),
         "check_suite" => parse_check_suite(payload).map(|e| Some(GitHubEvent::CheckSuite(e))),
         "status" => parse_status(payload).map(|e| Some(GitHubEvent::Status(e))),
         "pull_request_review" => {
@@ -209,7 +201,7 @@ struct RawRef {
     ref_name: String,
 }
 
-fn parse_pull_request(payload: &[u8]) -> Result<PullRequestEvent, ParseError> {
+fn parse_pull_request(payload: &[u8]) -> Result<Option<PullRequestEvent>, ParseError> {
     let raw: RawPullRequestPayload = serde_json::from_slice(payload)?;
 
     let action = match raw.action.as_str() {
@@ -221,12 +213,7 @@ fn parse_pull_request(payload: &[u8]) -> Result<PullRequestEvent, ParseError> {
         "converted_to_draft" => PrAction::ConvertedToDraft,
         "ready_for_review" => PrAction::ReadyForReview,
         // Other actions (assigned, labeled, etc.) are not relevant to us
-        other => {
-            return Err(ParseError::InvalidField {
-                field: "action",
-                value: other.to_string(),
-            });
-        }
+        _ => return Ok(None),
     };
 
     let head_sha =
@@ -250,7 +237,7 @@ fn parse_pull_request(payload: &[u8]) -> Result<PullRequestEvent, ParseError> {
                 .unwrap_or_default(),
         })?;
 
-    Ok(PullRequestEvent {
+    Ok(Some(PullRequestEvent {
         repo: RepoId::new(raw.repository.owner.login, raw.repository.name),
         action,
         pr_number: PrNumber(raw.pull_request.number),
@@ -261,7 +248,7 @@ fn parse_pull_request(payload: &[u8]) -> Result<PullRequestEvent, ParseError> {
         head_branch: raw.pull_request.head.ref_name,
         is_draft: raw.pull_request.draft.unwrap_or(false),
         author_id: raw.pull_request.user.id,
-    })
+    }))
 }
 
 // ============================================================================
@@ -942,8 +929,8 @@ mod tests {
     }
 
     #[test]
-    fn invalid_pr_action_returns_error() {
-        // "labeled" is a valid GitHub action but not one we handle
+    fn unhandled_pr_action_returns_none() {
+        // "labeled" is a valid GitHub action but not one we handle - should be ignored
         let payload = r#"{
             "action": "labeled",
             "pull_request": {
@@ -955,13 +942,39 @@ mod tests {
             "repository": { "owner": { "login": "o" }, "name": "r" }
         }"#;
         let result = parse_webhook("pull_request", payload.as_bytes());
-        assert!(matches!(
-            result,
-            Err(ParseError::InvalidField {
-                field: "action",
-                ..
-            })
-        ));
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn other_unhandled_pr_actions_return_none() {
+        // Various other PR actions that GitHub sends but we don't care about
+        for action in [
+            "assigned",
+            "unlabeled",
+            "review_requested",
+            "locked",
+            "milestoned",
+        ] {
+            let payload = format!(
+                r#"{{
+                "action": "{}",
+                "pull_request": {{
+                    "number": 1,
+                    "head": {{ "sha": "1234567890abcdef1234567890abcdef12345678", "ref": "b" }},
+                    "base": {{ "sha": "abcdef1234567890abcdef1234567890abcdef12", "ref": "main" }},
+                    "user": {{ "id": 1, "login": "u" }}
+                }},
+                "repository": {{ "owner": {{ "login": "o" }}, "name": "r" }}
+            }}"#,
+                action
+            );
+            let result = parse_webhook("pull_request", payload.as_bytes());
+            assert!(
+                result.unwrap().is_none(),
+                "action '{}' should return None",
+                action
+            );
+        }
     }
 
     // ========================================================================

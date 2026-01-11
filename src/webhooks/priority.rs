@@ -362,9 +362,13 @@ mod tests {
         }
 
         /// Non-stop issue comments get Normal priority.
+        ///
+        /// Uses a regex that CAN generate strings with `@` and `-` so the
+        /// prop_assume actually filters something. This ensures we test
+        /// realistic comment text including @ mentions that aren't commands.
         #[test]
         fn prop_non_stop_comments_are_normal_priority(
-            text in "[a-zA-Z0-9 !?.,:;]{0,100}",
+            text in "[a-zA-Z0-9 @!?.,:;-]{0,100}",
         ) {
             // Ensure the text doesn't contain a stop command
             prop_assume!(!text.to_lowercase().contains("@merge-train stop"));
