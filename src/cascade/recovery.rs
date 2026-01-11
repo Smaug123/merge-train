@@ -160,7 +160,12 @@ pub fn compute_recovery_plan(
             {
                 // PR was merged externally while in Preparing phase.
                 // Check if all descendants were prepared before the merge.
-                let remaining: Vec<_> = progress.remaining().collect();
+                // Filter to only open PRs - closed PRs that haven't been marked skipped yet
+                // should not block recovery.
+                let remaining: Vec<_> = progress
+                    .remaining()
+                    .filter(|pr_num| prs.get(pr_num).is_some_and(|p| p.state.is_open()))
+                    .collect();
 
                 if !remaining.is_empty() {
                     // ABORT: Unprepared descendants exist. Reconciling them now would
@@ -712,35 +717,31 @@ pub fn verify_descendants_prepared(
                         });
                     }
 
-                    // Now get the SHA via ls-remote (objects are now local)
+                    // Use FETCH_HEAD to get the SHA of what was actually fetched.
+                    // This avoids a race condition where ls-remote could return a different
+                    // SHA if the remote ref moves between fetch and ls-remote.
                     let output = crate::git::git_command(worktree)
-                        .arg("ls-remote")
-                        .arg("origin")
-                        .arg(format!("refs/pull/{}/head", pr_num.0))
+                        .arg("rev-parse")
+                        .arg("FETCH_HEAD")
                         .output()
                         .map_err(|e| crate::git::GitError::CommandFailed {
-                            command: "git ls-remote".to_string(),
+                            command: "git rev-parse FETCH_HEAD".to_string(),
                             stderr: e.to_string(),
                         })?;
 
                     if !output.status.success() {
                         return Err(crate::git::GitError::CommandFailed {
-                            command: "git ls-remote".to_string(),
+                            command: "git rev-parse FETCH_HEAD".to_string(),
                             stderr: String::from_utf8_lossy(&output.stderr).to_string(),
                         });
                     }
 
                     let stdout = String::from_utf8_lossy(&output.stdout);
-                    let sha_str = stdout.split_whitespace().next().ok_or_else(|| {
-                        crate::git::GitError::CommandFailed {
-                            command: "git ls-remote".to_string(),
-                            stderr: format!("No SHA found for refs/pull/{}/head", pr_num.0),
-                        }
-                    })?;
+                    let sha_str = stdout.trim();
 
                     Sha::parse(sha_str.to_string()).map_err(|_| {
                         crate::git::GitError::CommandFailed {
-                            command: "git ls-remote".to_string(),
+                            command: "git rev-parse FETCH_HEAD".to_string(),
                             stderr: format!("Invalid SHA: {}", sha_str),
                         }
                     })?
@@ -1036,11 +1037,13 @@ mod tests {
         let validation_idx = plan
             .effects
             .iter()
-            .position(|e| matches!(e, Effect::Git(GitEffect::ValidateSquashCommit { .. })));
+            .position(|e| matches!(e, Effect::Git(GitEffect::ValidateSquashCommit { .. })))
+            .expect("ValidateSquashCommit effect must be present");
         let comment_idx = plan
             .effects
             .iter()
-            .position(|e| matches!(e, Effect::GitHub(GitHubEffect::UpdateComment { .. })));
+            .position(|e| matches!(e, Effect::GitHub(GitHubEffect::UpdateComment { .. })))
+            .expect("UpdateComment effect must be present");
 
         assert!(
             validation_idx < comment_idx,
