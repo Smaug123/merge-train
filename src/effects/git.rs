@@ -75,6 +75,82 @@ pub enum GitEffect {
         message: String,
     },
 
+    /// Reconciliation merge: two-step merge for squash commit integration.
+    ///
+    /// This performs the reconciliation protocol from DESIGN.md:
+    /// 1. `git merge $SQUASH_SHA^` - Merge the parent of the squash commit
+    ///    (the default branch HEAD at the time of the squash)
+    /// 2. `git merge -s ours $SQUASH_SHA` - Create a merge commit marking the
+    ///    squash as an ancestor without changing the tree
+    ///
+    /// Step 1 brings in any commits that landed on the default branch between
+    /// preparation and squash. Step 2 marks the squash commit as an ancestor
+    /// without changing the tree (since the descendant was already prepared
+    /// with the predecessor's content before the squash).
+    ///
+    /// # Interpreter Validation Requirements
+    ///
+    /// The interpreter must validate the squash commit before reconciliation,
+    /// regardless of whether `expected_squash_parent` is provided:
+    ///
+    /// 1. **Single parent check**: Verify `squash_sha` has exactly one parent.
+    ///    If it has multiple parents, it's a regular merge commit, not a squash.
+    ///    Abort with an error indicating non-squash merge detected.
+    ///
+    /// 2. **Default branch ancestry**: Verify the computed `$SQUASH_SHA^` is on
+    ///    the `origin/{default_branch}` history (i.e., is an ancestor of the
+    ///    default branch HEAD). This ensures the squash landed on the correct
+    ///    branch and wasn't somehow misdirected.
+    ///
+    /// 3. **Expected parent match** (if `expected_squash_parent` is `Some`):
+    ///    Additionally verify the computed parent matches the expected value.
+    ///
+    /// Failing any of these checks should abort the operation with a descriptive
+    /// error. This prevents non-squash merges from corrupting the cascade.
+    MergeReconcile {
+        /// The squash commit SHA to reconcile against.
+        squash_sha: Sha,
+        /// The expected parent of the squash commit (`$SQUASH_SHA^`), if known.
+        ///
+        /// When provided, the interpreter should verify that the computed parent
+        /// matches this value. When `None`, the interpreter computes the parent
+        /// itself but cannot verify against an expected value.
+        ///
+        /// Note: Currently this is always `None` because the squash parent is not
+        /// known until after the GitHub squash-merge API returns. Future work:
+        /// extend SquashMerge response to include parent SHA, or add a pre-flight
+        /// RevParse effect. The interpreter MUST still validate even when None.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        expected_squash_parent: Option<Sha>,
+        /// The default branch name (e.g., "main").
+        ///
+        /// Used to verify the squash parent is on the default branch history,
+        /// ensuring we're reconciling against a valid squash merge.
+        default_branch: String,
+        /// The branch to push the result to.
+        target_branch: String,
+    },
+
+    /// Validate a squash commit without performing reconciliation.
+    ///
+    /// Use this when you need to verify a squash commit is valid but have no
+    /// descendants to reconcile (e.g., external merge of a PR with no descendants).
+    ///
+    /// The interpreter MUST validate:
+    /// 1. **Single parent check**: Verify `squash_sha` has exactly one parent.
+    ///    If it has multiple parents, it's a regular merge commit, not a squash.
+    /// 2. **Default branch ancestry**: Verify the computed `$SQUASH_SHA^` is on
+    ///    the `origin/{default_branch}` history.
+    ///
+    /// If validation fails, the interpreter should return an error that causes
+    /// the train to abort.
+    ValidateSquashCommit {
+        /// The squash commit SHA to validate.
+        squash_sha: Sha,
+        /// The default branch name (e.g., "main").
+        default_branch: String,
+    },
+
     /// Push refs to a remote.
     Push {
         /// The refspec to push (e.g., "HEAD:refs/heads/feature").
@@ -197,11 +273,37 @@ mod tests {
     }
 
     fn arb_git_effect() -> impl Strategy<Value = GitEffect> {
+        // COMPILE-TIME EXHAUSTIVENESS CHECK
+        // When you add a new GitEffect variant, this match will fail to compile,
+        // reminding you to add a corresponding generator to prop_oneof! below.
+        // Keep the match arms in the same order as the prop_oneof! branches.
+        #[allow(dead_code, unreachable_code)]
+        fn _assert_all_variants_covered(e: GitEffect) {
+            match e {
+                GitEffect::Fetch { .. } => {}
+                GitEffect::Checkout { .. } => {}
+                GitEffect::Merge { .. } => {}
+                GitEffect::MergeReconcile { .. } => {}
+                GitEffect::ValidateSquashCommit { .. } => {}
+                GitEffect::Push { .. } => {}
+                GitEffect::IsAncestor { .. } => {}
+                GitEffect::RevParse { .. } => {}
+                GitEffect::CreateWorktree { .. } => {}
+                GitEffect::RemoveWorktree { .. } => {}
+                GitEffect::MergeAbort => {}
+                GitEffect::ResetHard { .. } => {}
+                GitEffect::Clean { .. } => {}
+            }
+        }
+
         prop_oneof![
+            // Fetch
             prop::collection::vec(arb_refspec(), 1..5)
                 .prop_map(|refspecs| GitEffect::Fetch { refspecs }),
+            // Checkout
             (arb_target(), any::<bool>())
                 .prop_map(|(target, detach)| GitEffect::Checkout { target, detach }),
+            // Merge
             (arb_target(), arb_merge_strategy(), arb_message()).prop_map(
                 |(target, strategy, message)| GitEffect::Merge {
                     target,
@@ -209,19 +311,51 @@ mod tests {
                     message
                 }
             ),
+            // MergeReconcile
+            (
+                arb_sha(),
+                proptest::option::of(arb_sha()),
+                arb_target(),
+                arb_target(),
+            )
+                .prop_map(
+                    |(squash_sha, expected_squash_parent, default_branch, target_branch)| {
+                        GitEffect::MergeReconcile {
+                            squash_sha,
+                            expected_squash_parent,
+                            default_branch,
+                            target_branch,
+                        }
+                    },
+                ),
+            // ValidateSquashCommit
+            (arb_sha(), arb_target()).prop_map(|(squash_sha, default_branch)| {
+                GitEffect::ValidateSquashCommit {
+                    squash_sha,
+                    default_branch,
+                }
+            }),
+            // Push
             (arb_refspec(), any::<bool>())
                 .prop_map(|(refspec, force)| GitEffect::Push { refspec, force }),
+            // IsAncestor
             (arb_sha(), arb_sha()).prop_map(|(potential_ancestor, descendant)| {
                 GitEffect::IsAncestor {
                     potential_ancestor,
                     descendant,
                 }
             }),
+            // RevParse
             arb_target().prop_map(|rev| GitEffect::RevParse { rev }),
+            // CreateWorktree
             arb_worktree_name().prop_map(|name| GitEffect::CreateWorktree { name }),
+            // RemoveWorktree
             arb_worktree_name().prop_map(|name| GitEffect::RemoveWorktree { name }),
+            // MergeAbort
             Just(GitEffect::MergeAbort),
+            // ResetHard
             arb_target().prop_map(|target| GitEffect::ResetHard { target }),
+            // Clean
             (any::<bool>(), any::<bool>())
                 .prop_map(|(directories, force)| GitEffect::Clean { directories, force }),
         ]
@@ -309,6 +443,80 @@ mod tests {
                 let parsed: GitResponse = serde_json::from_str(&json).unwrap();
                 prop_assert_eq!(response, parsed);
             }
+        }
+    }
+
+    // ─── Regression Tests ─────────────────────────────────────────────────────
+
+    mod bug_regression_tests {
+        use super::*;
+
+        /// GitEffect::MergeReconcile includes expected_squash_parent and default_branch
+        /// needed for reconciliation validation.
+        ///
+        /// From DESIGN.md: "Reconciliation assumes all descendants were prepared...
+        /// the bot MUST verify for each descendant not in `completed`:
+        /// 1. Fetch the descendant's head SHA and the predecessor's pre-squash head SHA
+        /// 2. Check if the predecessor head is an ancestor of the descendant head"
+        ///
+        /// The interpreter needs expected_squash_parent to verify that:
+        /// - $SQUASH_SHA^ (parent of squash) is valid and accessible
+        /// - The squash commit is actually a squash (single parent pointing to main)
+        ///
+        /// And default_branch to verify:
+        /// - The squash parent is on the default branch history
+        #[test]
+        fn merge_reconcile_has_validation_fields() {
+            let squash_sha = Sha::parse("abc123def456789012345678901234567890abcd").unwrap();
+            let expected_squash_parent =
+                Sha::parse("1234567890abcdef1234567890abcdef12345678").unwrap();
+
+            // MergeReconcile with all validation fields populated
+            let effect_with_parent = GitEffect::MergeReconcile {
+                squash_sha: squash_sha.clone(),
+                expected_squash_parent: Some(expected_squash_parent.clone()),
+                default_branch: "main".to_string(),
+                target_branch: "feature".to_string(),
+            };
+
+            // Verify fields are serialized when present
+            let json = serde_json::to_string(&effect_with_parent).unwrap();
+
+            assert!(
+                json.contains("expected_squash_parent"),
+                "MergeReconcile should have expected_squash_parent when Some. JSON: {}",
+                json
+            );
+
+            assert!(
+                json.contains("default_branch"),
+                "MergeReconcile should have default_branch field. JSON: {}",
+                json
+            );
+
+            // Verify round-trip works with Some
+            let parsed: GitEffect = serde_json::from_str(&json).unwrap();
+            assert_eq!(effect_with_parent, parsed);
+
+            // MergeReconcile without expected_squash_parent (interpreter computes it)
+            let effect_without_parent = GitEffect::MergeReconcile {
+                squash_sha: squash_sha.clone(),
+                expected_squash_parent: None,
+                default_branch: "main".to_string(),
+                target_branch: "feature".to_string(),
+            };
+
+            // expected_squash_parent should be omitted from JSON when None
+            let json_without = serde_json::to_string(&effect_without_parent).unwrap();
+            assert!(
+                !json_without.contains("expected_squash_parent"),
+                "expected_squash_parent should be omitted when None. JSON: {}",
+                json_without
+            );
+
+            // Round-trip works with None
+            let parsed_without: GitEffect = serde_json::from_str(&json_without).unwrap();
+            assert_eq!(effect_without_parent, parsed_without);
         }
     }
 }
