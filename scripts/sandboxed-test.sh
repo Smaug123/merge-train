@@ -117,6 +117,15 @@ run_linux() {
         --chdir "$PROJECT_DIR"
     )
 
+    # Verify sandbox prevents writes next to the binary
+    local verify_file
+    verify_file="$(dirname "$test_binary")/sandbox-verify-$(uuidgen)"
+    if bwrap "${bwrap_args[@]}" /bin/sh -c "echo test > '$verify_file'" 2>/dev/null; then
+        echo "FATAL: Sandbox verification failed - was able to write to: $verify_file" >&2
+        rm -f "$verify_file"
+        exit 1
+    fi
+
     bwrap "${bwrap_args[@]}" "$test_binary" "${test_args[@]}"
 }
 
@@ -125,10 +134,7 @@ run_macos() {
     shift
     local test_args=("$@")
 
-    TMPDIR="$TEST_TMPDIR" \
-    HOME="$TEST_TMPDIR" \
-    RUST_BACKTRACE=1 \
-    sandbox-exec -p "
+    local sandbox_policy="
 (version 1)
 
 (allow default)
@@ -149,8 +155,21 @@ run_macos() {
     (literal \"/dev/null\")
     (literal \"/dev/tty\")
 )
-" \
-    "$test_binary" "${test_args[@]}"
+"
+
+    # Verify sandbox prevents writes next to the binary
+    local verify_file
+    verify_file="$(dirname "$test_binary")/sandbox-verify-$(uuidgen)"
+    if sandbox-exec -p "$sandbox_policy" /bin/sh -c "echo test > '$verify_file'" 2>/dev/null; then
+        echo "FATAL: Sandbox verification failed - was able to write to: $verify_file" >&2
+        rm -f "$verify_file"
+        exit 1
+    fi
+
+    TMPDIR="$TEST_TMPDIR" \
+    HOME="$TEST_TMPDIR" \
+    RUST_BACKTRACE=1 \
+    sandbox-exec -p "$sandbox_policy" "$test_binary" "${test_args[@]}"
 }
 
 OS="$(uname -s)"
