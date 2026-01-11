@@ -519,12 +519,10 @@ Rather than attempting truncated recovery (which is fragile and can violate free
 
    Truncation happens **before** JSON serialization, ensuring the size estimate remains valid. The full error details are preserved in the local event log for debugging.
 
-6. **Final size check**: Before posting/updating the status comment, the bot verifies the serialized JSON is under 60KB. If it exceeds this (which should not happen with the above limits):
-   - First, aggressively truncate `error.message` and `error.stderr` to 500 characters each and retry
-   - If STILL too large after aggressive truncation, this indicates a bug in the size estimation (the 50 PR limit with truncation should always fit). The bot MUST NOT post a minimal comment without JSON, as this would silently disable GitHub-based recovery:
-     - Abort the train with error: "Status comment size limit exceeded unexpectedly. This is a bug — please report it with the train configuration. Train aborted to prevent recovery data loss."
-     - Transition to `aborted` state
-     - Log the full serialized JSON size and structure for debugging
+6. **Final size check**: Before posting/updating the status comment, the bot verifies the serialized JSON is under 60KB. If it exceeds this (which should not happen with the above limits), this indicates a bug in the size estimation (the 50 PR limit with truncation should always fit). The bot MUST NOT post a minimal comment without JSON, as this would silently disable GitHub-based recovery:
+   - Abort the train with error: "Status comment size limit exceeded unexpectedly. This is a bug — please report it with the train configuration. Train aborted to prevent recovery data loss."
+   - Transition to `aborted` state
+   - Log the full serialized JSON size and structure for debugging
    - The local state remains authoritative; the user can retry after the bug is investigated
 
 **Why not degrade gracefully?** Posting a status comment without the embedded JSON would allow the cascade to continue, but if the bot crashes, GitHub-based recovery cannot determine which descendants were frozen, which were skipped, or what phase was interrupted. The train would transition to `needs_manual_review` on restart, forcing manual intervention anyway — but with the added risk that the cascade made progress that can't be safely resumed. It's better to fail fast when we detect the size limit is exceeded.

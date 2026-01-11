@@ -355,10 +355,24 @@ impl CascadeEngine {
             };
         };
 
-        // Check if PR is still open
+        // Check if PR is still open.
+        // In post-squash phases (Reconciling, CatchingUp, Retargeting), the current PR
+        // being merged is expected - the cascade performed the squash and we're now
+        // processing descendants. Only treat merged as "external" in pre-squash phases.
         if !current_pr.state.is_open() {
+            let is_post_squash = matches!(
+                train.cascade_phase,
+                CascadePhase::Reconciling { .. }
+                    | CascadePhase::CatchingUp { .. }
+                    | CascadePhase::Retargeting { .. }
+            );
+
             if current_pr.state.is_merged() {
-                // PR was merged externally - advance the train
+                if is_post_squash {
+                    // Expected state - proceed with descendant processing
+                    return TrainAction::Proceed;
+                }
+                // Pre-squash phases: external merge needs advancing
                 return TrainAction::AdvanceAfterExternalMerge {
                     merge_sha: current_pr
                         .state
@@ -366,6 +380,11 @@ impl CascadeEngine {
                         .cloned()
                         .expect("merged PR has merge_commit_sha"),
                 };
+            }
+            // PR closed without merge
+            if is_post_squash {
+                // Shouldn't happen in post-squash phases, but let phase execution handle it
+                return TrainAction::Proceed;
             }
             return TrainAction::Abort {
                 reason: AbortReason::PrClosed,

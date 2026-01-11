@@ -101,24 +101,37 @@ pub fn execute_cascade_step(
         };
     };
 
-    // Check if PR is still open
+    // Check if PR is still open.
+    // In post-squash phases (Reconciling, CatchingUp, Retargeting), the current PR
+    // being merged is expected - the cascade performed the squash and we're now
+    // processing descendants. Only handle as "external merge" in pre-squash phases.
     if !current_pr.state.is_open() {
-        if let PrState::Merged { merge_commit_sha } = &current_pr.state {
-            // PR was merged externally - handle this case
-            return handle_external_merge(&mut train, merge_commit_sha.clone(), prs, ctx);
+        let is_post_squash = matches!(
+            train.cascade_phase,
+            CascadePhase::Reconciling { .. }
+                | CascadePhase::CatchingUp { .. }
+                | CascadePhase::Retargeting { .. }
+        );
+
+        if !is_post_squash {
+            // Pre-squash phases: external merge or close needs special handling
+            if let PrState::Merged { merge_commit_sha } = &current_pr.state {
+                return handle_external_merge(&mut train, merge_commit_sha.clone(), prs, ctx);
+            }
+            train.abort(TrainError::new(
+                "pr_closed",
+                "PR was closed without merging",
+            ));
+            return StepResult {
+                train,
+                outcome: CascadeStepOutcome::Aborted {
+                    pr_number: current_pr_number,
+                    reason: AbortReason::PrClosed,
+                },
+                effects: vec![],
+            };
         }
-        train.abort(TrainError::new(
-            "pr_closed",
-            "PR was closed without merging",
-        ));
-        return StepResult {
-            train,
-            outcome: CascadeStepOutcome::Aborted {
-                pr_number: current_pr_number,
-                reason: AbortReason::PrClosed,
-            },
-            effects: vec![],
-        };
+        // Post-squash phases: current PR merged is expected, fall through to phase execution
     }
 
     // Clone the phase to avoid borrowing issues
