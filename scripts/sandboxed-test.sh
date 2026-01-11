@@ -18,12 +18,13 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$PROJECT_DIR"
 
 # Create a dedicated temp directory for the test run.
-# IMPORTANT: Canonicalize with realpath to resolve symlinks (e.g., /var -> /private/var on macOS).
-# This allows us to grant write permissions to only this specific directory, rather than
-# broad paths like /private/var/folders which would expose other applications' temp files.
-TEST_TMPDIR="$(realpath "$(mktemp -d)")"
+# IMPORTANT: Canonicalize to resolve symlinks (e.g., /var -> /private/var on macOS).
+# This ensures sandbox policies use the real path.
+TEST_TMPDIR_RAW="$(mktemp -d)"
+TEST_TMPDIR="$(cd "$TEST_TMPDIR_RAW" && pwd -P)"
 trap 'rm -rf "$TEST_TMPDIR"' EXIT
 
 # Locate Rust toolchain directories (needed read-only in sandbox)
@@ -47,9 +48,9 @@ run_linux() {
 
     local -a bwrap_args=(
         --die-with-parent
-        --unshare-net
-        --unshare-pid
-        --unshare-ipc
+        --new-session          # Prevent TIOCSTI terminal injection
+        --unshare-all          # Isolate all namespaces (net, pid, ipc, uts, cgroup, user)
+        --disable-userns       # Prevent creating nested user namespaces
 
         # Fresh /tmp for the test
         --tmpfs /tmp
@@ -92,10 +93,13 @@ run_linux() {
         --chdir "$PROJECT_DIR"
     )
 
-    # Verify sandbox prevents writes outside allowed directories
+    # Smoke test: verify sandbox prevents writes outside allowed directories.
+    # This is not comprehensive - it only checks one path. The real security comes
+    # from the bwrap configuration above; this just catches gross misconfigurations.
     local verify_file
-    verify_file="$PROJECT_DIR/sandbox-verify-$(uuidgen)"
-    if bwrap "${bwrap_args[@]}" /bin/sh -c "echo test > '$verify_file'" 2>/dev/null; then
+    verify_file="$PROJECT_DIR/sandbox-verify-$$-$RANDOM"
+    # shellcheck disable=SC2016 # $1 is intentionally for the inner shell
+    if bwrap "${bwrap_args[@]}" /bin/sh -c 'echo test >"$1"' _ "$verify_file" 2>/dev/null; then
         echo "FATAL: Sandbox verification failed - was able to write to: $verify_file" >&2
         rm -f "$verify_file"
         exit 1
@@ -107,11 +111,6 @@ run_linux() {
 
 # Run tests inside macOS sandbox
 run_macos() {
-    # Get the Darwin user temp directory (parent of TEST_TMPDIR).
-    # xcrun (which wraps git on macOS) writes cache files here.
-    local darwin_temp_dir
-    darwin_temp_dir="$(dirname "$TEST_TMPDIR")"
-
     local sandbox_policy="
 (version 1)
 
@@ -123,9 +122,9 @@ run_macos() {
 ; DENY writes everywhere except allowed paths
 (deny file-write*)
 
-; Allow writes to Darwin user temp directory (for xcrun cache, etc.)
+; Allow writes to test temp directory
 (allow file-write*
-    (subpath \"$darwin_temp_dir\")
+    (subpath \"$TEST_TMPDIR\")
 )
 
 ; Allow writes to target directory (for compilation output)
@@ -140,10 +139,13 @@ run_macos() {
 )
 "
 
-    # Verify sandbox prevents writes outside allowed directories
+    # Smoke test: verify sandbox prevents writes outside allowed directories.
+    # This is not comprehensive - it only checks one path. The real security comes
+    # from the seatbelt policy above; this just catches gross misconfigurations.
     local verify_file
-    verify_file="$PROJECT_DIR/sandbox-verify-$(uuidgen)"
-    if sandbox-exec -p "$sandbox_policy" /bin/sh -c "echo test > '$verify_file'" 2>/dev/null; then
+    verify_file="$PROJECT_DIR/sandbox-verify-$$-$RANDOM"
+    # shellcheck disable=SC2016 # $1 is intentionally for the inner shell
+    if sandbox-exec -p "$sandbox_policy" /bin/sh -c 'echo test >"$1"' _ "$verify_file" 2>/dev/null; then
         echo "FATAL: Sandbox verification failed - was able to write to: $verify_file" >&2
         rm -f "$verify_file"
         exit 1
