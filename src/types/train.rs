@@ -58,8 +58,8 @@ pub struct DescendantProgress {
     pub skipped: HashSet<PrNumber>,
 
     /// The descendant set captured when entering `Preparing`.
-    /// This is frozen and carried through ALL subsequent phases.
-    /// CRITICAL: Recovery MUST use this, not re-query the descendants index.
+    /// Frozen and carried through all subsequent phases.
+    /// Recovery must use this, not re-query the descendants index.
     pub frozen_descendants: Vec<PrNumber>,
 }
 
