@@ -83,7 +83,7 @@ pub enum RecoveryAction {
     /// before the squash.
     ///
     /// Uses `predecessor_head_sha` if available, otherwise falls back to fetching
-    /// `refs/pull/<predecessor_pr>/head` via git ls-remote.
+    /// `refs/pull/<predecessor_pr>/head` from origin.
     VerifyPrepared {
         /// The predecessor head SHA (if known). Use this first.
         predecessor_head_sha: Option<Sha>,
@@ -687,9 +687,32 @@ pub fn verify_descendants_prepared(
     let pred_sha = match predecessor_head_sha {
         Some(sha) => sha.clone(),
         None => {
-            // Fallback: fetch refs/pull/<predecessor_pr>/head via git ls-remote
+            // Fallback: fetch refs/pull/<predecessor_pr>/head from origin
             match predecessor_pr {
                 Some(pr_num) => {
+                    // Fetch the predecessor ref so its objects are available locally.
+                    // ls-remote only returns the SHA; we need the actual commit object
+                    // for merge-base --is-ancestor to work.
+                    let refspec = format!("+refs/pull/{}/head", pr_num.0);
+                    let output = crate::git::git_command(worktree)
+                        .arg("fetch")
+                        .arg("origin")
+                        .arg(&refspec)
+                        .output()
+                        .map_err(|e| crate::git::GitError::CommandFailed {
+                            command: "git fetch".to_string(),
+                            stderr: e.to_string(),
+                        })?;
+
+                    if !output.status.success() {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        return Err(crate::git::GitError::FetchFailed {
+                            refspec,
+                            details: stderr.to_string(),
+                        });
+                    }
+
+                    // Now get the SHA via ls-remote (objects are now local)
                     let output = crate::git::git_command(worktree)
                         .arg("ls-remote")
                         .arg("origin")
