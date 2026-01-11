@@ -108,14 +108,15 @@ pub async fn state_handler(
 fn find_current_snapshot(
     repo_state_dir: &std::path::Path,
 ) -> Result<Option<std::path::PathBuf>, StateError> {
-    // If the directory doesn't exist, there's no snapshot
-    if !repo_state_dir.exists() {
-        return Ok(None);
-    }
+    let read_dir = match fs::read_dir(repo_state_dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
 
     let mut highest_gen: Option<(u64, std::path::PathBuf)> = None;
 
-    for entry in fs::read_dir(repo_state_dir)? {
+    for entry in read_dir {
         let entry = entry?;
         let path = entry.path();
 
