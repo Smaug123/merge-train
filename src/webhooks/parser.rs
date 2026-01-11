@@ -161,12 +161,21 @@ fn parse_issue_comment(payload: &[u8]) -> Result<IssueCommentEvent, ParseError> 
     // Only set pr_number if this is a PR (has pull_request field)
     let pr_number = raw.issue.pull_request.map(|_| PrNumber(raw.issue.number));
 
+    // For deleted comments, the body is always empty (we don't care what
+    // GitHub sends since the comment no longer exists). This enforces the
+    // invariant documented on IssueCommentEvent::body.
+    let body = if action == CommentAction::Deleted {
+        String::new()
+    } else {
+        raw.comment.body.unwrap_or_default()
+    };
+
     Ok(IssueCommentEvent {
         repo: RepoId::new(raw.repository.owner.login, raw.repository.name),
         action,
         pr_number,
         comment_id: CommentId(raw.comment.id),
-        body: raw.comment.body.unwrap_or_default(),
+        body,
         author_id: raw.comment.user.id,
         author_login: raw.comment.user.login,
     })
@@ -525,6 +534,41 @@ mod tests {
             GitHubEvent::IssueComment(e) => {
                 assert_eq!(e.action, CommentAction::Deleted);
                 // Body is empty when not present
+                assert_eq!(e.body, "");
+            }
+            _ => panic!("expected IssueComment"),
+        }
+    }
+
+    #[test]
+    fn parse_issue_comment_deleted_body_is_empty_even_if_github_sends_body() {
+        // GitHub might still send the body in a deleted comment payload.
+        // We enforce the invariant that deleted comments have empty body
+        // since the content no longer exists on GitHub.
+        let payload = r#"{
+            "action": "deleted",
+            "comment": {
+                "id": 999,
+                "body": "This was the original comment text",
+                "user": { "id": 1, "login": "user" }
+            },
+            "issue": {
+                "number": 10,
+                "pull_request": {}
+            },
+            "repository": {
+                "owner": { "login": "org" },
+                "name": "repo"
+            }
+        }"#;
+
+        let result = parse_webhook("issue_comment", payload.as_bytes()).unwrap();
+        let event = result.expect("should parse");
+
+        match event {
+            GitHubEvent::IssueComment(e) => {
+                assert_eq!(e.action, CommentAction::Deleted);
+                // Body should be empty regardless of what GitHub sends
                 assert_eq!(e.body, "");
             }
             _ => panic!("expected IssueComment"),

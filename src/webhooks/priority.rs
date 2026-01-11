@@ -391,9 +391,12 @@ mod tests {
         fn prop_non_stop_comments_are_normal_priority(
             text in "[a-zA-Z0-9 @!?.,:;-]{0,100}",
         ) {
-            // Ensure the text doesn't contain a stop command
-            prop_assume!(!text.to_lowercase().contains("@merge-train stop"));
-            prop_assume!(!text.to_lowercase().contains("@merge-train  stop"));
+            // Use parse_command to check for stop commands, which handles all
+            // whitespace variations (tabs, multiple spaces, etc.)
+            prop_assume!(!matches!(
+                parse_command(&text, DEFAULT_BOT_NAME),
+                Some(Command::Stop) | Some(Command::StopForce)
+            ));
 
             let event = make_comment(&text, CommentAction::Created);
             prop_assert_eq!(classify_priority(&event), EventPriority::Normal);
