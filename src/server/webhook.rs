@@ -138,8 +138,10 @@ pub async fn webhook_handler(
     let (owner, repo) = extract_repository(&body_json)?;
 
     // Validate path components to prevent path traversal attacks.
+    // All three values (owner, repo, delivery_id) are used in filesystem paths.
     validate_path_component(&owner)?;
     validate_path_component(&repo)?;
+    validate_path_component(delivery_id.as_str())?;
 
     debug!(
         delivery_id = %delivery_id,
@@ -333,6 +335,6 @@ mod tests {
         assert_eq!(result.get("valid-header"), Some(&"valid-value".to_string()));
 
         // Invalid UTF-8 header should be filtered out
-        assert!(result.get("invalid-header").is_none());
+        assert!(!result.contains_key("invalid-header"));
     }
 }

@@ -603,11 +603,16 @@ mod integration_tests {
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
-        // Verify nothing was spooled
-        let bad_path = spool_dir.path().join("../etc").join("hello-world");
+        // Verify nothing was created in the spool directory
+        let entries: Vec<_> = std::fs::read_dir(spool_dir.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .collect();
         assert!(
-            !bad_path.exists(),
-            "Should not create directory with path traversal"
+            entries.is_empty(),
+            "Spool directory should be empty after rejected request, but found: {:?}",
+            entries
         );
     }
 
@@ -639,11 +644,57 @@ mod integration_tests {
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
-        // Verify nothing was spooled
-        let bad_path = spool_dir.path().join("octocat").join("../../secrets");
+        // Verify nothing was created in the spool directory
+        let entries: Vec<_> = std::fs::read_dir(spool_dir.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .collect();
         assert!(
-            !bad_path.exists(),
-            "Should not create directory with path traversal"
+            entries.is_empty(),
+            "Spool directory should be empty after rejected request, but found: {:?}",
+            entries
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_path_traversal_in_delivery_id() {
+        let secret = b"test-secret";
+        let (state, spool_dir, _state_dir) = test_app_state(secret);
+        let app = build_router(state);
+
+        // Valid owner/repo but path traversal in delivery ID header
+        let body = serde_json::json!({
+            "action": "opened",
+            "repository": {
+                "name": "hello-world",
+                "owner": {
+                    "login": "octocat"
+                }
+            }
+        });
+
+        let request = create_webhook_request(
+            secret,
+            "pull_request",
+            "../../../etc/passwd", // Path traversal in delivery ID
+            &body,
+        );
+
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Verify nothing was created in the spool directory
+        let entries: Vec<_> = std::fs::read_dir(spool_dir.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .collect();
+        assert!(
+            entries.is_empty(),
+            "Spool directory should be empty after rejected request, but found: {:?}",
+            entries
         );
     }
 }
