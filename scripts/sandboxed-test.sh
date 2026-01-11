@@ -16,6 +16,22 @@
 
 set -euo pipefail
 
+# Validate that a path is safe for interpolation into SBPL (Sandbox Profile Language).
+# Paths containing quotes, newlines, or backslashes could inject arbitrary policy directives.
+# We reject these rather than attempting to escape them - fail closed.
+sbpl_assert_safe_path() {
+    local path="$1"
+    local name="$2"
+    # Check for: double-quote, newline, carriage return, backslash
+    # Using printf to create the pattern since $'\n' in case patterns is tricky
+    if [[ "$path" == *\"* ]] || [[ "$path" == *\\* ]] || [[ "$path" == *$'\n'* ]] || [[ "$path" == *$'\r'* ]]; then
+        echo "FATAL: Unsafe character in path for SBPL policy: $name" >&2
+        echo "  Path contains quote, backslash, or newline which could inject policy directives." >&2
+        echo "  Path: $path" >&2
+        exit 1
+    fi
+}
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_DIR"
@@ -111,6 +127,11 @@ run_linux() {
 
 # Run tests inside macOS sandbox
 run_macos() {
+    # Validate paths before interpolating into SBPL policy.
+    # This prevents injection attacks via crafted paths containing quotes/newlines.
+    sbpl_assert_safe_path "$TEST_TMPDIR" "TEST_TMPDIR"
+    sbpl_assert_safe_path "$PROJECT_DIR" "PROJECT_DIR"
+
     local sandbox_policy="
 (version 1)
 
