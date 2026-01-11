@@ -109,11 +109,13 @@ run_linux() {
         --dev /dev
         --proc /proc
 
-        # Clear environment to prevent secret leakage, then set minimal env
+        # Clear environment to prevent secret leakage, then set minimal env.
+        # PATH is preserved to allow Nix-provided tools (like git) to be found.
         --clearenv
-        --setenv PATH "/usr/bin:/bin"
+        --setenv PATH "$PATH"
         --setenv HOME "$TEST_TMPDIR"
         --setenv TMPDIR "$TEST_TMPDIR"
+        --setenv USER sandbox
         --setenv RUST_BACKTRACE 1
 
         --chdir "$PROJECT_DIR"
@@ -136,6 +138,11 @@ run_macos() {
     shift
     local test_args=("$@")
 
+    # Get the Darwin user temp directory (parent of TEST_TMPDIR).
+    # xcrun (which wraps git on macOS) writes cache files here.
+    local darwin_temp_dir
+    darwin_temp_dir="$(dirname "$TEST_TMPDIR")"
+
     local sandbox_policy="
 (version 1)
 
@@ -147,9 +154,9 @@ run_macos() {
 ; DENY writes everywhere except temp
 (deny file-write*)
 
-; Allow writes to our specific temp directory only (path is canonicalized above)
+; Allow writes to Darwin user temp directory (for xcrun cache, etc.)
 (allow file-write*
-    (subpath \"$TEST_TMPDIR\")
+    (subpath \"$darwin_temp_dir\")
 )
 
 ; Allow /dev/null and /dev/tty (needed by git and other tools)
@@ -168,11 +175,13 @@ run_macos() {
         exit 1
     fi
 
-    # Clear environment to prevent secret leakage, then set minimal env
+    # Clear environment to prevent secret leakage, then set minimal env.
+    # PATH is preserved to allow Nix-provided tools (like git) to be found.
     env -i \
-        PATH="/usr/bin:/bin" \
+        PATH="$PATH" \
         HOME="$TEST_TMPDIR" \
         TMPDIR="$TEST_TMPDIR" \
+        USER=sandbox \
         RUST_BACKTRACE=1 \
         sandbox-exec -p "$sandbox_policy" "$test_binary" "${test_args[@]}"
 }
@@ -195,7 +204,7 @@ esac
 echo "  Temp dir: $TEST_TMPDIR" >&2
 echo "  Network: disabled" >&2
 echo "  Filesystem: read-only except temp directories" >&2
-echo "  Environment: cleared (minimal PATH, HOME, TMPDIR only)" >&2
+echo "  Environment: cleared (PATH, HOME, TMPDIR, USER only)" >&2
 echo "" >&2
 
 # Run all test binaries, collecting failures

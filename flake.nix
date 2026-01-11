@@ -72,6 +72,7 @@
             pkgs.pkg-config
             pkgs.openssl
             pkgs.libiconv
+            pkgs.git
             pkgs.claude-code
             pkgs.codex
             pkgs.alejandra
