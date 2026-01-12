@@ -185,12 +185,17 @@ run_macos() {
     fi
     echo "  Sandbox verification passed" >&2
 
-    # Convert NIX_LDFLAGS -L paths to RUSTFLAGS -L native= paths.
-    # This is needed because rustc invokes the linker directly and doesn't
-    # process NIX_LDFLAGS like the Nix cc wrapper does.
+    # Extract library paths from NIX_LDFLAGS for various uses:
+    # - LIBRARY_PATH: Direct linker search path (most reliable)
+    # - RUSTFLAGS -Lnative=: For rustc linking
+    # - RUSTDOCFLAGS -Lnative=: For doctest linking (rustdoc)
+    local library_path=""
     local rust_link_args=""
     if [[ -n "${NIX_LDFLAGS:-}" ]]; then
-        rust_link_args=$(echo "$NIX_LDFLAGS" | tr ' ' '\n' | grep '^-L' | sort -u | sed 's/^-L/-L native=/' | tr '\n' ' ')
+        # Extract -L paths, remove the -L prefix, join with colons for LIBRARY_PATH
+        library_path=$(echo "$NIX_LDFLAGS" | tr ' ' '\n' | grep '^-L' | sed 's/^-L//' | sort -u | tr '\n' ':' | sed 's/:$//')
+        # Convert to -Lnative= format for RUSTFLAGS (no space after -L!)
+        rust_link_args=$(echo "$NIX_LDFLAGS" | tr ' ' '\n' | grep '^-L' | sort -u | sed 's/^-L/-Lnative=/' | tr '\n' ' ')
     fi
 
     # Pass through Nix toolchain environment variables explicitly.
@@ -203,10 +208,13 @@ run_macos() {
         RUSTUP_HOME="$RUSTUP_HOME" \
         CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
         SDKROOT="${SDKROOT:-}" \
+        LIBRARY_PATH="$library_path" \
         RUSTFLAGS="$rust_link_args" \
+        RUSTDOCFLAGS="$rust_link_args" \
         NIX_CC="${NIX_CC:-}" \
         NIX_BINTOOLS="${NIX_BINTOOLS:-}" \
         NIX_LDFLAGS="${NIX_LDFLAGS:-}" \
+        NIX_CFLAGS_COMPILE="${NIX_CFLAGS_COMPILE:-}" \
         NIX_STORE="${NIX_STORE:-}" \
         USER=sandbox \
         RUST_BACKTRACE=1 \
