@@ -73,9 +73,10 @@ run_linux() {
         --unshare-user         # Create new user namespace (required for --disable-userns)
         --unshare-all          # Isolate all namespaces (net, pid, ipc, uts, cgroup)
         --disable-userns       # Prevent creating nested user namespaces
+        --assert-userns-disabled  # Fail if --disable-userns couldn't be enforced
 
-        # Fresh /tmp for the test
-        --tmpfs /tmp
+        # Fresh /tmp for the test (1777 matches real /tmp permissions)
+        --perms 1777 --tmpfs /tmp
 
         # Read-only system paths
         --ro-bind /usr /usr
