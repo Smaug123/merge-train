@@ -66,15 +66,24 @@
       };
 
       devShells.default = pkgs.mkShell {
-        buildInputs = [
-          rustToolchain
-          pkgs.pkg-config
-          pkgs.openssl
-          pkgs.libiconv
-          pkgs.claude-code
-          pkgs.codex
-          pkgs.alejandra
-        ];
+        buildInputs =
+          [
+            rustToolchain
+            pkgs.pkg-config
+            pkgs.openssl
+            pkgs.libiconv
+            pkgs.git
+            pkgs.claude-code
+            pkgs.codex
+            pkgs.alejandra
+            pkgs.shellcheck
+          ]
+          ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+            pkgs.bubblewrap
+          ]
+          ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
+            pkgs.apple-sdk
+          ];
 
         RUST_BACKTRACE = "1";
       };
