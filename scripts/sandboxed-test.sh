@@ -1,18 +1,16 @@
 #!/usr/bin/env bash
 #
-# Run cargo test in a sandbox to prevent filesystem/network escape.
-# The purpose is to run mutation tests safely, where mutated code must not
-# be able to escape during either compilation or execution.
+# Run cargo mutants in a sandbox to prevent filesystem/network escape.
+# Mutated code must not be able to escape during either compilation or execution.
 # Uses bubblewrap on Linux, sandbox-exec (seatbelt) on macOS.
 #
 # Usage:
-#   ./scripts/sandboxed-test.sh [cargo test args...]
+#   ./scripts/sandboxed-test.sh [cargo mutants args...]
 #
 # Examples:
 #   ./scripts/sandboxed-test.sh
-#   ./scripts/sandboxed-test.sh --release
-#   ./scripts/sandboxed-test.sh test_name_filter
-#   ./scripts/sandboxed-test.sh --release -- --test-threads=1
+#   ./scripts/sandboxed-test.sh --timeout=600
+#   ./scripts/sandboxed-test.sh -- --release
 
 set -euo pipefail
 
@@ -127,7 +125,7 @@ run_linux() {
     fi
     echo "  Sandbox verification passed" >&2
 
-    bwrap "${bwrap_args[@]}" cargo --frozen test "$@"
+    bwrap "${bwrap_args[@]}" cargo mutants --output "$TEST_TMPDIR/mutants.out" --cargo-arg=--frozen "$@"
 }
 
 # Run tests inside macOS sandbox
@@ -212,7 +210,7 @@ run_macos() {
         NIX_STORE="${NIX_STORE:-}" \
         USER=sandbox \
         RUST_BACKTRACE=1 \
-        sandbox-exec -p "$sandbox_policy" cargo --frozen test "$@"
+        sandbox-exec -p "$sandbox_policy" cargo mutants --output "$TEST_TMPDIR/mutants.out" --cargo-arg=--frozen "$@"
 }
 
 OS="$(uname -s)"
@@ -221,7 +219,7 @@ OS="$(uname -s)"
 echo "=== Fetching dependencies ===" >&2
 cargo fetch --quiet
 
-echo "=== Running tests in sandbox ===" >&2
+echo "=== Running mutation tests in sandbox ===" >&2
 case "$OS" in
     Linux)
         echo "  Sandbox: bubblewrap" >&2
@@ -237,15 +235,27 @@ esac
 
 echo "  Temp dir: $TEST_TMPDIR" >&2
 echo "  Target dir: $CARGO_TARGET_DIR" >&2
+echo "  Mutants output: $PROJECT_DIR/mutants.out (copied after completion)" >&2
 echo "  Network: disabled" >&2
 echo "  Filesystem: project read-only, writes only to temp dir" >&2
 echo "" >&2
 
+exit_code=0
 case "$OS" in
     Linux)
-        run_linux "$@"
+        run_linux "$@" || exit_code=$?
         ;;
     Darwin)
-        run_macos "$@"
+        run_macos "$@" || exit_code=$?
         ;;
 esac
+
+# Copy mutation test results back to project directory before cleanup
+if [[ -d "$TEST_TMPDIR/mutants.out" ]]; then
+    echo "" >&2
+    echo "=== Copying results to $PROJECT_DIR/mutants.out ===" >&2
+    rm -rf "$PROJECT_DIR/mutants.out"
+    cp -r "$TEST_TMPDIR/mutants.out" "$PROJECT_DIR/mutants.out"
+fi
+
+exit "$exit_code"
