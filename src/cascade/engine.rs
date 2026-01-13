@@ -201,36 +201,6 @@ impl CascadeEngine {
                 CascadeError::NotARoot(root_pr, "PR not found in computed stacks".to_string())
             })?;
 
-        // Check for overlapping trains: ensure no PR in this stack is already part of another train.
-        // This prevents starting a train when any PR is already being processed by another train.
-        for pr_in_stack in &stack.prs {
-            for (train_root, train) in active_trains {
-                // Check if this PR is the current PR being processed by another train
-                if train.current_pr == *pr_in_stack {
-                    return Err(CascadeError::NotARoot(
-                        root_pr,
-                        format!(
-                            "PR #{} is currently being processed by train #{}",
-                            pr_in_stack, train_root
-                        ),
-                    ));
-                }
-
-                // Check if this PR is in the frozen descendants of another train
-                if let Some(progress) = train.cascade_phase.progress()
-                    && progress.frozen_descendants.contains(pr_in_stack)
-                {
-                    return Err(CascadeError::NotARoot(
-                        root_pr,
-                        format!(
-                            "PR #{} is a descendant in active train #{}",
-                            pr_in_stack, train_root
-                        ),
-                    ));
-                }
-            }
-        }
-
         // Check stack size using ALL transitive descendants, not just linear stack.
         // This correctly handles fan-out trees where a root may have many direct descendants.
         // For example: main <- #1 <- {#2, #3, #4, ...} would have stack.len() = 1 but
@@ -245,6 +215,46 @@ impl CascadeEngine {
                 total_train_size,
                 MAX_TRAIN_SIZE,
             ));
+        }
+
+        // Check for overlapping trains: ensure no PR in this train (root + all transitive
+        // descendants) is already part of another active train. This is critical for fan-out
+        // scenarios where stack.prs might only contain the linear portion while transitive
+        // descendants include all fan-out branches.
+        //
+        // For example: main <- #1 <- {#2, #3, #4} - if train for #1 is active with frozen
+        // descendants [#2, #3, #4], we must prevent starting a new train whose descendants
+        // overlap with any of these.
+        let prs_in_new_train: Vec<PrNumber> = std::iter::once(root_pr)
+            .chain(all_descendants.iter().copied())
+            .collect();
+
+        for pr_in_train in &prs_in_new_train {
+            for (train_root, train) in active_trains {
+                // Check if this PR is the current PR being processed by another train
+                if train.current_pr == *pr_in_train {
+                    return Err(CascadeError::NotARoot(
+                        root_pr,
+                        format!(
+                            "PR #{} is currently being processed by train #{}",
+                            pr_in_train, train_root
+                        ),
+                    ));
+                }
+
+                // Check if this PR is in the frozen descendants of another train
+                if let Some(progress) = train.cascade_phase.progress()
+                    && progress.frozen_descendants.contains(pr_in_train)
+                {
+                    return Err(CascadeError::NotARoot(
+                        root_pr,
+                        format!(
+                            "PR #{} is a descendant in active train #{}",
+                            pr_in_train, train_root
+                        ),
+                    ));
+                }
+            }
         }
 
         // Create the train record
@@ -373,12 +383,20 @@ impl CascadeEngine {
                     return TrainAction::Proceed;
                 }
                 // Pre-squash phases: external merge needs advancing
-                return TrainAction::AdvanceAfterExternalMerge {
-                    merge_sha: current_pr
-                        .state
-                        .merge_commit_sha()
-                        .cloned()
-                        .expect("merged PR has merge_commit_sha"),
+                // merge_commit_sha should always be present for merged PRs. If missing,
+                // it indicates corrupted cached data - abort instead of panicking.
+                return match current_pr.state.merge_commit_sha() {
+                    Some(sha) => TrainAction::AdvanceAfterExternalMerge {
+                        merge_sha: sha.clone(),
+                    },
+                    None => TrainAction::Abort {
+                        reason: AbortReason::InternalInvariantViolation {
+                            details: format!(
+                                "Merged PR #{} has no merge_commit_sha in cached data",
+                                train.current_pr
+                            ),
+                        },
+                    },
                 };
             }
             // PR closed without merge
@@ -686,14 +704,29 @@ const MAX_STATUS_COMMENT_SIZE: usize = 60 * 1024;
 
 /// Truncate a string to a maximum length, adding "..." if truncated.
 ///
-/// Handles UTF-8 correctly by finding a valid character boundary. The result
-/// will be at most `max_len` bytes, including the "..." suffix if truncated.
+/// Handles UTF-8 correctly by finding a valid character boundary.
+///
+/// # Returns
+///
+/// - If `s.len() <= max_len`, returns `s` unchanged
+/// - Otherwise, returns a truncated string with "..." suffix that is at most
+///   `max_len` bytes (for `max_len >= 3`) or exactly 3 bytes (for `max_len < 3`)
+///
+/// # Edge case
+///
+/// When `max_len < 3` and truncation is needed, the result is `"..."` (3 bytes)
+/// regardless of `max_len`. Callers requiring strict size limits should ensure
+/// `max_len >= 3`.
 fn truncate_string(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         s.to_string()
+    } else if max_len < 3 {
+        // Edge case: max_len is too small to fit any content plus "..."
+        // Return just the ellipsis (minimum truncation indicator)
+        "...".to_string()
     } else {
         // Reserve space for "..." suffix
-        let truncate_at = max_len.saturating_sub(3);
+        let truncate_at = max_len - 3;
         // Find a valid UTF-8 character boundary at or before truncate_at.
         // This avoids panicking when truncate_at falls in the middle of a
         // multi-byte UTF-8 character.
@@ -1054,12 +1087,6 @@ mod tests {
             "[0-9a-f]{40}".prop_map(|s| Sha::parse(s).unwrap())
         }
 
-        /// Generate a vector of unique PR numbers (no duplicates).
-        fn arb_unique_prs(min: usize, max: usize) -> impl Strategy<Value = Vec<PrNumber>> {
-            prop::collection::hash_set(arb_pr_number(), min..max)
-                .prop_map(|set| set.into_iter().collect())
-        }
-
         fn make_test_pr(number: u64, base_ref: &str, predecessor: Option<PrNumber>) -> CachedPr {
             CachedPr::new(
                 PrNumber(number),
@@ -1080,99 +1107,74 @@ mod tests {
             /// For any set of active trains, the union of (current_pr ∪ frozen_descendants)
             /// across all trains must have no duplicates.
             ///
-            /// This property would have caught the bug where start_train only checked
-            /// if the root PR had an existing train, not if any descendant was already
-            /// part of another train.
+            /// This test attempts to start multiple trains that would have overlapping
+            /// descendants and verifies the engine rejects them.
             #[test]
             fn no_overlapping_trains_invariant(
-                train_roots in arb_unique_prs(1, 4),
-                extra_descendants in arb_unique_prs(0, 6),
+                root1 in 1u64..50,
+                root2 in 51u64..100,
+                shared_desc in 101u64..150,
             ) {
                 let engine = CascadeEngine::new("main");
 
-                // Build a set of PRs where each root has a subset of descendants
-                let mut prs = HashMap::new();
-                let mut active_trains: HashMap<PrNumber, TrainRecord> = HashMap::new();
+                // Create two roots that would both claim the same descendant:
+                // main <- #root1 <- #shared_desc
+                // main <- #root2 (independent root)
+                //
+                // Train #root1 starts first and freezes #shared_desc.
+                // Then we manually set train #root1's frozen_descendants to include #shared_desc.
+                // Then we create a PR structure where #root2's descendants also include #shared_desc
+                // and verify start_train rejects it.
 
-                // Create root PRs targeting main
-                for (i, &root) in train_roots.iter().enumerate() {
-                    let pr = make_test_pr(root.0, "main", None);
-                    prs.insert(root, pr);
+                let pr_root1 = make_test_pr(root1, "main", None);
+                let pr_shared = make_test_pr(shared_desc, &format!("branch-{}", root1), Some(PrNumber(root1)));
+                let pr_root2 = make_test_pr(root2, "main", None);
 
-                    // Only start trains for odd-indexed roots to test mixed state
-                    if i % 2 == 0 {
-                        // Attempt to start a train
-                        if let Ok(result) = engine.start_train(root, &prs, &active_trains) {
-                            active_trains.insert(root, result.train);
-                        }
-                    }
-                }
+                // Initial state: just root1 and its descendant
+                let mut prs = HashMap::from([
+                    (PrNumber(root1), pr_root1),
+                    (PrNumber(shared_desc), pr_shared),
+                ]);
 
-                // Try adding descendants to existing trains (simulating cascades with descendants)
-                for (i, &desc) in extra_descendants.iter().enumerate() {
-                    // Skip if this PR number conflicts with a root
-                    if train_roots.contains(&desc) {
-                        continue;
-                    }
+                let mut active_trains = HashMap::new();
 
-                    // Pick a "parent" from the roots
-                    let parent_idx = i % train_roots.len();
-                    let parent = train_roots[parent_idx];
-                    let parent_head = format!("branch-{}", parent.0);
+                // Start train for root1
+                let result1 = engine.start_train(PrNumber(root1), &prs, &active_trains);
+                prop_assert!(result1.is_ok(), "Should start train for root1");
+                let mut train1 = result1.unwrap().train;
 
-                    let pr = make_test_pr(desc.0, &parent_head, Some(parent));
-                    prs.insert(desc, pr);
-                }
+                // Transition train1 to Preparing with shared_desc frozen
+                train1.cascade_phase = CascadePhase::Preparing {
+                    progress: DescendantProgress::new(vec![PrNumber(shared_desc)]),
+                };
+                active_trains.insert(PrNumber(root1), train1);
 
-                // Transition trains to Preparing phase so frozen_descendants gets populated.
-                // Without this, trains stay in Idle and progress() returns None.
-                for (&root, train) in active_trains.iter_mut() {
-                    // Collect descendants for this root
-                    let descendants: Vec<PrNumber> = extra_descendants
-                        .iter()
-                        .filter(|&&d| {
-                            prs.get(&d)
-                                .and_then(|p| p.predecessor)
-                                .map(|pred| pred == root)
-                                .unwrap_or(false)
-                        })
-                        .copied()
-                        .collect();
+                // Now add root2 and make shared_desc also a descendant of root2
+                // by changing its predecessor
+                prs.insert(PrNumber(root2), pr_root2);
 
-                    if !descendants.is_empty() {
-                        train.cascade_phase = CascadePhase::Preparing {
-                            progress: DescendantProgress::new(descendants),
-                        };
-                    }
-                }
+                // Modify shared_desc to now be a descendant of root2
+                let pr_shared_for_root2 = make_test_pr(shared_desc, &format!("branch-{}", root2), Some(PrNumber(root2)));
+                prs.insert(PrNumber(shared_desc), pr_shared_for_root2);
 
-                // Now verify the invariant: no PR appears in multiple trains
-                let mut seen_prs: std::collections::HashSet<PrNumber> = std::collections::HashSet::new();
-                let mut duplicates: Vec<PrNumber> = Vec::new();
-
-                for train in active_trains.values() {
-                    // Check current_pr
-                    if seen_prs.contains(&train.current_pr) {
-                        duplicates.push(train.current_pr);
-                    }
-                    seen_prs.insert(train.current_pr);
-
-                    // Check frozen_descendants
-                    if let Some(progress) = train.cascade_phase.progress() {
-                        for &desc in &progress.frozen_descendants {
-                            if seen_prs.contains(&desc) {
-                                duplicates.push(desc);
-                            }
-                            seen_prs.insert(desc);
-                        }
-                    }
-                }
-
+                // Attempt to start train for root2 - should fail because shared_desc
+                // is already in train1's frozen_descendants
+                let result2 = engine.start_train(PrNumber(root2), &prs, &active_trains);
                 prop_assert!(
-                    duplicates.is_empty(),
-                    "Found PRs appearing in multiple trains: {:?}",
-                    duplicates
+                    result2.is_err(),
+                    "Starting train for root2 should fail - its descendant {} is in train {}'s frozen_descendants",
+                    shared_desc, root1
                 );
+
+                // Verify the error mentions the overlap
+                if let Err(CascadeError::NotARoot(pr, msg)) = result2 {
+                    prop_assert_eq!(pr, PrNumber(root2));
+                    prop_assert!(
+                        msg.contains(&format!("#{}", shared_desc)) || msg.contains("descendant"),
+                        "Error message should mention the overlapping PR: {}",
+                        msg
+                    );
+                }
             }
 
             /// Property: stop_train always emits a worktree removal effect.
@@ -1224,21 +1226,23 @@ mod tests {
                 }
             }
 
-            /// Property: Starting a train for a PR that's a descendant in another train fails.
+            /// Property: Starting a train for a PR whose descendants overlap with an active train fails.
             ///
             /// This tests the overlap guard - you cannot start a new train if any PR
-            /// in your stack is already part of an active train's current_pr or frozen_descendants.
+            /// in your descendant tree is already in an active train's frozen_descendants.
             ///
-            /// Scenario: Train #1 is in Preparing phase with #2 frozen. A new PR #4 targets
-            /// branch-2 (making #2 its predecessor). When we try to start a train for a
-            /// separate root #5, that should succeed. But trying to start #2 fails (NotARoot).
+            /// Scenario:
+            /// - main <- #1 <- #2 (train for #1 is active with #2 frozen)
+            /// - main <- #3 <- #2 (new root #3 wants #2 as descendant)
+            /// - Starting train for #3 should fail due to overlap
             #[test]
             fn start_train_rejects_overlapping_descendants(
                 sha in arb_sha(),
             ) {
                 let engine = CascadeEngine::new("main");
 
-                // Create a chain: main <- #1 <- #2
+                // Phase 1: Create initial structure and start train for #1
+                // main <- #1 <- #2
                 let pr1 = CachedPr::new(
                     PrNumber(1),
                     sha.clone(),
@@ -1261,7 +1265,25 @@ mod tests {
                     false,
                 );
 
-                // PR3 is an independent root (targets main, no predecessor)
+                let mut prs = HashMap::from([
+                    (PrNumber(1), pr1),
+                    (PrNumber(2), pr2),
+                ]);
+
+                // Start train for #1
+                let mut active_trains = HashMap::new();
+                let result1 = engine.start_train(PrNumber(1), &prs, &active_trains);
+                prop_assert!(result1.is_ok(), "Should be able to start train for #1");
+                let mut train1 = result1.unwrap().train;
+
+                // Transition train #1 to Preparing phase with #2 frozen
+                train1.cascade_phase = CascadePhase::Preparing {
+                    progress: DescendantProgress::new(vec![PrNumber(2)]),
+                };
+                active_trains.insert(PrNumber(1), train1);
+
+                // Phase 2: Add a new root #3 that would have #2 as its descendant
+                // main <- #3 <- #2 (we change #2's predecessor)
                 let pr3 = CachedPr::new(
                     PrNumber(3),
                     sha.clone(),
@@ -1272,11 +1294,115 @@ mod tests {
                     MergeStateStatus::Clean,
                     false,
                 );
+                prs.insert(PrNumber(3), pr3);
 
-                let prs = HashMap::from([
+                // Modify #2 to now be a descendant of #3
+                let pr2_modified = CachedPr::new(
+                    PrNumber(2),
+                    sha.clone(),
+                    "branch-2".to_string(),
+                    "branch-3".to_string(),
+                    Some(PrNumber(3)),
+                    PrState::Open,
+                    MergeStateStatus::Clean,
+                    false,
+                );
+                prs.insert(PrNumber(2), pr2_modified);
+
+                // Starting train for #3 should FAIL because #2 is in train #1's frozen_descendants
+                let result3 = engine.start_train(PrNumber(3), &prs, &active_trains);
+                prop_assert!(
+                    result3.is_err(),
+                    "Starting train for #3 should fail - its descendant #2 is in train #1's frozen_descendants"
+                );
+
+                // Verify the error is specifically about overlap (not some other error)
+                match result3 {
+                    Err(CascadeError::NotARoot(pr, msg)) => {
+                        prop_assert_eq!(pr, PrNumber(3));
+                        prop_assert!(
+                            msg.contains("#2") && msg.contains("descendant"),
+                            "Error should mention that #2 is a descendant in another train: {}",
+                            msg
+                        );
+                    }
+                    Err(other) => {
+                        prop_assert!(false, "Expected NotARoot error for overlap, got: {:?}", other);
+                    }
+                    Ok(_) => {
+                        prop_assert!(false, "Should have rejected overlapping train");
+                    }
+                }
+            }
+
+            /// Property: Fan-out overlap detection works correctly.
+            ///
+            /// Tests that the overlap guard checks ALL transitive descendants,
+            /// not just the linear stack. This catches the bug where fan-out
+            /// branches could be missed.
+            ///
+            /// Scenario:
+            /// - main <- #1 <- {#2, #3, #4} (fan-out from #1)
+            /// - Train for #1 starts with all fan-out descendants frozen
+            /// - main <- #5 <- #4 (new root #5 wants #4 as descendant)
+            /// - Starting train for #5 should fail due to overlap on #4
+            #[test]
+            fn start_train_rejects_fanout_overlap(
+                sha in arb_sha(),
+            ) {
+                let engine = CascadeEngine::new("main");
+
+                // Create fan-out structure: main <- #1 <- {#2, #3, #4}
+                let pr1 = CachedPr::new(
+                    PrNumber(1),
+                    sha.clone(),
+                    "branch-1".to_string(),
+                    "main".to_string(),
+                    None,
+                    PrState::Open,
+                    MergeStateStatus::Clean,
+                    false,
+                );
+
+                // Fan-out descendants all target branch-1
+                let pr2 = CachedPr::new(
+                    PrNumber(2),
+                    sha.clone(),
+                    "branch-2".to_string(),
+                    "branch-1".to_string(),
+                    Some(PrNumber(1)),
+                    PrState::Open,
+                    MergeStateStatus::Clean,
+                    false,
+                );
+
+                let pr3 = CachedPr::new(
+                    PrNumber(3),
+                    sha.clone(),
+                    "branch-3".to_string(),
+                    "branch-1".to_string(),
+                    Some(PrNumber(1)),
+                    PrState::Open,
+                    MergeStateStatus::Clean,
+                    false,
+                );
+
+                let pr4 = CachedPr::new(
+                    PrNumber(4),
+                    sha.clone(),
+                    "branch-4".to_string(),
+                    "branch-1".to_string(),
+                    Some(PrNumber(1)),
+                    PrState::Open,
+                    MergeStateStatus::Clean,
+                    false,
+                );
+
+                let mut prs = HashMap::from([
                     (PrNumber(1), pr1),
                     (PrNumber(2), pr2),
                     (PrNumber(3), pr3),
+                    (PrNumber(4), pr4),
                 ]);
 
                 // Start train for #1
@@ -1285,40 +1411,53 @@ mod tests {
                 prop_assert!(result1.is_ok(), "Should be able to start train for #1");
                 let mut train1 = result1.unwrap().train;
 
-                // Transition train #1 to Preparing phase so frozen_descendants is populated.
-                // Without this, the train stays in Idle and progress() returns None.
+                // Transition to Preparing with ALL fan-out descendants frozen
                 train1.cascade_phase = CascadePhase::Preparing {
-                    progress: DescendantProgress::new(vec![PrNumber(2)]),
+                    progress: DescendantProgress::new(vec![PrNumber(2), PrNumber(3), PrNumber(4)]),
                 };
                 active_trains.insert(PrNumber(1), train1);
 
-                // Starting train for #3 should succeed - it's independent (no overlap)
-                let result3 = engine.start_train(PrNumber(3), &prs, &active_trains);
+                // Add a new root #5 whose descendant is #4 (one of the fan-out PRs)
+                let pr5 = CachedPr::new(
+                    PrNumber(5),
+                    sha.clone(),
+                    "branch-5".to_string(),
+                    "main".to_string(),
+                    None,
+                    PrState::Open,
+                    MergeStateStatus::Clean,
+                    false,
+                );
+                prs.insert(PrNumber(5), pr5);
+
+                // Modify #4 to be a descendant of #5
+                let pr4_modified = CachedPr::new(
+                    PrNumber(4),
+                    sha.clone(),
+                    "branch-4".to_string(),
+                    "branch-5".to_string(),
+                    Some(PrNumber(5)),
+                    PrState::Open,
+                    MergeStateStatus::Clean,
+                    false,
+                );
+                prs.insert(PrNumber(4), pr4_modified);
+
+                // Starting train for #5 should fail - #4 is in train #1's frozen_descendants
+                let result5 = engine.start_train(PrNumber(5), &prs, &active_trains);
                 prop_assert!(
-                    result3.is_ok(),
-                    "Should be able to start independent train for #3: {:?}",
-                    result3.err()
+                    result5.is_err(),
+                    "Starting train for #5 should fail - its descendant #4 is in train #1's frozen_descendants (fan-out case)"
                 );
 
-                // Starting train for #2 should fail.
-                // Note: #2 isn't a root (has predecessor #1), so this fails with NotARoot.
-                // The overlap guard (checking frozen_descendants) would fire if #2 were a root.
-                let result2 = engine.start_train(PrNumber(2), &prs, &active_trains);
-                prop_assert!(
-                    result2.is_err(),
-                    "Starting train for descendant #2 should fail"
-                );
-
-                // Verify that the overlap is actually detectable: train #1's frozen_descendants
-                // contains #2, so any root whose stack includes #2 would be rejected.
-                let train1 = active_trains.get(&PrNumber(1)).unwrap();
-                if let Some(progress) = train1.cascade_phase.progress() {
+                // Verify the error mentions the specific overlap
+                if let Err(CascadeError::NotARoot(pr, msg)) = result5 {
+                    prop_assert_eq!(pr, PrNumber(5));
                     prop_assert!(
-                        progress.frozen_descendants.contains(&PrNumber(2)),
-                        "Train #1 should have #2 in frozen_descendants"
+                        msg.contains("#4"),
+                        "Error should mention the overlapping PR #4: {}",
+                        msg
                     );
-                } else {
-                    prop_assert!(false, "Train #1 should be in a phase with progress");
                 }
             }
         }
