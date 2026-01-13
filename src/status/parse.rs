@@ -274,6 +274,37 @@ Train aborted due to merge conflict.
     mod roundtrip {
         use super::*;
 
+        const TRUNCATION_SUFFIX: &str = "... [truncated]";
+
+        /// Verifies that a parsed string is either equal to the original or is a valid truncation.
+        /// A valid truncation means the parsed value (without suffix) is a prefix of the original.
+        fn verify_truncation_roundtrip(
+            parsed: &str,
+            original: &str,
+            field_name: &str,
+        ) -> Result<(), proptest::test_runner::TestCaseError> {
+            if parsed == original {
+                return Ok(());
+            }
+            // If truncated, parsed should end with suffix and content should be prefix of original
+            prop_assert!(
+                parsed.ends_with(TRUNCATION_SUFFIX),
+                "{} was modified but doesn't have truncation suffix. parsed={:?}, original={:?}",
+                field_name,
+                parsed,
+                original
+            );
+            let content = &parsed[..parsed.len() - TRUNCATION_SUFFIX.len()];
+            prop_assert!(
+                original.starts_with(content),
+                "{} truncation is invalid: content {:?} is not a prefix of original {:?}",
+                field_name,
+                content,
+                original
+            );
+            Ok(())
+        }
+
         proptest! {
             /// The core correctness property: parse(format(train)) == train
             #[test]
@@ -297,17 +328,21 @@ Train aborted due to merge conflict.
                 prop_assert_eq!(parsed_train.started_at, train.started_at);
                 prop_assert_eq!(parsed_train.ended_at, train.ended_at);
 
-                // Error comparison (message may be truncated but error_type preserved)
+                // Error comparison (message/stderr may be truncated but error_type preserved)
                 match (&parsed_train.error, &train.error) {
                     (None, None) => {}
                     (Some(p), Some(t)) => {
                         prop_assert_eq!(&p.error_type, &t.error_type);
-                        // Message may be truncated, so just check it starts with the original
-                        // or the original starts with it (for truncation case)
-                        let starts_same = t.message.starts_with(&p.message)
-                            || p.message.starts_with(&t.message)
-                            || p.message.contains("[truncated]");
-                        prop_assert!(starts_same, "Error message mismatch");
+                        // Verify message: either exact match or valid truncation
+                        verify_truncation_roundtrip(&p.message, &t.message, "message")?;
+                        // Verify stderr: either both None, or valid truncation
+                        match (&p.stderr, &t.stderr) {
+                            (None, None) => {}
+                            (Some(ps), Some(ts)) => {
+                                verify_truncation_roundtrip(ps, ts, "stderr")?;
+                            }
+                            _ => prop_assert!(false, "stderr presence mismatch: parsed={:?}, original={:?}", p.stderr, t.stderr),
+                        }
                     }
                     _ => prop_assert!(false, "Error presence mismatch"),
                 }

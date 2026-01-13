@@ -5,19 +5,19 @@
 
 use crate::types::train::TrainRecord;
 
-/// Maximum size for error.message in status comments (4KB).
+/// Maximum size for error.message in status comments (4KB bytes).
 const MAX_ERROR_MESSAGE_LEN: usize = 4096;
 
-/// Maximum size for error.stderr in status comments (2KB).
+/// Maximum size for error.stderr in status comments (2KB bytes).
 const MAX_ERROR_STDERR_LEN: usize = 2048;
 
-/// Aggressive truncation limit when first truncation still exceeds size (500 chars).
+/// Aggressive truncation limit when first truncation still exceeds size (500 bytes).
 const AGGRESSIVE_TRUNCATE_LEN: usize = 500;
 
-/// Maximum safe size for the JSON portion (60KB, leaving room for human text).
+/// Maximum safe size for the JSON portion (60KB bytes, leaving room for human text).
 const MAX_JSON_SIZE: usize = 60 * 1024;
 
-/// GitHub's comment size limit (65536 characters).
+/// GitHub's comment size limit (65536 bytes).
 pub const GITHUB_COMMENT_SIZE_LIMIT: usize = 65536;
 
 /// The marker that begins a status comment JSON block.
@@ -121,8 +121,8 @@ fn escape_html_comment_terminator(json: &str) -> String {
 /// Truncates variable-length fields to ensure the status comment fits within size limits.
 ///
 /// Truncates:
-/// - `error.message` to 4KB
-/// - `error.stderr` to 2KB
+/// - `error.message` to 4KB bytes
+/// - `error.stderr` to 2KB bytes
 ///
 /// All other fields are preserved exactly. The truncation happens before JSON serialization
 /// to ensure accurate size estimation.
@@ -140,7 +140,7 @@ pub fn truncate_for_size_limit(mut train: TrainRecord) -> TrainRecord {
     train
 }
 
-/// Aggressively truncates error fields to 500 characters each.
+/// Aggressively truncates error fields to 500 bytes each.
 fn truncate_aggressively(mut train: TrainRecord) -> TrainRecord {
     if let Some(ref mut error) = train.error {
         if error.message.len() > AGGRESSIVE_TRUNCATE_LEN {
@@ -263,7 +263,7 @@ mod tests {
     fn arb_large_train() -> impl Strategy<Value = TrainRecord> {
         (
             arb_pr_number(),
-            prop::collection::vec(arb_pr_number(), 10..50),
+            prop::collection::vec(arb_pr_number(), 10..=50),
             arb_train_state(),
             prop::option::of(arb_sha()),
             any::<u64>(),
