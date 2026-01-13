@@ -41,6 +41,8 @@ hex = "0.4"
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
+tower = "0.5"
+http-body-util = "0.1"
 
 [[example]]
 name = "github_integration_test"
