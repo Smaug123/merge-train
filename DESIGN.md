@@ -2556,7 +2556,7 @@ For end-to-end testing against real GitHub (or a GitHub Enterprise test instance
 
 ### Property-based testing with real git
 
-The cascade correctness properties are verified against real git using property-based tests. See implementations at commit `a75fbcb`:
+The cascade correctness properties are verified against real git using property-based tests. See implementations at commit `339a5ef50bb4243eb`:
 
 | Property | Test | Location |
 |----------|------|----------|
