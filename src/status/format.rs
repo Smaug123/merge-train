@@ -1,7 +1,8 @@
 //! Status comment formatting for recovery and user visibility.
 //!
 //! Status comments embed machine-readable JSON in an HTML comment, alongside
-//! human-readable status. The JSON contains the full `TrainRecord` for disaster recovery.
+//! human-readable status. The JSON contains the `TrainRecord` for disaster recovery
+//! (excluding `status_comment_id`, with error text possibly truncated for size).
 
 use crate::types::train::TrainRecord;
 
@@ -455,9 +456,10 @@ mod tests {
 
             let comment = format_status_comment(&train, "msg");
 
-            // The JSON should not contain status_comment_id
+            // The JSON should not contain the status_comment_id field.
+            // We only check for the field name, not the numeric value, since
+            // the value could legitimately appear elsewhere (timestamps, etc.).
             assert!(!comment.contains("status_comment_id"));
-            assert!(!comment.contains("12345"));
         }
 
         #[test]

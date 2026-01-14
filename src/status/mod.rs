@@ -14,7 +14,8 @@
 //! Human-readable status message.
 //! ```
 //!
-//! The JSON contains the full `TrainRecord` (minus `status_comment_id`) for disaster recovery.
+//! The JSON contains the `TrainRecord` for disaster recovery (excluding `status_comment_id`,
+//! with error text possibly truncated for size).
 
 pub mod format;
 pub mod parse;
