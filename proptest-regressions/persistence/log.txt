@@ -1,0 +1,12 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# temporary cases.
+#
+# This file can be added to version control to help ensure all
+# contributors end up having the same regressions check
+#
+# To regenerate all regression files locally, run:
+# cargo test --lib -- --ignored __proptest_fallback__
+
+# Test failure from CI
+cc 554151cae65d260a574b073ee83f4a688305678824a55aeb9b18044f123f9fb8
