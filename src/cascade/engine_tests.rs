@@ -1162,10 +1162,12 @@ mod property_based_bug_detection {
                 actual_size,
                 max_size,
             }) => {
-                // Expected for extreme inputs - verify the error is sensible
+                // Expected for extreme inputs - verify the error is sensible.
+                // The check uses >= (actual_size >= max_size triggers error),
+                // so actual_size may equal max_size at the boundary.
                 assert!(
-                    actual_size > max_size,
-                    "Oversize error should report actual > max"
+                    actual_size >= max_size,
+                    "Oversize error should report actual >= max"
                 );
             }
             Err(e) => panic!("Unexpected error: {:?}", e),

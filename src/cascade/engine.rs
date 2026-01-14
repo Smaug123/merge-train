@@ -727,9 +727,17 @@ pub fn format_phase_comment(train: &TrainRecord) -> Result<String, CascadeError>
         .cascade_phase
         .progress()
         .map_or_else(String::new, |p| {
-            let completed = p.completed.len();
+            let processed = p.completed.len() + p.skipped.len();
             let total = p.frozen_descendants.len();
-            format!(" ({}/{} descendants)", completed, total)
+            let skipped = p.skipped.len();
+            if skipped > 0 {
+                format!(
+                    " ({}/{} descendants, {} skipped)",
+                    processed, total, skipped
+                )
+            } else {
+                format!(" ({}/{} descendants)", processed, total)
+            }
         });
 
     // Derive status text from train.state for consistency with JSON payload.
@@ -840,7 +848,7 @@ fn format_train_json(train: &TrainRecord) -> Result<String, CascadeError> {
     let json = serde_json::to_string(&train_copy)
         .map_err(|e| CascadeError::SerializationFailed(e.to_string()))?;
 
-    // Enforce size limit (60KB per DESIGN.md) in release builds.
+    // Enforce size limit (60KB per DESIGN.md) unconditionally.
     // Per DESIGN.md: "If STILL too large after aggressive truncation, this indicates
     // a bug in the size estimation. The bot MUST NOT post a minimal comment without
     // JSON, as this would silently disable GitHub-based recovery."
