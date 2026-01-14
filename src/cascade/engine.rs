@@ -137,10 +137,13 @@ impl CascadeEngine {
     /// # Errors
     ///
     /// - `NotARoot`: The PR is not a valid root (doesn't target default branch,
-    ///   has unmerged predecessor, etc.)
+    ///   has unmerged predecessor, is a descendant in another active train, etc.)
+    /// - `PrNotFound`: The PR does not exist in the cache
     /// - `TrainAlreadyExists`: A train already exists for this root
     /// - `CycleDetected`: The predecessor graph contains a cycle
     /// - `TrainTooLarge`: The stack exceeds the maximum size
+    /// - `StatusCommentOversize`: The generated status comment exceeds size limits (bug)
+    /// - `SerializationFailed`: Failed to serialize train record to JSON (bug)
     pub fn start_train(
         &self,
         root_pr: PrNumber,
@@ -993,20 +996,24 @@ mod property_tests {
             // Attempt to start train for root2 - should fail because shared_desc
             // is already in train1's frozen_descendants
             let result2 = engine.start_train(PrNumber(root2), &prs, &active_trains);
-            prop_assert!(
-                result2.is_err(),
-                "Starting train for root2 should fail - its descendant {} is in train {}'s frozen_descendants",
-                shared_desc, root1
-            );
 
-            // Verify the error mentions the overlap
-            if let Err(CascadeError::NotARoot(pr, msg)) = result2 {
-                prop_assert_eq!(pr, PrNumber(root2));
-                prop_assert!(
-                    msg.contains(&format!("#{}", shared_desc)) || msg.contains("descendant"),
-                    "Error message should mention the overlapping PR: {}",
-                    msg
-                );
+            // Verify the error is specifically about overlap (not some other error)
+            match result2 {
+                Err(CascadeError::NotARoot(pr, msg)) => {
+                    prop_assert_eq!(pr, PrNumber(root2));
+                    prop_assert!(
+                        msg.contains(&format!("#{}", shared_desc)) || msg.contains("descendant"),
+                        "Error message should mention the overlapping PR: {}",
+                        msg
+                    );
+                }
+                Err(other) => {
+                    prop_assert!(false, "Expected NotARoot error for overlap, got: {:?}", other);
+                }
+                Ok(_) => {
+                    prop_assert!(false, "Starting train for root2 should fail - its descendant {} is in train {}'s frozen_descendants",
+                        shared_desc, root1);
+                }
             }
         }
 
@@ -1278,19 +1285,23 @@ mod property_tests {
 
             // Starting train for #5 should fail - #4 is in train #1's frozen_descendants
             let result5 = engine.start_train(PrNumber(5), &prs, &active_trains);
-            prop_assert!(
-                result5.is_err(),
-                "Starting train for #5 should fail - its descendant #4 is in train #1's frozen_descendants (fan-out case)"
-            );
 
-            // Verify the error mentions the specific overlap
-            if let Err(CascadeError::NotARoot(pr, msg)) = result5 {
-                prop_assert_eq!(pr, PrNumber(5));
-                prop_assert!(
-                    msg.contains("#4"),
-                    "Error should mention the overlapping PR #4: {}",
-                    msg
-                );
+            // Verify the error is specifically about overlap (not some other error)
+            match result5 {
+                Err(CascadeError::NotARoot(pr, msg)) => {
+                    prop_assert_eq!(pr, PrNumber(5));
+                    prop_assert!(
+                        msg.contains("#4"),
+                        "Error should mention the overlapping PR #4: {}",
+                        msg
+                    );
+                }
+                Err(other) => {
+                    prop_assert!(false, "Expected NotARoot error for fan-out overlap, got: {:?}", other);
+                }
+                Ok(_) => {
+                    prop_assert!(false, "Starting train for #5 should fail - its descendant #4 is in train #1's frozen_descendants (fan-out case)");
+                }
             }
         }
     }
