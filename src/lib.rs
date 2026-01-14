@@ -14,5 +14,6 @@ pub mod preflight;
 pub mod server;
 pub mod spool;
 pub mod state;
+pub mod status;
 pub mod types;
 pub mod webhooks;
