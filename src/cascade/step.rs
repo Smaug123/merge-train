@@ -61,7 +61,7 @@ pub struct StepResult {
 /// The caller is responsible for:
 /// 1. Executing the returned effects
 /// 2. Persisting the updated train record
-/// 3. Calling `process_step_result` with the operation outcome
+/// 3. Calling `process_operation_result` with the operation outcome
 ///
 /// # Arguments
 ///
@@ -795,8 +795,8 @@ fn handle_external_merge(
         CascadePhase::Idle => {
             // External merge in Idle = preparation was never started.
             // ALL descendants (direct and transitive) are unprepared. Must abort if
-            // there are any. Per DESIGN.md, we freeze all descendants at once, so
-            // an external merge bypassing preparation is unsafe for the entire tree.
+            // there are any, because an external merge bypasses the preparation phase
+            // where descendants would have received predecessor content.
             let descendants = compute_all_descendants(train.current_pr, prs);
             if descendants.is_empty() {
                 // No descendants - can complete safely
@@ -1201,7 +1201,11 @@ fn complete_cascade(train: &mut TrainRecord, progress: DescendantProgress) -> St
             train.predecessor_pr = None; // Clear - was for the old current_pr
             train.increment_seq();
 
-            // Update status comment again after advancing current_pr
+            // Update train state to WaitingCi BEFORE formatting the comment,
+            // so the comment reflects the actual returned state.
+            train.wait_for_ci();
+
+            // Update status comment after advancing current_pr and setting WaitingCi
             let effects = if let Some(comment_id) = train.status_comment_id {
                 match format_phase_comment(train) {
                     Ok(body) => {
@@ -1218,9 +1222,6 @@ fn complete_cascade(train: &mut TrainRecord, progress: DescendantProgress) -> St
             } else {
                 vec![]
             };
-
-            // Update train state to WaitingCi for consistency.
-            train.wait_for_ci();
 
             StepResult {
                 train: train.clone(),
