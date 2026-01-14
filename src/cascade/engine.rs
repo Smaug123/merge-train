@@ -137,10 +137,13 @@ impl CascadeEngine {
     /// # Errors
     ///
     /// - `NotARoot`: The PR is not a valid root (doesn't target default branch,
-    ///   has unmerged predecessor, etc.)
+    ///   has unmerged predecessor, is a descendant in another active train, etc.)
+    /// - `PrNotFound`: The PR does not exist in the cache
     /// - `TrainAlreadyExists`: A train already exists for this root
     /// - `CycleDetected`: The predecessor graph contains a cycle
     /// - `TrainTooLarge`: The stack exceeds the maximum size
+    /// - `StatusCommentOversize`: The generated status comment exceeds size limits (bug)
+    /// - `SerializationFailed`: Failed to serialize train record to JSON (bug)
     pub fn start_train(
         &self,
         root_pr: PrNumber,
@@ -201,36 +204,6 @@ impl CascadeEngine {
                 CascadeError::NotARoot(root_pr, "PR not found in computed stacks".to_string())
             })?;
 
-        // Check for overlapping trains: ensure no PR in this stack is already part of another train.
-        // This prevents starting a train when any PR is already being processed by another train.
-        for pr_in_stack in &stack.prs {
-            for (train_root, train) in active_trains {
-                // Check if this PR is the current PR being processed by another train
-                if train.current_pr == *pr_in_stack {
-                    return Err(CascadeError::NotARoot(
-                        root_pr,
-                        format!(
-                            "PR #{} is currently being processed by train #{}",
-                            pr_in_stack, train_root
-                        ),
-                    ));
-                }
-
-                // Check if this PR is in the frozen descendants of another train
-                if let Some(progress) = train.cascade_phase.progress()
-                    && progress.frozen_descendants.contains(pr_in_stack)
-                {
-                    return Err(CascadeError::NotARoot(
-                        root_pr,
-                        format!(
-                            "PR #{} is a descendant in active train #{}",
-                            pr_in_stack, train_root
-                        ),
-                    ));
-                }
-            }
-        }
-
         // Check stack size using ALL transitive descendants, not just linear stack.
         // This correctly handles fan-out trees where a root may have many direct descendants.
         // For example: main <- #1 <- {#2, #3, #4, ...} would have stack.len() = 1 but
@@ -245,6 +218,66 @@ impl CascadeEngine {
                 total_train_size,
                 MAX_TRAIN_SIZE,
             ));
+        }
+
+        // Check for overlapping trains: ensure no PR in this train (root + all transitive
+        // descendants) is already part of another active train. This is critical for fan-out
+        // scenarios where stack.prs might only contain the linear portion while transitive
+        // descendants include all fan-out branches.
+        //
+        // For example: main <- #1 <- {#2, #3, #4} - if train for #1 is active with frozen
+        // descendants [#2, #3, #4], we must prevent starting a new train whose descendants
+        // overlap with any of these.
+        //
+        // IMPORTANT: For trains in Idle phase, progress() returns None so frozen_descendants
+        // is not available. We must compute the *potential* descendants of Idle trains
+        // dynamically to prevent overlap.
+        let prs_in_new_train: Vec<PrNumber> = std::iter::once(root_pr)
+            .chain(all_descendants.iter().copied())
+            .collect();
+
+        for pr_in_train in &prs_in_new_train {
+            for (train_root, train) in active_trains {
+                // Check if this PR is the current PR being processed by another train
+                if train.current_pr == *pr_in_train {
+                    return Err(CascadeError::NotARoot(
+                        root_pr,
+                        format!(
+                            "PR #{} is currently being processed by train #{}",
+                            pr_in_train, train_root
+                        ),
+                    ));
+                }
+
+                // Check against the train's descendants.
+                // For non-Idle phases: use frozen_descendants from progress()
+                // For Idle phase: compute potential descendants dynamically
+                let is_in_train_descendants = match train.cascade_phase.progress() {
+                    Some(progress) => progress.frozen_descendants.contains(pr_in_train),
+                    None => {
+                        // Idle phase: compute potential descendants from current_pr.
+                        // This prevents race where a new train could overlap with an Idle
+                        // train's soon-to-be-frozen descendants.
+                        let potential_descendants =
+                            crate::state::descendants::collect_all_descendants(
+                                train.current_pr,
+                                &descendants_index,
+                                prs,
+                            );
+                        potential_descendants.contains(pr_in_train)
+                    }
+                };
+
+                if is_in_train_descendants {
+                    return Err(CascadeError::NotARoot(
+                        root_pr,
+                        format!(
+                            "PR #{} is a descendant in active train #{}",
+                            pr_in_train, train_root
+                        ),
+                    ));
+                }
+            }
         }
 
         // Create the train record
@@ -372,13 +405,58 @@ impl CascadeEngine {
                     // Expected state - proceed with descendant processing
                     return TrainAction::Proceed;
                 }
-                // Pre-squash phases: external merge needs advancing
-                return TrainAction::AdvanceAfterExternalMerge {
-                    merge_sha: current_pr
-                        .state
-                        .merge_commit_sha()
-                        .cloned()
-                        .expect("merged PR has merge_commit_sha"),
+
+                // Pre-squash phases: external merge needs special handling.
+                // If we're in Preparing phase with unprepared descendants, this violates
+                // the "prepare before squash" invariant and we must abort.
+                //
+                // Filter to open PRs only: closed/missing descendants would be skipped
+                // anyway (per DESIGN.md "Descendant PR closed during cascade" -> skip).
+                // Without this filter, we'd incorrectly abort if a descendant closed
+                // between the freeze point and when we mark it skipped.
+                if let Some(progress) = train.cascade_phase.progress() {
+                    let unprepared: Vec<PrNumber> = progress
+                        .remaining()
+                        .filter(|pr_num| {
+                            prs.get(pr_num)
+                                .map(|pr| pr.state.is_open())
+                                .unwrap_or(false)
+                        })
+                        .copied()
+                        .collect();
+                    if !unprepared.is_empty() {
+                        return TrainAction::Abort {
+                            reason: AbortReason::PreparationIncomplete {
+                                unprepared_descendants: unprepared,
+                            },
+                        };
+                    }
+                }
+
+                // Either Idle (no progress) or Preparing with all descendants complete.
+                // merge_commit_sha should always be present for merged PRs. If missing,
+                // it indicates corrupted cached data - abort instead of panicking.
+                //
+                // IMPORTANT: The handler for AdvanceAfterExternalMerge MUST verify
+                // preparation before reconciliation per DESIGN.md §"Verifying
+                // preparation before reconciliation". For each descendant, use
+                // `git merge-base --is-ancestor <predecessor_head> <descendant_head>`
+                // to confirm the predecessor's content was merged in. If not, abort
+                // with an error requiring manual intervention. This check catches
+                // cases where someone manually merged the PR via GitHub UI before
+                // preparation completed.
+                return match current_pr.state.merge_commit_sha() {
+                    Some(sha) => TrainAction::AdvanceAfterExternalMerge {
+                        merge_sha: sha.clone(),
+                    },
+                    None => TrainAction::Abort {
+                        reason: AbortReason::InternalInvariantViolation {
+                            details: format!(
+                                "Merged PR #{} has no merge_commit_sha in cached data",
+                                train.current_pr
+                            ),
+                        },
+                    },
                 };
             }
             // PR closed without merge
@@ -457,6 +535,10 @@ impl CascadeEngine {
     /// This captures the "frozen" set of descendants that will be processed
     /// through all subsequent phases. Descendants added after this point
     /// are NOT included (late additions).
+    ///
+    /// Returns ALL transitive descendants (not just direct), filtered to open PRs.
+    /// This aligns with `start_train`'s use of `collect_all_descendants` for size
+    /// checking and overlap detection.
     pub fn compute_frozen_descendants(
         &self,
         current_pr: PrNumber,
@@ -464,16 +546,9 @@ impl CascadeEngine {
     ) -> Vec<PrNumber> {
         let descendants_index = build_descendants_index(prs);
 
-        descendants_index
-            .get(&current_pr)
-            .map(|descendants| {
-                descendants
-                    .iter()
-                    .filter(|pr| prs.get(pr).map(|p| p.state.is_open()).unwrap_or(false))
-                    .copied()
-                    .collect()
-            })
-            .unwrap_or_default()
+        // Use collect_all_descendants for transitive closure, not just direct descendants.
+        // This function already filters to open PRs only.
+        crate::state::descendants::collect_all_descendants(current_pr, &descendants_index, prs)
     }
 
     /// Computes the initial phase when starting to process a PR.
@@ -495,6 +570,11 @@ impl CascadeEngine {
     /// Uses frozen progress from the current phase when available. This prevents
     /// late additions from leaking into outcomes. Only computes descendants fresh
     /// when in Idle phase (no frozen set yet).
+    ///
+    /// Note: This filters out closed/missing descendants from the outcome, even if
+    /// they're still in `progress.remaining()`. Callers should use
+    /// `mark_closed_descendants_skipped()` from the phases module to properly update
+    /// the progress tracking.
     pub fn create_step_outcome(
         &self,
         train: &TrainRecord,
@@ -504,11 +584,22 @@ impl CascadeEngine {
         // This ensures late additions don't leak into outcomes.
         let descendants: Vec<PrNumber> = match train.cascade_phase.progress() {
             Some(progress) => {
-                // Use the frozen set, filtered by what's completed (remaining)
-                progress.remaining().copied().collect()
+                // Use the frozen set, filtered by what's completed (remaining).
+                // Additionally filter out any PRs that are closed or missing from
+                // the cache, as they can't be processed and shouldn't appear in outcomes.
+                progress
+                    .remaining()
+                    .filter(|pr_num| {
+                        prs.get(pr_num)
+                            .map(|pr| pr.state.is_open())
+                            .unwrap_or(false)
+                    })
+                    .copied()
+                    .collect()
             }
             None => {
                 // Idle phase - no frozen set yet, compute fresh
+                // compute_frozen_descendants already filters to open PRs only
                 self.compute_frozen_descendants(train.current_pr, prs)
             }
         };
@@ -579,7 +670,9 @@ fn format_start_comment(train: &TrainRecord, stack: &MergeStack) -> Result<Strin
     lines.push("---".to_string());
     lines.push("*Use `@merge-train stop` to cancel.*".to_string());
 
-    Ok(lines.join("\n"))
+    let body = lines.join("\n");
+    check_final_comment_size(&body)?;
+    Ok(body)
 }
 
 /// Format the status comment when a train is stopped.
@@ -593,7 +686,7 @@ fn format_stop_comment(train: &TrainRecord) -> Result<String, CascadeError> {
     // Serialize train state as JSON for recovery
     let json_payload = format_train_json(train)?;
 
-    Ok([
+    let body = [
         format!(
             "<!-- merge-train-state\n{}\n-->",
             escape_for_html_comment(&json_payload)
@@ -608,7 +701,9 @@ fn format_stop_comment(train: &TrainRecord) -> Result<String, CascadeError> {
         "---".to_string(),
         "*Use `@merge-train start` to restart.*".to_string(),
     ]
-    .join("\n"))
+    .join("\n");
+    check_final_comment_size(&body)?;
+    Ok(body)
 }
 
 /// Format the status comment for a phase update.
@@ -635,9 +730,17 @@ pub fn format_phase_comment(train: &TrainRecord) -> Result<String, CascadeError>
         .cascade_phase
         .progress()
         .map_or_else(String::new, |p| {
-            let completed = p.completed.len();
+            let processed = p.completed.len() + p.skipped.len();
             let total = p.frozen_descendants.len();
-            format!(" ({}/{} descendants)", completed, total)
+            let skipped = p.skipped.len();
+            if skipped > 0 {
+                format!(
+                    " ({}/{} descendants, {} skipped)",
+                    processed, total, skipped
+                )
+            } else {
+                format!(" ({}/{} descendants)", processed, total)
+            }
         });
 
     // Derive status text from train.state for consistency with JSON payload.
@@ -654,7 +757,7 @@ pub fn format_phase_comment(train: &TrainRecord) -> Result<String, CascadeError>
         TrainState::NeedsManualReview => "Needs Manual Review".to_string(),
     };
 
-    Ok([
+    let body = [
         format!(
             "<!-- merge-train-state\n{}\n-->",
             escape_for_html_comment(&json_payload)
@@ -668,7 +771,9 @@ pub fn format_phase_comment(train: &TrainRecord) -> Result<String, CascadeError>
         "---".to_string(),
         "*Use `@merge-train stop` to stop the train.*".to_string(),
     ]
-    .join("\n"))
+    .join("\n");
+    check_final_comment_size(&body)?;
+    Ok(body)
 }
 
 /// Format train record as JSON for status comment recovery payload.
@@ -684,16 +789,34 @@ const MAX_ERROR_STDERR_SIZE: usize = 2 * 1024;
 /// Maximum status comment JSON size (60KB per DESIGN.md)
 const MAX_STATUS_COMMENT_SIZE: usize = 60 * 1024;
 
+/// GitHub's hard limit for comment body size (65536 bytes)
+const GITHUB_COMMENT_SIZE_LIMIT: usize = 65536;
+
 /// Truncate a string to a maximum length, adding "..." if truncated.
 ///
-/// Handles UTF-8 correctly by finding a valid character boundary. The result
-/// will be at most `max_len` bytes, including the "..." suffix if truncated.
+/// Handles UTF-8 correctly by finding a valid character boundary.
+///
+/// # Returns
+///
+/// - If `s.len() <= max_len`, returns `s` unchanged
+/// - Otherwise, returns a truncated string with "..." suffix that is at most
+///   `max_len` bytes (for `max_len >= 3`) or exactly 3 bytes (for `max_len < 3`)
+///
+/// # Edge case
+///
+/// When `max_len < 3` and truncation is needed, the result is `"..."` (3 bytes)
+/// regardless of `max_len`. Callers requiring strict size limits should ensure
+/// `max_len >= 3`.
 fn truncate_string(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         s.to_string()
+    } else if max_len < 3 {
+        // Edge case: max_len is too small to fit any content plus "..."
+        // Return just the ellipsis (minimum truncation indicator)
+        "...".to_string()
     } else {
         // Reserve space for "..." suffix
-        let truncate_at = max_len.saturating_sub(3);
+        let truncate_at = max_len - 3;
         // Find a valid UTF-8 character boundary at or before truncate_at.
         // This avoids panicking when truncate_at falls in the middle of a
         // multi-byte UTF-8 character.
@@ -728,19 +851,14 @@ fn format_train_json(train: &TrainRecord) -> Result<String, CascadeError> {
     let json = serde_json::to_string(&train_copy)
         .map_err(|e| CascadeError::SerializationFailed(e.to_string()))?;
 
-    // Enforce size limit (60KB per DESIGN.md) in release builds.
+    // Enforce size limit (60KB per DESIGN.md) unconditionally.
     // Per DESIGN.md: "If STILL too large after aggressive truncation, this indicates
     // a bug in the size estimation. The bot MUST NOT post a minimal comment without
     // JSON, as this would silently disable GitHub-based recovery."
+    //
+    // Note: We do NOT log here (no eprintln/tracing) because this is the pure engine
+    // layer. The error is propagated to the caller who can log via the imperative shell.
     if json.len() >= MAX_STATUS_COMMENT_SIZE {
-        // Log the issue (eprintln for now; in production this would use tracing)
-        eprintln!(
-            "ERROR: Status comment JSON ({} bytes) exceeds {} byte limit. \
-             Aborting train to prevent recovery data loss.",
-            json.len(),
-            MAX_STATUS_COMMENT_SIZE
-        );
-
         return Err(CascadeError::StatusCommentOversize {
             actual_size: json.len(),
             max_size: MAX_STATUS_COMMENT_SIZE,
@@ -761,948 +879,429 @@ fn escape_for_html_comment(json: &str) -> String {
     json.replace("-->", r"--\u003e")
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::types::{PrState, Sha, TrainState};
+/// Validate that the final comment body doesn't exceed GitHub's size limit.
+///
+/// This check happens AFTER escaping and markdown wrapping, ensuring the
+/// complete comment body fits within GitHub's 65536 byte limit. The earlier
+/// JSON size check (60KB) is a conservative pre-check; this validates the
+/// final result.
+fn check_final_comment_size(body: &str) -> Result<(), CascadeError> {
+    if body.len() > GITHUB_COMMENT_SIZE_LIMIT {
+        return Err(CascadeError::StatusCommentOversize {
+            actual_size: body.len(),
+            max_size: GITHUB_COMMENT_SIZE_LIMIT,
+        });
+    }
+    Ok(())
+}
 
-    fn make_sha(n: u64) -> Sha {
-        Sha::parse(format!("{:0>40x}", n)).unwrap()
+// Unit tests, regression tests, and property-based bug detection tests
+// are in engine_tests.rs. Only specification-level property tests remain here.
+#[cfg(test)]
+#[path = "engine_tests.rs"]
+mod engine_tests;
+
+/// Property-based specification tests for the cascade engine.
+///
+/// These tests specify key invariants that must hold for correctness:
+/// - No overlapping trains (a PR cannot be in multiple active trains)
+/// - Worktree cleanup on stop
+/// - Overlap detection works for fan-out structures
+///
+/// Unit tests, regression tests, and helper function tests are in `engine_tests.rs`.
+#[cfg(test)]
+mod property_tests {
+    use super::*;
+    use crate::types::{DescendantProgress, PrState};
+    use proptest::prelude::*;
+
+    fn arb_pr_number() -> impl Strategy<Value = PrNumber> {
+        (1u64..100).prop_map(PrNumber)
     }
 
-    fn make_pr(
-        number: u64,
-        base_ref: &str,
-        predecessor: Option<u64>,
-        state: PrState,
-        merge_state_status: MergeStateStatus,
-    ) -> CachedPr {
+    fn arb_sha() -> impl Strategy<Value = Sha> {
+        "[0-9a-f]{40}".prop_map(|s| Sha::parse(s).unwrap())
+    }
+
+    fn make_test_pr(number: u64, base_ref: &str, predecessor: Option<PrNumber>) -> CachedPr {
         CachedPr::new(
             PrNumber(number),
-            make_sha(number),
+            Sha::parse(format!("{:0>40x}", number)).unwrap(),
             format!("branch-{}", number),
             base_ref.to_string(),
-            predecessor.map(PrNumber),
-            state,
-            merge_state_status,
+            predecessor,
+            PrState::Open,
+            MergeStateStatus::Clean,
             false,
         )
     }
 
-    fn make_open_pr(number: u64, base_ref: &str, predecessor: Option<u64>) -> CachedPr {
-        make_pr(
-            number,
-            base_ref,
-            predecessor,
-            PrState::Open,
-            MergeStateStatus::Clean,
-        )
-    }
+    proptest! {
+        /// Property: No PR appears in multiple active trains.
+        ///
+        /// This invariant ensures that overlapping trains are never created.
+        /// For any set of active trains, the union of (current_pr ∪ frozen_descendants)
+        /// across all trains must have no duplicates.
+        ///
+        /// This test attempts to start multiple trains that would have overlapping
+        /// descendants and verifies the engine rejects them.
+        #[test]
+        fn no_overlapping_trains_invariant(
+            root1 in 1u64..50,
+            root2 in 51u64..100,
+            shared_desc in 101u64..150,
+        ) {
+            let engine = CascadeEngine::new("main");
 
-    #[test]
-    fn start_train_succeeds_for_valid_root() {
-        let engine = CascadeEngine::new("main");
+            // Create two roots that would both claim the same descendant:
+            // main <- #root1 <- #shared_desc
+            // main <- #root2 (independent root)
+            //
+            // Train #root1 starts first and freezes #shared_desc.
+            // Then we manually set train #root1's frozen_descendants to include #shared_desc.
+            // Then we create a PR structure where #root2's descendants also include #shared_desc
+            // and verify start_train rejects it.
 
-        let pr = make_open_pr(1, "main", None);
-        let prs = HashMap::from([(PrNumber(1), pr)]);
-        let active_trains = HashMap::new();
+            let pr_root1 = make_test_pr(root1, "main", None);
+            let pr_shared = make_test_pr(shared_desc, &format!("branch-{}", root1), Some(PrNumber(root1)));
+            let pr_root2 = make_test_pr(root2, "main", None);
 
-        let result = engine.start_train(PrNumber(1), &prs, &active_trains);
+            // Initial state: just root1 and its descendant
+            let mut prs = HashMap::from([
+                (PrNumber(root1), pr_root1),
+                (PrNumber(shared_desc), pr_shared),
+            ]);
 
-        assert!(result.is_ok());
-        let result = result.unwrap();
-        assert_eq!(result.train.original_root_pr, PrNumber(1));
-        assert_eq!(result.train.current_pr, PrNumber(1));
-        assert_eq!(result.train.state, TrainState::Running);
-        assert_eq!(result.stack.root(), Some(PrNumber(1)));
-    }
+            let mut active_trains = HashMap::new();
 
-    #[test]
-    fn start_train_fails_for_non_root() {
-        let engine = CascadeEngine::new("main");
+            // Start train for root1
+            let result1 = engine.start_train(PrNumber(root1), &prs, &active_trains);
+            prop_assert!(result1.is_ok(), "Should start train for root1");
+            let mut train1 = result1.unwrap().train;
 
-        // PR targets feature branch, not main
-        let pr = make_open_pr(1, "feature", None);
-        let prs = HashMap::from([(PrNumber(1), pr)]);
-        let active_trains = HashMap::new();
+            // Transition train1 to Preparing with shared_desc frozen
+            train1.cascade_phase = CascadePhase::Preparing {
+                progress: DescendantProgress::new(vec![PrNumber(shared_desc)]),
+            };
+            active_trains.insert(PrNumber(root1), train1);
 
-        let result = engine.start_train(PrNumber(1), &prs, &active_trains);
+            // Now add root2 and make shared_desc also a descendant of root2
+            // by changing its predecessor
+            prs.insert(PrNumber(root2), pr_root2);
 
-        assert!(matches!(result, Err(CascadeError::NotARoot(_, _))));
-    }
+            // Modify shared_desc to now be a descendant of root2
+            let pr_shared_for_root2 = make_test_pr(shared_desc, &format!("branch-{}", root2), Some(PrNumber(root2)));
+            prs.insert(PrNumber(shared_desc), pr_shared_for_root2);
 
-    #[test]
-    fn start_train_fails_for_existing_train() {
-        let engine = CascadeEngine::new("main");
+            // Attempt to start train for root2 - should fail because shared_desc
+            // is already in train1's frozen_descendants
+            let result2 = engine.start_train(PrNumber(root2), &prs, &active_trains);
 
-        let pr = make_open_pr(1, "main", None);
-        let prs = HashMap::from([(PrNumber(1), pr)]);
-
-        let existing_train = TrainRecord::new(PrNumber(1));
-        let active_trains = HashMap::from([(PrNumber(1), existing_train)]);
-
-        let result = engine.start_train(PrNumber(1), &prs, &active_trains);
-
-        assert!(matches!(result, Err(CascadeError::TrainAlreadyExists(_))));
-    }
-
-    #[test]
-    fn start_train_includes_descendants_in_stack() {
-        let engine = CascadeEngine::new("main");
-
-        // main <- #1 <- #2 <- #3
-        let pr1 = make_open_pr(1, "main", None);
-        let mut pr2 = make_open_pr(2, "branch-1", Some(1));
-        pr2.head_ref = "branch-2".to_string();
-        let mut pr3 = make_open_pr(3, "branch-2", Some(2));
-        pr3.head_ref = "branch-3".to_string();
-
-        let prs = HashMap::from([(PrNumber(1), pr1), (PrNumber(2), pr2), (PrNumber(3), pr3)]);
-        let active_trains = HashMap::new();
-
-        let result = engine.start_train(PrNumber(1), &prs, &active_trains);
-
-        assert!(result.is_ok());
-        let result = result.unwrap();
-        assert_eq!(
-            result.stack.prs,
-            vec![PrNumber(1), PrNumber(2), PrNumber(3)]
-        );
-    }
-
-    #[test]
-    fn stop_train_succeeds_for_active_train() {
-        let engine = CascadeEngine::new("main");
-
-        let train = TrainRecord::new(PrNumber(1));
-        let result = engine.stop_train(train, false);
-
-        assert!(result.is_ok());
-        let result = result.unwrap();
-        assert_eq!(result.train.state, TrainState::Stopped);
-        assert!(result.train.ended_at.is_some());
-    }
-
-    #[test]
-    fn stop_train_fails_for_inactive_train_without_force() {
-        let engine = CascadeEngine::new("main");
-
-        let mut train = TrainRecord::new(PrNumber(1));
-        train.stop();
-
-        let result = engine.stop_train(train, false);
-
-        assert!(matches!(result, Err(CascadeError::InvalidState(_, _, _))));
-    }
-
-    #[test]
-    fn stop_train_succeeds_for_inactive_train_with_force() {
-        let engine = CascadeEngine::new("main");
-
-        let mut train = TrainRecord::new(PrNumber(1));
-        train.stop();
-
-        let result = engine.stop_train(train, true);
-
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn evaluate_train_returns_proceed_for_clean_pr() {
-        let engine = CascadeEngine::new("main");
-
-        let train = TrainRecord::new(PrNumber(1));
-        let pr = make_open_pr(1, "main", None);
-        let prs = HashMap::from([(PrNumber(1), pr)]);
-
-        let action = engine.evaluate_train(&train, &prs);
-
-        assert_eq!(action, TrainAction::Proceed);
-    }
-
-    #[test]
-    fn evaluate_train_returns_block_for_blocked_pr() {
-        let engine = CascadeEngine::new("main");
-
-        let train = TrainRecord::new(PrNumber(1));
-        let pr = make_pr(1, "main", None, PrState::Open, MergeStateStatus::Blocked);
-        let prs = HashMap::from([(PrNumber(1), pr)]);
-
-        let action = engine.evaluate_train(&train, &prs);
-
-        assert!(matches!(
-            action,
-            TrainAction::Block {
-                reason: BlockReason::Blocked
+            // Verify the error is specifically about overlap (not some other error)
+            match result2 {
+                Err(CascadeError::NotARoot(pr, msg)) => {
+                    prop_assert_eq!(pr, PrNumber(root2));
+                    prop_assert!(
+                        msg.contains(&format!("#{}", shared_desc)) || msg.contains("descendant"),
+                        "Error message should mention the overlapping PR: {}",
+                        msg
+                    );
+                }
+                Err(other) => {
+                    prop_assert!(false, "Expected NotARoot error for overlap, got: {:?}", other);
+                }
+                Ok(_) => {
+                    prop_assert!(false, "Starting train for root2 should fail - its descendant {} is in train {}'s frozen_descendants",
+                        shared_desc, root1);
+                }
             }
-        ));
-    }
-
-    #[test]
-    fn evaluate_train_returns_abort_for_closed_pr() {
-        let engine = CascadeEngine::new("main");
-
-        let train = TrainRecord::new(PrNumber(1));
-        let pr = make_pr(1, "main", None, PrState::Closed, MergeStateStatus::Clean);
-        let prs = HashMap::from([(PrNumber(1), pr)]);
-
-        let action = engine.evaluate_train(&train, &prs);
-
-        assert!(matches!(
-            action,
-            TrainAction::Abort {
-                reason: AbortReason::PrClosed
-            }
-        ));
-    }
-
-    #[test]
-    fn evaluate_train_returns_abort_for_dirty_pr() {
-        let engine = CascadeEngine::new("main");
-
-        let train = TrainRecord::new(PrNumber(1));
-        let pr = make_pr(1, "main", None, PrState::Open, MergeStateStatus::Dirty);
-        let prs = HashMap::from([(PrNumber(1), pr)]);
-
-        let action = engine.evaluate_train(&train, &prs);
-
-        assert!(matches!(
-            action,
-            TrainAction::Abort {
-                reason: AbortReason::MergeConflict { .. }
-            }
-        ));
-    }
-
-    #[test]
-    fn evaluate_train_returns_block_for_behind_root() {
-        // TODO: BEHIND roots should eventually be updated (merge main, push) instead of blocked.
-        // For now, we treat them the same as non-root BEHIND PRs.
-        let engine = CascadeEngine::new("main");
-
-        let train = TrainRecord::new(PrNumber(1));
-        let pr = make_pr(1, "main", None, PrState::Open, MergeStateStatus::Behind);
-        let prs = HashMap::from([(PrNumber(1), pr)]);
-
-        let action = engine.evaluate_train(&train, &prs);
-
-        assert_eq!(
-            action,
-            TrainAction::Block {
-                reason: BlockReason::Behind
-            }
-        );
-    }
-
-    #[test]
-    fn compute_frozen_descendants_returns_open_descendants() {
-        let engine = CascadeEngine::new("main");
-
-        let pr1 = make_open_pr(1, "main", None);
-        let mut pr2 = make_open_pr(2, "branch-1", Some(1));
-        pr2.head_ref = "branch-2".to_string();
-        // pr3 is closed, should not be included
-        let mut pr3 = make_pr(
-            3,
-            "branch-1",
-            Some(1),
-            PrState::Closed,
-            MergeStateStatus::Clean,
-        );
-        pr3.head_ref = "branch-3".to_string();
-
-        let prs = HashMap::from([(PrNumber(1), pr1), (PrNumber(2), pr2), (PrNumber(3), pr3)]);
-
-        let descendants = engine.compute_frozen_descendants(PrNumber(1), &prs);
-
-        assert_eq!(descendants.len(), 1);
-        assert!(descendants.contains(&PrNumber(2)));
-        assert!(!descendants.contains(&PrNumber(3)));
-    }
-
-    #[test]
-    fn compute_initial_phase_with_descendants() {
-        let engine = CascadeEngine::new("main");
-
-        let phase = engine.compute_initial_phase(vec![PrNumber(2), PrNumber(3)]);
-
-        assert!(matches!(phase, CascadePhase::Preparing { .. }));
-        if let CascadePhase::Preparing { progress } = phase {
-            assert_eq!(progress.frozen_descendants, vec![PrNumber(2), PrNumber(3)]);
-        }
-    }
-
-    #[test]
-    fn compute_initial_phase_without_descendants() {
-        let engine = CascadeEngine::new("main");
-
-        let phase = engine.compute_initial_phase(vec![]);
-
-        assert!(matches!(phase, CascadePhase::SquashPending { .. }));
-    }
-
-    mod property_tests {
-        use super::*;
-        use crate::types::DescendantProgress;
-        use proptest::prelude::*;
-
-        fn arb_pr_number() -> impl Strategy<Value = PrNumber> {
-            (1u64..100).prop_map(PrNumber)
         }
 
-        fn arb_sha() -> impl Strategy<Value = Sha> {
-            "[0-9a-f]{40}".prop_map(|s| Sha::parse(s).unwrap())
+        /// Property: stop_train always emits a worktree removal effect.
+        ///
+        /// When stopping a train, the worktree must be cleaned up to avoid
+        /// leaving stale worktrees on disk. This property verifies that
+        /// stop_train always includes a RemoveWorktree effect.
+        #[test]
+        fn stop_train_emits_worktree_removal(
+            root_pr in arb_pr_number(),
+            has_status_comment in any::<bool>(),
+        ) {
+            let engine = CascadeEngine::new("main");
+
+            let mut train = TrainRecord::new(root_pr);
+            if has_status_comment {
+                train.status_comment_id = Some(crate::types::CommentId(12345));
+            }
+
+            let result = engine.stop_train(train.clone(), false);
+
+            prop_assert!(result.is_ok(), "stop_train should succeed for active train");
+
+            let stop_result = result.unwrap();
+
+            // Check that RemoveWorktree effect is present
+            let has_worktree_removal = stop_result.effects.iter().any(|effect| {
+                matches!(effect, Effect::Git(GitEffect::RemoveWorktree { name })
+                    if name == &format!("stack-{}", root_pr))
+            });
+
+            prop_assert!(
+                has_worktree_removal,
+                "stop_train must emit RemoveWorktree effect for stack-{}. Effects: {:?}",
+                root_pr,
+                stop_result.effects
+            );
+
+            // If there's a status comment, also verify UpdateComment is emitted
+            if has_status_comment {
+                let has_comment_update = stop_result.effects.iter().any(|effect| {
+                    matches!(effect, Effect::GitHub(GitHubEffect::UpdateComment { .. }))
+                });
+
+                prop_assert!(
+                    has_comment_update,
+                    "stop_train must emit UpdateComment when status_comment_id is set"
+                );
+            }
         }
 
-        /// Generate a vector of unique PR numbers (no duplicates).
-        fn arb_unique_prs(min: usize, max: usize) -> impl Strategy<Value = Vec<PrNumber>> {
-            prop::collection::hash_set(arb_pr_number(), min..max)
-                .prop_map(|set| set.into_iter().collect())
-        }
+        /// Property: Starting a train for a PR whose descendants overlap with an active train fails.
+        ///
+        /// This tests the overlap guard - you cannot start a new train if any PR
+        /// in your descendant tree is already in an active train's frozen_descendants.
+        ///
+        /// Scenario:
+        /// - main <- #1 <- #2 (train for #1 is active with #2 frozen)
+        /// - main <- #3 <- #2 (new root #3 wants #2 as descendant)
+        /// - Starting train for #3 should fail due to overlap
+        #[test]
+        fn start_train_rejects_overlapping_descendants(
+            sha in arb_sha(),
+        ) {
+            let engine = CascadeEngine::new("main");
 
-        fn make_test_pr(number: u64, base_ref: &str, predecessor: Option<PrNumber>) -> CachedPr {
-            CachedPr::new(
-                PrNumber(number),
-                Sha::parse(format!("{:0>40x}", number)).unwrap(),
-                format!("branch-{}", number),
-                base_ref.to_string(),
-                predecessor,
+            // Phase 1: Create initial structure and start train for #1
+            // main <- #1 <- #2
+            let pr1 = CachedPr::new(
+                PrNumber(1),
+                sha.clone(),
+                "branch-1".to_string(),
+                "main".to_string(),
+                None,
                 PrState::Open,
                 MergeStateStatus::Clean,
                 false,
-            )
-        }
+            );
 
-        proptest! {
-            /// Property: No PR appears in multiple active trains.
-            ///
-            /// This invariant ensures that overlapping trains are never created.
-            /// For any set of active trains, the union of (current_pr ∪ frozen_descendants)
-            /// across all trains must have no duplicates.
-            ///
-            /// This property would have caught the bug where start_train only checked
-            /// if the root PR had an existing train, not if any descendant was already
-            /// part of another train.
-            #[test]
-            fn no_overlapping_trains_invariant(
-                train_roots in arb_unique_prs(1, 4),
-                extra_descendants in arb_unique_prs(0, 6),
-            ) {
-                let engine = CascadeEngine::new("main");
+            let pr2 = CachedPr::new(
+                PrNumber(2),
+                sha.clone(),
+                "branch-2".to_string(),
+                "branch-1".to_string(),
+                Some(PrNumber(1)),
+                PrState::Open,
+                MergeStateStatus::Clean,
+                false,
+            );
 
-                // Build a set of PRs where each root has a subset of descendants
-                let mut prs = HashMap::new();
-                let mut active_trains: HashMap<PrNumber, TrainRecord> = HashMap::new();
+            let mut prs = HashMap::from([
+                (PrNumber(1), pr1),
+                (PrNumber(2), pr2),
+            ]);
 
-                // Create root PRs targeting main
-                for (i, &root) in train_roots.iter().enumerate() {
-                    let pr = make_test_pr(root.0, "main", None);
-                    prs.insert(root, pr);
+            // Start train for #1
+            let mut active_trains = HashMap::new();
+            let result1 = engine.start_train(PrNumber(1), &prs, &active_trains);
+            prop_assert!(result1.is_ok(), "Should be able to start train for #1");
+            let mut train1 = result1.unwrap().train;
 
-                    // Only start trains for odd-indexed roots to test mixed state
-                    if i % 2 == 0 {
-                        // Attempt to start a train
-                        if let Ok(result) = engine.start_train(root, &prs, &active_trains) {
-                            active_trains.insert(root, result.train);
-                        }
-                    }
-                }
+            // Transition train #1 to Preparing phase with #2 frozen
+            train1.cascade_phase = CascadePhase::Preparing {
+                progress: DescendantProgress::new(vec![PrNumber(2)]),
+            };
+            active_trains.insert(PrNumber(1), train1);
 
-                // Try adding descendants to existing trains (simulating cascades with descendants)
-                for (i, &desc) in extra_descendants.iter().enumerate() {
-                    // Skip if this PR number conflicts with a root
-                    if train_roots.contains(&desc) {
-                        continue;
-                    }
+            // Phase 2: Add a new root #3 that would have #2 as its descendant
+            // main <- #3 <- #2 (we change #2's predecessor)
+            let pr3 = CachedPr::new(
+                PrNumber(3),
+                sha.clone(),
+                "branch-3".to_string(),
+                "main".to_string(),
+                None,
+                PrState::Open,
+                MergeStateStatus::Clean,
+                false,
+            );
+            prs.insert(PrNumber(3), pr3);
 
-                    // Pick a "parent" from the roots
-                    let parent_idx = i % train_roots.len();
-                    let parent = train_roots[parent_idx];
-                    let parent_head = format!("branch-{}", parent.0);
+            // Modify #2 to now be a descendant of #3
+            let pr2_modified = CachedPr::new(
+                PrNumber(2),
+                sha.clone(),
+                "branch-2".to_string(),
+                "branch-3".to_string(),
+                Some(PrNumber(3)),
+                PrState::Open,
+                MergeStateStatus::Clean,
+                false,
+            );
+            prs.insert(PrNumber(2), pr2_modified);
 
-                    let pr = make_test_pr(desc.0, &parent_head, Some(parent));
-                    prs.insert(desc, pr);
-                }
+            // Starting train for #3 should FAIL because #2 is in train #1's frozen_descendants
+            let result3 = engine.start_train(PrNumber(3), &prs, &active_trains);
+            prop_assert!(
+                result3.is_err(),
+                "Starting train for #3 should fail - its descendant #2 is in train #1's frozen_descendants"
+            );
 
-                // Transition trains to Preparing phase so frozen_descendants gets populated.
-                // Without this, trains stay in Idle and progress() returns None.
-                for (&root, train) in active_trains.iter_mut() {
-                    // Collect descendants for this root
-                    let descendants: Vec<PrNumber> = extra_descendants
-                        .iter()
-                        .filter(|&&d| {
-                            prs.get(&d)
-                                .and_then(|p| p.predecessor)
-                                .map(|pred| pred == root)
-                                .unwrap_or(false)
-                        })
-                        .copied()
-                        .collect();
-
-                    if !descendants.is_empty() {
-                        train.cascade_phase = CascadePhase::Preparing {
-                            progress: DescendantProgress::new(descendants),
-                        };
-                    }
-                }
-
-                // Now verify the invariant: no PR appears in multiple trains
-                let mut seen_prs: std::collections::HashSet<PrNumber> = std::collections::HashSet::new();
-                let mut duplicates: Vec<PrNumber> = Vec::new();
-
-                for train in active_trains.values() {
-                    // Check current_pr
-                    if seen_prs.contains(&train.current_pr) {
-                        duplicates.push(train.current_pr);
-                    }
-                    seen_prs.insert(train.current_pr);
-
-                    // Check frozen_descendants
-                    if let Some(progress) = train.cascade_phase.progress() {
-                        for &desc in &progress.frozen_descendants {
-                            if seen_prs.contains(&desc) {
-                                duplicates.push(desc);
-                            }
-                            seen_prs.insert(desc);
-                        }
-                    }
-                }
-
-                prop_assert!(
-                    duplicates.is_empty(),
-                    "Found PRs appearing in multiple trains: {:?}",
-                    duplicates
-                );
-            }
-
-            /// Property: stop_train always emits a worktree removal effect.
-            ///
-            /// When stopping a train, the worktree must be cleaned up to avoid
-            /// leaving stale worktrees on disk. This property verifies that
-            /// stop_train always includes a RemoveWorktree effect.
-            #[test]
-            fn stop_train_emits_worktree_removal(
-                root_pr in arb_pr_number(),
-                has_status_comment in any::<bool>(),
-            ) {
-                let engine = CascadeEngine::new("main");
-
-                let mut train = TrainRecord::new(root_pr);
-                if has_status_comment {
-                    train.status_comment_id = Some(crate::types::CommentId(12345));
-                }
-
-                let result = engine.stop_train(train.clone(), false);
-
-                prop_assert!(result.is_ok(), "stop_train should succeed for active train");
-
-                let stop_result = result.unwrap();
-
-                // Check that RemoveWorktree effect is present
-                let has_worktree_removal = stop_result.effects.iter().any(|effect| {
-                    matches!(effect, Effect::Git(GitEffect::RemoveWorktree { name })
-                        if name == &format!("stack-{}", root_pr))
-                });
-
-                prop_assert!(
-                    has_worktree_removal,
-                    "stop_train must emit RemoveWorktree effect for stack-{}. Effects: {:?}",
-                    root_pr,
-                    stop_result.effects
-                );
-
-                // If there's a status comment, also verify UpdateComment is emitted
-                if has_status_comment {
-                    let has_comment_update = stop_result.effects.iter().any(|effect| {
-                        matches!(effect, Effect::GitHub(GitHubEffect::UpdateComment { .. }))
-                    });
-
+            // Verify the error is specifically about overlap (not some other error)
+            match result3 {
+                Err(CascadeError::NotARoot(pr, msg)) => {
+                    prop_assert_eq!(pr, PrNumber(3));
                     prop_assert!(
-                        has_comment_update,
-                        "stop_train must emit UpdateComment when status_comment_id is set"
+                        msg.contains("#2") && msg.contains("descendant"),
+                        "Error should mention that #2 is a descendant in another train: {}",
+                        msg
                     );
                 }
-            }
-
-            /// Property: Starting a train for a PR that's a descendant in another train fails.
-            ///
-            /// This tests the overlap guard - you cannot start a new train if any PR
-            /// in your stack is already part of an active train's current_pr or frozen_descendants.
-            ///
-            /// Scenario: Train #1 is in Preparing phase with #2 frozen. A new PR #4 targets
-            /// branch-2 (making #2 its predecessor). When we try to start a train for a
-            /// separate root #5, that should succeed. But trying to start #2 fails (NotARoot).
-            #[test]
-            fn start_train_rejects_overlapping_descendants(
-                sha in arb_sha(),
-            ) {
-                let engine = CascadeEngine::new("main");
-
-                // Create a chain: main <- #1 <- #2
-                let pr1 = CachedPr::new(
-                    PrNumber(1),
-                    sha.clone(),
-                    "branch-1".to_string(),
-                    "main".to_string(),
-                    None,
-                    PrState::Open,
-                    MergeStateStatus::Clean,
-                    false,
-                );
-
-                let pr2 = CachedPr::new(
-                    PrNumber(2),
-                    sha.clone(),
-                    "branch-2".to_string(),
-                    "branch-1".to_string(),
-                    Some(PrNumber(1)),
-                    PrState::Open,
-                    MergeStateStatus::Clean,
-                    false,
-                );
-
-                // PR3 is an independent root (targets main, no predecessor)
-                let pr3 = CachedPr::new(
-                    PrNumber(3),
-                    sha.clone(),
-                    "branch-3".to_string(),
-                    "main".to_string(),
-                    None,
-                    PrState::Open,
-                    MergeStateStatus::Clean,
-                    false,
-                );
-
-                let prs = HashMap::from([
-                    (PrNumber(1), pr1),
-                    (PrNumber(2), pr2),
-                    (PrNumber(3), pr3),
-                ]);
-
-                // Start train for #1
-                let mut active_trains = HashMap::new();
-                let result1 = engine.start_train(PrNumber(1), &prs, &active_trains);
-                prop_assert!(result1.is_ok(), "Should be able to start train for #1");
-                let mut train1 = result1.unwrap().train;
-
-                // Transition train #1 to Preparing phase so frozen_descendants is populated.
-                // Without this, the train stays in Idle and progress() returns None.
-                train1.cascade_phase = CascadePhase::Preparing {
-                    progress: DescendantProgress::new(vec![PrNumber(2)]),
-                };
-                active_trains.insert(PrNumber(1), train1);
-
-                // Starting train for #3 should succeed - it's independent (no overlap)
-                let result3 = engine.start_train(PrNumber(3), &prs, &active_trains);
-                prop_assert!(
-                    result3.is_ok(),
-                    "Should be able to start independent train for #3: {:?}",
-                    result3.err()
-                );
-
-                // Starting train for #2 should fail.
-                // Note: #2 isn't a root (has predecessor #1), so this fails with NotARoot.
-                // The overlap guard (checking frozen_descendants) would fire if #2 were a root.
-                let result2 = engine.start_train(PrNumber(2), &prs, &active_trains);
-                prop_assert!(
-                    result2.is_err(),
-                    "Starting train for descendant #2 should fail"
-                );
-
-                // Verify that the overlap is actually detectable: train #1's frozen_descendants
-                // contains #2, so any root whose stack includes #2 would be rejected.
-                let train1 = active_trains.get(&PrNumber(1)).unwrap();
-                if let Some(progress) = train1.cascade_phase.progress() {
-                    prop_assert!(
-                        progress.frozen_descendants.contains(&PrNumber(2)),
-                        "Train #1 should have #2 in frozen_descendants"
-                    );
-                } else {
-                    prop_assert!(false, "Train #1 should be in a phase with progress");
+                Err(other) => {
+                    prop_assert!(false, "Expected NotARoot error for overlap, got: {:?}", other);
+                }
+                Ok(_) => {
+                    prop_assert!(false, "Should have rejected overlapping train");
                 }
             }
         }
-    }
 
-    // ─── Regression Tests ─────────────────────────────────────────────────────
-
-    mod bug_regression_tests {
-        use super::*;
-        use crate::types::{CommentId, DescendantProgress};
-
-        fn make_sha(n: u64) -> Sha {
-            Sha::parse(format!("{:0>40x}", n)).unwrap()
-        }
-
-        /// Regression test: evaluate_train must block draft PRs even if they have CLEAN
-        /// mergeStateStatus. GitHub's API can report CLEAN for drafts (if CI passes),
-        /// but the merge API will reject them.
+        /// Property: Fan-out overlap detection works correctly.
+        ///
+        /// Tests that the overlap guard checks ALL transitive descendants,
+        /// not just the linear stack. This catches the bug where fan-out
+        /// branches could be missed.
+        ///
+        /// Scenario:
+        /// - main <- #1 <- {#2, #3, #4} (fan-out from #1)
+        /// - Train for #1 starts with all fan-out descendants frozen
+        /// - main <- #5 <- #4 (new root #5 wants #4 as descendant)
+        /// - Starting train for #5 should fail due to overlap on #4
         #[test]
-        fn evaluate_train_blocks_draft_prs() {
+        fn start_train_rejects_fanout_overlap(
+            sha in arb_sha(),
+        ) {
             let engine = CascadeEngine::new("main");
 
-            let train = TrainRecord::new(PrNumber(1));
+            // Create fan-out structure: main <- #1 <- {#2, #3, #4}
+            let pr1 = CachedPr::new(
+                PrNumber(1),
+                sha.clone(),
+                "branch-1".to_string(),
+                "main".to_string(),
+                None,
+                PrState::Open,
+                MergeStateStatus::Clean,
+                false,
+            );
 
-            // Create a draft PR that reports CLEAN status (this can happen per DESIGN.md).
-            // We construct directly because CachedPr::new() has a debug_assert preventing
-            // this combination, but GitHub's API can actually return it.
-            let draft_pr = CachedPr {
-                number: PrNumber(1),
-                head_sha: make_sha(1),
-                head_ref: "branch-1".to_string(),
-                base_ref: "main".to_string(),
-                predecessor: None,
-                state: PrState::Open,
-                merge_state_status: MergeStateStatus::Clean, // Draft can still be CLEAN!
-                is_draft: true,                              // This is the key: it's a draft
-                closed_at: None,
-                predecessor_squash_reconciled: None,
+            // Fan-out descendants all target branch-1
+            let pr2 = CachedPr::new(
+                PrNumber(2),
+                sha.clone(),
+                "branch-2".to_string(),
+                "branch-1".to_string(),
+                Some(PrNumber(1)),
+                PrState::Open,
+                MergeStateStatus::Clean,
+                false,
+            );
+
+            let pr3 = CachedPr::new(
+                PrNumber(3),
+                sha.clone(),
+                "branch-3".to_string(),
+                "branch-1".to_string(),
+                Some(PrNumber(1)),
+                PrState::Open,
+                MergeStateStatus::Clean,
+                false,
+            );
+
+            let pr4 = CachedPr::new(
+                PrNumber(4),
+                sha.clone(),
+                "branch-4".to_string(),
+                "branch-1".to_string(),
+                Some(PrNumber(1)),
+                PrState::Open,
+                MergeStateStatus::Clean,
+                false,
+            );
+
+            let mut prs = HashMap::from([
+                (PrNumber(1), pr1),
+                (PrNumber(2), pr2),
+                (PrNumber(3), pr3),
+                (PrNumber(4), pr4),
+            ]);
+
+            // Start train for #1
+            let mut active_trains = HashMap::new();
+            let result1 = engine.start_train(PrNumber(1), &prs, &active_trains);
+            prop_assert!(result1.is_ok(), "Should be able to start train for #1");
+            let mut train1 = result1.unwrap().train;
+
+            // Transition to Preparing with ALL fan-out descendants frozen
+            train1.cascade_phase = CascadePhase::Preparing {
+                progress: DescendantProgress::new(vec![PrNumber(2), PrNumber(3), PrNumber(4)]),
             };
+            active_trains.insert(PrNumber(1), train1);
 
-            let prs = HashMap::from([(PrNumber(1), draft_pr)]);
-
-            let action = engine.evaluate_train(&train, &prs);
-
-            assert!(
-                matches!(
-                    action,
-                    TrainAction::Block {
-                        reason: BlockReason::Draft
-                    }
-                ),
-                "evaluate_train must return Block {{ reason: Draft }} for draft PRs. \
-                 Got: {:?}",
-                action
+            // Add a new root #5 whose descendant is #4 (one of the fan-out PRs)
+            let pr5 = CachedPr::new(
+                PrNumber(5),
+                sha.clone(),
+                "branch-5".to_string(),
+                "main".to_string(),
+                None,
+                PrState::Open,
+                MergeStateStatus::Clean,
+                false,
             );
-        }
+            prs.insert(PrNumber(5), pr5);
 
-        /// Regression test: Status comment JSON must use compact serialization,
-        /// omit local-only fields, and respect the 60KB size limit.
-        #[test]
-        fn status_comment_json_has_size_guard() {
-            // Create a train with a large number of descendants (within the 50 PR limit)
-            let mut train = TrainRecord::new(PrNumber(1));
-            train.status_comment_id = Some(CommentId(12345)); // LOCAL-ONLY field
-
-            // Add many descendants to approach size limits
-            let descendants: Vec<PrNumber> = (2..=45).map(PrNumber).collect();
-            train.cascade_phase = CascadePhase::Preparing {
-                progress: DescendantProgress::new(descendants),
-            };
-
-            // Generate the status comment JSON
-            let json = format_train_json(&train).expect("Should not overflow with moderate input");
-
-            // status_comment_id should be omitted from JSON (it's local-only)
-            assert!(
-                !json.contains("status_comment_id"),
-                "status_comment_id should be omitted from recovery JSON. \
-                 JSON: {}",
-                json
+            // Modify #4 to be a descendant of #5
+            let pr4_modified = CachedPr::new(
+                PrNumber(4),
+                sha.clone(),
+                "branch-4".to_string(),
+                "branch-5".to_string(),
+                Some(PrNumber(5)),
+                PrState::Open,
+                MergeStateStatus::Clean,
+                false,
             );
+            prs.insert(PrNumber(4), pr4_modified);
 
-            // Should use compact serialization, not pretty-printed
-            let has_excessive_whitespace = json.lines().count() > 10;
-            assert!(
-                !has_excessive_whitespace,
-                "Status comment JSON should use compact format. Lines: {}",
-                json.lines().count()
-            );
+            // Starting train for #5 should fail - #4 is in train #1's frozen_descendants
+            let result5 = engine.start_train(PrNumber(5), &prs, &active_trains);
 
-            // Verify size is under 60KB
-            assert!(
-                json.len() < 60 * 1024,
-                "Status comment JSON ({} bytes) exceeds 60KB limit",
-                json.len()
-            );
-        }
-
-        /// Regression test: format_train_json must truncate error fields per DESIGN.md.
-        /// error.message: Maximum 4KB, error.stderr: Maximum 2KB
-        #[test]
-        fn status_comment_truncates_error_fields() {
-            let mut train = TrainRecord::new(PrNumber(1));
-
-            // Create an error with very long message and stderr
-            let long_message = "x".repeat(10_000); // 10KB, over 4KB limit
-            let long_stderr = "y".repeat(5_000); // 5KB, over 2KB limit
-
-            train.abort(
-                TrainError::new("test_error", long_message.clone())
-                    .with_stderr(long_stderr.clone()),
-            );
-
-            let json = format_train_json(&train).expect("Should not overflow with moderate input");
-
-            // Check that message was truncated (should not contain full 10KB string)
-            assert!(
-                !json.contains(&long_message),
-                "error.message ({} bytes) should be truncated to 4KB limit",
-                long_message.len()
-            );
-
-            // Check that stderr was truncated (should not contain full 5KB string)
-            assert!(
-                !json.contains(&long_stderr),
-                "error.stderr ({} bytes) should be truncated to 2KB limit",
-                long_stderr.len()
-            );
-
-            // Verify truncation indicator is present
-            assert!(
-                json.contains("..."),
-                "Truncated fields should have '...' indicator"
-            );
-        }
-
-        // ─────────────────────────────────────────────────────────────────────────────
-        // Property-based invariant tests
-        // ─────────────────────────────────────────────────────────────────────────────
-
-        mod property_based_bug_detection {
-            use super::*;
-            use proptest::prelude::*;
-
-            /// truncate_string handles non-ASCII boundaries safely.
-            ///
-            /// Property: truncate_string NEVER panics, regardless of input string
-            /// content or max_len value. The output is always valid UTF-8.
-            #[test]
-            fn truncate_string_never_panics() {
-                proptest!(|(
-                    s in "\\PC{0,200}",  // Any Unicode string up to 200 chars
-                    max_len in 0usize..100
-                )| {
-                    // This should never panic
-                    let result = truncate_string(&s, max_len);
-
-                    // Result should be valid UTF-8 (it's a String, so it is)
-                    prop_assert!(result.len() <= max_len.max(3), // at least "..."
-                        "Result length {} exceeds max_len {}",
-                        result.len(), max_len
+            // Verify the error is specifically about overlap (not some other error)
+            match result5 {
+                Err(CascadeError::NotARoot(pr, msg)) => {
+                    prop_assert_eq!(pr, PrNumber(5));
+                    prop_assert!(
+                        msg.contains("#4"),
+                        "Error should mention the overlapping PR #4: {}",
+                        msg
                     );
-
-                    // If truncated, should end with "..."
-                    if s.len() > max_len && max_len >= 3 {
-                        prop_assert!(
-                            result.ends_with("..."),
-                            "Truncated string should end with '...'"
-                        );
-                    }
-                });
-            }
-
-            /// BUG #5 (specific cases): truncate_string with multi-byte UTF-8.
-            ///
-            /// Property: Truncation at any position within multi-byte characters
-            /// should find a valid boundary and not panic.
-            #[test]
-            fn truncate_string_handles_multibyte_chars() {
-                // Test with various multi-byte UTF-8 strings
-                let test_cases = [
-                    "Hello 世界!", // Chinese
-                    "Привет мир",  // Russian
-                    "🎉🎊🎁🎈",    // Emojis (4-byte UTF-8)
-                    "café résumé", // Latin with diacritics
-                    "αβγδε",       // Greek
-                    "こんにちは",  // Japanese
-                ];
-
-                for s in &test_cases {
-                    // Try truncating at every possible byte position
-                    for max_len in 0..=s.len() + 5 {
-                        let result = truncate_string(s, max_len);
-
-                        // Should never panic, and result should be valid UTF-8
-                        assert!(
-                            result.len() <= max_len.max(3),
-                            "truncate_string({:?}, {}) = {:?} exceeds max",
-                            s,
-                            max_len,
-                            result
-                        );
-                    }
                 }
-            }
-
-            /// Status comment size is enforced in release builds.
-            ///
-            /// Property: format_train_json ALWAYS returns a string under 60KB,
-            /// even in release builds, even with pathologically large input.
-            #[test]
-            fn format_train_json_enforces_size_limit() {
-                proptest!(|(
-                    desc_count in 0usize..50,
-                    error_msg_len in 0usize..20000,
-                    stderr_len in 0usize..10000
-                )| {
-                    let mut train = TrainRecord::new(PrNumber(1));
-
-                    // Add many descendants
-                    let descendants: Vec<PrNumber> = (2..=(desc_count as u64 + 1))
-                        .map(PrNumber)
-                        .collect();
-                    if !descendants.is_empty() {
-                        train.cascade_phase = CascadePhase::Preparing {
-                            progress: DescendantProgress::new(descendants),
-                        };
-                    }
-
-                    // Add a large error
-                    if error_msg_len > 0 {
-                        let msg = "E".repeat(error_msg_len);
-                        let mut error = TrainError::new("test", msg);
-                        if stderr_len > 0 {
-                            error = error.with_stderr("S".repeat(stderr_len));
-                        }
-                        train.abort(error);
-                    }
-
-                    // format_train_json now returns Result - it should either succeed
-                    // with a reasonably-sized JSON, or error if oversize.
-                    match format_train_json(&train) {
-                        Ok(json) => {
-                            // If it succeeds, MUST be under 60KB
-                            prop_assert!(
-                                json.len() < 60 * 1024,
-                                "BUG: format_train_json returned {} bytes, exceeding 60KB limit",
-                                json.len()
-                            );
-
-                            // Must be valid JSON
-                            prop_assert!(
-                                serde_json::from_str::<serde_json::Value>(&json).is_ok(),
-                                "format_train_json must return valid JSON"
-                            );
-                        }
-                        Err(CascadeError::StatusCommentOversize { .. }) => {
-                            // Expected for extreme inputs - this is correct behavior per DESIGN.md
-                        }
-                        Err(e) => {
-                            prop_assert!(false, "Unexpected error: {:?}", e);
-                        }
-                    }
-                });
-            }
-
-            /// BUG #4 (extreme case): Even with max-size input, should either succeed
-            /// under 60KB OR return StatusCommentOversize error.
-            #[test]
-            fn format_train_json_handles_extreme_input() {
-                let mut train = TrainRecord::new(PrNumber(1));
-
-                // Max descendants (50 is the limit per MAX_TRAIN_SIZE)
-                let descendants: Vec<PrNumber> = (2..=50).map(PrNumber).collect();
-                train.cascade_phase = CascadePhase::Preparing {
-                    progress: DescendantProgress::new(descendants),
-                };
-
-                // Max error sizes
-                let huge_msg = "X".repeat(100_000); // 100KB message
-                let huge_stderr = "Y".repeat(50_000); // 50KB stderr
-                train.abort(TrainError::new("huge_error", huge_msg).with_stderr(huge_stderr));
-
-                match format_train_json(&train) {
-                    Ok(json) => {
-                        // If it succeeds, must stay under 60KB
-                        assert!(
-                            json.len() < 60 * 1024,
-                            "BUG: Extreme input produced {} byte JSON, exceeding 60KB limit",
-                            json.len()
-                        );
-
-                        // Must still be valid JSON
-                        assert!(
-                            serde_json::from_str::<serde_json::Value>(&json).is_ok(),
-                            "Extreme input must still produce valid JSON"
-                        );
-                    }
-                    Err(CascadeError::StatusCommentOversize {
-                        actual_size,
-                        max_size,
-                    }) => {
-                        // Expected for extreme inputs - verify the error is sensible
-                        assert!(
-                            actual_size > max_size,
-                            "Oversize error should report actual > max"
-                        );
-                    }
-                    Err(e) => panic!("Unexpected error: {:?}", e),
+                Err(other) => {
+                    prop_assert!(false, "Expected NotARoot error for fan-out overlap, got: {:?}", other);
                 }
-            }
-
-            /// Property: escape_for_html_comment prevents --> from terminating comments,
-            /// and the escaped JSON still parses correctly, recovering the original value.
-            #[test]
-            fn escape_for_html_comment_preserves_json_semantics() {
-                proptest!(|(
-                    prefix in "[a-zA-Z0-9 ]{0,20}",
-                    suffix in "[a-zA-Z0-9 ]{0,20}",
-                    arrow_count in 1usize..5
-                )| {
-                    // Create a string with --> embedded
-                    let dangerous_content = format!("{}{}{}", prefix, "-->".repeat(arrow_count), suffix);
-
-                    // Create a TrainRecord with this dangerous content in an error
-                    let mut train = TrainRecord::new(PrNumber(1));
-                    let error = TrainError::new("git", dangerous_content.clone())
-                        .with_stderr(format!("stderr also has --> in it: {}", dangerous_content));
-                    train.abort(error);
-
-                    // Serialize and escape
-                    let json = format_train_json(&train).expect("should serialize");
-                    let escaped = escape_for_html_comment(&json);
-
-                    // Property 1: No --> in escaped output
-                    prop_assert!(
-                        !escaped.contains("-->"),
-                        "Escaped JSON must not contain -->, but found: {}",
-                        escaped.chars().take(200).collect::<String>()
-                    );
-
-                    // Property 2: Escaped JSON is still valid JSON
-                    let parsed: serde_json::Value = serde_json::from_str(&escaped)
-                        .expect("Escaped JSON must still be valid JSON");
-
-                    // Property 3: The original content is recoverable after parsing
-                    let error_obj = parsed.get("error").expect("should have error field");
-                    let message = error_obj.get("message").and_then(|v| v.as_str()).expect("should have message");
-                    let stderr = error_obj.get("stderr").and_then(|v| v.as_str()).expect("should have stderr");
-
-                    prop_assert!(
-                        message.contains("-->"),
-                        "Original --> should be recovered in message after parsing"
-                    );
-                    prop_assert!(
-                        stderr.contains("-->"),
-                        "Original --> should be recovered in stderr after parsing"
-                    );
-                });
-            }
-
-            /// Edge case: Multiple overlapping --> sequences
-            #[test]
-            fn escape_handles_overlapping_arrows() {
-                // Test case: "-->" appears multiple times, including "---->>" (overlapping)
-                let input = r#"{"msg":"a-->b---->c"}"#;
-                let escaped = escape_for_html_comment(input);
-
-                assert!(
-                    !escaped.contains("-->"),
-                    "Should escape all --> occurrences"
-                );
-                assert_eq!(
-                    escaped, r#"{"msg":"a--\u003eb----\u003ec"}"#,
-                    "Each --> should be escaped independently"
-                );
-
-                // Verify it round-trips correctly
-                let parsed: serde_json::Value = serde_json::from_str(&escaped).unwrap();
-                assert_eq!(
-                    parsed.get("msg").unwrap().as_str().unwrap(),
-                    "a-->b---->c",
-                    "Original string should be recovered after parsing"
-                );
+                Ok(_) => {
+                    prop_assert!(false, "Starting train for #5 should fail - its descendant #4 is in train #1's frozen_descendants (fan-out case)");
+                }
             }
         }
     }

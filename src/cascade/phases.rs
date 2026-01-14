@@ -91,7 +91,22 @@ impl PhaseExecutionResult {
         )
     }
 
-    /// Converts a failure result to an abort reason.
+    /// Converts a failure result to an abort reason, if applicable.
+    ///
+    /// Returns `None` for:
+    /// - Success results (no failure)
+    /// - `PrClosed` - requires caller context to determine action
+    ///
+    /// **Important:** `PrClosed` returns `None` because the correct action depends
+    /// on whether the closed PR is the current (root) PR or a descendant:
+    /// - Current PR closed → abort the train
+    /// - Descendant closed → skip that descendant, continue with others
+    ///
+    /// Per DESIGN.md §"Diagnosing divergence": "Descendant PR closed/deleted when
+    /// we try to prepare/reconcile: Skip this descendant with a warning."
+    ///
+    /// Callers must handle `PrClosed` explicitly by checking `pr` against the
+    /// current PR number before deciding to abort vs skip.
     pub fn to_abort_reason(&self) -> Option<AbortReason> {
         match self {
             PhaseExecutionResult::Success { .. } | PhaseExecutionResult::Squashed { .. } => None,
@@ -103,12 +118,44 @@ impl PhaseExecutionResult {
             PhaseExecutionResult::PushRejected { details, .. } => Some(AbortReason::PushRejected {
                 details: details.clone(),
             }),
-            PhaseExecutionResult::PrClosed { .. } => Some(AbortReason::PrClosed),
+            // PrClosed requires context: current PR closed = abort, descendant closed = skip.
+            // Return None to force callers to handle this case explicitly.
+            PhaseExecutionResult::PrClosed { .. } => None,
             PhaseExecutionResult::ApiError { details } => Some(AbortReason::ApiError {
                 details: details.clone(),
             }),
         }
     }
+}
+
+/// Marks any closed or missing descendants in the progress as skipped.
+///
+/// This should be called before `*_next_action` functions or phase transitions
+/// to ensure `progress.remaining()` only contains PRs that are actually processable.
+/// Without this, closed descendants remain in `remaining()` indefinitely, causing
+/// the train to appear stuck or incomplete.
+///
+/// Returns the list of PRs that were marked as skipped.
+pub fn mark_closed_descendants_skipped(
+    progress: &mut DescendantProgress,
+    prs: &HashMap<PrNumber, CachedPr>,
+) -> Vec<PrNumber> {
+    let to_skip: Vec<PrNumber> = progress
+        .remaining()
+        .filter(|pr_number| {
+            match prs.get(pr_number) {
+                Some(pr) => !pr.state.is_open(),
+                None => true, // PR not in cache - skip it
+            }
+        })
+        .copied()
+        .collect();
+
+    for pr_number in &to_skip {
+        progress.mark_skipped(*pr_number);
+    }
+
+    to_skip
 }
 
 /// Determines the next action for the Preparing phase.
@@ -117,7 +164,9 @@ pub fn preparing_next_action(
     current_pr: &CachedPr,
     prs: &HashMap<PrNumber, CachedPr>,
 ) -> PhaseAction {
-    // Find the next descendant to prepare
+    // Note: Callers should call mark_closed_descendants_skipped() first to ensure
+    // remaining() only contains open PRs. This function does a defensive re-check
+    // but won't mark descendants as skipped.
     for pr_number in progress.remaining() {
         if let Some(desc_pr) = prs.get(pr_number)
             && desc_pr.state.is_open()
@@ -128,7 +177,8 @@ pub fn preparing_next_action(
                 target_branch: desc_pr.head_ref.clone(),
             };
         }
-        // If PR not found or closed, it will be skipped on the next step
+        // Closed/missing PRs should have been marked skipped by caller.
+        // If we get here, continue to next remaining descendant.
     }
 
     // All remaining descendants are either done or invalid
@@ -596,5 +646,71 @@ mod tests {
         };
 
         assert!(validate_transition(&idle, &reconciling).is_err());
+    }
+
+    #[test]
+    fn mark_closed_descendants_skipped_handles_closed_prs() {
+        let mut progress = DescendantProgress::new(vec![PrNumber(2), PrNumber(3), PrNumber(4)]);
+
+        // PR #2 is open, #3 is closed, #4 is missing from cache
+        let pr2 = make_open_pr(2, "branch-1", Some(1));
+        let mut pr3 = make_open_pr(3, "branch-1", Some(1));
+        pr3.state = PrState::Closed;
+
+        let prs = HashMap::from([
+            (PrNumber(2), pr2),
+            (PrNumber(3), pr3),
+            // #4 not in cache
+        ]);
+
+        let skipped = mark_closed_descendants_skipped(&mut progress, &prs);
+
+        // Should have marked #3 (closed) and #4 (missing) as skipped
+        assert_eq!(skipped.len(), 2);
+        assert!(skipped.contains(&PrNumber(3)));
+        assert!(skipped.contains(&PrNumber(4)));
+
+        // #2 should still be remaining
+        let remaining: Vec<_> = progress.remaining().collect();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0], &PrNumber(2));
+
+        // Progress should reflect skipped PRs
+        assert!(progress.skipped.contains(&PrNumber(3)));
+        assert!(progress.skipped.contains(&PrNumber(4)));
+    }
+
+    #[test]
+    fn mark_closed_descendants_skipped_no_op_when_all_open() {
+        let mut progress = DescendantProgress::new(vec![PrNumber(2), PrNumber(3)]);
+
+        let pr2 = make_open_pr(2, "branch-1", Some(1));
+        let pr3 = make_open_pr(3, "branch-1", Some(1));
+
+        let prs = HashMap::from([(PrNumber(2), pr2), (PrNumber(3), pr3)]);
+
+        let skipped = mark_closed_descendants_skipped(&mut progress, &prs);
+
+        assert!(skipped.is_empty());
+        assert_eq!(progress.remaining().count(), 2);
+    }
+
+    #[test]
+    fn mark_closed_descendants_skipped_with_merged_prs() {
+        let mut progress = DescendantProgress::new(vec![PrNumber(2), PrNumber(3)]);
+
+        let pr2 = make_open_pr(2, "branch-1", Some(1));
+        let mut pr3 = make_open_pr(3, "branch-1", Some(1));
+        pr3.state = PrState::Merged {
+            merge_commit_sha: make_sha(300),
+        };
+
+        let prs = HashMap::from([(PrNumber(2), pr2), (PrNumber(3), pr3)]);
+
+        let skipped = mark_closed_descendants_skipped(&mut progress, &prs);
+
+        // Merged PRs are not open, so should be skipped
+        assert_eq!(skipped, vec![PrNumber(3)]);
+        assert!(progress.skipped.contains(&PrNumber(3)));
     }
 }
