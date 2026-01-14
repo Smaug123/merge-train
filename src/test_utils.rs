@@ -13,7 +13,18 @@ pub fn arb_sha() -> impl Strategy<Value = Sha> {
 }
 
 pub fn arb_train_error() -> impl Strategy<Value = TrainError> {
-    ("[a-z_]{1,20}", "[a-zA-Z0-9 ]{1,100}").prop_map(|(t, m)| TrainError::new(t, m))
+    (
+        "[a-z_]{1,20}",
+        "[a-zA-Z0-9 ]{1,100}",
+        prop::option::of("[a-zA-Z0-9 ]{1,50}".prop_map(String::from)),
+    )
+        .prop_map(|(t, m, stderr)| {
+            let mut err = TrainError::new(t, m);
+            if let Some(s) = stderr {
+                err = err.with_stderr(s);
+            }
+            err
+        })
 }
 
 pub fn arb_descendant_progress() -> impl Strategy<Value = DescendantProgress> {
