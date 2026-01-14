@@ -91,7 +91,22 @@ impl PhaseExecutionResult {
         )
     }
 
-    /// Converts a failure result to an abort reason.
+    /// Converts a failure result to an abort reason, if applicable.
+    ///
+    /// Returns `None` for:
+    /// - Success results (no failure)
+    /// - `PrClosed` - requires caller context to determine action
+    ///
+    /// **Important:** `PrClosed` returns `None` because the correct action depends
+    /// on whether the closed PR is the current (root) PR or a descendant:
+    /// - Current PR closed → abort the train
+    /// - Descendant closed → skip that descendant, continue with others
+    ///
+    /// Per DESIGN.md §"Diagnosing divergence": "Descendant PR closed/deleted when
+    /// we try to prepare/reconcile: Skip this descendant with a warning."
+    ///
+    /// Callers must handle `PrClosed` explicitly by checking `pr` against the
+    /// current PR number before deciding to abort vs skip.
     pub fn to_abort_reason(&self) -> Option<AbortReason> {
         match self {
             PhaseExecutionResult::Success { .. } | PhaseExecutionResult::Squashed { .. } => None,
@@ -103,7 +118,9 @@ impl PhaseExecutionResult {
             PhaseExecutionResult::PushRejected { details, .. } => Some(AbortReason::PushRejected {
                 details: details.clone(),
             }),
-            PhaseExecutionResult::PrClosed { .. } => Some(AbortReason::PrClosed),
+            // PrClosed requires context: current PR closed = abort, descendant closed = skip.
+            // Return None to force callers to handle this case explicitly.
+            PhaseExecutionResult::PrClosed { .. } => None,
             PhaseExecutionResult::ApiError { details } => Some(AbortReason::ApiError {
                 details: details.clone(),
             }),

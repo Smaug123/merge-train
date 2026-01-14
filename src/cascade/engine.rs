@@ -433,6 +433,15 @@ impl CascadeEngine {
                 // Either Idle (no progress) or Preparing with all descendants complete.
                 // merge_commit_sha should always be present for merged PRs. If missing,
                 // it indicates corrupted cached data - abort instead of panicking.
+                //
+                // IMPORTANT: The handler for AdvanceAfterExternalMerge MUST verify
+                // preparation before reconciliation per DESIGN.md §"Verifying
+                // preparation before reconciliation". For each descendant, use
+                // `git merge-base --is-ancestor <predecessor_head> <descendant_head>`
+                // to confirm the predecessor's content was merged in. If not, abort
+                // with an error requiring manual intervention. This check catches
+                // cases where someone manually merged the PR via GitHub UI before
+                // preparation completed.
                 return match current_pr.state.merge_commit_sha() {
                     Some(sha) => TrainAction::AdvanceAfterExternalMerge {
                         merge_sha: sha.clone(),
