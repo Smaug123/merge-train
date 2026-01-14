@@ -1178,17 +1178,27 @@ mod tests {
         );
     }
 
-    /// Regression test: overlap detection must check against trains in Idle phase.
-    /// A train in Idle hasn't frozen its descendants yet (progress() returns None),
-    /// but we still need to prevent starting a train for a PR that is a potential
-    /// descendant of the Idle train.
+    /// Verifies that descendants of an active train cannot be started as new trains.
+    ///
+    /// This test validates an architectural invariant: in a tree-shaped PR graph,
+    /// a descendant of a train's root PR cannot itself be a valid root because it
+    /// targets its parent's head branch rather than `main`. The `is_root()` check
+    /// rejects such attempts before the overlap detection code is reached.
+    ///
+    /// Note: The Idle-phase overlap detection code (lines 254-265 in start_train)
+    /// exists as a defensive measure but is architecturally unreachable in normal
+    /// scenarios because:
+    /// 1. A PR can only have one base branch
+    /// 2. To be a valid root, a PR must target `main`
+    /// 3. To be a descendant of another PR, it must target that PR's head (not main)
+    /// 4. These are mutually exclusive
     ///
     /// Scenario:
     /// - main <- #1 <- #2 (train for #1 in Idle phase)
     /// - Attempt to start train for #2 (which is a descendant of #1)
-    /// - Should fail because #2 is being claimed by train #1
+    /// - Should fail with NotARoot because #2 targets branch-1, not main
     #[test]
-    fn start_train_rejects_overlap_with_idle_train() {
+    fn start_train_rejects_descendant_of_idle_train_as_root() {
         let engine = CascadeEngine::new("main");
 
         // Create structure: main <- #1 <- #2
@@ -1217,36 +1227,38 @@ mod tests {
         // Add train #1 to active trains (in Idle phase)
         active_trains.insert(PrNumber(1), train1);
 
-        // Try to start train for #2 - should fail because #2 is a potential
-        // descendant of the Idle train #1 (it's also #1's descendant in the graph)
+        // Try to start train for #2 - should fail because #2 targets branch-1, not main
         let result2 = engine.start_train(PrNumber(2), &prs, &active_trains);
-
-        // Note: #2 isn't a valid root (targets branch-1, not main), so we expect
-        // NotARoot error. But even if it were a valid root, the overlap would be caught.
-        // Let's verify the error is about #2.
         assert!(result2.is_err(), "Starting train for #2 should fail");
 
-        // Verify error mentions it's not a valid root (targets branch-1)
-        if let Err(CascadeError::NotARoot(pr, _msg)) = result2 {
+        // Verify error is NotARoot because #2 targets branch-1
+        if let Err(CascadeError::NotARoot(pr, msg)) = result2 {
             assert_eq!(pr, PrNumber(2));
+            assert!(
+                msg.contains("branch-1"),
+                "Error should mention the invalid base_ref"
+            );
         } else {
             panic!("Expected NotARoot error, got {:?}", result2);
         }
     }
 
-    /// Regression test: Two independent roots cannot both claim the same descendant.
-    /// If #1 and #3 both target main, and #2 is a descendant of both, the second
-    /// train should be rejected (even if the first train is in Idle phase).
+    /// Verifies that Idle-phase overlap detection uses the current PR graph, not a snapshot.
     ///
-    /// Note: This tests the case where the new train's *descendant* overlaps with
-    /// an Idle train's potential descendants (different from the train root itself
-    /// being a descendant).
+    /// When a train is in Idle phase, its potential descendants are computed dynamically
+    /// from the current PR graph. If the graph changes (e.g., a PR retargets to a different
+    /// branch), the overlap detection should reflect the new structure.
+    ///
+    /// Scenario:
+    /// 1. Initially: main <- #1 <- #2 (train for #1 starts in Idle phase)
+    /// 2. Graph changes: #2 retargets to branch-3, creating main <- #3 <- #2
+    /// 3. Now #2 is no longer a descendant of #1
+    /// 4. Starting train for #3 should succeed because there's no overlap
     #[test]
-    fn start_train_rejects_descendant_overlap_with_idle_train() {
+    fn start_train_allows_after_retarget_removes_overlap() {
         let engine = CascadeEngine::new("main");
 
-        // Create structure where #2 has two potential predecessors:
-        // Initially: main <- #1 <- #2 (train for #1 starts)
+        // Initially: main <- #1 <- #2
         let pr1 = make_open_pr(1, "main", None);
         let mut pr2 = make_open_pr(2, "branch-1", Some(1));
         pr2.head_ref = "branch-2".to_string();
@@ -1259,13 +1271,12 @@ mod tests {
         assert!(result1.is_ok(), "Should start train for #1");
         let train1 = result1.unwrap().train;
 
-        // Verify train is in Idle phase
+        // Verify train is in Idle phase (potential descendants computed dynamically)
         assert!(train1.cascade_phase.progress().is_none());
         active_trains.insert(PrNumber(1), train1);
 
-        // Now modify the structure so #2 becomes a descendant of #3:
-        // main <- #3 <- #2 (and remove #1 <- #2 relationship)
-        // Also keep #1 in active_trains (in Idle phase, still claims #2 based on old structure)
+        // Modify the structure: #2 retargets from branch-1 to branch-3
+        // New structure: main <- #1 (no descendants), main <- #3 <- #2
         let pr3 = make_open_pr(3, "main", None);
         prs.insert(PrNumber(3), pr3);
 
@@ -1273,16 +1284,10 @@ mod tests {
         pr2_modified.head_ref = "branch-2".to_string();
         prs.insert(PrNumber(2), pr2_modified);
 
-        // Now when we check for overlaps:
-        // - Train #1 is in Idle phase with current_pr = #1
-        // - We compute potential descendants of #1 from current PR graph
-        // - But #2's predecessor is now #3, not #1, so #2 is NOT a descendant of #1 anymore
-        //
-        // This means the overlap check won't catch it, which is actually correct behavior!
-        // The PR graph has changed, so #2 is legitimately a descendant of #3 now, not #1.
-        //
-        // The real issue would be if the PR graph hadn't changed but we weren't checking.
-        // Let's verify train for #3 CAN be started (since #2 is now legitimately its descendant).
+        // Overlap check for Train #3:
+        // - Train #1's potential descendants are computed from CURRENT graph = []
+        // - Train #3's PRs are [#3, #2]
+        // - No overlap → train #3 should be allowed
         let result3 = engine.start_train(PrNumber(3), &prs, &active_trains);
         assert!(
             result3.is_ok(),
