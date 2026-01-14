@@ -382,7 +382,22 @@ impl CascadeEngine {
                     // Expected state - proceed with descendant processing
                     return TrainAction::Proceed;
                 }
-                // Pre-squash phases: external merge needs advancing
+
+                // Pre-squash phases: external merge needs special handling.
+                // If we're in Preparing phase with unprepared descendants, this violates
+                // the "prepare before squash" invariant and we must abort.
+                if let Some(progress) = train.cascade_phase.progress() {
+                    let unprepared: Vec<PrNumber> = progress.remaining().copied().collect();
+                    if !unprepared.is_empty() {
+                        return TrainAction::Abort {
+                            reason: AbortReason::PreparationIncomplete {
+                                unprepared_descendants: unprepared,
+                            },
+                        };
+                    }
+                }
+
+                // Either Idle (no progress) or Preparing with all descendants complete.
                 // merge_commit_sha should always be present for merged PRs. If missing,
                 // it indicates corrupted cached data - abort instead of panicking.
                 return match current_pr.state.merge_commit_sha() {
@@ -513,6 +528,11 @@ impl CascadeEngine {
     /// Uses frozen progress from the current phase when available. This prevents
     /// late additions from leaking into outcomes. Only computes descendants fresh
     /// when in Idle phase (no frozen set yet).
+    ///
+    /// Note: This filters out closed/missing descendants from the outcome, even if
+    /// they're still in `progress.remaining()`. Callers should use
+    /// `mark_closed_descendants_skipped()` from the phases module to properly update
+    /// the progress tracking.
     pub fn create_step_outcome(
         &self,
         train: &TrainRecord,
@@ -522,11 +542,22 @@ impl CascadeEngine {
         // This ensures late additions don't leak into outcomes.
         let descendants: Vec<PrNumber> = match train.cascade_phase.progress() {
             Some(progress) => {
-                // Use the frozen set, filtered by what's completed (remaining)
-                progress.remaining().copied().collect()
+                // Use the frozen set, filtered by what's completed (remaining).
+                // Additionally filter out any PRs that are closed or missing from
+                // the cache, as they can't be processed and shouldn't appear in outcomes.
+                progress
+                    .remaining()
+                    .filter(|pr_num| {
+                        prs.get(pr_num)
+                            .map(|pr| pr.state.is_open())
+                            .unwrap_or(false)
+                    })
+                    .copied()
+                    .collect()
             }
             None => {
                 // Idle phase - no frozen set yet, compute fresh
+                // compute_frozen_descendants already filters to open PRs only
                 self.compute_frozen_descendants(train.current_pr, prs)
             }
         };
@@ -597,7 +628,9 @@ fn format_start_comment(train: &TrainRecord, stack: &MergeStack) -> Result<Strin
     lines.push("---".to_string());
     lines.push("*Use `@merge-train stop` to cancel.*".to_string());
 
-    Ok(lines.join("\n"))
+    let body = lines.join("\n");
+    check_final_comment_size(&body)?;
+    Ok(body)
 }
 
 /// Format the status comment when a train is stopped.
@@ -611,7 +644,7 @@ fn format_stop_comment(train: &TrainRecord) -> Result<String, CascadeError> {
     // Serialize train state as JSON for recovery
     let json_payload = format_train_json(train)?;
 
-    Ok([
+    let body = [
         format!(
             "<!-- merge-train-state\n{}\n-->",
             escape_for_html_comment(&json_payload)
@@ -626,7 +659,9 @@ fn format_stop_comment(train: &TrainRecord) -> Result<String, CascadeError> {
         "---".to_string(),
         "*Use `@merge-train start` to restart.*".to_string(),
     ]
-    .join("\n"))
+    .join("\n");
+    check_final_comment_size(&body)?;
+    Ok(body)
 }
 
 /// Format the status comment for a phase update.
@@ -672,7 +707,7 @@ pub fn format_phase_comment(train: &TrainRecord) -> Result<String, CascadeError>
         TrainState::NeedsManualReview => "Needs Manual Review".to_string(),
     };
 
-    Ok([
+    let body = [
         format!(
             "<!-- merge-train-state\n{}\n-->",
             escape_for_html_comment(&json_payload)
@@ -686,7 +721,9 @@ pub fn format_phase_comment(train: &TrainRecord) -> Result<String, CascadeError>
         "---".to_string(),
         "*Use `@merge-train stop` to stop the train.*".to_string(),
     ]
-    .join("\n"))
+    .join("\n");
+    check_final_comment_size(&body)?;
+    Ok(body)
 }
 
 /// Format train record as JSON for status comment recovery payload.
@@ -701,6 +738,9 @@ const MAX_ERROR_STDERR_SIZE: usize = 2 * 1024;
 
 /// Maximum status comment JSON size (60KB per DESIGN.md)
 const MAX_STATUS_COMMENT_SIZE: usize = 60 * 1024;
+
+/// GitHub's hard limit for comment body size (65536 bytes)
+const GITHUB_COMMENT_SIZE_LIMIT: usize = 65536;
 
 /// Truncate a string to a maximum length, adding "..." if truncated.
 ///
@@ -765,15 +805,10 @@ fn format_train_json(train: &TrainRecord) -> Result<String, CascadeError> {
     // Per DESIGN.md: "If STILL too large after aggressive truncation, this indicates
     // a bug in the size estimation. The bot MUST NOT post a minimal comment without
     // JSON, as this would silently disable GitHub-based recovery."
+    //
+    // Note: We do NOT log here (no eprintln/tracing) because this is the pure engine
+    // layer. The error is propagated to the caller who can log via the imperative shell.
     if json.len() >= MAX_STATUS_COMMENT_SIZE {
-        // Log the issue (eprintln for now; in production this would use tracing)
-        eprintln!(
-            "ERROR: Status comment JSON ({} bytes) exceeds {} byte limit. \
-             Aborting train to prevent recovery data loss.",
-            json.len(),
-            MAX_STATUS_COMMENT_SIZE
-        );
-
         return Err(CascadeError::StatusCommentOversize {
             actual_size: json.len(),
             max_size: MAX_STATUS_COMMENT_SIZE,
@@ -792,6 +827,22 @@ fn format_train_json(train: &TrainRecord) -> Result<String, CascadeError> {
 /// `\u003e` back to `>`, so the original string is recovered.
 fn escape_for_html_comment(json: &str) -> String {
     json.replace("-->", r"--\u003e")
+}
+
+/// Validate that the final comment body doesn't exceed GitHub's size limit.
+///
+/// This check happens AFTER escaping and markdown wrapping, ensuring the
+/// complete comment body fits within GitHub's 65536 byte limit. The earlier
+/// JSON size check (60KB) is a conservative pre-check; this validates the
+/// final result.
+fn check_final_comment_size(body: &str) -> Result<(), CascadeError> {
+    if body.len() > GITHUB_COMMENT_SIZE_LIMIT {
+        return Err(CascadeError::StatusCommentOversize {
+            actual_size: body.len(),
+            max_size: GITHUB_COMMENT_SIZE_LIMIT,
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1843,6 +1894,292 @@ mod tests {
                     "Original string should be recovered after parsing"
                 );
             }
+        }
+
+        /// Regression test: External merge during Preparing phase with unprepared descendants
+        /// must abort (not advance). If preparation isn't complete, descendants haven't
+        /// had the predecessor's content merged into them, violating the invariant.
+        #[test]
+        fn external_merge_during_preparing_with_unprepared_descendants_aborts() {
+            let engine = CascadeEngine::new("main");
+
+            // Create a train in Preparing phase with unprepared descendants
+            let mut train = TrainRecord::new(PrNumber(1));
+            train.cascade_phase = CascadePhase::Preparing {
+                progress: DescendantProgress::new(vec![PrNumber(2), PrNumber(3)]),
+            };
+
+            // The current PR was externally merged
+            let merged_pr = CachedPr {
+                number: PrNumber(1),
+                head_sha: make_sha(1),
+                head_ref: "branch-1".to_string(),
+                base_ref: "main".to_string(),
+                predecessor: None,
+                state: PrState::Merged {
+                    merge_commit_sha: make_sha(100),
+                },
+                merge_state_status: MergeStateStatus::Clean,
+                is_draft: false,
+                closed_at: None,
+                predecessor_squash_reconciled: None,
+            };
+
+            let prs = HashMap::from([(PrNumber(1), merged_pr)]);
+
+            let action = engine.evaluate_train(&train, &prs);
+
+            // Should abort because descendants #2 and #3 weren't prepared
+            assert!(
+                matches!(
+                    action,
+                    TrainAction::Abort {
+                        reason: AbortReason::PreparationIncomplete { .. }
+                    }
+                ),
+                "External merge during Preparing with unprepared descendants should abort. \
+                 Got: {:?}",
+                action
+            );
+
+            // Verify the unprepared descendants are mentioned
+            if let TrainAction::Abort {
+                reason:
+                    AbortReason::PreparationIncomplete {
+                        unprepared_descendants,
+                    },
+            } = action
+            {
+                assert!(
+                    unprepared_descendants.contains(&PrNumber(2)),
+                    "Should mention unprepared descendant #2"
+                );
+                assert!(
+                    unprepared_descendants.contains(&PrNumber(3)),
+                    "Should mention unprepared descendant #3"
+                );
+            }
+        }
+
+        /// External merge in Preparing phase when all descendants are prepared should advance.
+        #[test]
+        fn external_merge_during_preparing_with_all_prepared_advances() {
+            let engine = CascadeEngine::new("main");
+
+            // Create a train in Preparing phase with ALL descendants completed
+            let mut train = TrainRecord::new(PrNumber(1));
+            let mut progress = DescendantProgress::new(vec![PrNumber(2), PrNumber(3)]);
+            progress.mark_completed(PrNumber(2));
+            progress.mark_completed(PrNumber(3));
+            train.cascade_phase = CascadePhase::Preparing { progress };
+
+            // The current PR was externally merged
+            let merged_pr = CachedPr {
+                number: PrNumber(1),
+                head_sha: make_sha(1),
+                head_ref: "branch-1".to_string(),
+                base_ref: "main".to_string(),
+                predecessor: None,
+                state: PrState::Merged {
+                    merge_commit_sha: make_sha(100),
+                },
+                merge_state_status: MergeStateStatus::Clean,
+                is_draft: false,
+                closed_at: None,
+                predecessor_squash_reconciled: None,
+            };
+
+            let prs = HashMap::from([(PrNumber(1), merged_pr)]);
+
+            let action = engine.evaluate_train(&train, &prs);
+
+            // Should advance because all descendants were prepared
+            assert!(
+                matches!(action, TrainAction::AdvanceAfterExternalMerge { .. }),
+                "External merge during Preparing with all descendants prepared should advance. \
+                 Got: {:?}",
+                action
+            );
+        }
+
+        /// External merge in Idle phase should always advance (no preparation yet).
+        #[test]
+        fn external_merge_during_idle_advances() {
+            let engine = CascadeEngine::new("main");
+
+            let train = TrainRecord::new(PrNumber(1)); // Idle phase by default
+
+            // The current PR was externally merged
+            let merged_pr = CachedPr {
+                number: PrNumber(1),
+                head_sha: make_sha(1),
+                head_ref: "branch-1".to_string(),
+                base_ref: "main".to_string(),
+                predecessor: None,
+                state: PrState::Merged {
+                    merge_commit_sha: make_sha(100),
+                },
+                merge_state_status: MergeStateStatus::Clean,
+                is_draft: false,
+                closed_at: None,
+                predecessor_squash_reconciled: None,
+            };
+
+            let prs = HashMap::from([(PrNumber(1), merged_pr)]);
+
+            let action = engine.evaluate_train(&train, &prs);
+
+            // Should advance (Idle has no frozen descendants to check)
+            assert!(
+                matches!(action, TrainAction::AdvanceAfterExternalMerge { .. }),
+                "External merge during Idle should advance. Got: {:?}",
+                action
+            );
+        }
+
+        /// Regression test: create_step_outcome must filter out closed descendants.
+        /// If a descendant closes mid-train but isn't marked as skipped yet,
+        /// it should not appear in the outcome.
+        #[test]
+        fn create_step_outcome_filters_closed_descendants() {
+            let engine = CascadeEngine::new("main");
+
+            // Create a train with some descendants, one of which is closed
+            let mut train = TrainRecord::new(PrNumber(1));
+            train.cascade_phase = CascadePhase::Preparing {
+                progress: DescendantProgress::new(vec![PrNumber(2), PrNumber(3), PrNumber(4)]),
+            };
+
+            // PR #1 is current, #2 is open, #3 is closed, #4 is open
+            let pr1 = CachedPr {
+                number: PrNumber(1),
+                head_sha: make_sha(1),
+                head_ref: "branch-1".to_string(),
+                base_ref: "main".to_string(),
+                predecessor: None,
+                state: PrState::Open,
+                merge_state_status: MergeStateStatus::Clean,
+                is_draft: false,
+                closed_at: None,
+                predecessor_squash_reconciled: None,
+            };
+
+            let pr2 = CachedPr {
+                number: PrNumber(2),
+                head_sha: make_sha(2),
+                head_ref: "branch-2".to_string(),
+                base_ref: "branch-1".to_string(),
+                predecessor: Some(PrNumber(1)),
+                state: PrState::Open,
+                merge_state_status: MergeStateStatus::Clean,
+                is_draft: false,
+                closed_at: None,
+                predecessor_squash_reconciled: None,
+            };
+
+            let pr3 = CachedPr {
+                number: PrNumber(3),
+                head_sha: make_sha(3),
+                head_ref: "branch-3".to_string(),
+                base_ref: "branch-1".to_string(),
+                predecessor: Some(PrNumber(1)),
+                state: PrState::Closed, // Closed!
+                merge_state_status: MergeStateStatus::Clean,
+                is_draft: false,
+                closed_at: None,
+                predecessor_squash_reconciled: None,
+            };
+
+            let pr4 = CachedPr {
+                number: PrNumber(4),
+                head_sha: make_sha(4),
+                head_ref: "branch-4".to_string(),
+                base_ref: "branch-1".to_string(),
+                predecessor: Some(PrNumber(1)),
+                state: PrState::Open,
+                merge_state_status: MergeStateStatus::Clean,
+                is_draft: false,
+                closed_at: None,
+                predecessor_squash_reconciled: None,
+            };
+
+            let prs = HashMap::from([
+                (PrNumber(1), pr1),
+                (PrNumber(2), pr2),
+                (PrNumber(3), pr3),
+                (PrNumber(4), pr4),
+            ]);
+
+            let outcome = engine.create_step_outcome(&train, &prs);
+
+            // Should be FanOut with only the open descendants (#2 and #4)
+            match outcome {
+                CascadeStepOutcome::FanOut { descendants } => {
+                    assert_eq!(descendants.len(), 2, "Should have 2 open descendants");
+                    assert!(
+                        descendants.contains(&PrNumber(2)),
+                        "Should contain open PR #2"
+                    );
+                    assert!(
+                        !descendants.contains(&PrNumber(3)),
+                        "Should NOT contain closed PR #3"
+                    );
+                    assert!(
+                        descendants.contains(&PrNumber(4)),
+                        "Should contain open PR #4"
+                    );
+                }
+                other => panic!("Expected FanOut with 2 descendants, got {:?}", other),
+            }
+        }
+
+        /// create_step_outcome returns Complete when all remaining descendants are closed.
+        #[test]
+        fn create_step_outcome_complete_when_all_descendants_closed() {
+            let engine = CascadeEngine::new("main");
+
+            let mut train = TrainRecord::new(PrNumber(1));
+            train.cascade_phase = CascadePhase::Preparing {
+                progress: DescendantProgress::new(vec![PrNumber(2)]),
+            };
+
+            // Current PR is open, but the only descendant is closed
+            let pr1 = CachedPr {
+                number: PrNumber(1),
+                head_sha: make_sha(1),
+                head_ref: "branch-1".to_string(),
+                base_ref: "main".to_string(),
+                predecessor: None,
+                state: PrState::Open,
+                merge_state_status: MergeStateStatus::Clean,
+                is_draft: false,
+                closed_at: None,
+                predecessor_squash_reconciled: None,
+            };
+
+            let pr2 = CachedPr {
+                number: PrNumber(2),
+                head_sha: make_sha(2),
+                head_ref: "branch-2".to_string(),
+                base_ref: "branch-1".to_string(),
+                predecessor: Some(PrNumber(1)),
+                state: PrState::Closed,
+                merge_state_status: MergeStateStatus::Clean,
+                is_draft: false,
+                closed_at: None,
+                predecessor_squash_reconciled: None,
+            };
+
+            let prs = HashMap::from([(PrNumber(1), pr1), (PrNumber(2), pr2)]);
+
+            let outcome = engine.create_step_outcome(&train, &prs);
+
+            // All remaining descendants are closed, so outcome should be Complete
+            assert!(
+                matches!(outcome, CascadeStepOutcome::Complete),
+                "Expected Complete when all descendants are closed, got {:?}",
+                outcome
+            );
         }
     }
 }
