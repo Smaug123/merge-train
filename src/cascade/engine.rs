@@ -406,8 +406,21 @@ impl CascadeEngine {
                 // Pre-squash phases: external merge needs special handling.
                 // If we're in Preparing phase with unprepared descendants, this violates
                 // the "prepare before squash" invariant and we must abort.
+                //
+                // Filter to open PRs only: closed/missing descendants would be skipped
+                // anyway (per DESIGN.md "Descendant PR closed during cascade" -> skip).
+                // Without this filter, we'd incorrectly abort if a descendant closed
+                // between the freeze point and when we mark it skipped.
                 if let Some(progress) = train.cascade_phase.progress() {
-                    let unprepared: Vec<PrNumber> = progress.remaining().copied().collect();
+                    let unprepared: Vec<PrNumber> = progress
+                        .remaining()
+                        .filter(|pr_num| {
+                            prs.get(pr_num)
+                                .map(|pr| pr.state.is_open())
+                                .unwrap_or(false)
+                        })
+                        .copied()
+                        .collect();
                     if !unprepared.is_empty() {
                         return TrainAction::Abort {
                             reason: AbortReason::PreparationIncomplete {
@@ -2095,7 +2108,38 @@ mod tests {
                 predecessor_squash_reconciled: None,
             };
 
-            let prs = HashMap::from([(PrNumber(1), merged_pr)]);
+            // Descendants must be open PRs in the cache for the abort check to fire
+            let pr2 = CachedPr {
+                number: PrNumber(2),
+                head_sha: make_sha(2),
+                head_ref: "branch-2".to_string(),
+                base_ref: "branch-1".to_string(),
+                predecessor: Some(PrNumber(1)),
+                state: PrState::Open,
+                merge_state_status: MergeStateStatus::Clean,
+                is_draft: false,
+                closed_at: None,
+                predecessor_squash_reconciled: None,
+            };
+
+            let pr3 = CachedPr {
+                number: PrNumber(3),
+                head_sha: make_sha(3),
+                head_ref: "branch-3".to_string(),
+                base_ref: "branch-1".to_string(),
+                predecessor: Some(PrNumber(1)),
+                state: PrState::Open,
+                merge_state_status: MergeStateStatus::Clean,
+                is_draft: false,
+                closed_at: None,
+                predecessor_squash_reconciled: None,
+            };
+
+            let prs = HashMap::from([
+                (PrNumber(1), merged_pr),
+                (PrNumber(2), pr2),
+                (PrNumber(3), pr3),
+            ]);
 
             let action = engine.evaluate_train(&train, &prs);
 
@@ -2205,6 +2249,117 @@ mod tests {
                 "External merge during Idle should advance. Got: {:?}",
                 action
             );
+        }
+
+        /// External merge with unprepared descendants that are all closed should advance.
+        /// Closed descendants would be skipped anyway, so they shouldn't block progress.
+        #[test]
+        fn external_merge_with_only_closed_unprepared_descendants_advances() {
+            let engine = CascadeEngine::new("main");
+
+            // Create a train in Preparing phase with unprepared descendants
+            let mut train = TrainRecord::new(PrNumber(1));
+            train.cascade_phase = CascadePhase::Preparing {
+                progress: DescendantProgress::new(vec![PrNumber(2), PrNumber(3)]),
+            };
+
+            // The current PR was externally merged
+            let merged_pr = CachedPr {
+                number: PrNumber(1),
+                head_sha: make_sha(1),
+                head_ref: "branch-1".to_string(),
+                base_ref: "main".to_string(),
+                predecessor: None,
+                state: PrState::Merged {
+                    merge_commit_sha: make_sha(100),
+                },
+                merge_state_status: MergeStateStatus::Clean,
+                is_draft: false,
+                closed_at: None,
+                predecessor_squash_reconciled: None,
+            };
+
+            // Descendants #2 and #3 are closed (not in prs map or closed state)
+            // They would be skipped anyway, so external merge should advance
+            let prs = HashMap::from([(PrNumber(1), merged_pr)]);
+
+            let action = engine.evaluate_train(&train, &prs);
+
+            // Should advance because closed descendants would be skipped
+            assert!(
+                matches!(action, TrainAction::AdvanceAfterExternalMerge { .. }),
+                "External merge with only closed unprepared descendants should advance. \
+                 Got: {:?}",
+                action
+            );
+        }
+
+        /// External merge with mix of open and closed unprepared descendants should abort.
+        /// Only the open ones matter for the "preparation incomplete" check.
+        #[test]
+        fn external_merge_with_mixed_open_closed_unprepared_aborts() {
+            let engine = CascadeEngine::new("main");
+
+            // Create a train in Preparing phase with unprepared descendants
+            let mut train = TrainRecord::new(PrNumber(1));
+            train.cascade_phase = CascadePhase::Preparing {
+                progress: DescendantProgress::new(vec![PrNumber(2), PrNumber(3)]),
+            };
+
+            // The current PR was externally merged
+            let merged_pr = CachedPr {
+                number: PrNumber(1),
+                head_sha: make_sha(1),
+                head_ref: "branch-1".to_string(),
+                base_ref: "main".to_string(),
+                predecessor: None,
+                state: PrState::Merged {
+                    merge_commit_sha: make_sha(100),
+                },
+                merge_state_status: MergeStateStatus::Clean,
+                is_draft: false,
+                closed_at: None,
+                predecessor_squash_reconciled: None,
+            };
+
+            // #2 is open (unprepared), #3 is closed
+            let open_pr = CachedPr {
+                number: PrNumber(2),
+                head_sha: make_sha(2),
+                head_ref: "branch-2".to_string(),
+                base_ref: "branch-1".to_string(),
+                predecessor: Some(PrNumber(1)),
+                state: PrState::Open,
+                merge_state_status: MergeStateStatus::Clean,
+                is_draft: false,
+                closed_at: None,
+                predecessor_squash_reconciled: None,
+            };
+
+            let prs = HashMap::from([(PrNumber(1), merged_pr), (PrNumber(2), open_pr)]);
+            // #3 is not in prs (closed/missing)
+
+            let action = engine.evaluate_train(&train, &prs);
+
+            // Should abort because #2 is open and unprepared
+            match action {
+                TrainAction::Abort {
+                    reason:
+                        AbortReason::PreparationIncomplete {
+                            unprepared_descendants,
+                        },
+                } => {
+                    assert_eq!(
+                        unprepared_descendants,
+                        vec![PrNumber(2)],
+                        "Only open unprepared descendants should be listed"
+                    );
+                }
+                other => panic!(
+                    "Expected Abort with PreparationIncomplete, got: {:?}",
+                    other
+                ),
+            }
         }
 
         /// Regression test: create_step_outcome must filter out closed descendants.
