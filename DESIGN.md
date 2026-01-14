@@ -1607,7 +1607,7 @@ Let's assume a stack of this shape: main ← #123 ← #124 ← #125
 **REQUIRED TESTS**: The correctness of this operation sequence is verified by Properties 1-3 in the "Property-based testing with real git" section:
 - Property 1 (`descendant_content_preserved_after_cascade`): Verifies all content from predecessor, descendant, and intervening main commits is preserved
 - Property 2 (`intervening_main_commits_preserved`): Verifies commits pushed to main during the cascade (that don't conflict) survive the train
-- Property 3 (`squash_parent_ordering_prevents_lost_commits`): Verifies the $SQUASH_SHA^ ordering is essential and that the naive (wrong) approach loses commits
+- Property 3 (`squash_has_single_parent`, `squash_parent_ordering_incorporates_late_commits`): Verifies the $SQUASH_SHA^ ordering is essential and that the naive (wrong) approach loses commits
 
 The cascade proceeds by repeating the following for each PR, starting from the root:
 
@@ -1842,9 +1842,9 @@ The validation uses a two-pronged approach:
 2. **Parent validation** (required, not optional): We verify that `merge_commit_sha` has exactly one parent AND that parent is the prior default branch HEAD. This catches: (a) repository settings changed after preflight, (b) force-pushed commits, (c) multi-commit rebase or fast-forward merges. Without this check, reconciliation would use `$SHA^` incorrectly and could lose commits.
 
 **REQUIRED TESTS**: The property-based testing section verifies merge method handling:
-- Property 4 (`squash_merge_detection_accepts_squash`): Validates that legitimate squash merges (single parent, parent is prior main HEAD) pass validation
-- Property 5 (`squash_merge_detection_rejects_merge_commit`): Validates that true merge commits (two parents) are rejected
-- Property 6 (`squash_merge_detection_rejects_wrong_parent`): Validates that commits whose parent is NOT the prior main HEAD are rejected (catches multi-commit rebase/fast-forward)
+- Property 4 (`valid_squash_has_matching_parent`): Validates that legitimate squash merges (single parent, parent is prior main HEAD) pass validation
+- Property 5 (`merge_commit_has_two_parents`): Validates that true merge commits (two parents) are rejected
+- Property 6 (`squash_fails_on_wrong_parent`): Validates that commits whose parent is NOT the prior main HEAD are rejected (catches multi-commit rebase/fast-forward)
 - Preflight test (`squash_only_preflight_check`): Validates that the bot refuses to start when `allow_merge_commit` or `allow_rebase_merge` is true (see "Merge method preflight check" section)
 
 **Polling fallback**: During `PollActiveTrains`, also scan for "orphaned" PRs:
@@ -2556,16 +2556,16 @@ For end-to-end testing against real GitHub (or a GitHub Enterprise test instance
 
 ### Property-based testing with real git
 
-The cascade correctness properties are verified against real git using property-based tests. See implementations at commit `a75fbcb`:
+The cascade correctness properties are verified against real git using property-based tests. See implementations at commit `339a5ef50bb4243eb`:
 
 | Property | Test | Location |
 |----------|------|----------|
 | 1. Descendant content preserved | `descendant_content_preserved_after_cascade` | `src/git/property_tests.rs:231` |
 | 2. Intervening main commits preserved | `intervening_main_commits_preserved` | `src/git/property_tests.rs:275` |
 | 3. $SQUASH_SHA^ ordering | `squash_has_single_parent`, `squash_parent_ordering_incorporates_late_commits` | `src/git/property_tests.rs:463`, `:590` |
-| 4. Squash accepts valid | proptest `valid_squash_commit_accepted` | `src/state/validation.rs:837` |
+| 4. Squash accepts valid | proptest `valid_squash_has_matching_parent` | `src/state/validation.rs:833` |
 | 5. Squash rejects merge commits | `merge_commit_has_two_parents` | `src/state/validation.rs:757` |
-| 6. Squash rejects wrong parent | proptest `wrong_parent_rejected` | `src/state/validation.rs:850` |
+| 6. Squash rejects wrong parent | proptest `squash_fails_on_wrong_parent` | `src/state/validation.rs:843` |
 | 7. Preflight rejects non-squash-only | `preflight_rejects_non_squash_only` | `src/preflight/merge_method.rs:313` |
 | 8. Fan-out worktree lifecycle | `fanout_worktree_ordering` | `src/git/property_tests.rs:923` |
 | 9. Recovery uses frozen descendants | `recovery_uses_frozen_descendants` | `src/git/property_tests.rs:781` |
