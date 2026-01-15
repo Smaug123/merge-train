@@ -370,7 +370,7 @@ impl EventLog {
 mod tests {
     use super::*;
     use crate::test_utils::arb_state_event_payload;
-    use crate::types::{CascadePhase, DescendantProgress, PrNumber, Sha};
+    use crate::types::{CascadePhase, CommentId, DescendantProgress, PrNumber, Sha};
     use proptest::prelude::*;
     use std::io::Write;
     use tempfile::tempdir;
@@ -652,6 +652,7 @@ mod tests {
             log.append(StateEventPayload::PredecessorDeclared {
                 pr: PrNumber(i),
                 predecessor: PrNumber(i + 1),
+                comment_id: CommentId(1000 + i),
             })
             .unwrap();
         }

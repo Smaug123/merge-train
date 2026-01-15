@@ -32,6 +32,7 @@
 //! ```
 
 pub mod events;
+pub mod handlers;
 pub mod parser;
 pub mod priority;
 pub mod signature;
@@ -40,6 +41,10 @@ pub mod signature;
 pub use events::{
     CheckSuiteAction, CheckSuiteEvent, CommentAction, GitHubEvent, IssueCommentEvent, PrAction,
     PullRequestEvent, PullRequestReviewEvent, ReviewAction, ReviewState, StatusEvent, StatusState,
+};
+pub use handlers::{
+    HandlerError, HandlerResult, handle_check_suite, handle_event, handle_issue_comment,
+    handle_pull_request, handle_review, handle_status,
 };
 pub use parser::{ParseError, parse_webhook};
 pub use priority::{EventPriority, classify_priority, classify_priority_with_bot_name};

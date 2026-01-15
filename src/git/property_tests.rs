@@ -807,6 +807,7 @@ fn recovery_uses_frozen_descendants() {
             CachedPr {
                 number: PrNumber(pr),
                 predecessor: Some(PrNumber(100)), // All are descendants of pr-100
+                predecessor_comment_id: None,
                 head_sha: Sha::parse("a".repeat(40)).unwrap(),
                 head_ref: format!("pr-{}", pr),
                 base_ref: "pr-100".to_string(),

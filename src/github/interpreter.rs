@@ -126,6 +126,7 @@ async fn execute_effect(
             list_recently_merged_prs(client, since_days).await
         }
         GitHubEffect::GetMergeState { pr } => get_merge_state(client, pr).await,
+        GitHubEffect::RefetchPr { pr } => refetch_pr(client, pr).await,
         GitHubEffect::SquashMerge { pr, expected_sha } => {
             squash_merge(client, pr, expected_sha).await
         }
@@ -450,6 +451,45 @@ async fn get_merge_state(
         }
         Err(e) => Err(GitHubApiError::from_octocrab(e)),
     }
+}
+
+/// Refetches a PR's full data and merge state.
+///
+/// This is a combined operation that first fetches the PR data via REST API,
+/// then fetches the merge state via GraphQL. The combination is returned as
+/// a single `PrRefetched` response.
+async fn refetch_pr(
+    client: &OctocrabClient,
+    pr: PrNumber,
+) -> Result<GitHubResponse, GitHubApiError> {
+    // First, get the PR data
+    let pr_response = get_pr(client, pr).await?;
+    let pr_data = match pr_response {
+        GitHubResponse::Pr(data) => data,
+        _ => {
+            return Err(GitHubApiError::permanent_without_source(format!(
+                "Unexpected response type from get_pr for PR {}",
+                pr
+            )));
+        }
+    };
+
+    // Then, get the merge state
+    let merge_state_response = get_merge_state(client, pr).await?;
+    let merge_state = match merge_state_response {
+        GitHubResponse::MergeState(status) => status,
+        _ => {
+            return Err(GitHubApiError::permanent_without_source(format!(
+                "Unexpected response type from get_merge_state for PR {}",
+                pr
+            )));
+        }
+    };
+
+    Ok(GitHubResponse::PrRefetched {
+        pr: pr_data,
+        merge_state,
+    })
 }
 
 /// Parses the mergeStateStatus string from GraphQL into our enum.
