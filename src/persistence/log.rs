@@ -652,7 +652,7 @@ mod tests {
             log.append(StateEventPayload::PredecessorDeclared {
                 pr: PrNumber(i),
                 predecessor: PrNumber(i + 1),
-                comment_id: Some(CommentId(1000 + i)),
+                comment_id: CommentId(1000 + i),
             })
             .unwrap();
         }

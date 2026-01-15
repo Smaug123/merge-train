@@ -174,7 +174,7 @@ pub fn arb_state_event_payload() -> impl Strategy<Value = StateEventPayload> {
             StateEventPayload::PredecessorDeclared {
                 pr,
                 predecessor: pred,
-                comment_id: Some(cid),
+                comment_id: cid,
             }
         }),
         (arb_pr_number(), arb_comment_id()).prop_map(|(pr, cid)| {

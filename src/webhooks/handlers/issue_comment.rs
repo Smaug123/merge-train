@@ -250,24 +250,38 @@ fn handle_authoritative_predecessor_edit(
 
     // Check if a train is running that involves this PR
     let train_involved = find_train_for_pr(pr_number, state);
-    if train_involved.is_some() {
+    if let Some(train_root) = train_involved {
         // Per DESIGN.md: "If a train is already started and the predecessor is changed
         // or removed, the bot aborts with an error"
-        return Ok(HandlerResult::with_effects(vec![Effect::GitHub(
-            GitHubEffect::PostComment {
-                pr: pr_number,
-                body: format!(
-                    "Error: Cannot change predecessor from #{} to #{} while a train is running. \
-                     Stop the train first with `@merge-train stop`.",
-                    state
-                        .prs
-                        .get(&pr_number)
-                        .and_then(|pr| pr.predecessor)
-                        .map_or("?".to_string(), |p| p.0.to_string()),
-                    new_predecessor
-                ),
+        let old_predecessor = state
+            .prs
+            .get(&pr_number)
+            .and_then(|pr| pr.predecessor)
+            .map_or("?".to_string(), |p| p.0.to_string());
+        let error_message = format!(
+            "Predecessor was changed from #{} to #{} while a train is running",
+            old_predecessor, new_predecessor
+        );
+        let state_events = vec![
+            StateEventPayload::TrainAborted {
+                root_pr: train_root,
+                error: TrainError::new("predecessor_changed", &error_message),
             },
-        )]));
+            StateEventPayload::PredecessorDeclared {
+                pr: pr_number,
+                predecessor: new_predecessor,
+                comment_id: event.comment_id,
+            },
+        ];
+        let effects = vec![Effect::GitHub(GitHubEffect::PostComment {
+            pr: pr_number,
+            body: format!(
+                "Error: {}. The train has been aborted. \
+                 Please restart the train after verifying the predecessor relationship.",
+                error_message
+            ),
+        })];
+        return Ok(HandlerResult::new(state_events, effects));
     }
 
     // Validate the new predecessor exists in cache
@@ -325,7 +339,7 @@ fn handle_authoritative_predecessor_edit(
     let state_events = vec![StateEventPayload::PredecessorDeclared {
         pr: pr_number,
         predecessor: new_predecessor,
-        comment_id: Some(event.comment_id),
+        comment_id: event.comment_id,
     }];
 
     let effects = vec![Effect::GitHub(GitHubEffect::AddReaction {
@@ -437,7 +451,7 @@ fn handle_predecessor_command(
     let state_events = vec![StateEventPayload::PredecessorDeclared {
         pr: pr_number,
         predecessor,
-        comment_id: Some(event.comment_id),
+        comment_id: event.comment_id,
     }];
 
     // Acknowledge with thumbs up reaction
@@ -682,7 +696,7 @@ mod tests {
         assert!(matches!(
             &result.state_events[0],
             StateEventPayload::PredecessorDeclared { pr, predecessor, comment_id }
-            if *pr == PrNumber(2) && *predecessor == PrNumber(1) && *comment_id == Some(CommentId(12345))
+            if *pr == PrNumber(2) && *predecessor == PrNumber(1) && *comment_id == CommentId(12345)
         ));
 
         // Should have a thumbs up reaction
@@ -965,7 +979,7 @@ mod tests {
         assert!(matches!(
             &result.state_events[0],
             StateEventPayload::PredecessorDeclared { pr, predecessor, comment_id }
-            if *pr == PrNumber(2) && *predecessor == PrNumber(1) && *comment_id == Some(CommentId(12345))
+            if *pr == PrNumber(2) && *predecessor == PrNumber(1) && *comment_id == CommentId(12345)
         ));
     }
 
@@ -1119,7 +1133,7 @@ mod tests {
         assert!(matches!(
             &result.state_events[0],
             StateEventPayload::PredecessorDeclared { pr, predecessor, comment_id }
-            if *pr == PrNumber(2) && *predecessor == PrNumber(3) && *comment_id == Some(CommentId(12345))
+            if *pr == PrNumber(2) && *predecessor == PrNumber(3) && *comment_id == CommentId(12345)
         ));
     }
 
