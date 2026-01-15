@@ -347,9 +347,7 @@ When the bot takes ownership of a stack (via `@merge-train start`), it persists 
 Phases with multiple descendants (`Preparing`, `Reconciling`, `CatchingUp`, `Retargeting`) include:
 - `completed`: Which descendants have finished this phase
 - `skipped`: Descendants that failed during processing (PR closed, branch deleted, etc.) — not retried
-- `frozen_descendants`: The descendant set captured when entering `Preparing`; carried through ALL subsequent phases
-
-**CRITICAL**: Recovery MUST use `frozen_descendants` from the persisted state, NOT re-query `repo_state.descendants`. Between crash and recovery, new descendants may have been added via `predecessor_declared` events during spool replay. These new descendants were never prepared and must not be reconciled in the current cascade step — they'll be handled when the next PR becomes the root.
+- `frozen_descendants`: The descendant set captured when entering `Preparing`; carried through ALL subsequent phases (see "Descendant set freezing")
 
 **Recovery semantics:**
 
@@ -492,7 +490,7 @@ Train running — reconciling PR #124 after squash (1/2 descendants complete)
 
 **JSON fields:** Same as the `TrainRecord` fields documented in "Local train state" above, **except** `status_comment_id` (which is only known locally after the comment is created): `version`, `recovery_seq`, `state`, `original_root_pr`, `current_pr`, `cascade_phase` (as full `CascadePhase` object), `predecessor_pr`, `predecessor_head_sha`, `last_squash_sha`, `started_at`, `stopped_at`, `error`. The `recovery_seq` is a monotonic counter incremented on each state change, used to determine which record is "ahead" during recovery. Deserialization must tolerate a missing `status_comment_id` field.
 
-**Critical for recovery:** The `cascade_phase` MUST include the full object with `completed`, `skipped`, AND `frozen_descendants`. Without `frozen_descendants`, GitHub-based recovery cannot correctly identify which descendants were promised preparation — it might include new descendants added after the freeze point, leading to unprepared PRs being reconciled (data loss). Without `skipped`, recovery would endlessly retry failed descendants.
+**Critical for recovery:** The `cascade_phase` MUST include `completed`, `skipped`, AND `frozen_descendants`. See "Descendant set freezing" for why this is essential.
 
 **Comment size limits and train size validation:** GitHub comments have a 65536-character limit. Since the status comment contains the full `TrainRecord` JSON (including `frozen_descendants` and `completed` lists), excessively large trains would exceed this limit.
 
@@ -529,7 +527,7 @@ Rather than attempting truncated recovery (which is fragile and can violate free
 
 **Why not degrade gracefully?** Posting a status comment without the embedded JSON would allow the cascade to continue, but if the bot crashes, GitHub-based recovery cannot determine which descendants were frozen, which were skipped, or what phase was interrupted. The train would transition to `needs_manual_review` on restart, forcing manual intervention anyway — but with the added risk that the cascade made progress that can't be safely resumed. It's better to fail fast when we detect the size limit is exceeded.
 
-This approach is simpler and safer than truncation-based recovery, which would require reconstructing `frozen_descendants` from current declarations — a process that violates the freeze invariant by potentially including PRs added after preparation began or missing PRs that were removed via comment edits.
+This approach is simpler and safer than truncation-based recovery, which would violate the freeze invariant (see "Descendant set freezing").
 
 **Primary vs recovery sources:** During normal operation, the local event log is the primary target for state changes. Status comments mirror this state for disaster recovery. On restart, "Recovery precedence" (above) determines which source to use when they disagree. Status comments serve as:
 - User-facing observability (what is the bot doing?)
@@ -743,44 +741,20 @@ This ensures that at any crash point, either the old or new generation is comple
 
 ### Design decision: local file state persistence
 
-The bot persists per-repo state using an append-only event log with periodic snapshots (see "Local state storage" in Data Model). This enables fast bootstrap, robust restart recovery, and GitHub-based disaster recovery.
+The bot persists per-repo state using an append-only event log with periodic snapshots. See "Local state storage" in Data Model for file formats, generation-based compaction, and crash-safety guarantees.
 
 **Why local files instead of GitHub storage or a database:**
 
 - **Restart safety**: State and in-progress cascades survive process restarts.
 - **Append-only durability**: Event log can survive partial writes; snapshots use atomic rename.
 - **Debuggable**: Can inspect event history to understand state transitions.
-- **No GitHub state coupling for normal operation**: No reliance on special refs or Contents/Git Data APIs.
 - **GitHub recovery fallback**: Status comments on PRs enable full recovery if local state is lost.
-- **Easy ops**: Files are easy to back up, inspect, and rotate.
 
-**Event log append strategy**:
+**Recovery-critical events** (require fsync before continuing): `train_started`, `train_stopped`, `train_completed`, `train_aborted`, `phase_transition`, `squash_committed`. Non-critical events (`pr_merged`, `pr_state_changed`, `predecessor_declared`) are batched for performance.
 
-- Append JSON line to `events.log`
-- `fsync` on **recovery-critical events** (see below) to ensure durability before proceeding
-- Partial writes leave valid JSON Lines prefix (crash-safe)
+**Relationship to operation commit points**: Recovery-critical events are **phase-level** markers. Irreversible operations (git push, squash-merge, retarget) use a separate **intent/done commit-point pattern** (see "Durability and commit points").
 
-**Recovery-critical events** (require fsync before continuing):
-- `train_started`, `train_stopped`, `train_completed`, `train_aborted`
-- `phase_transition` (any phase change: `Preparing`, `SquashPending`, `Reconciling`, `Idle`)
-- `squash_committed` (records the squash SHA needed for reconciliation recovery)
-
-**Relationship to operation commit points**: These recovery-critical events are **phase-level** markers — they record state machine transitions, not individual operations. Irreversible operations (git push, squash-merge, retarget) use a separate **intent/done commit-point pattern** described in "Durability and commit points" below. The distinction:
-- Phase-level events (above): Recorded once per phase transition, enable recovery to the correct phase
-- Operation-level commit points: Bracket each irreversible operation with intent→operation→done, enabling idempotent retry
-
-Note that `squash_committed` serves a dual role: it's both the completion event for the squash-merge operation (part of the intent/done pattern) AND a recovery-critical event requiring immediate fsync.
-
-Non-critical events (fsync batched for performance):
-- `pr_merged`, `pr_state_changed`, `predecessor_declared`
-
-**Snapshot update strategy**:
-
-Use the **generation-based compaction** approach (see "Compaction" in the Data Model section and "Snapshot update" in State Persistence). The naive "rename snapshot then truncate log" approach is **not crash-atomic** — a crash between these operations would either replay duplicates or lose events. Generation-based compaction provides correct crash recovery by maintaining complete generations that can be switched atomically.
-
-**Critical**: All directory fsyncs (for both spool and snapshot directories) are **mandatory**, not best-effort. Without directory fsync, a power loss can drop files even after the file contents were fsynced, because the directory entry wasn't persisted.
-
-**Concurrency**: This design assumes a single active bot process per `state_dir`. Multi-instance deployment is a non-goal.
+**Concurrency**: Single active bot process per `state_dir`. Multi-instance deployment is a non-goal.
 
 **Startup lock**: To prevent accidental multi-instance split-brain (which could cause double-merges), the bot acquires an exclusive `flock` on `<state_dir>/lock` at startup:
 
@@ -972,53 +946,11 @@ Periodic re-sync is implemented by injecting a `PeriodicSync` event into the sam
 
 ### State persistence
 
-The bot persists state via an append-only event log with periodic snapshots (see "Local state storage" above).
+See "Local state storage" in Data Model for file formats, event log structure, and generation-based compaction. See `src/persistence/` for implementation.
 
-**Event log appends:**
+**Snapshot triggers:** Periodic timer (if log size > threshold), after full bootstrap, after train completion.
 
-| Trigger | Action | fsync? |
-|---------|--------|--------|
-| Phase transition | Append event to `events.log` | Yes (critical) |
-| Train start | Append event to `events.log` | Yes (critical) |
-| Train stop/abort | Append event to `events.log` | Yes (critical) |
-| Train completion | Append event to `events.log` | Yes (critical) |
-| Squash committed | Append event to `events.log` | Yes (critical) |
-| PR merged | Append event to `events.log` | No (batched) |
-| PR state change | Append event to `events.log` | No (batched) |
-
-**Append strategy:**
-
-```rust
-fn append_event(log: &mut File, event: &Event) -> io::Result<()> {
-    writeln!(log, "{}", serde_json::to_string(event)?)?;
-    if event.is_critical() {
-        log.sync_all()?; // fsync on phase transitions, train lifecycle, squash commits
-    }
-    Ok(())
-}
-```
-
-**Snapshot triggers:**
-
-| Trigger | Action | Rationale |
-|---------|--------|-----------|
-| Periodic timer | Compact if log size > threshold | Bound log growth |
-| Full bootstrap completion | Write snapshot | Fresh state worth preserving |
-| Train completion | OK to compact (train events no longer needed) | Remove stale entries |
-
-**Snapshot update (generation-based):**
-
-See "Compaction" in the Data Model section for the full algorithm. In brief:
-
-- Write new snapshot to `snapshot.<N+1>.json` with `log_generation = N+1`, `log_position = 0`
-- fsync the file, then fsync the directory
-- Start new log file `events.<N+1>.log`
-- Update `generation` file to `N+1`, fsync, fsync directory
-- Delete old `snapshot.<N>.json` and `events.<N>.log` only after new generation is durable
-
-This avoids the crash-atomicity problem of "rename snapshot, then truncate log" — at any crash point, at least one complete generation exists.
-
-**Failure handling**: If state persistence fails (disk full, permissions, I/O errors), the bot treats this as fatal for that repo: it logs loudly, stops advancing trains, and returns an error for new webhook deliveries for that repo until persistence is restored. This avoids silently running with state that cannot survive a restart.
+**Failure handling**: If state persistence fails (disk full, I/O errors), the bot treats this as fatal for that repo and stops advancing trains until persistence is restored.
 
 ### State pruning
 
@@ -1039,99 +971,14 @@ The state file is the authoritative local cache. Pruning doesn't need to be perf
 
 **Size limit fallback**: If the `prs` map exceeds `max_prs_in_snapshot` (default: 1000), aggressively prune the oldest unreferenced merged/closed PRs (by PR number, lower = older) until under limit. This prevents unbounded growth even in pathological cases.
 
-**Pruning algorithm** (runs before each state save):
+**Pruning algorithm**: Runs before each state save. See `src/persistence/pruning.rs` for implementation. Key rules:
+1. Keep all open PRs
+2. Keep all PRs in active trains
+3. Transitive closure: keep predecessors of kept PRs
+4. Prune unreferenced merged/closed PRs older than retention period
+5. Size limit fallback if snapshot exceeds `max_prs_in_snapshot`
 
-```rust
-fn prune_snapshot(snapshot: &mut PersistedRepoSnapshot, config: &Config) {
-    let now = Utc::now();
-    let retention = Duration::days(config.pr_retention_days as i64);
-
-    // Collect PRs to keep
-    let mut keep: HashSet<u64> = HashSet::new();
-
-    // 1. Keep all open PRs
-    for (pr_num, pr) in &snapshot.prs {
-        if pr.state == "open" {
-            keep.insert(pr_num.parse().unwrap());
-        }
-    }
-
-    // 2. Keep all PRs in active trains
-    for train in snapshot.active_trains.values() {
-        keep.insert(train.current_pr.0);
-    }
-
-    // 3. Transitive closure: keep predecessors of kept PRs
-    loop {
-        let mut added = false;
-        for (pr_num, pr) in &snapshot.prs {
-            let num: u64 = pr_num.parse().unwrap();
-            if keep.contains(&num) {
-                if let Some(pred) = pr.predecessor {
-                    if keep.insert(pred) {
-                        added = true;
-                    }
-                }
-            }
-        }
-        if !added { break; }
-    }
-
-    // 4. Prune unreferenced merged/closed PRs older than retention period
-    snapshot.prs.retain(|pr_num, pr| {
-        let num: u64 = pr_num.parse().unwrap();
-        if keep.contains(&num) {
-            return true;
-        }
-        // Check closed_at if available
-        if let Some(closed_at) = &pr.closed_at {
-            if let Ok(dt) = DateTime::parse_from_rfc3339(closed_at) {
-                return now - dt.with_timezone(&Utc) < retention;
-            }
-        }
-        // No closed_at timestamp - keep for now (legacy entries)
-        true
-    });
-
-    // 5. Size limit fallback
-    if snapshot.prs.len() > config.max_prs_in_snapshot {
-        // Sort merged/closed PRs by PR number (ascending = oldest first)
-        let mut prunable: Vec<u64> = snapshot.prs.iter()
-            .filter(|(pr_num, pr)| {
-                let num: u64 = pr_num.parse().unwrap();
-                !keep.contains(&num) && pr.state != "open"
-            })
-            .map(|(pr_num, _)| pr_num.parse().unwrap())
-            .collect();
-        prunable.sort();
-
-        // Remove oldest until under limit
-        let to_remove = snapshot.prs.len() - config.max_prs_in_snapshot;
-        for pr_num in prunable.into_iter().take(to_remove) {
-            snapshot.prs.remove(&pr_num.to_string());
-        }
-    }
-}
-```
-
-**Schema addition**: Add `closed_at` timestamp to `PersistedPr`:
-
-```rust
-#[derive(Serialize, Deserialize)]
-struct PersistedPr {
-    head_sha: String,
-    base_ref: String,
-    predecessor: Option<u64>,
-    state: String,
-    /// When the PR was merged or closed (ISO 8601). Null for open PRs.
-    /// Used for retention-based pruning.
-    closed_at: Option<String>,
-    /// SHA of the predecessor's squash commit that this PR was reconciled against.
-    /// Set after normal cascade or late-addition reconciliation completes.
-    /// Required for is_root() to return true when predecessor is merged.
-    predecessor_squash_reconciled: Option<String>,
-}
-```
+**PR schema**: See `CachedPr` in `src/types/pr.rs`. Includes `closed_at` for retention-based pruning and `predecessor_squash_reconciled` for late-addition reconciliation tracking.
 
 The `closed_at` field is set when processing `pull_request.closed` events. Existing entries without this field are treated as "keep until size limit forces pruning."
 
@@ -1307,26 +1154,7 @@ Each per-repo worker loop:
 10. On cascade phase transitions or irreversible operations, flush pending batch first
 11. Loops (or shuts down after idle timeout)
 
-**Marker file atomicity:**
-```rust
-// Creating a marker file atomically
-fn create_marker(path: &Path) -> io::Result<()> {
-    // Create marker with a unique temp name first.
-    // IMPORTANT: Append ".tmp" rather than replacing the extension, so that
-    // <id>.json.proc and <id>.json.done get distinct temp files:
-    //   <id>.json.proc -> <id>.json.proc.tmp
-    //   <id>.json.done -> <id>.json.done.tmp
-    let mut temp_name = path.as_os_str().to_owned();
-    temp_name.push(".tmp");
-    let temp = PathBuf::from(temp_name);
-
-    let file = File::create(&temp)?;
-    file.sync_all()?;  // fsync the (empty) file
-    std::fs::rename(&temp, path)?;  // atomic rename
-    // Directory fsync happens separately after all markers in batch
-    Ok(())
-}
-```
+**Marker file atomicity:** Markers are created atomically using temp-file + fsync + rename. See `create_marker_file` in `src/spool/delivery.rs`.
 
 **Critical invariant:** A delivery's `.done` marker is only created after all state effects from that delivery are durably persisted (fsynced). This ensures that on restart, unprocessed deliveries are replayed correctly. For batched events, `.done` is deferred until the batch fsync completes.
 
@@ -1459,41 +1287,7 @@ On restart, the bot:
 
 If the process dies mid-git operation, worktrees may be left in a dirty state (in-progress merge, uncommitted changes). Since worktrees use **detached HEAD mode** (not checked-out branches), and branches may be deleted after PR merge, the cleanup approach must not rely on `origin/<branch>` being available.
 
-**Cleanup strategy:**
-
-```rust
-async fn cleanup_worktree_on_restart(
-    worktree_path: &Path,
-    train_state: &TrainRecord,
-    ctx: &AppContext,
-) -> Result<()> {
-    // First, try to abort any in-progress merge
-    run_git_in_worktree(worktree_path, &["merge", "--abort"]).await.ok();
-
-    // Try to clean up uncommitted changes
-    let cleanup_result = run_git_in_worktree(worktree_path, &["reset", "--hard"]).await
-        .and_then(|_| run_git_in_worktree(worktree_path, &["clean", "-fd"]).await);
-
-    match cleanup_result {
-        Ok(_) => {
-            // Worktree is clean, but we're in detached HEAD at an unknown commit.
-            // The recovery logic will fetch and checkout the appropriate ref.
-            Ok(())
-        }
-        Err(_) => {
-            // Worktree is too corrupted — delete and recreate
-            tracing::warn!(
-                ?worktree_path,
-                train_root = train_state.original_root_pr.0,
-                "worktree corrupted, deleting and recreating"
-            );
-            delete_worktree(worktree_path).await?;
-            // Worktree will be recreated on first cascade operation
-            Ok(())
-        }
-    }
-}
-```
+**Cleanup strategy:** See `cleanup_worktree_on_restart` in `src/git/recovery.rs`. Steps: abort any in-progress merge, hard reset, clean untracked files. On corruption, delete and recreate.
 
 **Why not `git reset --hard origin/<branch>`:**
 1. **Detached HEAD**: Worktrees use detached HEAD mode to avoid branch locking issues across multiple worktrees.
@@ -1902,14 +1696,7 @@ for pr in repo_state.prs.values() {
 
 This scan prevents manually-retargeted PRs from being discovered as roots (via `is_root()`) until proper reconciliation completes. The warning comment alerts the PR author to the unusual state.
 
-**Event log format for frozen descendants**:
-```json
-{"seq":5,"ts":"...","type":"phase_transition","train_root":123,"current_pr":123,
- "predecessor_pr":null,"last_squash_sha":null,
- "phase":{"Preparing":{"completed":[],"skipped":[],"frozen_descendants":[124,125]}}}
-```
-
-The `frozen_descendants` field captures the exact set that will be processed. Recovery uses this list to avoid re-querying descendants (which might have changed).
+**Event log format for frozen descendants**: Phase transition events include `frozen_descendants` in the phase object (see "Descendant set freezing" for invariants).
 
 ### Durability and commit points
 
@@ -1977,11 +1764,9 @@ Each phase that performs irreversible operations uses intent/done pairs:
 | CatchingUp | `intent_push_catchup` | `done_push_catchup` | Yes |
 | Retargeting | `intent_retarget` | `done_retarget` | Yes |
 
-Each descendant in the `frozen_descendants` set requires its own intent/done cycle. The `completed` vector in each phase tracks which descendants have finished, enabling crash recovery to skip already-completed work.
+Each descendant in the `frozen_descendants` set requires its own intent/done cycle (see "Descendant set freezing" for the freeze invariant). The `completed` vector tracks finished descendants for crash recovery.
 
 **Critical invariant:** The `squash_committed` event with the squash SHA must be durably recorded before any reconciliation pushes occur. If the bot crashes after squash but before recording the SHA, it must re-fetch the SHA from GitHub (PR's `merge_commit_sha` field).
-
-**Critical invariant:** The `frozen_descendants` set must be carried through all phases (SquashPending, Reconciling, CatchingUp, Retargeting). Recovery must use this set, not re-query `repo_state.descendants`, which may have changed during spool replay.
 
 ### Expected state tracking
 
@@ -2147,22 +1932,7 @@ On abort, the bot:
 4. Posts a comment on downstream PRs that the train is halted
 5. Takes no further action until human intervenes or condition resolves
 
-**Worktree cleanup on abort**: When an abort occurs (especially due to merge conflicts), the worktree may be left in an unmerged state with conflict markers in the index. This would cause subsequent `git checkout --detach` calls to fail, wedging the train. The bot MUST clean up the worktree before transitioning to aborted state:
-
-```rust
-async fn cleanup_worktree_on_abort(worktree_path: &Path) -> Result<()> {
-    // 1. Abort any in-progress merge (clears MERGE_HEAD and unmerged index entries)
-    run_git_in_worktree(worktree_path, &["merge", "--abort"]).await.ok();
-
-    // 2. Reset index to HEAD (clears any staged changes)
-    run_git_in_worktree(worktree_path, &["reset", "--hard", "HEAD"]).await?;
-
-    // 3. Clean untracked files (conflict artifacts, temp files)
-    run_git_in_worktree(worktree_path, &["clean", "-fd"]).await?;
-
-    Ok(())
-}
-```
+**Worktree cleanup on abort**: When an abort occurs (especially due to merge conflicts), the worktree may be left in an unmerged state. The bot MUST clean up the worktree before transitioning to aborted state. See `cleanup_worktree_on_abort` in `src/git/recovery.rs`.
 
 **Why this is critical**: Git refuses to checkout a different ref when the index contains unmerged entries. Without this cleanup:
 - The next cascade operation (after user fixes the issue) would call `git checkout --detach origin/<branch>`
@@ -2229,38 +1999,7 @@ The `sha` parameter is a **race condition guard**. GitHub will reject the merge 
 
 2. **TOCTOU bugs**: Between "check if ready" and "merge", the PR state can change. The SHA guard makes the operation atomic.
 
-```rust
-async fn squash_merge(
-    &self,
-    pr_number: PrNumber,
-    expected_head_sha: &str,
-) -> Result<String> {
-    let response = self.client
-        .put(format!("/repos/{}/{}/pulls/{}/merge", owner, repo, pr_number.0))
-        .json(&json!({
-            "merge_method": "squash",
-            "sha": expected_head_sha,  // CRITICAL: prevents merging unreviewed commits
-        }))
-        .send()
-        .await?;
-
-    match response.status() {
-        StatusCode::OK => {
-            let body: MergeResponse = response.json().await?;
-            Ok(body.sha)  // This is the squash commit SHA
-        }
-        StatusCode::CONFLICT => {
-            // PR head changed since we checked — abort and re-evaluate
-            Err(Error::HeadShaChanged)
-        }
-        StatusCode::METHOD_NOT_ALLOWED => {
-            // PR is not mergeable (conflicts, branch protection, etc.)
-            Err(Error::NotMergeable)
-        }
-        _ => Err(Error::ApiError(response.status())),
-    }
-}
-```
+See `squash_merge` in `src/github/interpreter.rs` for implementation.
 
 **Handling 409 Conflict**: If the merge returns 409, the bot should:
 1. Log the SHA mismatch
@@ -2269,18 +2008,7 @@ async fn squash_merge(
 4. If still ready with the new head SHA, retry (the new commits may have been benign)
 5. If no longer ready (CI failing, reviews dismissed), wait for the appropriate webhook
 
-**GraphQL for merge state**: The bot uses GitHub's GraphQL API to query `mergeStateStatus`, which encapsulates all branch protection checks (required status checks, required reviewers, etc.) into a single authoritative value:
-
-```graphql
-query($owner: String!, $repo: String!, $number: Int!) {
-  repository(owner: $owner, name: $repo) {
-    pullRequest(number: $number) {
-      mergeable
-      mergeStateStatus
-    }
-  }
-}
-```
+**GraphQL for merge state**: The bot uses GitHub's GraphQL API to query `mergeStateStatus`, which encapsulates all branch protection checks (required status checks, required reviewers, etc.) into a single authoritative value. See `MERGE_STATE_QUERY` in `src/github/interpreter.rs`.
 
 ---
 
@@ -2311,36 +2039,7 @@ The bot needs:
 
 ## Implementation Notes (Rust)
 
-### Crate suggestions
-
-- `octocrab` — GitHub API client
-- `axum` — webhook HTTP server
-- `tokio` — async runtime
-- `tokio_util` — `CancellationToken` for cooperative cancellation
-- `serde` — JSON (de)serialisation
-- `tracing` — structured logging
-
-We shell out to `git` for git operations.
-
-### Module structure
-
-See `src/` for implementations. Key modules:
-
-| Module | Purpose |
-|--------|---------|
-| `types/` | Core domain types: `PrNumber`, `Sha`, `RepoId`, `TrainRecord`, `CascadePhase` |
-| `state/` | Pure state logic: topology, descendants index, phase transitions |
-| `commands/` | Command parser for `@merge-train` comments |
-| `effects/` | Effect types (`GitEffect`, `GitHubEffect`) for effects-as-data pattern |
-| `persistence/` | Event log, snapshots, generation-based compaction, pruning |
-| `spool/` | Webhook delivery queue with filesystem-based crash safety |
-| `git/` | Local git operations: worktrees, prepare/reconcile/catch-up merges |
-| `github/` | GitHub API client, retry logic, effect interpreter |
-| `cascade/` | Cascade engine, phase actions, step execution |
-| `status/` | Status comment formatting and parsing |
-| `preflight/` | Pre-start validation (merge method, branch protection) |
-| `webhooks/` | Signature verification, payload parsing, event handlers |
-| `server/` | HTTP server (webhook endpoint, health, state export) |
+See `src/` for module structure and `Cargo.toml` for dependencies.
 
 ### Train identity model
 
@@ -2399,9 +2098,7 @@ See `src/types/train.rs` for full definitions. Key points:
 
 **TrainRecord**: Persisted train state with `recovery_seq` for comparing local vs GitHub state during recovery.
 
-**CascadePhase**: `Idle → Preparing → SquashPending → Reconciling → CatchingUp → Retargeting → Idle`
-
-**frozen_descendants invariant**: Captured when entering `Preparing`, carried through ALL subsequent phases. Recovery MUST use this list, NOT `repo_state.descendants`. This prevents new descendants added mid-cascade from being processed without preparation.
+**CascadePhase**: `Idle → Preparing → SquashPending → Reconciling → CatchingUp → Retargeting → Idle` (see "Descendant set freezing" for the frozen_descendants invariant)
 
 ---
 
