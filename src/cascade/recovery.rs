@@ -632,8 +632,11 @@ pub fn apply_recovery_plan(
                 if let Some(&completed) = verification_results.get(branch)
                     && completed
                 {
-                    // Push completed - phase-based recovery will skip this descendant
-                    // since it's already in the completed set (or will be added).
+                    // Push completed. The recovery executor (not this function) is responsible
+                    // for writing the completion event (e.g., `done_push_prep`), which triggers
+                    // normal state update logic to mark this descendant as completed. Phase-based
+                    // recovery generates RetryMerge actions from `progress.remaining()`, which
+                    // won't include descendants already in the completed set.
                 }
                 // If !completed or no result, phase-based recovery's RetryMerge will redo it.
             }
@@ -1648,8 +1651,8 @@ mod tests {
             /// Property: Recovery transitions that change phase MUST emit status comment update.
             /// Without this, a second crash before the next operation leaves stale phase in GitHub.
             ///
-            /// BUG: Recovery from SquashPending (with merged PR) transitions to Reconciling
-            /// but doesn't emit a status comment update effect.
+            /// Specifically: Recovery from SquashPending (with merged PR) transitions to Reconciling
+            /// and must emit a status comment update effect to persist the new phase to GitHub.
             #[test]
             fn recovery_phase_transitions_emit_status_comment_update(
                 frozen_descendants in arb_unique_descendants(1, 3),
