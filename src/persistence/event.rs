@@ -254,7 +254,7 @@ pub enum StateEventPayload {
         /// The PR that was merged.
         pr: PrNumber,
         /// The merge commit SHA.
-        sha: Sha,
+        merge_sha: Sha,
     },
 
     /// A PR's state has changed (opened, closed, etc.).
@@ -273,6 +273,122 @@ pub enum StateEventPayload {
         pr: PrNumber,
         /// The declared predecessor PR.
         predecessor: PrNumber,
+    },
+
+    // ─── PR lifecycle events (non-critical, for cache updates) ───
+    /// A new PR has been opened.
+    #[serde(rename = "pr_opened")]
+    PrOpened {
+        /// The PR number.
+        pr: PrNumber,
+        /// The head SHA of the PR.
+        head_sha: Sha,
+        /// The head branch name.
+        head_ref: String,
+        /// The base branch name.
+        base_ref: String,
+        /// Whether the PR is a draft.
+        is_draft: bool,
+    },
+
+    /// A PR has been closed without merging.
+    #[serde(rename = "pr_closed")]
+    PrClosed {
+        /// The PR that was closed.
+        pr: PrNumber,
+    },
+
+    /// A PR has been reopened.
+    #[serde(rename = "pr_reopened")]
+    PrReopened {
+        /// The PR that was reopened.
+        pr: PrNumber,
+    },
+
+    /// A PR's base branch has been changed.
+    #[serde(rename = "pr_base_changed")]
+    PrBaseChanged {
+        /// The PR whose base changed.
+        pr: PrNumber,
+        /// The old base branch.
+        old_base: String,
+        /// The new base branch.
+        new_base: String,
+    },
+
+    /// A PR has been synchronized (new commits pushed).
+    #[serde(rename = "pr_synchronized")]
+    PrSynchronized {
+        /// The PR that was synchronized.
+        pr: PrNumber,
+        /// The new head SHA.
+        new_head_sha: Sha,
+    },
+
+    /// A PR has been converted to draft.
+    #[serde(rename = "pr_converted_to_draft")]
+    PrConvertedToDraft {
+        /// The PR that was converted to draft.
+        pr: PrNumber,
+    },
+
+    /// A PR is ready for review (no longer a draft).
+    #[serde(rename = "pr_ready_for_review")]
+    PrReadyForReview {
+        /// The PR that is ready for review.
+        pr: PrNumber,
+    },
+
+    /// A descendant PR was skipped during cascade.
+    #[serde(rename = "descendant_skipped")]
+    DescendantSkipped {
+        /// The train root.
+        root_pr: PrNumber,
+        /// The descendant that was skipped.
+        descendant_pr: PrNumber,
+        /// The reason for skipping.
+        reason: String,
+    },
+
+    // ─── CI/Review events (non-critical, for cache updates) ───
+    /// A check suite has completed.
+    #[serde(rename = "check_suite_completed")]
+    CheckSuiteCompleted {
+        /// The commit SHA the check suite ran on.
+        sha: Sha,
+        /// The conclusion (success, failure, etc.).
+        conclusion: String,
+    },
+
+    /// A commit status has been received.
+    #[serde(rename = "status_received")]
+    StatusReceived {
+        /// The commit SHA the status is for.
+        sha: Sha,
+        /// The context (name) of the status check.
+        context: String,
+        /// The state of the status.
+        state: String,
+    },
+
+    /// A review has been submitted.
+    #[serde(rename = "review_submitted")]
+    ReviewSubmitted {
+        /// The PR that was reviewed.
+        pr: PrNumber,
+        /// The reviewer's login.
+        reviewer: String,
+        /// The review state (approved, changes_requested, etc.).
+        state: String,
+    },
+
+    /// A review has been dismissed.
+    #[serde(rename = "review_dismissed")]
+    ReviewDismissed {
+        /// The PR whose review was dismissed.
+        pr: PrNumber,
+        /// The reviewer whose review was dismissed.
+        reviewer: String,
     },
 }
 
@@ -310,7 +426,19 @@ impl StateEventPayload {
             // Observational events (not critical for recovery)
             StateEventPayload::PrMerged { .. }
             | StateEventPayload::PrStateChanged { .. }
-            | StateEventPayload::PredecessorDeclared { .. } => false,
+            | StateEventPayload::PredecessorDeclared { .. }
+            | StateEventPayload::PrOpened { .. }
+            | StateEventPayload::PrClosed { .. }
+            | StateEventPayload::PrReopened { .. }
+            | StateEventPayload::PrBaseChanged { .. }
+            | StateEventPayload::PrSynchronized { .. }
+            | StateEventPayload::PrConvertedToDraft { .. }
+            | StateEventPayload::PrReadyForReview { .. }
+            | StateEventPayload::DescendantSkipped { .. }
+            | StateEventPayload::CheckSuiteCompleted { .. }
+            | StateEventPayload::StatusReceived { .. }
+            | StateEventPayload::ReviewSubmitted { .. }
+            | StateEventPayload::ReviewDismissed { .. } => false,
         }
     }
 }
@@ -436,7 +564,7 @@ mod tests {
         let non_critical_payloads = vec![
             StateEventPayload::PrMerged {
                 pr: PrNumber(1),
-                sha: Sha::parse("0".repeat(40)).unwrap(),
+                merge_sha: Sha::parse("0".repeat(40)).unwrap(),
             },
             StateEventPayload::PrStateChanged {
                 pr: PrNumber(1),

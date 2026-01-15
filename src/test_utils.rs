@@ -161,8 +161,9 @@ pub fn arb_state_event_payload() -> impl Strategy<Value = StateEventPayload> {
                 new_roots: new,
                 original_root_pr: orig
             }),
-        // Non-critical
-        (arb_pr_number(), arb_sha()).prop_map(|(pr, sha)| StateEventPayload::PrMerged { pr, sha }),
+        // Non-critical - PR state
+        (arb_pr_number(), arb_sha())
+            .prop_map(|(pr, sha)| StateEventPayload::PrMerged { pr, merge_sha: sha }),
         (arb_pr_number(), "[a-z]{1,10}".prop_map(String::from))
             .prop_map(|(pr, st)| StateEventPayload::PrStateChanged { pr, state: st }),
         (arb_pr_number(), arb_pr_number()).prop_map(|(pr, pred)| {
@@ -171,6 +172,78 @@ pub fn arb_state_event_payload() -> impl Strategy<Value = StateEventPayload> {
                 predecessor: pred,
             }
         }),
+        // PR lifecycle events
+        (
+            arb_pr_number(),
+            arb_sha(),
+            arb_branch_name(),
+            arb_branch_name(),
+            any::<bool>()
+        )
+            .prop_map(|(pr, head_sha, head_ref, base_ref, is_draft)| {
+                StateEventPayload::PrOpened {
+                    pr,
+                    head_sha,
+                    head_ref,
+                    base_ref,
+                    is_draft,
+                }
+            }),
+        arb_pr_number().prop_map(|pr| StateEventPayload::PrClosed { pr }),
+        arb_pr_number().prop_map(|pr| StateEventPayload::PrReopened { pr }),
+        (arb_pr_number(), arb_branch_name(), arb_branch_name()).prop_map(
+            |(pr, old_base, new_base)| {
+                StateEventPayload::PrBaseChanged {
+                    pr,
+                    old_base,
+                    new_base,
+                }
+            }
+        ),
+        (arb_pr_number(), arb_sha()).prop_map(|(pr, sha)| StateEventPayload::PrSynchronized {
+            pr,
+            new_head_sha: sha
+        }),
+        arb_pr_number().prop_map(|pr| StateEventPayload::PrConvertedToDraft { pr }),
+        arb_pr_number().prop_map(|pr| StateEventPayload::PrReadyForReview { pr }),
+        (
+            arb_pr_number(),
+            arb_pr_number(),
+            "[a-z ]{1,50}".prop_map(String::from)
+        )
+            .prop_map(|(root_pr, descendant_pr, reason)| {
+                StateEventPayload::DescendantSkipped {
+                    root_pr,
+                    descendant_pr,
+                    reason,
+                }
+            }),
+        // CI/Review events
+        (arb_sha(), "[a-z_]{1,20}".prop_map(String::from)).prop_map(|(sha, conclusion)| {
+            StateEventPayload::CheckSuiteCompleted { sha, conclusion }
+        }),
+        (
+            arb_sha(),
+            "[a-z/]{1,30}".prop_map(String::from),
+            "[a-z]{1,10}".prop_map(String::from)
+        )
+            .prop_map(|(sha, context, state)| StateEventPayload::StatusReceived {
+                sha,
+                context,
+                state,
+            }),
+        (
+            arb_pr_number(),
+            "[a-z]{1,20}".prop_map(String::from),
+            "[a-z_]{1,20}".prop_map(String::from)
+        )
+            .prop_map(|(pr, reviewer, state)| StateEventPayload::ReviewSubmitted {
+                pr,
+                reviewer,
+                state,
+            }),
+        (arb_pr_number(), "[a-z]{1,20}".prop_map(String::from))
+            .prop_map(|(pr, reviewer)| { StateEventPayload::ReviewDismissed { pr, reviewer } }),
     ]
 }
 
