@@ -271,6 +271,9 @@ pub enum StateEventPayload {
     ///
     /// The `comment_id` tracks which comment is authoritative for this declaration.
     /// This enables proper handling of comment edits and deletions per DESIGN.md.
+    ///
+    /// Note: `comment_id` is optional for backwards compatibility with older event logs
+    /// that were created before comment tracking was implemented.
     #[serde(rename = "predecessor_declared")]
     PredecessorDeclared {
         /// The PR declaring a predecessor.
@@ -278,7 +281,9 @@ pub enum StateEventPayload {
         /// The declared predecessor PR.
         predecessor: PrNumber,
         /// The comment ID containing the authoritative declaration.
-        comment_id: CommentId,
+        /// None for legacy events or when comment tracking is unavailable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        comment_id: Option<CommentId>,
     },
 
     /// A predecessor declaration has been removed.
@@ -592,7 +597,7 @@ mod tests {
             StateEventPayload::PredecessorDeclared {
                 pr: PrNumber(2),
                 predecessor: PrNumber(1),
-                comment_id: CommentId(12345),
+                comment_id: Some(CommentId(12345)),
             },
             StateEventPayload::PredecessorRemoved {
                 pr: PrNumber(2),
@@ -636,5 +641,43 @@ mod tests {
             StateEventPayload::PrMerged { pr, merge_sha }
             if pr == PrNumber(42) && merge_sha.as_str() == "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         ));
+    }
+
+    #[test]
+    fn predecessor_declared_deserializes_without_comment_id() {
+        // Old format didn't have comment_id field
+        let old_json = r#"{"type":"predecessor_declared","pr":2,"predecessor":1}"#;
+        let parsed: StateEventPayload = serde_json::from_str(old_json).unwrap();
+
+        assert!(matches!(
+            parsed,
+            StateEventPayload::PredecessorDeclared { pr, predecessor, comment_id }
+            if pr == PrNumber(2) && predecessor == PrNumber(1) && comment_id.is_none()
+        ));
+    }
+
+    #[test]
+    fn predecessor_declared_deserializes_with_comment_id() {
+        // New format has comment_id field
+        let new_json = r#"{"type":"predecessor_declared","pr":2,"predecessor":1,"comment_id":12345}"#;
+        let parsed: StateEventPayload = serde_json::from_str(new_json).unwrap();
+
+        assert!(matches!(
+            parsed,
+            StateEventPayload::PredecessorDeclared { pr, predecessor, comment_id }
+            if pr == PrNumber(2) && predecessor == PrNumber(1) && comment_id == Some(CommentId(12345))
+        ));
+    }
+
+    #[test]
+    fn predecessor_declared_serializes_without_comment_id_when_none() {
+        // When comment_id is None, it should be omitted from serialization
+        let payload = StateEventPayload::PredecessorDeclared {
+            pr: PrNumber(2),
+            predecessor: PrNumber(1),
+            comment_id: None,
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(!json.contains("comment_id"));
     }
 }

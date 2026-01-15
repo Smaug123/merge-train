@@ -11,7 +11,7 @@ use crate::commands::{Command, parse_command};
 use crate::effects::{Effect, GitHubEffect, Reaction};
 use crate::persistence::event::StateEventPayload;
 use crate::persistence::snapshot::PersistedRepoSnapshot;
-use crate::types::{PrNumber, PrState};
+use crate::types::{PrNumber, TrainError};
 use crate::webhooks::events::{CommentAction, IssueCommentEvent};
 
 use super::{HandlerError, HandlerResult};
@@ -119,21 +119,34 @@ fn handle_edited(
                 // Per DESIGN.md: "If this was the authoritative predecessor comment for
                 // the PR (tracked via comment ID), remove the predecessor relationship."
                 let train_involved = find_train_for_pr(pr_number, state);
-                if train_involved.is_some() {
+                if let Some(train_root) = train_involved {
                     // Per DESIGN.md: "If a train is already started and the predecessor
                     // is changed or removed, the bot aborts with an error"
-                    return Ok(HandlerResult::with_effects(vec![Effect::GitHub(
-                        GitHubEffect::PostComment {
-                            pr: pr_number,
-                            body: format!(
-                                "Error: Predecessor declaration was removed from comment {} \
-                                 while a train is running. The train has been aborted. \
-                                 Please re-establish the predecessor relationship and \
-                                 restart the train.",
-                                event.comment_id
-                            ),
+                    let error_message = format!(
+                        "Predecessor declaration was removed from comment {} \
+                         while a train is running",
+                        event.comment_id
+                    );
+                    let state_events = vec![
+                        StateEventPayload::TrainAborted {
+                            root_pr: train_root,
+                            error: TrainError::new("predecessor_removed", &error_message),
                         },
-                    )]));
+                        StateEventPayload::PredecessorRemoved {
+                            pr: pr_number,
+                            comment_id: event.comment_id,
+                        },
+                    ];
+                    let effects = vec![Effect::GitHub(GitHubEffect::PostComment {
+                        pr: pr_number,
+                        body: format!(
+                            "Error: {}. The train has been aborted. \
+                             Please re-establish the predecessor relationship and \
+                             restart the train.",
+                            error_message
+                        ),
+                    })];
+                    return Ok(HandlerResult::new(state_events, effects));
                 }
 
                 // Remove the predecessor relationship
@@ -177,19 +190,31 @@ fn handle_deleted(
 
     // Check if a train is running that involves this PR
     let train_involved = find_train_for_pr(pr_number, state);
-    if train_involved.is_some() {
+    if let Some(train_root) = train_involved {
         // Per DESIGN.md: "If a train is running that involves this PR, abort with error"
-        return Ok(HandlerResult::with_effects(vec![Effect::GitHub(
-            GitHubEffect::PostComment {
-                pr: pr_number,
-                body: format!(
-                    "Error: Predecessor declaration (comment {}) was deleted while a train \
-                     is running. The train has been aborted. Please re-establish the \
-                     predecessor relationship and restart the train.",
-                    event.comment_id
-                ),
+        let error_message = format!(
+            "Predecessor declaration (comment {}) was deleted while a train is running",
+            event.comment_id
+        );
+        let state_events = vec![
+            StateEventPayload::TrainAborted {
+                root_pr: train_root,
+                error: TrainError::new("predecessor_deleted", &error_message),
             },
-        )]));
+            StateEventPayload::PredecessorRemoved {
+                pr: pr_number,
+                comment_id: event.comment_id,
+            },
+        ];
+        let effects = vec![Effect::GitHub(GitHubEffect::PostComment {
+            pr: pr_number,
+            body: format!(
+                "Error: {}. The train has been aborted. Please re-establish the \
+                 predecessor relationship and restart the train.",
+                error_message
+            ),
+        })];
+        return Ok(HandlerResult::new(state_events, effects));
     }
 
     // Remove the predecessor relationship
@@ -258,16 +283,40 @@ fn handle_authoritative_predecessor_edit(
         )]));
     };
 
-    // Validate the new predecessor is not closed without being merged
-    if pred_pr.state == PrState::Closed {
+    // Validate the predecessor is valid (same validation as handle_predecessor_command):
+    // 1. Open AND (targeting the default branch OR has its own predecessor declaration)
+    // 2. Already merged (predecessor's content is in main)
+    //
+    // Per DESIGN.md: "A PR whose predecessor was closed without merge is **orphaned**"
+    let predecessor_valid = if pred_pr.state.is_merged() {
+        true
+    } else if pred_pr.state.is_open() {
+        // Open predecessor must target default branch or have its own predecessor
+        pred_pr.base_ref == state.default_branch || pred_pr.predecessor.is_some()
+    } else {
+        // Closed without merge - not valid
+        false
+    };
+
+    if !predecessor_valid {
+        // Predecessor exists but isn't a valid stack member
+        let error_msg = if !pred_pr.state.is_open() && !pred_pr.state.is_merged() {
+            format!(
+                "Error: PR #{} was closed without being merged. \
+                 The predecessor must be an open PR or a merged PR.",
+                new_predecessor
+            )
+        } else {
+            format!(
+                "Error: PR #{} cannot be a predecessor because it doesn't target {} \
+                 and doesn't have its own predecessor declaration.",
+                new_predecessor, state.default_branch
+            )
+        };
         return Ok(HandlerResult::with_effects(vec![Effect::GitHub(
             GitHubEffect::PostComment {
                 pr: pr_number,
-                body: format!(
-                    "Error: Cannot change predecessor to #{} because it was closed \
-                     without being merged.",
-                    new_predecessor
-                ),
+                body: error_msg,
             },
         )]));
     }
@@ -276,7 +325,7 @@ fn handle_authoritative_predecessor_edit(
     let state_events = vec![StateEventPayload::PredecessorDeclared {
         pr: pr_number,
         predecessor: new_predecessor,
-        comment_id: event.comment_id,
+        comment_id: Some(event.comment_id),
     }];
 
     let effects = vec![Effect::GitHub(GitHubEffect::AddReaction {
@@ -388,7 +437,7 @@ fn handle_predecessor_command(
     let state_events = vec![StateEventPayload::PredecessorDeclared {
         pr: pr_number,
         predecessor,
-        comment_id: event.comment_id,
+        comment_id: Some(event.comment_id),
     }];
 
     // Acknowledge with thumbs up reaction
@@ -633,7 +682,7 @@ mod tests {
         assert!(matches!(
             &result.state_events[0],
             StateEventPayload::PredecessorDeclared { pr, predecessor, comment_id }
-            if *pr == PrNumber(2) && *predecessor == PrNumber(1) && *comment_id == CommentId(12345)
+            if *pr == PrNumber(2) && *predecessor == PrNumber(1) && *comment_id == Some(CommentId(12345))
         ));
 
         // Should have a thumbs up reaction
@@ -916,7 +965,7 @@ mod tests {
         assert!(matches!(
             &result.state_events[0],
             StateEventPayload::PredecessorDeclared { pr, predecessor, comment_id }
-            if *pr == PrNumber(2) && *predecessor == PrNumber(1) && *comment_id == CommentId(12345)
+            if *pr == PrNumber(2) && *predecessor == PrNumber(1) && *comment_id == Some(CommentId(12345))
         ));
     }
 
@@ -1070,7 +1119,7 @@ mod tests {
         assert!(matches!(
             &result.state_events[0],
             StateEventPayload::PredecessorDeclared { pr, predecessor, comment_id }
-            if *pr == PrNumber(2) && *predecessor == PrNumber(3) && *comment_id == CommentId(12345)
+            if *pr == PrNumber(2) && *predecessor == PrNumber(3) && *comment_id == Some(CommentId(12345))
         ));
     }
 
