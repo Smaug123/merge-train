@@ -1,11 +1,15 @@
 //! Shared test utilities and arbitrary generators for property-based testing.
 
 use crate::persistence::event::{StateEvent, StateEventPayload};
-use crate::types::{CascadePhase, DescendantProgress, PrNumber, Sha, TrainError};
+use crate::types::{CascadePhase, CommentId, DescendantProgress, PrNumber, Sha, TrainError};
 use proptest::prelude::*;
 
 pub fn arb_pr_number() -> impl Strategy<Value = PrNumber> {
     any::<u64>().prop_map(PrNumber)
+}
+
+pub fn arb_comment_id() -> impl Strategy<Value = CommentId> {
+    any::<u64>().prop_map(CommentId)
 }
 
 pub fn arb_sha() -> impl Strategy<Value = Sha> {
@@ -166,10 +170,17 @@ pub fn arb_state_event_payload() -> impl Strategy<Value = StateEventPayload> {
             .prop_map(|(pr, sha)| StateEventPayload::PrMerged { pr, merge_sha: sha }),
         (arb_pr_number(), "[a-z]{1,10}".prop_map(String::from))
             .prop_map(|(pr, st)| StateEventPayload::PrStateChanged { pr, state: st }),
-        (arb_pr_number(), arb_pr_number()).prop_map(|(pr, pred)| {
+        (arb_pr_number(), arb_pr_number(), arb_comment_id()).prop_map(|(pr, pred, cid)| {
             StateEventPayload::PredecessorDeclared {
                 pr,
                 predecessor: pred,
+                comment_id: cid,
+            }
+        }),
+        (arb_pr_number(), arb_comment_id()).prop_map(|(pr, cid)| {
+            StateEventPayload::PredecessorRemoved {
+                pr,
+                comment_id: cid,
             }
         }),
         // PR lifecycle events

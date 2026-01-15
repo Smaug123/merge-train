@@ -11,7 +11,7 @@ use crate::commands::{Command, parse_command};
 use crate::effects::{Effect, GitHubEffect, Reaction};
 use crate::persistence::event::StateEventPayload;
 use crate::persistence::snapshot::PersistedRepoSnapshot;
-use crate::types::PrNumber;
+use crate::types::{PrNumber, PrState};
 use crate::webhooks::events::{CommentAction, IssueCommentEvent};
 
 use super::{HandlerError, HandlerResult};
@@ -71,34 +71,83 @@ fn handle_created(
 /// Handles an edited comment.
 ///
 /// Re-parses the command and updates state if necessary.
+///
+/// Per DESIGN.md, when a predecessor declaration is edited, the bot handles:
+/// 1. Command changed (e.g., `#123` to `#456`): Re-validate and update
+/// 2. Command removed: Remove predecessor relationship if authoritative
+/// 3. Command added to non-predecessor comment: Rejected if PR already has predecessor
 fn handle_edited(
     event: &IssueCommentEvent,
     state: &PersistedRepoSnapshot,
     bot_name: &str,
     pr_number: PrNumber,
 ) -> Result<HandlerResult, HandlerError> {
-    // For now, treat edits like new comments for predecessor declarations.
-    // A more sophisticated implementation would track the authoritative comment ID
-    // and handle command removal/changes accordingly.
-    //
-    // Per DESIGN.md: "When a predecessor declaration is edited, the bot handles
-    // several cases: Command changed, Command removed, Command added to non-predecessor comment"
-    //
-    // TODO: Implement full edit handling with authoritative comment tracking
-    let Some(command) = parse_command(&event.body, bot_name) else {
-        // Command was removed from comment - this is a no-op for now
-        // Full implementation would check if this was the authoritative predecessor comment
-        return Ok(HandlerResult::empty());
-    };
+    let command = parse_command(&event.body, bot_name);
+
+    // Check if this was the authoritative predecessor comment
+    let is_authoritative = state
+        .prs
+        .get(&pr_number)
+        .is_some_and(|pr| pr.predecessor_comment_id == Some(event.comment_id));
 
     match command {
-        Command::Predecessor(predecessor) => {
-            // Re-validate and update predecessor
-            handle_predecessor_command(event, state, pr_number, predecessor)
+        Some(Command::Predecessor(predecessor)) => {
+            if is_authoritative {
+                // This is the authoritative comment being edited to a (possibly new) predecessor.
+                // Per DESIGN.md: "Command changed (e.g., `#123` to `#456`): Re-run full
+                // validation, update if passes, reject if fails"
+                //
+                // We handle this specially because handle_predecessor_command would reject
+                // "PR already has predecessor" - but editing the authoritative comment is allowed.
+                handle_authoritative_predecessor_edit(event, state, pr_number, predecessor)
+            } else {
+                // This is a non-authoritative comment being edited to add a predecessor.
+                // Per DESIGN.md: "Command added to non-predecessor comment: Rejected if
+                // the PR already has a predecessor declaration."
+                // handle_predecessor_command already handles this case.
+                handle_predecessor_command(event, state, pr_number, predecessor)
+            }
         }
-        // start/stop commands in edited comments are ignored
-        // (they should be fresh commands)
-        _ => Ok(HandlerResult::empty()),
+        Some(_) => {
+            // start/stop commands in edited comments are ignored
+            // (they should be fresh commands)
+            Ok(HandlerResult::empty())
+        }
+        None => {
+            // Command was removed from comment
+            if is_authoritative {
+                // Per DESIGN.md: "If this was the authoritative predecessor comment for
+                // the PR (tracked via comment ID), remove the predecessor relationship."
+                let train_involved = find_train_for_pr(pr_number, state);
+                if train_involved.is_some() {
+                    // Per DESIGN.md: "If a train is already started and the predecessor
+                    // is changed or removed, the bot aborts with an error"
+                    return Ok(HandlerResult::with_effects(vec![Effect::GitHub(
+                        GitHubEffect::PostComment {
+                            pr: pr_number,
+                            body: format!(
+                                "Error: Predecessor declaration was removed from comment {} \
+                                 while a train is running. The train has been aborted. \
+                                 Please re-establish the predecessor relationship and \
+                                 restart the train.",
+                                event.comment_id
+                            ),
+                        },
+                    )]));
+                }
+
+                // Remove the predecessor relationship
+                let state_events = vec![StateEventPayload::PredecessorRemoved {
+                    pr: pr_number,
+                    comment_id: event.comment_id,
+                }];
+
+                Ok(HandlerResult::new(state_events, vec![]))
+            } else {
+                // Not the authoritative comment, nothing to do
+                Ok(HandlerResult::empty())
+            }
+        }
     }
 }
 
@@ -107,18 +156,135 @@ fn handle_edited(
 /// If the deleted comment was the authoritative predecessor declaration,
 /// removes the predecessor relationship.
 fn handle_deleted(
-    _event: &IssueCommentEvent,
-    _state: &PersistedRepoSnapshot,
-    _pr_number: PrNumber,
+    event: &IssueCommentEvent,
+    state: &PersistedRepoSnapshot,
+    pr_number: PrNumber,
 ) -> Result<HandlerResult, HandlerError> {
     // Per DESIGN.md: "When a comment is deleted, the bot checks if it was the
     // authoritative predecessor declaration for a PR. If so:
     // 1. Remove the predecessor relationship from the cached state
     // 2. If a train is running that involves this PR, abort with error"
     //
-    // TODO: Implement with authoritative comment ID tracking
-    // For now, we don't track comment IDs, so deleted comments are no-ops
-    Ok(HandlerResult::empty())
+    // Check if this comment was the authoritative predecessor declaration
+    let Some(pr) = state.prs.get(&pr_number) else {
+        return Ok(HandlerResult::empty());
+    };
+
+    // Only process if this was the authoritative predecessor comment
+    if pr.predecessor_comment_id != Some(event.comment_id) {
+        return Ok(HandlerResult::empty());
+    }
+
+    // Check if a train is running that involves this PR
+    let train_involved = find_train_for_pr(pr_number, state);
+    if train_involved.is_some() {
+        // Per DESIGN.md: "If a train is running that involves this PR, abort with error"
+        return Ok(HandlerResult::with_effects(vec![Effect::GitHub(
+            GitHubEffect::PostComment {
+                pr: pr_number,
+                body: format!(
+                    "Error: Predecessor declaration (comment {}) was deleted while a train \
+                     is running. The train has been aborted. Please re-establish the \
+                     predecessor relationship and restart the train.",
+                    event.comment_id
+                ),
+            },
+        )]));
+    }
+
+    // Remove the predecessor relationship
+    let state_events = vec![StateEventPayload::PredecessorRemoved {
+        pr: pr_number,
+        comment_id: event.comment_id,
+    }];
+
+    Ok(HandlerResult::new(state_events, vec![]))
+}
+
+/// Handles editing the authoritative predecessor comment to change the predecessor.
+///
+/// This is called when the user edits the comment that established the predecessor
+/// relationship, changing it to point to a different PR.
+fn handle_authoritative_predecessor_edit(
+    event: &IssueCommentEvent,
+    state: &PersistedRepoSnapshot,
+    pr_number: PrNumber,
+    new_predecessor: PrNumber,
+) -> Result<HandlerResult, HandlerError> {
+    // Check if the predecessor is the same (no-op, just acknowledge)
+    if let Some(existing_pr) = state.prs.get(&pr_number)
+        && existing_pr.predecessor == Some(new_predecessor)
+    {
+        return Ok(HandlerResult::with_effects(vec![Effect::GitHub(
+            GitHubEffect::AddReaction {
+                comment_id: event.comment_id,
+                reaction: Reaction::ThumbsUp,
+            },
+        )]));
+    }
+
+    // Check if a train is running that involves this PR
+    let train_involved = find_train_for_pr(pr_number, state);
+    if train_involved.is_some() {
+        // Per DESIGN.md: "If a train is already started and the predecessor is changed
+        // or removed, the bot aborts with an error"
+        return Ok(HandlerResult::with_effects(vec![Effect::GitHub(
+            GitHubEffect::PostComment {
+                pr: pr_number,
+                body: format!(
+                    "Error: Cannot change predecessor from #{} to #{} while a train is running. \
+                     Stop the train first with `@merge-train stop`.",
+                    state
+                        .prs
+                        .get(&pr_number)
+                        .and_then(|pr| pr.predecessor)
+                        .map_or("?".to_string(), |p| p.0.to_string()),
+                    new_predecessor
+                ),
+            },
+        )]));
+    }
+
+    // Validate the new predecessor exists in cache
+    let Some(pred_pr) = state.prs.get(&new_predecessor) else {
+        return Ok(HandlerResult::with_effects(vec![Effect::GitHub(
+            GitHubEffect::PostComment {
+                pr: pr_number,
+                body: format!(
+                    "Error: PR #{} not found. The predecessor must be an open PR in this repository.",
+                    new_predecessor
+                ),
+            },
+        )]));
+    };
+
+    // Validate the new predecessor is not closed without being merged
+    if pred_pr.state == PrState::Closed {
+        return Ok(HandlerResult::with_effects(vec![Effect::GitHub(
+            GitHubEffect::PostComment {
+                pr: pr_number,
+                body: format!(
+                    "Error: Cannot change predecessor to #{} because it was closed \
+                     without being merged.",
+                    new_predecessor
+                ),
+            },
+        )]));
+    }
+
+    // Emit the updated predecessor declaration
+    let state_events = vec![StateEventPayload::PredecessorDeclared {
+        pr: pr_number,
+        predecessor: new_predecessor,
+        comment_id: event.comment_id,
+    }];
+
+    let effects = vec![Effect::GitHub(GitHubEffect::AddReaction {
+        comment_id: event.comment_id,
+        reaction: Reaction::ThumbsUp,
+    })];
+
+    Ok(HandlerResult::new(state_events, effects))
 }
 
 /// Handles the `@merge-train predecessor #N` command.
@@ -142,14 +308,20 @@ fn handle_predecessor_command(
             )]));
         }
         // Different predecessor - reject per DESIGN.md
-        // "Subsequent declarations are rejected with error"
+        // "Subsequent declarations are rejected with error: PR already has predecessor
+        // declaration in comment #C pointing to #N. Edit that comment to change
+        // predecessors, or delete it first."
+        let comment_ref = match existing_pr.predecessor_comment_id {
+            Some(cid) => format!(" in comment {}", cid),
+            None => String::new(),
+        };
         return Ok(HandlerResult::with_effects(vec![Effect::GitHub(
             GitHubEffect::PostComment {
                 pr: pr_number,
                 body: format!(
-                    "Error: PR #{} already has a predecessor declaration pointing to #{}. \
-                     Delete that comment first to change the predecessor.",
-                    pr_number, existing_pred
+                    "Error: PR #{} already has a predecessor declaration{} pointing to #{}. \
+                     Edit that comment to change predecessors, or delete it first.",
+                    pr_number, comment_ref, existing_pred
                 ),
             },
         )]));
@@ -212,10 +384,11 @@ fn handle_predecessor_command(
         )]));
     }
 
-    // Record the predecessor declaration
+    // Record the predecessor declaration with the authoritative comment ID
     let state_events = vec![StateEventPayload::PredecessorDeclared {
         pr: pr_number,
         predecessor,
+        comment_id: event.comment_id,
     }];
 
     // Acknowledge with thumbs up reaction
@@ -407,6 +580,17 @@ mod tests {
         )
     }
 
+    fn make_cached_pr_with_comment(
+        number: u64,
+        base_ref: &str,
+        predecessor: Option<u64>,
+        predecessor_comment_id: Option<u64>,
+    ) -> CachedPr {
+        let mut pr = make_cached_pr(number, base_ref, predecessor);
+        pr.predecessor_comment_id = predecessor_comment_id.map(CommentId);
+        pr
+    }
+
     #[test]
     fn ignores_comment_on_issue_not_pr() {
         let event = make_comment_event(CommentAction::Created, None, "@merge-train start");
@@ -448,8 +632,8 @@ mod tests {
         assert_eq!(result.state_events.len(), 1);
         assert!(matches!(
             &result.state_events[0],
-            StateEventPayload::PredecessorDeclared { pr, predecessor }
-            if *pr == PrNumber(2) && *predecessor == PrNumber(1)
+            StateEventPayload::PredecessorDeclared { pr, predecessor, comment_id }
+            if *pr == PrNumber(2) && *predecessor == PrNumber(1) && *comment_id == CommentId(12345)
         ));
 
         // Should have a thumbs up reaction
@@ -731,8 +915,8 @@ mod tests {
         assert_eq!(result.state_events.len(), 1);
         assert!(matches!(
             &result.state_events[0],
-            StateEventPayload::PredecessorDeclared { pr, predecessor }
-            if *pr == PrNumber(2) && *predecessor == PrNumber(1)
+            StateEventPayload::PredecessorDeclared { pr, predecessor, comment_id }
+            if *pr == PrNumber(2) && *predecessor == PrNumber(1) && *comment_id == CommentId(12345)
         ));
     }
 
@@ -753,5 +937,172 @@ mod tests {
 
         // Should return PrNotFound error
         assert!(matches!(result, Err(HandlerError::PrNotFound(2))));
+    }
+
+    // ─── Delete handling tests ───────────────────────────────────────────────
+
+    #[test]
+    fn delete_authoritative_comment_removes_predecessor() {
+        let event = make_comment_event(CommentAction::Deleted, Some(2), "");
+        let mut state = make_state();
+        state
+            .prs
+            .insert(PrNumber(1), make_cached_pr(1, "main", None));
+        // PR 2 has predecessor #1 via comment 12345 (matching the event's comment_id)
+        state.prs.insert(
+            PrNumber(2),
+            make_cached_pr_with_comment(2, "branch-1", Some(1), Some(12345)),
+        );
+
+        let result = handle_issue_comment(&event, &state, "merge-train").unwrap();
+
+        // Should emit PredecessorRemoved event
+        assert_eq!(result.state_events.len(), 1);
+        assert!(matches!(
+            &result.state_events[0],
+            StateEventPayload::PredecessorRemoved { pr, comment_id }
+            if *pr == PrNumber(2) && *comment_id == CommentId(12345)
+        ));
+    }
+
+    #[test]
+    fn delete_non_authoritative_comment_is_noop() {
+        let event = make_comment_event(CommentAction::Deleted, Some(2), "");
+        let mut state = make_state();
+        state
+            .prs
+            .insert(PrNumber(1), make_cached_pr(1, "main", None));
+        // PR 2 has predecessor #1 via a DIFFERENT comment (99999, not 12345)
+        state.prs.insert(
+            PrNumber(2),
+            make_cached_pr_with_comment(2, "branch-1", Some(1), Some(99999)),
+        );
+
+        let result = handle_issue_comment(&event, &state, "merge-train").unwrap();
+
+        // Should be no-op (not the authoritative comment)
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn delete_comment_unknown_pr_is_noop() {
+        let event = make_comment_event(CommentAction::Deleted, Some(99), "");
+        let state = make_state();
+
+        let result = handle_issue_comment(&event, &state, "merge-train").unwrap();
+
+        // PR not in cache, should be no-op
+        assert!(result.is_empty());
+    }
+
+    // ─── Edit handling tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn edit_remove_command_from_authoritative_removes_predecessor() {
+        // Edit the authoritative comment to remove the command
+        let event = make_comment_event(CommentAction::Edited, Some(2), "Just some text now");
+        let mut state = make_state();
+        state
+            .prs
+            .insert(PrNumber(1), make_cached_pr(1, "main", None));
+        // PR 2 has predecessor #1 via comment 12345
+        state.prs.insert(
+            PrNumber(2),
+            make_cached_pr_with_comment(2, "branch-1", Some(1), Some(12345)),
+        );
+
+        let result = handle_issue_comment(&event, &state, "merge-train").unwrap();
+
+        // Should emit PredecessorRemoved event
+        assert_eq!(result.state_events.len(), 1);
+        assert!(matches!(
+            &result.state_events[0],
+            StateEventPayload::PredecessorRemoved { pr, comment_id }
+            if *pr == PrNumber(2) && *comment_id == CommentId(12345)
+        ));
+    }
+
+    #[test]
+    fn edit_remove_command_from_non_authoritative_is_noop() {
+        // Edit a non-authoritative comment (comment_id doesn't match)
+        let event = make_comment_event(CommentAction::Edited, Some(2), "Just some text now");
+        let mut state = make_state();
+        state
+            .prs
+            .insert(PrNumber(1), make_cached_pr(1, "main", None));
+        // PR 2 has predecessor #1 via a DIFFERENT comment (99999)
+        state.prs.insert(
+            PrNumber(2),
+            make_cached_pr_with_comment(2, "branch-1", Some(1), Some(99999)),
+        );
+
+        let result = handle_issue_comment(&event, &state, "merge-train").unwrap();
+
+        // Should be no-op
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn edit_change_predecessor_in_authoritative_updates() {
+        // Edit the authoritative comment to change predecessor from #1 to #3
+        let event = make_comment_event(
+            CommentAction::Edited,
+            Some(2),
+            "@merge-train predecessor #3",
+        );
+        let mut state = make_state();
+        state
+            .prs
+            .insert(PrNumber(1), make_cached_pr(1, "main", None));
+        state
+            .prs
+            .insert(PrNumber(3), make_cached_pr(3, "main", None));
+        // PR 2 has predecessor #1 via comment 12345 (the authoritative comment)
+        state.prs.insert(
+            PrNumber(2),
+            make_cached_pr_with_comment(2, "branch-1", Some(1), Some(12345)),
+        );
+
+        let result = handle_issue_comment(&event, &state, "merge-train").unwrap();
+
+        // Should emit new PredecessorDeclared event (updating the predecessor)
+        assert_eq!(result.state_events.len(), 1);
+        assert!(matches!(
+            &result.state_events[0],
+            StateEventPayload::PredecessorDeclared { pr, predecessor, comment_id }
+            if *pr == PrNumber(2) && *predecessor == PrNumber(3) && *comment_id == CommentId(12345)
+        ));
+    }
+
+    #[test]
+    fn edit_add_command_to_non_predecessor_comment_rejected_if_already_has_predecessor() {
+        // Try to add a predecessor command to a different comment when PR already has one
+        let event = make_comment_event(
+            CommentAction::Edited,
+            Some(2),
+            "@merge-train predecessor #3",
+        );
+        let mut state = make_state();
+        state
+            .prs
+            .insert(PrNumber(1), make_cached_pr(1, "main", None));
+        state
+            .prs
+            .insert(PrNumber(3), make_cached_pr(3, "main", None));
+        // PR 2 already has predecessor #1 via a DIFFERENT comment (99999)
+        state.prs.insert(
+            PrNumber(2),
+            make_cached_pr_with_comment(2, "branch-1", Some(1), Some(99999)),
+        );
+
+        let result = handle_issue_comment(&event, &state, "merge-train").unwrap();
+
+        // Should be rejected with error comment
+        assert!(result.state_events.is_empty());
+        assert!(result.effects.iter().any(|e| matches!(
+            e,
+            Effect::GitHub(GitHubEffect::PostComment { body, .. })
+            if body.contains("already has a predecessor")
+        )));
     }
 }

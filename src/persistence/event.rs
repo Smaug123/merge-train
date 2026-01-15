@@ -6,7 +6,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::types::{CascadePhase, PrNumber, Sha, TrainError};
+use crate::types::{CascadePhase, CommentId, PrNumber, Sha, TrainError};
 
 /// An event in the event log.
 ///
@@ -268,12 +268,29 @@ pub enum StateEventPayload {
     },
 
     /// A predecessor has been declared via `@merge-train predecessor`.
+    ///
+    /// The `comment_id` tracks which comment is authoritative for this declaration.
+    /// This enables proper handling of comment edits and deletions per DESIGN.md.
     #[serde(rename = "predecessor_declared")]
     PredecessorDeclared {
         /// The PR declaring a predecessor.
         pr: PrNumber,
         /// The declared predecessor PR.
         predecessor: PrNumber,
+        /// The comment ID containing the authoritative declaration.
+        comment_id: CommentId,
+    },
+
+    /// A predecessor declaration has been removed.
+    ///
+    /// This occurs when the authoritative predecessor comment is deleted or edited
+    /// to remove the `@merge-train predecessor` command.
+    #[serde(rename = "predecessor_removed")]
+    PredecessorRemoved {
+        /// The PR whose predecessor declaration was removed.
+        pr: PrNumber,
+        /// The comment ID that was removed/edited.
+        comment_id: CommentId,
     },
 
     // ─── PR lifecycle events (non-critical, for cache updates) ───
@@ -428,6 +445,7 @@ impl StateEventPayload {
             StateEventPayload::PrMerged { .. }
             | StateEventPayload::PrStateChanged { .. }
             | StateEventPayload::PredecessorDeclared { .. }
+            | StateEventPayload::PredecessorRemoved { .. }
             | StateEventPayload::PrOpened { .. }
             | StateEventPayload::PrClosed { .. }
             | StateEventPayload::PrReopened { .. }
@@ -574,6 +592,11 @@ mod tests {
             StateEventPayload::PredecessorDeclared {
                 pr: PrNumber(2),
                 predecessor: PrNumber(1),
+                comment_id: CommentId(12345),
+            },
+            StateEventPayload::PredecessorRemoved {
+                pr: PrNumber(2),
+                comment_id: CommentId(12345),
             },
         ];
 
