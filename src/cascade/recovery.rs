@@ -425,7 +425,7 @@ pub fn compute_recovery_plan(
 
             if !remaining_descendants.is_empty() {
                 // Per DESIGN.md: use predecessor_head_sha, or fallback to fetching
-                // refs/pull/<predecessor_pr>/head via git ls-remote
+                // refs/pull/<predecessor_pr>/head via git fetch + rev-parse FETCH_HEAD
                 actions.push(RecoveryAction::VerifyPrepared {
                     predecessor_head_sha: train.predecessor_head_sha.clone(),
                     predecessor_pr: train.predecessor_pr,
@@ -587,6 +587,7 @@ pub fn verify_push_completed(
 ///
 /// * `plan` - The recovery plan to apply
 /// * `verification_results` - Results of verifying pending operations
+/// * `default_branch` - The repository's default branch name (for error messages)
 ///
 /// # Returns
 ///
@@ -594,6 +595,7 @@ pub fn verify_push_completed(
 pub fn apply_recovery_plan(
     mut plan: RecoveryPlan,
     verification_results: &HashMap<String, bool>,
+    default_branch: &str,
 ) -> (TrainRecord, Option<AbortReason>) {
     let mut needs_manual_review = false;
     let mut manual_review_reason = String::new();
@@ -605,12 +607,20 @@ pub fn apply_recovery_plan(
                 expected_tree: _,
                 pre_push_sha: _,
             } => {
-                // Check verification result
+                // Check verification result.
+                // If verification shows push didn't complete (!completed), we DON'T set
+                // needs_manual_review here because phase-based recovery (RetryMerge for
+                // remaining descendants) will handle the retry. The VerifyPush action is
+                // primarily for logging/debugging; the actual retry mechanism comes from
+                // the phase-specific recovery logic that adds RetryMerge for all descendants
+                // still in `progress.remaining()`.
                 if let Some(&completed) = verification_results.get(branch)
-                    && !completed
+                    && completed
                 {
-                    // Push didn't complete - will be retried
+                    // Push completed - phase-based recovery will skip this descendant
+                    // since it's already in the completed set (or will be added).
                 }
+                // If !completed or no result, phase-based recovery's RetryMerge will redo it.
             }
             RecoveryAction::VerifyPrepared { descendants, .. } => {
                 // Check verification results for each descendant.
@@ -632,8 +642,9 @@ pub fn apply_recovery_plan(
                     manual_review_reason = format!(
                         "Descendants {:?} were not prepared before squash. \
                          The predecessor head is not an ancestor of their heads. \
-                         Manual intervention required: merge main into these branches or rebase.",
-                        unprepared.iter().map(|p| p.0).collect::<Vec<_>>()
+                         Manual intervention required: merge {} into these branches or rebase.",
+                        unprepared.iter().map(|p| p.0).collect::<Vec<_>>(),
+                        default_branch
                     );
                 }
             }
@@ -1135,10 +1146,103 @@ mod tests {
             effects: vec![],
         };
 
-        let (updated_train, abort_reason) = apply_recovery_plan(plan, &HashMap::new());
+        let (updated_train, abort_reason) = apply_recovery_plan(plan, &HashMap::new(), "main");
 
         assert_eq!(updated_train.state, TrainState::NeedsManualReview);
         assert!(abort_reason.is_some());
+    }
+
+    /// Regression test: The manual-review message for unprepared descendants should include
+    /// the actual default branch name, not a hardcoded "main".
+    #[test]
+    fn apply_recovery_plan_unprepared_message_uses_default_branch() {
+        // Create a plan with VerifyPrepared action
+        let descendants = vec![(PrNumber(42), make_sha(4200))];
+        let actions = vec![RecoveryAction::VerifyPrepared {
+            predecessor_head_sha: Some(make_sha(1000)),
+            predecessor_pr: None,
+            descendants,
+        }];
+
+        let plan = RecoveryPlan {
+            train: TrainRecord::new(PrNumber(1)),
+            actions,
+            effects: vec![],
+        };
+
+        // Simulate failed verification - descendant was NOT prepared
+        let mut verification_results = HashMap::new();
+        verification_results.insert("prepared:42".to_string(), false);
+
+        // Test with a non-standard default branch name
+        let (train, abort_reason) = apply_recovery_plan(plan, &verification_results, "develop");
+
+        assert_eq!(train.state, TrainState::NeedsManualReview);
+        let abort = abort_reason.expect("should have abort reason");
+        match abort {
+            AbortReason::ApiError { details } => {
+                // The message should include "develop", not "main"
+                assert!(
+                    details.contains("develop"),
+                    "Error message should include default branch 'develop', got: {}",
+                    details
+                );
+                assert!(
+                    !details.contains("main"),
+                    "Error message should not contain hardcoded 'main', got: {}",
+                    details
+                );
+            }
+            _ => panic!("Expected ApiError abort reason"),
+        }
+    }
+
+    /// Regression test: Pending push intents should generate VerifyPush actions,
+    /// AND phase-based recovery should generate RetryMerge for the same branches.
+    /// This ensures crash-mid-push recovery will actually retry the push.
+    #[test]
+    fn pending_push_intents_have_retry_via_phase_recovery() {
+        let mut train = TrainRecord::new(PrNumber(1));
+        train.cascade_phase = CascadePhase::Preparing {
+            progress: DescendantProgress::new(vec![PrNumber(2)]),
+        };
+        train.predecessor_head_sha = Some(make_sha(1000));
+
+        // Pending push intent for branch-2
+        let pending_intents = vec![PendingIntent {
+            train_root: PrNumber(1),
+            intent_type: IntentType::PushPrep,
+            branch: "branch-2".to_string(),
+            expected_tree: make_sha(2000),
+            pre_push_sha: make_sha(3000),
+        }];
+
+        let pr2 = make_open_pr(2, "branch-1", Some(1));
+        let prs = HashMap::from([(PrNumber(2), pr2)]);
+
+        let plan = compute_recovery_plan(&train, &prs, &pending_intents, "main");
+
+        // Should have VerifyPush for the pending intent
+        let has_verify_push = plan.actions.iter().any(
+            |a| matches!(a, RecoveryAction::VerifyPush { branch, .. } if branch == "branch-2"),
+        );
+        assert!(
+            has_verify_push,
+            "Recovery plan should include VerifyPush for pending intent. Actions: {:?}",
+            plan.actions
+        );
+
+        // Should ALSO have RetryMerge for the same descendant from phase-based recovery.
+        // This is the actual retry mechanism - VerifyPush is just for verification/logging.
+        let has_retry_merge = plan.actions.iter().any(|a| {
+            matches!(a, RecoveryAction::RetryMerge { descendant: PrNumber(2), target_branch, .. }
+                if target_branch == "branch-2")
+        });
+        assert!(
+            has_retry_merge,
+            "Recovery plan should include RetryMerge from phase-based recovery. Actions: {:?}",
+            plan.actions
+        );
     }
 
     mod property_tests {
@@ -1264,7 +1368,7 @@ mod tests {
 
                 // Property 3: Plan can be applied without panicking
                 let verification_results = HashMap::new();
-                let (recovered_train, abort_reason) = apply_recovery_plan(plan.clone(), &verification_results);
+                let (recovered_train, abort_reason) = apply_recovery_plan(plan.clone(), &verification_results, "main");
 
                 // The recovered train should be in a valid state
                 prop_assert!(
@@ -1811,7 +1915,7 @@ mod tests {
                 let mut verification_results = HashMap::new();
                 verification_results.insert(format!("prepared:{}", pr_number), false);
 
-                let (train, abort_reason) = apply_recovery_plan(plan, &verification_results);
+                let (train, abort_reason) = apply_recovery_plan(plan, &verification_results, "main");
 
                 prop_assert_eq!(
                     train.state,
@@ -1849,7 +1953,7 @@ mod tests {
                 let mut verification_results = HashMap::new();
                 verification_results.insert(format!("prepared:{}", pr_number), true);
 
-                let (train, abort_reason) = apply_recovery_plan(plan, &verification_results);
+                let (train, abort_reason) = apply_recovery_plan(plan, &verification_results, "main");
 
                 prop_assert_eq!(
                     train.state,
