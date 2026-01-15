@@ -500,11 +500,18 @@ pub fn compute_recovery_plan(
                 }
             }
 
-            // Update plan_train with the updated progress
+            // Update plan_train with the updated progress.
+            // Only increment_seq if we actually marked something as completed.
+            // This maintains the monotonic recovery_seq invariant: same seq with different
+            // completed contents would break local-vs-GitHub recovery precedence.
+            let any_marked_completed = updated_progress.completed.len() > progress.completed.len();
             plan_train.cascade_phase = CascadePhase::Retargeting {
                 progress: updated_progress,
                 squash_sha: squash_sha.clone(),
             };
+            if any_marked_completed {
+                plan_train.increment_seq();
+            }
 
             if actions.is_empty() {
                 actions.push(RecoveryAction::ResumeClean);

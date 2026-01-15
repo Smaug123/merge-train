@@ -808,10 +808,14 @@ fn handle_external_merge(
         }
         CascadePhase::Preparing { progress } => {
             // External merge in Preparing phase.
-            // If any descendants are unprepared, abort (they don't have predecessor content).
+            // If any OPEN descendants are unprepared, abort (they don't have predecessor content).
             // If all are prepared, reset progress for reconciliation - the "completed" set
             // tracks which descendants were PREPARED, not reconciled. All must be reconciled.
-            let has_unprepared = progress.remaining().next().is_some();
+            // Filter to open PRs only - closed PRs that haven't been marked skipped yet
+            // should not block the cascade. This is consistent with recovery.rs:165-168.
+            let has_unprepared = progress
+                .remaining()
+                .any(|pr_num| prs.get(pr_num).is_some_and(|p| p.state.is_open()));
             if has_unprepared {
                 (progress.clone(), true)
             } else {
