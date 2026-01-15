@@ -254,6 +254,7 @@ pub enum StateEventPayload {
         /// The PR that was merged.
         pr: PrNumber,
         /// The merge commit SHA.
+        #[serde(alias = "sha")]
         merge_sha: Sha,
     },
 
@@ -583,5 +584,34 @@ mod tests {
                 payload
             );
         }
+    }
+
+    // ─── Backwards compatibility tests ───
+
+    #[test]
+    fn pr_merged_deserializes_with_old_sha_field() {
+        // Old format used "sha" field name
+        let old_json =
+            r#"{"type":"pr_merged","pr":42,"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#;
+        let parsed: StateEventPayload = serde_json::from_str(old_json).unwrap();
+
+        assert!(matches!(
+            parsed,
+            StateEventPayload::PrMerged { pr, merge_sha }
+            if pr == PrNumber(42) && merge_sha.as_str() == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
+    }
+
+    #[test]
+    fn pr_merged_deserializes_with_new_merge_sha_field() {
+        // New format uses "merge_sha" field name
+        let new_json = r#"{"type":"pr_merged","pr":42,"merge_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}"#;
+        let parsed: StateEventPayload = serde_json::from_str(new_json).unwrap();
+
+        assert!(matches!(
+            parsed,
+            StateEventPayload::PrMerged { pr, merge_sha }
+            if pr == PrNumber(42) && merge_sha.as_str() == "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        ));
     }
 }

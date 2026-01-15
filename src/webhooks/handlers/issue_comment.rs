@@ -144,7 +144,7 @@ fn handle_predecessor_command(
                 pr: pr_number,
                 body: format!(
                     "Error: PR #{} already has a predecessor declaration pointing to #{}. \
-                     Edit that comment to change predecessors, or delete it first.",
+                     Delete that comment first to change the predecessor.",
                     pr_number, existing_pred
                 ),
             },
@@ -155,12 +155,24 @@ fn handle_predecessor_command(
     // 1. Targeting the default branch (root of a stack)
     // 2. Has its own predecessor declaration (part of a stack)
     // 3. Already merged (predecessor's content is in main)
-    let predecessor_pr = state.prs.get(&predecessor);
-    let predecessor_valid = predecessor_pr.is_some_and(|pr| {
-        pr.base_ref == state.default_branch || pr.predecessor.is_some() || pr.state.is_merged()
-    });
+    let Some(predecessor_pr) = state.prs.get(&predecessor) else {
+        // Predecessor PR not found in cache
+        return Ok(HandlerResult::with_effects(vec![Effect::GitHub(
+            GitHubEffect::PostComment {
+                pr: pr_number,
+                body: format!(
+                    "Error: PR #{} not found. The predecessor must be an open PR in this repository.",
+                    predecessor
+                ),
+            },
+        )]));
+    };
 
-    if !predecessor_valid && predecessor_pr.is_some() {
+    let predecessor_valid = predecessor_pr.base_ref == state.default_branch
+        || predecessor_pr.predecessor.is_some()
+        || predecessor_pr.state.is_merged();
+
+    if !predecessor_valid {
         // Predecessor exists but isn't a valid stack member
         return Ok(HandlerResult::with_effects(vec![Effect::GitHub(
             GitHubEffect::PostComment {
@@ -577,5 +589,34 @@ mod tests {
             Effect::GitHub(GitHubEffect::PostComment { body, .. })
             if body.contains("already has a predecessor")
         )));
+    }
+
+    #[test]
+    fn predecessor_not_found_rejects() {
+        let event = make_comment_event(
+            CommentAction::Created,
+            Some(2),
+            "@merge-train predecessor #99",
+        );
+        let mut state = make_state();
+        // Only PR 2 exists, predecessor #99 does not
+        state
+            .prs
+            .insert(PrNumber(2), make_cached_pr(2, "main", None));
+
+        let result = handle_issue_comment(&event, &state, "merge-train").unwrap();
+
+        // No state events (rejected)
+        assert!(result.state_events.is_empty());
+        // Should have error comment about PR not found
+        assert!(
+            result.effects.iter().any(|e| matches!(
+                e,
+                Effect::GitHub(GitHubEffect::PostComment { body, .. })
+                if body.contains("#99 not found")
+            )),
+            "Expected error about PR not found, got: {:?}",
+            result.effects
+        );
     }
 }

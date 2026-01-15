@@ -75,7 +75,7 @@ pub enum GitHubEffect {
     ///
     /// This is a combined operation that updates the cached PR data including
     /// its merge state. Used when CI completes, reviews are submitted, or
-    /// other events that may change a PR's mergability.
+    /// other events that may change a PR's mergeability.
     RefetchPr { pr: PrNumber },
 
     // ─── PR Mutations ─────────────────────────────────────────────────────────
