@@ -195,27 +195,13 @@ pub async fn webhook_handler(
             Ok((StatusCode::ACCEPTED, "Accepted"))
         }
         Err(SpoolError::DuplicateDelivery(_)) => {
-            // Duplicate deliveries are idempotent - return success
+            // Duplicate deliveries are idempotent - return success without dispatching.
+            // The delivery was already spooled and will be (or has been) processed.
+            // Dispatching again would risk double-processing.
             debug!(
                 delivery_id = %delivery_id,
-                "Duplicate webhook delivery (idempotent)"
+                "Duplicate webhook delivery (idempotent, not dispatched)"
             );
-
-            // Still dispatch for duplicates - the worker will handle deduplication
-            if let Some(dispatcher) = app_state.dispatcher() {
-                let dispatcher = std::sync::Arc::clone(dispatcher);
-                let repo_id = RepoId::new(&owner, &repo);
-                let delivery = SpooledDelivery::new(&repo_spool_dir, delivery_id.clone());
-                tokio::spawn(async move {
-                    if let Err(e) = dispatcher.dispatch(&repo_id, delivery).await {
-                        warn!(
-                            repo = %repo_id,
-                            error = %e,
-                            "Failed to dispatch webhook to worker"
-                        );
-                    }
-                });
-            }
 
             Ok((StatusCode::ACCEPTED, "Accepted (duplicate)"))
         }

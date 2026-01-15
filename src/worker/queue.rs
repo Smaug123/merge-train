@@ -12,7 +12,7 @@
 //! From DESIGN.md:
 //! > "priority: stop > others"
 
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashSet};
 
 use crate::types::{DeliveryId, MergeStateStatus, PrNumber, Sha};
 use crate::webhooks::events::GitHubEvent;
@@ -106,6 +106,8 @@ impl Ord for QueuedEvent {
 ///
 /// Uses a binary heap (max-heap) to efficiently process high-priority events first.
 /// Within the same priority level, events are processed in FIFO order.
+///
+/// Tracks delivery IDs to prevent duplicate enqueueing.
 #[derive(Debug, Default)]
 pub struct EventQueue {
     /// The underlying binary heap.
@@ -113,6 +115,10 @@ pub struct EventQueue {
 
     /// Counter for generating sequence numbers.
     next_sequence: u64,
+
+    /// Set of delivery IDs currently in the queue.
+    /// Used to prevent duplicate enqueueing.
+    queued_ids: HashSet<DeliveryId>,
 }
 
 impl EventQueue {
@@ -121,6 +127,7 @@ impl EventQueue {
         EventQueue {
             heap: BinaryHeap::new(),
             next_sequence: 0,
+            queued_ids: HashSet::new(),
         }
     }
 
@@ -134,23 +141,45 @@ impl EventQueue {
         self.heap.is_empty()
     }
 
+    /// Returns true if a delivery with this ID is already in the queue.
+    pub fn contains(&self, delivery_id: &DeliveryId) -> bool {
+        self.queued_ids.contains(delivery_id)
+    }
+
     /// Pushes an event onto the queue.
     ///
     /// Events are assigned a sequence number to maintain FIFO ordering
     /// within the same priority level.
-    pub fn push(&mut self, event: GitHubEvent, delivery_id: DeliveryId, priority: EventPriority) {
+    ///
+    /// Returns `true` if the event was enqueued, `false` if it was already
+    /// in the queue (duplicate delivery ID).
+    pub fn push(
+        &mut self,
+        event: GitHubEvent,
+        delivery_id: DeliveryId,
+        priority: EventPriority,
+    ) -> bool {
+        // Prevent duplicate enqueueing
+        if self.queued_ids.contains(&delivery_id) {
+            return false;
+        }
+
         let sequence = self.next_sequence;
         self.next_sequence += 1;
 
+        self.queued_ids.insert(delivery_id.clone());
         self.heap
             .push(QueuedEvent::new(event, delivery_id, priority, sequence));
+        true
     }
 
     /// Pops the highest-priority event from the queue.
     ///
     /// Returns `None` if the queue is empty.
     pub fn pop(&mut self) -> Option<QueuedEvent> {
-        self.heap.pop()
+        let event = self.heap.pop()?;
+        self.queued_ids.remove(&event.delivery_id);
+        Some(event)
     }
 
     /// Peeks at the highest-priority event without removing it.
@@ -168,7 +197,15 @@ impl EventQueue {
         while let Some(event) = self.pop() {
             events.push(event);
         }
+        // queued_ids is already cleared by pop() calls
         events
+    }
+
+    /// Clears the queue.
+    pub fn clear(&mut self) {
+        self.heap.clear();
+        self.queued_ids.clear();
+        // Don't reset next_sequence to maintain FIFO guarantees
     }
 }
 

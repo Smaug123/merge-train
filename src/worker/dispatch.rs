@@ -41,7 +41,6 @@ use crate::spool::delivery::SpooledDelivery;
 use crate::types::{DeliveryId, PrNumber, RepoId};
 
 use super::message::WorkerMessage;
-use super::poll::PollConfig;
 use super::worker::{RepoWorker, WorkerConfig, WorkerError};
 
 /// Errors that can occur during dispatch operations.
@@ -133,9 +132,6 @@ pub struct Dispatcher {
     /// Dispatcher configuration.
     config: DispatcherConfig,
 
-    /// Polling configuration.
-    poll_config: PollConfig,
-
     /// Active workers, keyed by repository ID.
     /// Protected by RwLock for async-safe access.
     workers: RwLock<HashMap<RepoId, WorkerHandle>>,
@@ -155,7 +151,6 @@ impl Dispatcher {
 
         Dispatcher {
             config,
-            poll_config: PollConfig::from_env(),
             workers: RwLock::new(HashMap::new()),
             shutdown: CancellationToken::new(),
         }
@@ -171,7 +166,6 @@ impl Dispatcher {
 
         Dispatcher {
             config,
-            poll_config: PollConfig::from_env(),
             workers: RwLock::new(HashMap::new()),
             shutdown,
         }
@@ -270,9 +264,12 @@ impl Dispatcher {
 
         let worker = RepoWorker::new(worker_config)?;
 
-        // Create channel and cancellation token
+        // Create channel and cancellation token.
+        // IMPORTANT: Use the same token for both the worker task and the handle
+        // so that remove_worker() cancels the correct token.
         let (tx, rx) = mpsc::channel(WORKER_CHANNEL_BUFFER);
         let cancel = self.shutdown.child_token();
+        let cancel_for_handle = cancel.clone();
 
         // Spawn worker task
         let repo_for_task = repo.clone();
@@ -285,7 +282,7 @@ impl Dispatcher {
         let handle = WorkerHandle {
             tx: tx.clone(),
             task,
-            cancel: self.shutdown.child_token(),
+            cancel: cancel_for_handle,
         };
         workers.insert(repo.clone(), handle);
 
@@ -336,8 +333,11 @@ impl Dispatcher {
 
     /// Broadcasts a poll message to all active workers.
     ///
-    /// This is called periodically to ensure trains make progress even if
-    /// webhooks are missed.
+    /// This can be used to trigger an immediate poll of all workers,
+    /// for example when recovering from a network outage.
+    ///
+    /// Note: Workers handle their own jittered polling for normal operation.
+    /// This method is for exceptional cases only.
     pub async fn broadcast_poll(&self) {
         let workers = self.workers.read().await;
 
@@ -349,25 +349,15 @@ impl Dispatcher {
 
     /// Runs the dispatcher's background loop.
     ///
-    /// This handles periodic polling of all workers. Call this as a spawned task.
+    /// This waits for the shutdown signal. Workers handle their own
+    /// polling with per-repo jitter to avoid thundering herd problems.
     pub async fn run(&self) {
         info!("Dispatcher background loop started");
 
-        loop {
-            let poll_interval = self.poll_config.poll_interval;
+        // Just wait for shutdown - workers handle their own jittered polling
+        self.shutdown.cancelled().await;
 
-            tokio::select! {
-                _ = self.shutdown.cancelled() => {
-                    info!("Dispatcher shutdown signal received");
-                    break;
-                }
-                _ = tokio::time::sleep(poll_interval) => {
-                    self.broadcast_poll().await;
-                }
-            }
-        }
-
-        info!("Dispatcher background loop stopped");
+        info!("Dispatcher shutdown signal received, stopping");
     }
 }
 
@@ -594,7 +584,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let config = DispatcherConfig::new(dir.path().join("spool"), dir.path().join("state"));
 
-        let dispatcher = Dispatcher::new(config.clone());
+        let shutdown = CancellationToken::new();
+        let dispatcher = Dispatcher::new_with_shutdown(config.clone(), shutdown.clone());
         let repo = RepoId::new("owner", "repo");
 
         // Create worker
@@ -607,10 +598,141 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         assert_eq!(dispatcher.worker_count().await, 1);
 
+        // Verify shutdown token is not cancelled yet
+        assert!(!shutdown.is_cancelled());
+
         // Shutdown all workers
         dispatcher.shutdown_all().await;
 
+        // Verify shutdown token IS cancelled after shutdown
+        assert!(
+            shutdown.is_cancelled(),
+            "Shutdown token should be cancelled after shutdown_all"
+        );
+
         // Workers should stop (give them time)
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Attempt to dispatch to a NEW repo after shutdown - worker will be created
+        // but should immediately see the cancelled shutdown token
+        let repo2 = RepoId::new("owner", "repo2");
+        let envelope2 = make_pr_opened_envelope(99);
+        let delivery_id2 = DeliveryId::new("post-shutdown-delivery");
+        spool_webhook(&config.spool_dir(&repo2), &delivery_id2, &envelope2).unwrap();
+        let delivery2 = SpooledDelivery::new(&config.spool_dir(&repo2), delivery_id2);
+
+        // This may succeed in creating a worker, but the worker will receive
+        // a cancelled token and should exit promptly
+        let _result = dispatcher.dispatch(&repo2, delivery2).await;
+
+        // Give any new worker time to notice shutdown
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // ─── Stage 17 Integration Tests ───
+
+    #[tokio::test]
+    async fn dispatcher_run_exits_on_shutdown() {
+        // Test oracle: dispatcher.run() exits when shutdown signal is received
+        let dir = tempdir().unwrap();
+        let config = DispatcherConfig::new(dir.path().join("spool"), dir.path().join("state"));
+
+        let shutdown = CancellationToken::new();
+        let dispatcher = Arc::new(Dispatcher::new_with_shutdown(config, shutdown.clone()));
+
+        // Spawn the dispatcher run loop
+        let dispatcher_handle = {
+            let dispatcher = Arc::clone(&dispatcher);
+            tokio::spawn(async move {
+                dispatcher.run().await;
+            })
+        };
+
+        // Give run() time to start
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Verify it's still running
+        assert!(!dispatcher_handle.is_finished());
+
+        // Signal shutdown
+        shutdown.cancel();
+
+        // Wait for run() to exit (with timeout)
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(1), dispatcher_handle).await;
+
+        assert!(
+            result.is_ok(),
+            "dispatcher.run() should exit after shutdown signal"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_worker_cancels_worker() {
+        // Test oracle: remove_worker cancels the correct worker token
+        let dir = tempdir().unwrap();
+        let config = DispatcherConfig::new(dir.path().join("spool"), dir.path().join("state"));
+
+        let dispatcher = Arc::new(Dispatcher::new(config.clone()));
+        let repo = RepoId::new("owner", "repo");
+
+        // Create worker
+        let envelope = make_pr_opened_envelope(42);
+        let delivery_id = DeliveryId::new("test-delivery");
+        spool_webhook(&config.spool_dir(&repo), &delivery_id, &envelope).unwrap();
+        let delivery = SpooledDelivery::new(&config.spool_dir(&repo), delivery_id);
+        dispatcher.dispatch(&repo, delivery).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(dispatcher.has_worker(&repo).await);
+
+        // Remove the worker
+        let removed = dispatcher.remove_worker(&repo).await;
+        assert!(removed);
+
+        // Worker should no longer exist
+        assert!(!dispatcher.has_worker(&repo).await);
+
+        // Give worker task time to notice cancellation and exit
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Dispatching a new event should create a fresh worker
+        let envelope2 = make_pr_opened_envelope(43);
+        let delivery_id2 = DeliveryId::new("test-delivery-2");
+        spool_webhook(&config.spool_dir(&repo), &delivery_id2, &envelope2).unwrap();
+        let delivery2 = SpooledDelivery::new(&config.spool_dir(&repo), delivery_id2);
+        dispatcher.dispatch(&repo, delivery2).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(dispatcher.has_worker(&repo).await);
+    }
+
+    #[tokio::test]
+    async fn cancel_stack_message_is_delivered() {
+        // Test that cancel_stack sends a message to the worker
+        let dir = tempdir().unwrap();
+        let config = DispatcherConfig::new(dir.path().join("spool"), dir.path().join("state"));
+
+        let dispatcher = Dispatcher::new(config.clone());
+        let repo = RepoId::new("owner", "repo");
+
+        // Create worker
+        let envelope = make_pr_opened_envelope(42);
+        let delivery_id = DeliveryId::new("test-delivery");
+        spool_webhook(&config.spool_dir(&repo), &delivery_id, &envelope).unwrap();
+        let delivery = SpooledDelivery::new(&config.spool_dir(&repo), delivery_id);
+        dispatcher.dispatch(&repo, delivery).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(dispatcher.has_worker(&repo).await);
+
+        // Send cancel_stack - should not error
+        let result = dispatcher.cancel_stack(&repo, PrNumber(42)).await;
+        assert!(result.is_ok());
+
+        // Cancelling for non-existent repo should not error (just no-op)
+        let other_repo = RepoId::new("owner", "other");
+        let result2 = dispatcher.cancel_stack(&other_repo, PrNumber(1)).await;
+        assert!(result2.is_ok());
     }
 }

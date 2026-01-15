@@ -284,7 +284,35 @@ impl RepoWorker {
     ///
     /// This is called by the dispatch layer when a new webhook arrives
     /// while the worker is running.
+    ///
+    /// # Deduplication
+    ///
+    /// The delivery is NOT enqueued if:
+    /// - It's already marked as done (`.done` marker exists)
+    /// - It's already in the queue (same delivery ID)
+    ///
+    /// This prevents duplicate processing when:
+    /// - A redelivery arrives for an already-processed webhook
+    /// - The same delivery is dispatched multiple times (e.g., on restart)
     pub fn enqueue(&mut self, delivery: SpooledDelivery) -> Result<()> {
+        // Skip if already done
+        if delivery.is_done() {
+            trace!(
+                delivery_id = %delivery.delivery_id,
+                "Skipping already-done delivery"
+            );
+            return Ok(());
+        }
+
+        // Skip if already in queue
+        if self.queue.contains(&delivery.delivery_id) {
+            trace!(
+                delivery_id = %delivery.delivery_id,
+                "Skipping already-queued delivery"
+            );
+            return Ok(());
+        }
+
         if let Some((event, priority)) = parse_and_classify(&delivery, &self.config.bot_name)? {
             self.queue.push(event, delivery.delivery_id, priority);
         } else {
@@ -443,6 +471,19 @@ impl RepoWorker {
         shutdown: CancellationToken,
     ) -> Result<()> {
         info!("Worker event loop started");
+
+        // Process any events that were already in the queue from startup.
+        // This handles the case where drain_pending() found deliveries but
+        // no new webhooks arrive to trigger processing.
+        if !self.queue.is_empty() {
+            debug!(queued = self.queue.len(), "Processing startup backlog");
+            while self.process_next()? {}
+
+            // Flush pending batch after processing startup backlog
+            if !self.pending_batch.is_empty() {
+                self.flush_pending_batch()?;
+            }
+        }
 
         // Schedule initial poll with jitter
         let initial_delay = self.poll_config.initial_poll_delay(&self.config.repo);
@@ -776,9 +817,32 @@ impl RepoWorker {
     ///
     /// Returns `true` if any event was critical (requires immediate fsync).
     fn apply_handler_result(&mut self, result: &HandlerResult) -> Result<bool> {
+        use crate::persistence::event::StateEventPayload;
+
         let mut has_critical = false;
 
         for payload in &result.state_events {
+            // Before applying TrainStopped/TrainAborted, cancel any in-flight operations.
+            // This must happen BEFORE we apply to state so we can still find the train.
+            match payload {
+                StateEventPayload::TrainStopped { root_pr }
+                | StateEventPayload::TrainAborted { root_pr, .. } => {
+                    // Cancel in-flight operations for this train
+                    if let Some(token) = self.stack_tokens.get(root_pr) {
+                        debug!(
+                            root_pr = %root_pr,
+                            "Cancelling in-flight operations for stopped/aborted train"
+                        );
+                        token.cancel();
+                    }
+                    // Remove the token
+                    self.stack_tokens.remove(root_pr);
+                    // Remove any pending timers for this train
+                    self.pending_timers.retain(|t| &t.train_root != root_pr);
+                }
+                _ => {}
+            }
+
             // Append to event log
             let event = self.event_log.append(payload.clone())?;
 
@@ -792,6 +856,18 @@ impl RepoWorker {
         }
 
         Ok(has_critical)
+    }
+
+    /// Cancels operations for a stack by root PR.
+    ///
+    /// This cancels the token and removes any pending timers.
+    pub fn cancel_stack(&mut self, root_pr: PrNumber) {
+        if let Some(token) = self.stack_tokens.get(&root_pr) {
+            info!(root_pr = %root_pr, "Cancelling stack operations");
+            token.cancel();
+        }
+        self.stack_tokens.remove(&root_pr);
+        self.pending_timers.retain(|t| t.train_root != root_pr);
     }
 }
 
@@ -893,6 +969,12 @@ fn apply_event_to_state(state: &mut PersistedRepoSnapshot, event: &StateEvent) {
         }
 
         StateEventPayload::TrainStopped { root_pr } => {
+            // Update train state before removing so that if this event is
+            // replayed during recovery, the state is consistent.
+            if let Some(train) = state.active_trains.get_mut(root_pr) {
+                train.stop();
+            }
+            // Stopped trains are removed from active_trains (like completed trains)
             state.active_trains.remove(root_pr);
             trace!(root_pr = %root_pr, "Train stopped");
         }
@@ -903,9 +985,9 @@ fn apply_event_to_state(state: &mut PersistedRepoSnapshot, event: &StateEvent) {
         }
 
         StateEventPayload::TrainAborted { root_pr, error } => {
-            // Update train state to aborted rather than removing
+            // Update train state to aborted, including state, ended_at, and error
             if let Some(train) = state.active_trains.get_mut(root_pr) {
-                train.error = Some(error.clone());
+                train.abort(error.clone());
             }
             trace!(root_pr = %root_pr, error = ?error, "Train aborted");
         }
@@ -1349,5 +1431,266 @@ mod tests {
 
         let result = find_latest_snapshot(&state_dir).unwrap();
         assert!(result.is_none());
+    }
+
+    // ─── Stage 17 Integration Tests ───
+    //
+    // These tests verify the key oracles for the per-repo worker system:
+    // - Spool → worker processing
+    // - Stop priority ordering
+    // - Serial processing within a repo
+    // - .done only after fsync
+    // - Deduplication of already-done deliveries
+
+    #[test]
+    fn done_marker_only_created_after_flush() {
+        // Test oracle: .done marker is only created AFTER fsync
+        let dir = tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        let state_dir = dir.path().join("state");
+
+        // Spool an event
+        let envelope = make_pr_opened_envelope(42);
+        let delivery_id = DeliveryId::new("test-delivery");
+        spool_webhook(&spool_dir, &delivery_id, &envelope).unwrap();
+
+        let config = WorkerConfig::new(RepoId::new("owner", "repo"), &spool_dir, &state_dir);
+        let mut worker = RepoWorker::new(config).unwrap();
+
+        // Process the event
+        worker.process_next().unwrap();
+
+        // Before flush: .done marker should NOT exist
+        let delivery = SpooledDelivery::new(&spool_dir, delivery_id.clone());
+        assert!(
+            !delivery.is_done(),
+            "Done marker should not exist before flush"
+        );
+
+        // After flush: .done marker should exist
+        worker.flush_pending_batch().unwrap();
+        assert!(delivery.is_done(), "Done marker should exist after flush");
+    }
+
+    #[test]
+    fn enqueue_skips_already_done_deliveries() {
+        // Test oracle: Deduplication - already-done deliveries are skipped
+        let dir = tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        let state_dir = dir.path().join("state");
+
+        // Spool and process an event
+        let envelope = make_pr_opened_envelope(42);
+        let delivery_id = DeliveryId::new("already-processed");
+        spool_webhook(&spool_dir, &delivery_id, &envelope).unwrap();
+
+        let config = WorkerConfig::new(RepoId::new("owner", "repo"), &spool_dir, &state_dir);
+        let mut worker = RepoWorker::new(config).unwrap();
+
+        // Process and flush
+        worker.process_all().unwrap();
+        assert!(worker.queue_is_empty());
+
+        // Manually construct a delivery for the same ID
+        let delivery = SpooledDelivery::new(&spool_dir, delivery_id.clone());
+        assert!(delivery.is_done(), "Delivery should be marked done");
+
+        // Try to enqueue it again - should be skipped
+        worker.enqueue(delivery).unwrap();
+        assert!(
+            worker.queue_is_empty(),
+            "Already-done delivery should not be enqueued"
+        );
+    }
+
+    #[test]
+    fn enqueue_skips_duplicate_deliveries_in_queue() {
+        // Test oracle: Deduplication - deliveries already in queue are skipped
+        let dir = tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        let state_dir = dir.path().join("state");
+
+        // Spool an event
+        let envelope = make_pr_opened_envelope(42);
+        let delivery_id = DeliveryId::new("test-delivery");
+        spool_webhook(&spool_dir, &delivery_id, &envelope).unwrap();
+
+        let config = WorkerConfig::new(RepoId::new("owner", "repo"), &spool_dir, &state_dir);
+        let mut worker = RepoWorker::new(config).unwrap();
+
+        // Queue should have 1 item from startup drain
+        assert_eq!(worker.queue_len(), 1);
+
+        // Try to enqueue the same delivery again
+        let delivery = SpooledDelivery::new(&spool_dir, delivery_id);
+        worker.enqueue(delivery).unwrap();
+
+        // Queue should still have only 1 item (duplicate was skipped)
+        assert_eq!(
+            worker.queue_len(),
+            1,
+            "Duplicate delivery should be skipped"
+        );
+    }
+
+    #[test]
+    fn multiple_stop_commands_maintain_fifo_order() {
+        // Test oracle: Multiple high-priority events maintain FIFO order
+        let dir = tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        let state_dir = dir.path().join("state");
+
+        // Spool multiple stop commands
+        for i in 0..3 {
+            let envelope = make_comment_envelope(42, "@merge-train stop");
+            let delivery_id = DeliveryId::new(format!("stop-{}", i));
+            spool_webhook(&spool_dir, &delivery_id, &envelope).unwrap();
+        }
+
+        let config = WorkerConfig::new(RepoId::new("owner", "repo"), &spool_dir, &state_dir);
+        let mut worker = RepoWorker::new(config).unwrap();
+
+        assert_eq!(worker.queue_len(), 3);
+
+        // All should be high priority and in FIFO order
+        let first = worker.queue.pop().unwrap();
+        assert_eq!(first.priority, EventPriority::High);
+        assert_eq!(first.delivery_id.as_str(), "stop-0");
+
+        let second = worker.queue.pop().unwrap();
+        assert_eq!(second.priority, EventPriority::High);
+        assert_eq!(second.delivery_id.as_str(), "stop-1");
+
+        let third = worker.queue.pop().unwrap();
+        assert_eq!(third.priority, EventPriority::High);
+        assert_eq!(third.delivery_id.as_str(), "stop-2");
+    }
+
+    #[test]
+    fn worker_processes_backlog_serially() {
+        // Test oracle: Events are processed serially (one at a time)
+        let dir = tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        let state_dir = dir.path().join("state");
+
+        // Spool multiple events
+        for i in 0..5 {
+            let envelope = make_pr_opened_envelope(i);
+            let delivery_id = DeliveryId::new(format!("delivery-{}", i));
+            spool_webhook(&spool_dir, &delivery_id, &envelope).unwrap();
+        }
+
+        let config = WorkerConfig::new(RepoId::new("owner", "repo"), &spool_dir, &state_dir);
+        let mut worker = RepoWorker::new(config).unwrap();
+
+        assert_eq!(worker.queue_len(), 5);
+
+        // Process one at a time and verify queue decreases
+        for remaining in (0..5).rev() {
+            let processed = worker.process_next().unwrap();
+            assert!(processed);
+            assert_eq!(worker.queue_len(), remaining);
+        }
+
+        // Queue should be empty
+        assert!(worker.queue_is_empty());
+
+        // All deliveries should be marked done after flush
+        worker.flush_pending_batch().unwrap();
+
+        for i in 0..5 {
+            let delivery =
+                SpooledDelivery::new(&spool_dir, DeliveryId::new(format!("delivery-{}", i)));
+            assert!(delivery.is_done(), "Delivery {} should be marked done", i);
+        }
+    }
+
+    #[test]
+    fn process_all_handles_empty_queue() {
+        // Test that process_all gracefully handles empty queue
+        let dir = tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        let state_dir = dir.path().join("state");
+
+        let config = WorkerConfig::new(RepoId::new("owner", "repo"), &spool_dir, &state_dir);
+        let mut worker = RepoWorker::new(config).unwrap();
+
+        // Queue should be empty
+        assert!(worker.queue_is_empty());
+
+        // process_all should return 0 without error
+        let count = worker.process_all().unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn queue_push_returns_false_for_duplicates() {
+        // Test the EventQueue deduplication at the queue level
+        use crate::types::Sha;
+        use crate::webhooks::events::{GitHubEvent, PrAction, PullRequestEvent};
+
+        let mut queue = super::super::queue::EventQueue::new();
+
+        let event = GitHubEvent::PullRequest(PullRequestEvent {
+            repo: RepoId::new("owner", "repo"),
+            action: PrAction::Opened,
+            pr_number: PrNumber(42),
+            merged: false,
+            merge_commit_sha: None,
+            head_sha: Sha::parse("a".repeat(40)).unwrap(),
+            base_branch: "main".to_string(),
+            head_branch: "feature".to_string(),
+            is_draft: false,
+            author_id: 1,
+        });
+
+        // First push should succeed
+        let first = queue.push(
+            event.clone(),
+            DeliveryId::new("test-id"),
+            EventPriority::Normal,
+        );
+        assert!(first, "First push should succeed");
+
+        // Second push with same ID should fail
+        let second = queue.push(event, DeliveryId::new("test-id"), EventPriority::Normal);
+        assert!(!second, "Second push with same ID should fail");
+
+        // Queue should only have 1 item
+        assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn queue_contains_tracks_queued_ids() {
+        use crate::types::Sha;
+        use crate::webhooks::events::{GitHubEvent, PrAction, PullRequestEvent};
+
+        let mut queue = super::super::queue::EventQueue::new();
+
+        let event = GitHubEvent::PullRequest(PullRequestEvent {
+            repo: RepoId::new("owner", "repo"),
+            action: PrAction::Opened,
+            pr_number: PrNumber(42),
+            merged: false,
+            merge_commit_sha: None,
+            head_sha: Sha::parse("a".repeat(40)).unwrap(),
+            base_branch: "main".to_string(),
+            head_branch: "feature".to_string(),
+            is_draft: false,
+            author_id: 1,
+        });
+
+        let delivery_id = DeliveryId::new("test-id");
+
+        // Before push: should not contain
+        assert!(!queue.contains(&delivery_id));
+
+        // After push: should contain
+        queue.push(event, delivery_id.clone(), EventPriority::Normal);
+        assert!(queue.contains(&delivery_id));
+
+        // After pop: should not contain
+        let _ = queue.pop();
+        assert!(!queue.contains(&delivery_id));
     }
 }
