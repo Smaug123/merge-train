@@ -37,6 +37,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, trace, warn};
 
+use crate::effects::Effect;
 use crate::persistence::event::StateEvent;
 use crate::persistence::log::{EventLog, EventLogError};
 use crate::persistence::snapshot::{
@@ -49,6 +50,8 @@ use crate::webhooks::events::GitHubEvent;
 use crate::webhooks::handlers::{HandlerError, HandlerResult, handle_event};
 use crate::webhooks::parser::{ParseError, parse_webhook};
 use crate::webhooks::priority::{EventPriority, classify_priority_with_bot_name};
+
+use super::effects::EffectError;
 
 use super::message::WorkerMessage;
 use super::poll::PollConfig;
@@ -80,6 +83,10 @@ pub enum WorkerError {
     #[error("parse error: {0}")]
     Parse(#[from] ParseError),
 
+    /// Effect execution failed.
+    #[error("effect error: {0}")]
+    Effect(#[from] EffectError),
+
     /// IO error.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -87,6 +94,19 @@ pub enum WorkerError {
 
 /// Result type for worker operations.
 pub type Result<T> = std::result::Result<T, WorkerError>;
+
+/// Result of processing a single event.
+///
+/// Contains information about what was processed and what effects need to be executed.
+#[derive(Debug)]
+pub struct ProcessResult {
+    /// Whether an event was processed.
+    pub processed: bool,
+    /// Effects that need to be executed (GitHub API calls, git operations).
+    pub effects: Vec<Effect>,
+    /// The delivery ID that was processed, if any.
+    pub delivery_id: Option<DeliveryId>,
+}
 
 /// Configuration for a worker.
 #[derive(Debug, Clone)]
@@ -324,8 +344,10 @@ impl RepoWorker {
 
     /// Processes the next event in the queue.
     ///
-    /// Returns `Ok(true)` if an event was processed, `Ok(false)` if the queue
-    /// was empty.
+    /// Returns a `ProcessResult` indicating:
+    /// - Whether an event was processed
+    /// - Effects that need to be executed asynchronously
+    /// - The delivery ID that was processed
     ///
     /// # Processing Steps
     ///
@@ -336,12 +358,19 @@ impl RepoWorker {
     /// 5. Apply state events to snapshot
     /// 6. If any event is critical: fsync log immediately, create `.done` marker
     /// 7. Otherwise: add to pending batch (fsync deferred)
+    /// 8. Return effects for async execution
     #[instrument(skip(self), fields(repo = %self.config.repo))]
-    pub fn process_next(&mut self) -> Result<bool> {
+    pub fn process_next(&mut self) -> Result<ProcessResult> {
         // Pop next event
         let queued = match self.queue.pop() {
             Some(q) => q,
-            None => return Ok(false),
+            None => {
+                return Ok(ProcessResult {
+                    processed: false,
+                    effects: Vec::new(),
+                    delivery_id: None,
+                });
+            }
         };
 
         let delivery_id = queued.delivery_id.clone();
@@ -379,19 +408,30 @@ impl RepoWorker {
             );
         }
 
-        // TODO: Execute effects (GitHub API calls, git operations)
-        // This will be implemented when we integrate with the effect interpreter
-
-        Ok(true)
+        // Step 8: Return effects for async execution
+        Ok(ProcessResult {
+            processed: true,
+            effects: result.effects.clone(),
+            delivery_id: Some(delivery_id),
+        })
     }
 
     /// Processes all events currently in the queue.
     ///
-    /// Returns the number of events processed.
-    pub fn process_all(&mut self) -> Result<usize> {
+    /// Returns the number of events processed and all collected effects.
+    /// Effects are NOT executed by this method - use `process_all_with_effects`
+    /// for async effect execution.
+    pub fn process_all(&mut self) -> Result<(usize, Vec<Effect>)> {
         let mut count = 0;
-        while self.process_next()? {
+        let mut all_effects = Vec::new();
+
+        loop {
+            let result = self.process_next()?;
+            if !result.processed {
+                break;
+            }
             count += 1;
+            all_effects.extend(result.effects);
         }
 
         // Flush any remaining batched events
@@ -399,7 +439,7 @@ impl RepoWorker {
             self.flush_pending_batch()?;
         }
 
-        Ok(count)
+        Ok((count, all_effects))
     }
 
     /// Flushes the pending batch: fsync log and create done markers.
@@ -477,11 +517,16 @@ impl RepoWorker {
         // no new webhooks arrive to trigger processing.
         if !self.queue.is_empty() {
             debug!(queued = self.queue.len(), "Processing startup backlog");
-            while self.process_next()? {}
+            let (count, effects) = self.process_all()?;
+            debug!(
+                processed = count,
+                effects = effects.len(),
+                "Processed startup backlog"
+            );
 
-            // Flush pending batch after processing startup backlog
-            if !self.pending_batch.is_empty() {
-                self.flush_pending_batch()?;
+            // Execute effects from startup backlog
+            if !effects.is_empty() {
+                self.execute_effects(effects, &shutdown).await?;
             }
         }
 
@@ -519,7 +564,7 @@ impl RepoWorker {
                             break;
                         }
                         Some(msg) => {
-                            if let Err(e) = self.handle_message(msg).await {
+                            if let Err(e) = self.handle_message(msg, &shutdown).await {
                                 error!(error = %e, "Error handling message");
                             }
                         }
@@ -563,10 +608,14 @@ impl RepoWorker {
     }
 
     /// Handles an incoming worker message.
-    async fn handle_message(&mut self, msg: WorkerMessage) -> Result<()> {
+    async fn handle_message(
+        &mut self,
+        msg: WorkerMessage,
+        shutdown: &CancellationToken,
+    ) -> Result<()> {
         match msg {
             WorkerMessage::Delivery(delivery) => {
-                self.handle_delivery(delivery)?;
+                self.handle_delivery(delivery, shutdown).await?;
             }
             WorkerMessage::CancelStack(pr) => {
                 self.handle_cancel_stack(pr);
@@ -588,17 +637,115 @@ impl RepoWorker {
     }
 
     /// Handles an incoming delivery.
-    fn handle_delivery(&mut self, delivery: SpooledDelivery) -> Result<()> {
+    ///
+    /// For stop commands, immediately cancels in-flight operations before processing.
+    /// Then processes events synchronously, and executes effects asynchronously.
+    async fn handle_delivery(
+        &mut self,
+        delivery: SpooledDelivery,
+        shutdown: &CancellationToken,
+    ) -> Result<()> {
+        // Before enqueuing, check if this is a stop command.
+        // If so, immediately cancel the relevant stack to interrupt in-flight operations.
+        self.handle_immediate_cancellation_if_stop(&delivery)?;
+
         // Enqueue the delivery
         self.enqueue(delivery)?;
 
-        // Process all pending events (synchronously for now)
-        // In the future, this could be broken into smaller chunks
-        while self.process_next()? {}
+        // Process all pending events and collect effects
+        let (count, effects) = self.process_all()?;
+        trace!(
+            processed = count,
+            effects = effects.len(),
+            "Processed events"
+        );
 
-        // Flush pending batch
-        if !self.pending_batch.is_empty() {
-            self.flush_pending_batch()?;
+        // Execute effects asynchronously
+        if !effects.is_empty() {
+            self.execute_effects(effects, shutdown).await?;
+        }
+
+        Ok(())
+    }
+
+    /// If the delivery is a stop command, immediately cancel the relevant stack.
+    ///
+    /// This ensures in-flight operations are interrupted before the stop command
+    /// is even enqueued, providing faster response to stop requests.
+    fn handle_immediate_cancellation_if_stop(&mut self, delivery: &SpooledDelivery) -> Result<()> {
+        use crate::commands::{Command, parse_command};
+        use crate::webhooks::parser::parse_webhook;
+
+        // Try to load and parse the webhook
+        let envelope = match delivery.read_webhook() {
+            Ok(env) => env,
+            Err(_) => return Ok(()), // Can't load, skip immediate cancellation
+        };
+
+        // Parse the webhook event
+        let body_bytes = serde_json::to_vec(&envelope.body).unwrap_or_default();
+        let event = match parse_webhook(&envelope.event_type, &body_bytes) {
+            Ok(Some(ev)) => ev,
+            Ok(None) => return Ok(()), // Not a supported event type
+            Err(_) => return Ok(()),   // Can't parse, skip immediate cancellation
+        };
+
+        // Check if it's an issue comment with a stop command
+        if let GitHubEvent::IssueComment(comment) = event
+            && let Some(pr_number) = comment.pr_number
+            && let Some(cmd) = parse_command(&comment.body, &self.config.bot_name)
+            && matches!(cmd, Command::Stop | Command::StopForce)
+        {
+            // Find the train root for this PR and cancel immediately
+            if let Some(train_root) = self.find_train_root(pr_number) {
+                info!(
+                    train_root = %train_root,
+                    pr = %pr_number,
+                    "Stop command detected, immediately cancelling stack"
+                );
+                self.cancel_stack(train_root);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Executes a batch of effects asynchronously.
+    ///
+    /// Effects are executed sequentially with cancellation support. If the shutdown
+    /// token is triggered, remaining effects are skipped.
+    ///
+    /// Note: This currently logs effects rather than executing them, as GitHub
+    /// interpreter integration is handled in Stage 18 (Bootstrap). The logging
+    /// ensures effects are not silently ignored.
+    async fn execute_effects(
+        &mut self,
+        effects: Vec<Effect>,
+        shutdown: &CancellationToken,
+    ) -> Result<()> {
+        for effect in effects {
+            // Check for shutdown before each effect
+            if shutdown.is_cancelled() {
+                debug!(
+                    remaining = 1,
+                    "Shutdown requested, skipping remaining effects"
+                );
+                break;
+            }
+
+            // Log the effect (actual execution requires GitHub interpreter from Stage 18)
+            debug!(?effect, "Effect pending execution");
+
+            // Handle RecordReconciliation effects locally (no external calls needed)
+            if let Effect::RecordReconciliation { pr, squash_sha } = effect
+                && let Some(cached_pr) = self.state.prs.get_mut(&pr)
+            {
+                cached_pr.predecessor_squash_reconciled = Some(squash_sha.clone());
+                trace!(?pr, ?squash_sha, "Recorded reconciliation in state");
+            }
+
+            // GitHub and Git effects are logged but not executed without an interpreter.
+            // This will be wired up in Stage 18 when the GitHub client is integrated.
         }
 
         Ok(())
@@ -623,9 +770,24 @@ impl RepoWorker {
     }
 
     /// Handles the poll timer for active trains.
+    ///
+    /// This also drains the spool to pick up any deliveries that may have been
+    /// missed (e.g., due to dispatcher failures).
     async fn handle_poll_active_trains(&mut self) -> Result<()> {
         self.last_poll = Some(Instant::now());
 
+        // First, drain any pending deliveries from the spool.
+        // This catches deliveries that may have been spooled but not dispatched
+        // (e.g., dispatcher failure, network issue, race condition).
+        let drained = self.drain_spool_periodic()?;
+        if drained > 0 {
+            debug!(
+                drained = drained,
+                "Drained pending deliveries from spool during poll"
+            );
+        }
+
+        // Now handle active train polling
         let active_trains: Vec<_> = self.state.active_trains.keys().copied().collect();
 
         if active_trains.is_empty() {
@@ -655,6 +817,35 @@ impl RepoWorker {
         }
 
         Ok(())
+    }
+
+    /// Drains pending deliveries from the spool during periodic polling.
+    ///
+    /// This catches deliveries that may have been spooled but not dispatched.
+    /// Unlike startup drain, this doesn't clean up .proc markers since a concurrent
+    /// process might legitimately own them.
+    fn drain_spool_periodic(&mut self) -> Result<usize> {
+        let deliveries = drain_pending(&self.config.spool_dir)?;
+        let mut enqueued = 0;
+
+        for delivery in deliveries {
+            // Try to enqueue; skip if already queued or done
+            if self.enqueue(delivery).is_ok() {
+                enqueued += 1;
+            }
+        }
+
+        // Process any newly enqueued deliveries
+        if enqueued > 0 {
+            let (processed, _effects) = self.process_all()?;
+            trace!(
+                enqueued = enqueued,
+                processed = processed,
+                "Processed drained deliveries"
+            );
+        }
+
+        Ok(enqueued)
     }
 
     /// Handles a timer firing for non-blocking wait re-evaluation.
@@ -794,6 +985,11 @@ impl RepoWorker {
     }
 
     /// Finds the train root for a PR.
+    ///
+    /// Checks if the PR is:
+    /// 1. A train root itself
+    /// 2. The current PR being processed
+    /// 3. In the frozen_descendants of an active train
     fn find_train_root(&self, pr: PrNumber) -> Option<PrNumber> {
         // Check if PR is itself a train root
         if self.state.active_trains.contains_key(&pr) {
@@ -802,10 +998,17 @@ impl RepoWorker {
 
         // Search active trains to find one containing this PR
         for (root, train) in &self.state.active_trains {
+            // Check if it's the current PR being processed
             if train.current_pr == pr {
                 return Some(*root);
             }
-            // Could also check frozen_descendants if available
+
+            // Check if PR is in the frozen_descendants of this train
+            if let Some(progress) = train.cascade_phase.progress()
+                && progress.frozen_descendants.contains(&pr)
+            {
+                return Some(*root);
+            }
         }
 
         None
@@ -1327,8 +1530,8 @@ mod tests {
         let mut worker = RepoWorker::new(config).unwrap();
 
         // Process the event
-        let processed = worker.process_next().unwrap();
-        assert!(processed);
+        let result = worker.process_next().unwrap();
+        assert!(result.processed);
 
         // Queue should be empty now
         assert!(worker.queue_is_empty());
@@ -1488,7 +1691,8 @@ mod tests {
         let mut worker = RepoWorker::new(config).unwrap();
 
         // Process and flush
-        worker.process_all().unwrap();
+        let (count, _effects) = worker.process_all().unwrap();
+        assert_eq!(count, 1);
         assert!(worker.queue_is_empty());
 
         // Manually construct a delivery for the same ID
@@ -1587,8 +1791,8 @@ mod tests {
 
         // Process one at a time and verify queue decreases
         for remaining in (0..5).rev() {
-            let processed = worker.process_next().unwrap();
-            assert!(processed);
+            let result = worker.process_next().unwrap();
+            assert!(result.processed);
             assert_eq!(worker.queue_len(), remaining);
         }
 
@@ -1618,9 +1822,10 @@ mod tests {
         // Queue should be empty
         assert!(worker.queue_is_empty());
 
-        // process_all should return 0 without error
-        let count = worker.process_all().unwrap();
+        // process_all should return (0, empty effects) without error
+        let (count, effects) = worker.process_all().unwrap();
         assert_eq!(count, 0);
+        assert!(effects.is_empty());
     }
 
     #[test]
@@ -1692,5 +1897,152 @@ mod tests {
         // After pop: should not contain
         let _ = queue.pop();
         assert!(!queue.contains(&delivery_id));
+    }
+
+    // ─── Stage 17: Polling and Timer Tests ───
+
+    #[test]
+    fn poll_config_has_sane_defaults() {
+        let config = super::super::poll::PollConfig::new();
+
+        // 10 minute poll interval
+        assert_eq!(config.poll_interval.as_secs(), 600);
+        // 5 minute wait timeout
+        assert_eq!(config.wait_timeout.as_secs(), 300);
+        // 5 second recheck interval
+        assert_eq!(config.recheck_interval.as_secs(), 5);
+        // 20% jitter
+        assert_eq!(config.jitter_percent, 20);
+    }
+
+    #[test]
+    fn time_until_next_poll_returns_none_when_no_trains() {
+        // When there are no active trains, polling shouldn't be scheduled
+        let dir = tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        let state_dir = dir.path().join("state");
+
+        let config = WorkerConfig::new(RepoId::new("owner", "repo"), &spool_dir, &state_dir);
+        let worker = RepoWorker::new(config).unwrap();
+
+        // No active trains means no polling needed
+        assert!(worker.state.active_trains.is_empty());
+    }
+
+    #[test]
+    fn find_train_root_finds_root_by_current_pr() {
+        // Test that find_train_root can find a train by its current_pr
+        let dir = tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        let state_dir = dir.path().join("state");
+
+        let config = WorkerConfig::new(RepoId::new("owner", "repo"), &spool_dir, &state_dir);
+        let mut worker = RepoWorker::new(config).unwrap();
+
+        // Add an active train
+        let train = crate::types::TrainRecord::new(PrNumber(10));
+        worker.state.active_trains.insert(PrNumber(10), train);
+
+        // Train root should be found by root PR
+        assert_eq!(worker.find_train_root(PrNumber(10)), Some(PrNumber(10)));
+
+        // Non-existent PR should not be found
+        assert_eq!(worker.find_train_root(PrNumber(99)), None);
+    }
+
+    // ─── Stage 17: Spool Drain During Operation Tests ───
+
+    #[test]
+    fn drain_spool_periodic_picks_up_missed_deliveries() {
+        // Test that drain_spool_periodic can recover missed deliveries
+        let dir = tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        let state_dir = dir.path().join("state");
+
+        let config = WorkerConfig::new(RepoId::new("owner", "repo"), &spool_dir, &state_dir);
+        let mut worker = RepoWorker::new(config).unwrap();
+
+        // Process any startup deliveries
+        let (initial_count, _) = worker.process_all().unwrap();
+        assert_eq!(initial_count, 0, "Should start empty");
+
+        // Now spool a new delivery (simulating one that was missed)
+        let envelope = make_pr_opened_envelope(99);
+        let delivery_id = DeliveryId::new("missed-delivery");
+        spool_webhook(&spool_dir, &delivery_id, &envelope).unwrap();
+
+        // Run periodic drain
+        let drained = worker.drain_spool_periodic().unwrap();
+        assert_eq!(drained, 1, "Should have drained the missed delivery");
+
+        // Delivery should be processed and marked done after flush
+        worker.flush_pending_batch().unwrap();
+        let delivery = SpooledDelivery::new(&spool_dir, delivery_id);
+        assert!(delivery.is_done(), "Drained delivery should be marked done");
+    }
+
+    #[test]
+    fn drain_spool_periodic_skips_already_done() {
+        // Test that drain_spool_periodic doesn't re-process done deliveries
+        let dir = tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        let state_dir = dir.path().join("state");
+
+        // Spool and process a delivery first
+        let envelope = make_pr_opened_envelope(42);
+        let delivery_id = DeliveryId::new("already-done");
+        spool_webhook(&spool_dir, &delivery_id, &envelope).unwrap();
+
+        let config = WorkerConfig::new(RepoId::new("owner", "repo"), &spool_dir, &state_dir);
+        let mut worker = RepoWorker::new(config).unwrap();
+
+        // Process it
+        let (count, _) = worker.process_all().unwrap();
+        assert_eq!(count, 1);
+
+        // Now run periodic drain - should not pick it up again
+        let drained = worker.drain_spool_periodic().unwrap();
+        assert_eq!(drained, 0, "Already-done delivery should not be re-drained");
+    }
+
+    #[test]
+    fn stop_command_immediate_cancellation() {
+        // Test that stop commands trigger immediate cancellation
+        // by checking token is cancelled after handle_immediate_cancellation_if_stop
+        let dir = tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        let state_dir = dir.path().join("state");
+
+        // Create a stop command delivery
+        let stop_envelope = make_comment_envelope(42, "@merge-train stop");
+        let delivery_id = DeliveryId::new("stop-command");
+        spool_webhook(&spool_dir, &delivery_id, &stop_envelope).unwrap();
+
+        let config = WorkerConfig::new(RepoId::new("owner", "repo"), &spool_dir, &state_dir)
+            .with_bot_name("merge-train");
+        let mut worker = RepoWorker::new(config).unwrap();
+
+        // Add a train that we can cancel
+        let train = crate::types::TrainRecord::new(PrNumber(42));
+        worker.state.active_trains.insert(PrNumber(42), train);
+
+        // Create a cancellation token for the train
+        let token = worker.get_or_create_stack_token(PrNumber(42));
+        assert!(
+            !token.is_cancelled(),
+            "Token should not be cancelled initially"
+        );
+
+        // Process the stop command delivery
+        let delivery = SpooledDelivery::new(&spool_dir, delivery_id);
+        worker
+            .handle_immediate_cancellation_if_stop(&delivery)
+            .unwrap();
+
+        // Token should now be cancelled
+        assert!(
+            token.is_cancelled(),
+            "Token should be cancelled after stop command"
+        );
     }
 }

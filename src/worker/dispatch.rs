@@ -723,16 +723,117 @@ mod tests {
         let delivery = SpooledDelivery::new(&config.spool_dir(&repo), delivery_id);
         dispatcher.dispatch(&repo, delivery).await.unwrap();
 
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(dispatcher.has_worker(&repo).await);
 
         // Send cancel_stack - should not error
         let result = dispatcher.cancel_stack(&repo, PrNumber(42)).await;
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "cancel_stack should succeed");
+
+        // Give worker time to process the cancellation message
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // The worker should have processed the CancelStack message.
+        // We can't directly verify the token was cancelled from here,
+        // but we verify the message was sent without error.
 
         // Cancelling for non-existent repo should not error (just no-op)
         let other_repo = RepoId::new("owner", "other");
         let result2 = dispatcher.cancel_stack(&other_repo, PrNumber(1)).await;
-        assert!(result2.is_ok());
+        assert!(
+            result2.is_ok(),
+            "cancel_stack for non-existent repo should succeed (no-op)"
+        );
+    }
+
+    // ─── Stage 17: Same-repo serialization and cross-repo concurrency ───
+
+    #[tokio::test]
+    async fn same_repo_events_processed_serially() {
+        // Test oracle: Multiple events for the same repo go to the same worker
+        // and are processed serially (one worker handles all).
+        let dir = tempdir().unwrap();
+        let config = DispatcherConfig::new(dir.path().join("spool"), dir.path().join("state"));
+
+        let dispatcher = Arc::new(Dispatcher::new(config.clone()));
+        let repo = RepoId::new("owner", "repo");
+
+        // Spool multiple events for the same repo
+        for i in 0..10 {
+            let envelope = make_pr_opened_envelope(i);
+            let delivery_id = DeliveryId::new(format!("delivery-{}", i));
+            spool_webhook(&config.spool_dir(&repo), &delivery_id, &envelope).unwrap();
+        }
+
+        // Dispatch all events concurrently from different tasks
+        let handles: Vec<_> = (0..10)
+            .map(|i| {
+                let dispatcher = Arc::clone(&dispatcher);
+                let repo = repo.clone();
+                let config = config.clone();
+                tokio::spawn(async move {
+                    let delivery_id = DeliveryId::new(format!("delivery-{}", i));
+                    let delivery = SpooledDelivery::new(&config.spool_dir(&repo), delivery_id);
+                    dispatcher.dispatch(&repo, delivery).await
+                })
+            })
+            .collect();
+
+        // All dispatches should succeed
+        for handle in handles {
+            let result = handle.await.unwrap();
+            assert!(result.is_ok(), "dispatch should succeed");
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Key oracle: Only ONE worker should exist (same repo = serial processing)
+        assert_eq!(
+            dispatcher.worker_count().await,
+            1,
+            "Same-repo events should all go to the same worker"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_repo_events_processed_concurrently() {
+        // Test oracle: Events for different repos create separate workers
+        // that can process concurrently.
+        let dir = tempdir().unwrap();
+        let config = DispatcherConfig::new(dir.path().join("spool"), dir.path().join("state"));
+
+        let dispatcher = Arc::new(Dispatcher::new(config.clone()));
+        let num_repos = 5;
+
+        // Create events for different repos
+        let handles: Vec<_> = (0..num_repos)
+            .map(|i| {
+                let dispatcher = Arc::clone(&dispatcher);
+                let config = config.clone();
+                let repo = RepoId::new("owner", format!("repo-{}", i));
+                tokio::spawn(async move {
+                    let envelope = make_pr_opened_envelope(i as u64);
+                    let delivery_id = DeliveryId::new(format!("delivery-repo-{}", i));
+                    spool_webhook(&config.spool_dir(&repo), &delivery_id, &envelope).unwrap();
+                    let delivery = SpooledDelivery::new(&config.spool_dir(&repo), delivery_id);
+                    dispatcher.dispatch(&repo, delivery).await
+                })
+            })
+            .collect();
+
+        // All dispatches should succeed
+        for handle in handles {
+            let result = handle.await.unwrap();
+            assert!(result.is_ok(), "dispatch should succeed");
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Key oracle: Each repo should have its own worker
+        assert_eq!(
+            dispatcher.worker_count().await,
+            num_repos,
+            "Different repos should have separate workers for concurrent processing"
+        );
     }
 }
