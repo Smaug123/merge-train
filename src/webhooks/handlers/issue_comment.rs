@@ -32,8 +32,12 @@ pub fn handle_issue_comment(
     state: &PersistedRepoSnapshot,
     bot_name: &str,
 ) -> Result<HandlerResult, HandlerError> {
-    // Only handle comments on PRs, not regular issues
-    let pr_number = event.pr_number.ok_or(HandlerError::NotAPullRequest)?;
+    // Only handle comments on PRs, not regular issues.
+    // Per DESIGN.md: "Returns an empty result for events that don't require any action."
+    // Comments on issues (not PRs) are silently ignored - they're not actionable.
+    let Some(pr_number) = event.pr_number else {
+        return Ok(HandlerResult::empty());
+    };
 
     match event.action {
         CommentAction::Created => handle_created(event, state, bot_name, pr_number),
@@ -151,10 +155,16 @@ fn handle_predecessor_command(
         )]));
     }
 
+    // Validate the target PR exists in cache
+    if !state.prs.contains_key(&pr_number) {
+        return Err(HandlerError::PrNotFound(pr_number.0));
+    }
+
     // Validate the predecessor exists and is either:
-    // 1. Targeting the default branch (root of a stack)
-    // 2. Has its own predecessor declaration (part of a stack)
-    // 3. Already merged (predecessor's content is in main)
+    // 1. Open AND (targeting the default branch OR has its own predecessor declaration)
+    // 2. Already merged (predecessor's content is in main)
+    //
+    // Per DESIGN.md: "A PR whose predecessor was closed without merge is **orphaned**"
     let Some(predecessor_pr) = state.prs.get(&predecessor) else {
         // Predecessor PR not found in cache
         return Ok(HandlerResult::with_effects(vec![Effect::GitHub(
@@ -168,20 +178,36 @@ fn handle_predecessor_command(
         )]));
     };
 
-    let predecessor_valid = predecessor_pr.base_ref == state.default_branch
-        || predecessor_pr.predecessor.is_some()
-        || predecessor_pr.state.is_merged();
+    // Check if predecessor is merged (always valid)
+    let predecessor_valid = if predecessor_pr.state.is_merged() {
+        true
+    } else if predecessor_pr.state.is_open() {
+        // Open predecessor must target default branch or have its own predecessor
+        predecessor_pr.base_ref == state.default_branch || predecessor_pr.predecessor.is_some()
+    } else {
+        // Closed without merge - not valid
+        false
+    };
 
     if !predecessor_valid {
         // Predecessor exists but isn't a valid stack member
+        let error_msg = if !predecessor_pr.state.is_open() && !predecessor_pr.state.is_merged() {
+            format!(
+                "Error: PR #{} was closed without being merged. \
+                 The predecessor must be an open PR or a merged PR.",
+                predecessor
+            )
+        } else {
+            format!(
+                "Error: PR #{} cannot be a predecessor because it doesn't target {} \
+                 and doesn't have its own predecessor declaration.",
+                predecessor, state.default_branch
+            )
+        };
         return Ok(HandlerResult::with_effects(vec![Effect::GitHub(
             GitHubEffect::PostComment {
                 pr: pr_number,
-                body: format!(
-                    "Error: PR #{} cannot be a predecessor because it doesn't target {} \
-                     and doesn't have its own predecessor declaration.",
-                    predecessor, state.default_branch
-                ),
+                body: error_msg,
             },
         )]));
     }
@@ -386,8 +412,10 @@ mod tests {
         let event = make_comment_event(CommentAction::Created, None, "@merge-train start");
         let state = make_state();
 
-        let result = handle_issue_comment(&event, &state, "merge-train");
-        assert!(matches!(result, Err(HandlerError::NotAPullRequest)));
+        // Comments on issues (not PRs) should be silently ignored, not an error.
+        // Per DESIGN.md: "Returns an empty result for events that don't require any action."
+        let result = handle_issue_comment(&event, &state, "merge-train").unwrap();
+        assert!(result.is_empty());
     }
 
     #[test]
@@ -618,5 +646,112 @@ mod tests {
             "Expected error about PR not found, got: {:?}",
             result.effects
         );
+    }
+
+    fn make_cached_pr_with_state(
+        number: u64,
+        base_ref: &str,
+        predecessor: Option<u64>,
+        state: PrState,
+    ) -> CachedPr {
+        CachedPr::new(
+            PrNumber(number),
+            Sha::parse("a".repeat(40)).unwrap(),
+            format!("branch-{}", number),
+            base_ref.to_string(),
+            predecessor.map(PrNumber),
+            state,
+            MergeStateStatus::Clean,
+            false,
+        )
+    }
+
+    #[test]
+    fn predecessor_closed_without_merge_rejects() {
+        let event = make_comment_event(
+            CommentAction::Created,
+            Some(2),
+            "@merge-train predecessor #1",
+        );
+        let mut state = make_state();
+        // PR 1 is closed without merge (not a valid predecessor)
+        state.prs.insert(
+            PrNumber(1),
+            make_cached_pr_with_state(1, "main", None, PrState::Closed),
+        );
+        state.prs.insert(
+            PrNumber(2),
+            make_cached_pr_with_state(2, "branch-1", None, PrState::Open),
+        );
+
+        let result = handle_issue_comment(&event, &state, "merge-train").unwrap();
+
+        // No state events (rejected)
+        assert!(result.state_events.is_empty());
+        // Should have error comment about closed PR
+        assert!(
+            result.effects.iter().any(|e| matches!(
+                e,
+                Effect::GitHub(GitHubEffect::PostComment { body, .. })
+                if body.contains("closed without being merged")
+            )),
+            "Expected error about closed PR, got: {:?}",
+            result.effects
+        );
+    }
+
+    #[test]
+    fn predecessor_merged_is_valid() {
+        let event = make_comment_event(
+            CommentAction::Created,
+            Some(2),
+            "@merge-train predecessor #1",
+        );
+        let mut state = make_state();
+        // PR 1 was merged (valid as predecessor per late-addition handling)
+        state.prs.insert(
+            PrNumber(1),
+            make_cached_pr_with_state(
+                1,
+                "main",
+                None,
+                PrState::Merged {
+                    merge_commit_sha: Sha::parse("b".repeat(40)).unwrap(),
+                },
+            ),
+        );
+        state.prs.insert(
+            PrNumber(2),
+            make_cached_pr_with_state(2, "branch-1", None, PrState::Open),
+        );
+
+        let result = handle_issue_comment(&event, &state, "merge-train").unwrap();
+
+        // Should have PredecessorDeclared event
+        assert_eq!(result.state_events.len(), 1);
+        assert!(matches!(
+            &result.state_events[0],
+            StateEventPayload::PredecessorDeclared { pr, predecessor }
+            if *pr == PrNumber(2) && *predecessor == PrNumber(1)
+        ));
+    }
+
+    #[test]
+    fn target_pr_not_in_cache_returns_error() {
+        let event = make_comment_event(
+            CommentAction::Created,
+            Some(2),
+            "@merge-train predecessor #1",
+        );
+        let mut state = make_state();
+        // PR 1 exists but PR 2 (the target) does not
+        state
+            .prs
+            .insert(PrNumber(1), make_cached_pr(1, "main", None));
+
+        let result = handle_issue_comment(&event, &state, "merge-train");
+
+        // Should return PrNotFound error
+        assert!(matches!(result, Err(HandlerError::PrNotFound(2))));
     }
 }
