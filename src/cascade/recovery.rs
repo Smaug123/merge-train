@@ -261,6 +261,21 @@ pub fn compute_recovery_plan(
                 };
             }
 
+            // Check if the current PR was closed without merge.
+            // This is inconsistent with the train continuing - can't squash a closed PR.
+            if let Some(current_pr) = prs.get(&train.current_pr)
+                && current_pr.state == PrState::Closed
+            {
+                actions.push(RecoveryAction::NeedsManualReview {
+                    reason: "Current PR was closed without merging".to_string(),
+                });
+                return RecoveryPlan {
+                    train: plan_train,
+                    actions,
+                    effects,
+                };
+            }
+
             // Normal case: PR not merged, continue with preparation recovery.
             // Use frozen_descendants, not current descendants.
             recover_multi_descendant_phase(&mut actions, &mut effects, progress, prs, |desc_pr| {
@@ -699,72 +714,80 @@ pub fn verify_descendants_prepared(
         return Ok(HashMap::new());
     };
 
-    // Determine the predecessor head SHA to use
-    let pred_sha = match predecessor_head_sha {
-        Some(sha) => sha.clone(),
-        None => {
-            // Fallback: fetch refs/pull/<predecessor_pr>/head from origin
-            match predecessor_pr {
-                Some(pr_num) => {
-                    // Fetch the predecessor ref so its objects are available locally.
-                    // ls-remote only returns the SHA; we need the actual commit object
-                    // for merge-base --is-ancestor to work.
-                    let refspec = format!("+refs/pull/{}/head", pr_num.0);
-                    let output = crate::git::git_command(worktree)
-                        .arg("fetch")
-                        .arg("origin")
-                        .arg(&refspec)
-                        .output()
-                        .map_err(|e| crate::git::GitError::CommandFailed {
-                            command: "git fetch".to_string(),
-                            stderr: e.to_string(),
-                        })?;
+    // Determine the predecessor head SHA to use.
+    //
+    // Even when predecessor_head_sha is Some, we should fetch via predecessor_pr
+    // if available. After a crash, local objects may not exist even if we have
+    // the SHA recorded. Fetching ensures the commit object is available locally
+    // for `git merge-base --is-ancestor` to work.
+    let pred_sha = if let Some(pr_num) = predecessor_pr {
+        // Fetch the predecessor ref so its objects are available locally.
+        // This is needed even if we have predecessor_head_sha because the
+        // local repo may have been cleaned up or the commit may have been
+        // garbage collected after a crash.
+        let refspec = format!("+refs/pull/{}/head", pr_num.0);
+        let output = crate::git::git_command(worktree)
+            .arg("fetch")
+            .arg("origin")
+            .arg(&refspec)
+            .output()
+            .map_err(|e| crate::git::GitError::CommandFailed {
+                command: "git fetch".to_string(),
+                stderr: e.to_string(),
+            })?;
 
-                    if !output.status.success() {
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        return Err(crate::git::GitError::FetchFailed {
-                            refspec,
-                            details: stderr.to_string(),
-                        });
-                    }
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(crate::git::GitError::FetchFailed {
+                refspec,
+                details: stderr.to_string(),
+            });
+        }
 
-                    // Use FETCH_HEAD to get the SHA of what was actually fetched.
-                    // This avoids a race condition where ls-remote could return a different
-                    // SHA if the remote ref moves between fetch and ls-remote.
-                    let output = crate::git::git_command(worktree)
-                        .arg("rev-parse")
-                        .arg("FETCH_HEAD")
-                        .output()
-                        .map_err(|e| crate::git::GitError::CommandFailed {
-                            command: "git rev-parse FETCH_HEAD".to_string(),
-                            stderr: e.to_string(),
-                        })?;
+        // Use predecessor_head_sha if available (it's the SHA at preparation time),
+        // otherwise use FETCH_HEAD (current ref, which may have moved).
+        match predecessor_head_sha {
+            Some(sha) => sha.clone(),
+            None => {
+                // Use FETCH_HEAD to get the SHA of what was actually fetched.
+                let output = crate::git::git_command(worktree)
+                    .arg("rev-parse")
+                    .arg("FETCH_HEAD")
+                    .output()
+                    .map_err(|e| crate::git::GitError::CommandFailed {
+                        command: "git rev-parse FETCH_HEAD".to_string(),
+                        stderr: e.to_string(),
+                    })?;
 
-                    if !output.status.success() {
-                        return Err(crate::git::GitError::CommandFailed {
-                            command: "git rev-parse FETCH_HEAD".to_string(),
-                            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-                        });
-                    }
-
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    let sha_str = stdout.trim();
-
-                    Sha::parse(sha_str.to_string()).map_err(|_| {
-                        crate::git::GitError::CommandFailed {
-                            command: "git rev-parse FETCH_HEAD".to_string(),
-                            stderr: format!("Invalid SHA: {}", sha_str),
-                        }
-                    })?
-                }
-                None => {
+                if !output.status.success() {
                     return Err(crate::git::GitError::CommandFailed {
-                        command: "verify_descendants_prepared".to_string(),
-                        stderr: "Neither predecessor_head_sha nor predecessor_pr available for verification".to_string(),
+                        command: "git rev-parse FETCH_HEAD".to_string(),
+                        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
                     });
                 }
+
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let sha_str = stdout.trim();
+
+                Sha::parse(sha_str.to_string()).map_err(|_| {
+                    crate::git::GitError::CommandFailed {
+                        command: "git rev-parse FETCH_HEAD".to_string(),
+                        stderr: format!("Invalid SHA: {}", sha_str),
+                    }
+                })?
             }
         }
+    } else if let Some(sha) = predecessor_head_sha {
+        // No predecessor_pr to fetch from, but we have the SHA.
+        // We'll try to use it directly; if the objects aren't local,
+        // merge-base will fail and we'll treat it as "unprepared" below.
+        sha.clone()
+    } else {
+        return Err(crate::git::GitError::CommandFailed {
+            command: "verify_descendants_prepared".to_string(),
+            stderr: "Neither predecessor_head_sha nor predecessor_pr available for verification"
+                .to_string(),
+        });
     };
 
     // Fetch descendant PR refs before verification. Without this, git merge-base
@@ -824,7 +847,16 @@ pub fn verify_descendants_prepared(
             Some(1) => {
                 results.insert(key, false);
             }
-            // Other exit codes (e.g., 128) = fatal error, likely missing objects
+            // Exit code 128 = fatal error, typically missing objects.
+            // If the predecessor commit object isn't available locally (e.g., because
+            // we only had predecessor_head_sha without predecessor_pr and the objects
+            // were garbage collected), we can't verify preparation.
+            // Treat as "unprepared" since we can't confirm it was prepared - this is
+            // the fail-safe behavior that will trigger manual review.
+            Some(128) => {
+                results.insert(key, false);
+            }
+            // Other exit codes = unexpected error
             _ => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 return Err(crate::git::GitError::CommandFailed {
@@ -948,6 +980,51 @@ mod tests {
             plan.actions
                 .iter()
                 .any(|a| matches!(a, RecoveryAction::NeedsManualReview { .. }))
+        );
+    }
+
+    /// Regression test: Preparing phase with closed PR must return NeedsManualReview.
+    /// Previously, closed PRs would fall through to normal preparation recovery and
+    /// emit RetryMerge actions for a PR that can never be squashed.
+    #[test]
+    fn recovery_plan_for_preparing_with_closed_pr_needs_review() {
+        let mut train = TrainRecord::new(PrNumber(1));
+        train.cascade_phase = CascadePhase::Preparing {
+            progress: DescendantProgress::new(vec![PrNumber(2)]),
+        };
+        train.predecessor_head_sha = Some(make_sha(1000));
+
+        // Current PR is closed (not merged)
+        let mut pr1 = make_open_pr(1, "main", None);
+        pr1.state = PrState::Closed;
+        let pr2 = make_open_pr(2, "branch-1", Some(1));
+        let prs = HashMap::from([(PrNumber(1), pr1), (PrNumber(2), pr2)]);
+
+        let plan = compute_recovery_plan(&train, &prs, &[], "main");
+
+        // Must return NeedsManualReview
+        let has_manual_review = plan.actions.iter().any(|a| {
+            matches!(
+                a,
+                RecoveryAction::NeedsManualReview { reason }
+                if reason.contains("closed without merging")
+            )
+        });
+        assert!(
+            has_manual_review,
+            "Recovery from Preparing with closed PR should return NeedsManualReview. Actions: {:?}",
+            plan.actions
+        );
+
+        // Must NOT have RetryMerge (can't continue with closed PR)
+        let has_retry_merge = plan
+            .actions
+            .iter()
+            .any(|a| matches!(a, RecoveryAction::RetryMerge { .. }));
+        assert!(
+            !has_retry_merge,
+            "Recovery from Preparing with closed PR should NOT emit RetryMerge. Actions: {:?}",
+            plan.actions
         );
     }
 
