@@ -472,15 +472,21 @@ pub fn compute_recovery_plan(
 
         CascadePhase::Retargeting {
             progress,
-            squash_sha: _,
+            squash_sha,
         } => {
+            // Clone progress so we can update it with already-completed retargets
+            let mut updated_progress = progress.clone();
+
             // Retargeting uses GitHub API, so we verify each descendant's base
             for pr_number in progress.remaining() {
                 if let Some(desc_pr) = prs.get(pr_number)
                     && desc_pr.state.is_open()
                 {
                     if desc_pr.base_ref == default_branch {
-                        // Already retargeted
+                        // Already retargeted - mark as completed in progress.
+                        // This handles the case where GitHub retarget succeeded but the
+                        // completion event wasn't persisted before a crash.
+                        updated_progress.mark_completed(*pr_number);
                         continue;
                     }
                     actions.push(RecoveryAction::RetryRetarget {
@@ -493,6 +499,12 @@ pub fn compute_recovery_plan(
                     }));
                 }
             }
+
+            // Update plan_train with the updated progress
+            plan_train.cascade_phase = CascadePhase::Retargeting {
+                progress: updated_progress,
+                squash_sha: squash_sha.clone(),
+            };
 
             if actions.is_empty() {
                 actions.push(RecoveryAction::ResumeClean);
@@ -1161,7 +1173,7 @@ mod tests {
 
         let plan = compute_recovery_plan(&train, &prs, &[], "main");
 
-        // Should only have retarget for #3
+        // Should only have retarget for #3 (not #2)
         let retarget_count = plan
             .actions
             .iter()
@@ -1176,6 +1188,40 @@ mod tests {
             })
             .count();
         assert_eq!(retarget_count, 1);
+
+        // No RetryRetarget for #2
+        let has_retry_for_2 = plan.actions.iter().any(|a| {
+            matches!(
+                a,
+                RecoveryAction::RetryRetarget {
+                    pr: PrNumber(2),
+                    ..
+                }
+            )
+        });
+        assert!(
+            !has_retry_for_2,
+            "Should not emit RetryRetarget for already-retargeted PR #2"
+        );
+
+        // #2 must be marked as completed in the plan's train progress.
+        // Without this, the train could get stuck if the retarget succeeded but
+        // the completion event wasn't persisted before a crash.
+        if let CascadePhase::Retargeting { progress, .. } = &plan.train.cascade_phase {
+            assert!(
+                progress.completed.contains(&PrNumber(2)),
+                "Already-retargeted PR #2 must be marked as completed in recovery plan. \
+                 Completed: {:?}",
+                progress.completed
+            );
+            // #3 should still be in remaining (not completed yet)
+            assert!(
+                !progress.completed.contains(&PrNumber(3)),
+                "PR #3 should not be marked completed yet"
+            );
+        } else {
+            panic!("Expected Retargeting phase in plan.train");
+        }
     }
 
     #[test]
@@ -1589,6 +1635,98 @@ mod tests {
                         phase.name()
                     );
                 }
+            }
+
+            /// Property: Recovery for Retargeting marks already-retargeted PRs as completed.
+            ///
+            /// When a PR's base_ref already matches the default branch, it was retargeted
+            /// successfully but the completion event may not have been persisted. Recovery
+            /// must mark such PRs as completed to prevent the train from getting stuck.
+            #[test]
+            fn retargeting_recovery_marks_already_retargeted_as_completed(
+                frozen_descendants in arb_unique_descendants(2, 5),
+                squash_sha in arb_sha(),
+                pr_sha in arb_sha(),
+                // How many of the descendants are already retargeted (at least 1, at most all)
+                num_already_retargeted in 1usize..5,
+            ) {
+                let num_already = num_already_retargeted.min(frozen_descendants.len());
+
+                let mut train = TrainRecord::new(PrNumber(1));
+                train.cascade_phase = CascadePhase::Retargeting {
+                    progress: DescendantProgress::new(frozen_descendants.clone()),
+                    squash_sha: squash_sha.clone(),
+                };
+
+                let mut prs = HashMap::new();
+                prs.insert(PrNumber(1), make_open_pr_for_test(1, "main", None, pr_sha.clone()));
+
+                // Mark some descendants as already retargeted (base_ref = "main")
+                // and others as still needing retarget (base_ref = "branch-1")
+                let already_retargeted: Vec<_> = frozen_descendants.iter().take(num_already).copied().collect();
+                let needs_retarget: Vec<_> = frozen_descendants.iter().skip(num_already).copied().collect();
+
+                for &desc in &already_retargeted {
+                    let mut pr = make_open_pr_for_test(desc.0, "main", Some(PrNumber(1)), pr_sha.clone());
+                    pr.base_ref = "main".to_string(); // Already retargeted
+                    prs.insert(desc, pr);
+                }
+                for &desc in &needs_retarget {
+                    let pr = make_open_pr_for_test(desc.0, "branch-1", Some(PrNumber(1)), pr_sha.clone());
+                    prs.insert(desc, pr);
+                }
+
+                let plan = compute_recovery_plan(&train, &prs, &[], "main");
+
+                // Verify the plan's train has the correct progress state
+                if let CascadePhase::Retargeting { progress, .. } = &plan.train.cascade_phase {
+                    // All already-retargeted PRs must be marked completed
+                    for &pr_num in &already_retargeted {
+                        prop_assert!(
+                            progress.completed.contains(&pr_num),
+                            "BUG: Already-retargeted PR {} not marked completed. \
+                             Completed: {:?}, Already retargeted: {:?}",
+                            pr_num, progress.completed, already_retargeted
+                        );
+                    }
+
+                    // PRs that still need retarget should NOT be in completed
+                    for &pr_num in &needs_retarget {
+                        prop_assert!(
+                            !progress.completed.contains(&pr_num),
+                            "PR {} still needs retarget but was marked completed",
+                            pr_num
+                        );
+                    }
+                } else {
+                    prop_assert!(false, "Expected Retargeting phase in plan.train");
+                }
+
+                // Verify actions: RetryRetarget only for those that still need it
+                for action in &plan.actions {
+                    if let RecoveryAction::RetryRetarget { pr, .. } = action {
+                        prop_assert!(
+                            needs_retarget.contains(pr),
+                            "RetryRetarget emitted for already-retargeted PR {}",
+                            pr
+                        );
+                        prop_assert!(
+                            !already_retargeted.contains(pr),
+                            "RetryRetarget emitted for already-retargeted PR {}",
+                            pr
+                        );
+                    }
+                }
+
+                // Should have exactly one RetryRetarget per PR that still needs it
+                let retry_count = plan.actions.iter()
+                    .filter(|a| matches!(a, RecoveryAction::RetryRetarget { .. }))
+                    .count();
+                prop_assert_eq!(
+                    retry_count,
+                    needs_retarget.len(),
+                    "Should have one RetryRetarget per PR that needs it"
+                );
             }
 
             // ─── Recovery Phase Transition Tests ─────────────────────────────────────────
