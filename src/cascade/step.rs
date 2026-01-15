@@ -847,7 +847,13 @@ fn handle_external_merge(
     // If we have unprepared descendants, abort. These descendants don't have the
     // predecessor's content merged into them, so reconciliation would drop changes.
     if needs_abort {
-        let unprepared: Vec<PrNumber> = progress.remaining().copied().collect();
+        // Filter to open PRs only - must match the has_unprepared check above.
+        // Closed PRs shouldn't appear in the abort message.
+        let unprepared: Vec<PrNumber> = progress
+            .remaining()
+            .filter(|pr_num| prs.get(pr_num).is_some_and(|p| p.state.is_open()))
+            .copied()
+            .collect();
         let reason = AbortReason::PreparationIncomplete {
             unprepared_descendants: unprepared.clone(),
         };

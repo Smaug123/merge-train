@@ -629,10 +629,11 @@ pub fn verify_push_completed(
 pub fn apply_recovery_plan(
     mut plan: RecoveryPlan,
     verification_results: &HashMap<String, bool>,
-    default_branch: &str,
+    _default_branch: &str,
 ) -> (TrainRecord, Option<AbortReason>) {
-    let mut needs_manual_review = false;
-    let mut manual_review_reason = String::new();
+    // Track specific abort reasons. PreparationIncomplete takes precedence over
+    // generic ApiError because it's more specific and actionable.
+    let mut abort_reason: Option<AbortReason> = None;
 
     for action in &plan.actions {
         match action {
@@ -643,7 +644,7 @@ pub fn apply_recovery_plan(
             } => {
                 // Check verification result.
                 // If verification shows push didn't complete (!completed), we DON'T set
-                // needs_manual_review here because phase-based recovery (RetryMerge for
+                // abort_reason here because phase-based recovery (RetryMerge for
                 // remaining descendants) will handle the retry. The VerifyPush action is
                 // primarily for logging/debugging; the actual retry mechanism comes from
                 // the phase-specific recovery logic that adds RetryMerge for all descendants
@@ -675,19 +676,19 @@ pub fn apply_recovery_plan(
                 }
 
                 if !unprepared.is_empty() {
-                    needs_manual_review = true;
-                    manual_review_reason = format!(
-                        "Descendants {:?} were not prepared before squash. \
-                         The predecessor head is not an ancestor of their heads. \
-                         Manual intervention required: merge {} into these branches or rebase.",
-                        unprepared.iter().map(|p| p.0).collect::<Vec<_>>(),
-                        default_branch
-                    );
+                    // Use PreparationIncomplete - matches step.rs handle_external_merge semantics
+                    abort_reason = Some(AbortReason::PreparationIncomplete {
+                        unprepared_descendants: unprepared,
+                    });
                 }
             }
             RecoveryAction::NeedsManualReview { reason } => {
-                needs_manual_review = true;
-                manual_review_reason = reason.clone();
+                // Only set ApiError if we don't already have a more specific reason
+                if abort_reason.is_none() {
+                    abort_reason = Some(AbortReason::ApiError {
+                        details: reason.clone(),
+                    });
+                }
             }
             _ => {
                 // Other actions don't affect the recovery state directly
@@ -695,14 +696,9 @@ pub fn apply_recovery_plan(
         }
     }
 
-    if needs_manual_review {
+    if let Some(reason) = abort_reason {
         plan.train.state = TrainState::NeedsManualReview;
-        return (
-            plan.train,
-            Some(AbortReason::ApiError {
-                details: manual_review_reason,
-            }),
-        );
+        return (plan.train, Some(reason));
     }
 
     (plan.train, None)
@@ -747,7 +743,11 @@ pub fn verify_descendants_prepared(
         // This is needed even if we have predecessor_head_sha because the
         // local repo may have been cleaned up or the commit may have been
         // garbage collected after a crash.
-        let refspec = format!("+refs/pull/{}/head", pr_num.0);
+        // Use full refspec with destination for consistency with rest of codebase.
+        let refspec = format!(
+            "+refs/pull/{}/head:refs/remotes/origin/pr/{}",
+            pr_num.0, pr_num.0
+        );
         let output = crate::git::git_command(worktree)
             .arg("fetch")
             .arg("origin")
@@ -815,9 +815,15 @@ pub fn verify_descendants_prepared(
     // Fetch descendant PR refs before verification. Without this, git merge-base
     // may fail if objects aren't local, returning non-zero (same as "not ancestor")
     // and causing false negatives.
+    // Use full refspec with destination for consistency with rest of codebase.
     let refspecs: Vec<String> = descendants
         .iter()
-        .map(|(pr_num, _)| format!("+refs/pull/{}/head", pr_num.0))
+        .map(|(pr_num, _)| {
+            format!(
+                "+refs/pull/{}/head:refs/remotes/origin/pr/{}",
+                pr_num.0, pr_num.0
+            )
+        })
         .collect();
 
     if !refspecs.is_empty() {
@@ -1285,10 +1291,10 @@ mod tests {
         assert!(abort_reason.is_some());
     }
 
-    /// Regression test: The manual-review message for unprepared descendants should include
-    /// the actual default branch name, not a hardcoded "main".
+    /// Test that apply_recovery_plan uses PreparationIncomplete for failed verification.
+    /// This matches the semantics of handle_external_merge in step.rs.
     #[test]
-    fn apply_recovery_plan_unprepared_message_uses_default_branch() {
+    fn apply_recovery_plan_unprepared_uses_preparation_incomplete() {
         // Create a plan with VerifyPrepared action
         let descendants = vec![(PrNumber(42), make_sha(4200))];
         let actions = vec![RecoveryAction::VerifyPrepared {
@@ -1307,26 +1313,25 @@ mod tests {
         let mut verification_results = HashMap::new();
         verification_results.insert("prepared:42".to_string(), false);
 
-        // Test with a non-standard default branch name
-        let (train, abort_reason) = apply_recovery_plan(plan, &verification_results, "develop");
+        let (train, abort_reason) = apply_recovery_plan(plan, &verification_results, "main");
 
         assert_eq!(train.state, TrainState::NeedsManualReview);
         let abort = abort_reason.expect("should have abort reason");
         match abort {
-            AbortReason::ApiError { details } => {
-                // The message should include "develop", not "main"
-                assert!(
-                    details.contains("develop"),
-                    "Error message should include default branch 'develop', got: {}",
-                    details
-                );
-                assert!(
-                    !details.contains("main"),
-                    "Error message should not contain hardcoded 'main', got: {}",
-                    details
+            AbortReason::PreparationIncomplete {
+                unprepared_descendants,
+            } => {
+                // Should contain the unprepared PR
+                assert_eq!(
+                    unprepared_descendants,
+                    vec![PrNumber(42)],
+                    "Should contain PR #42 as unprepared"
                 );
             }
-            _ => panic!("Expected ApiError abort reason"),
+            other => panic!(
+                "Expected PreparationIncomplete abort reason, got: {:?}",
+                other
+            ),
         }
     }
 
@@ -2111,7 +2116,8 @@ mod tests {
                 }
             }
 
-            /// Property: apply_recovery_plan with failed verification produces NeedsManualReview.
+            /// Property: apply_recovery_plan with failed verification produces NeedsManualReview
+            /// and uses PreparationIncomplete abort reason (matching step.rs semantics).
             #[test]
             fn apply_recovery_plan_failed_verification_needs_review(
                 pr_number in 2u64..100,
@@ -2147,10 +2153,24 @@ mod tests {
                     TrainState::NeedsManualReview,
                     "Failed verification should result in NeedsManualReview"
                 );
-                prop_assert!(
-                    abort_reason.is_some(),
-                    "Failed verification should produce abort reason"
-                );
+
+                // Must use PreparationIncomplete, not ApiError - matches step.rs semantics
+                match abort_reason {
+                    Some(AbortReason::PreparationIncomplete { unprepared_descendants }) => {
+                        prop_assert!(
+                            unprepared_descendants.contains(&PrNumber(pr_number)),
+                            "PreparationIncomplete should contain the unprepared PR {}",
+                            pr_number
+                        );
+                    }
+                    other => {
+                        prop_assert!(
+                            false,
+                            "Expected PreparationIncomplete abort reason, got: {:?}",
+                            other
+                        );
+                    }
+                }
             }
 
             /// Property: apply_recovery_plan with passed verification does NOT produce NeedsManualReview.
