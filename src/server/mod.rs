@@ -26,6 +26,10 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use thiserror::Error;
 
+use std::sync::Arc as StdArc;
+
+use crate::worker::Dispatcher;
+
 pub mod health;
 pub mod state;
 pub mod webhook;
@@ -98,6 +102,9 @@ struct AppStateInner {
 
     /// Webhook secret for HMAC-SHA256 signature verification.
     webhook_secret: Vec<u8>,
+
+    /// Event dispatcher for routing webhooks to per-repo workers.
+    dispatcher: Option<StdArc<Dispatcher>>,
 }
 
 impl AppState {
@@ -118,6 +125,31 @@ impl AppState {
                 spool_dir: spool_dir.into(),
                 state_dir: state_dir.into(),
                 webhook_secret: webhook_secret.into(),
+                dispatcher: None,
+            }),
+        }
+    }
+
+    /// Creates a new `AppState` with a dispatcher for worker management.
+    ///
+    /// # Arguments
+    ///
+    /// * `spool_dir` - Directory for spooling webhook deliveries
+    /// * `state_dir` - Directory for persisted repository state
+    /// * `webhook_secret` - Secret for verifying webhook signatures
+    /// * `dispatcher` - Event dispatcher for routing webhooks to workers
+    pub fn new_with_dispatcher(
+        spool_dir: impl Into<PathBuf>,
+        state_dir: impl Into<PathBuf>,
+        webhook_secret: impl Into<Vec<u8>>,
+        dispatcher: StdArc<Dispatcher>,
+    ) -> Self {
+        AppState {
+            inner: Arc::new(AppStateInner {
+                spool_dir: spool_dir.into(),
+                state_dir: state_dir.into(),
+                webhook_secret: webhook_secret.into(),
+                dispatcher: Some(dispatcher),
             }),
         }
     }
@@ -135,6 +167,11 @@ impl AppState {
     /// Returns the webhook secret.
     pub fn webhook_secret(&self) -> &[u8] {
         &self.inner.webhook_secret
+    }
+
+    /// Returns the dispatcher, if configured.
+    pub fn dispatcher(&self) -> Option<&StdArc<Dispatcher>> {
+        self.inner.dispatcher.as_ref()
     }
 }
 

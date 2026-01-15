@@ -14,9 +14,25 @@
 
 use std::collections::BinaryHeap;
 
-use crate::types::DeliveryId;
+use crate::types::{DeliveryId, MergeStateStatus, PrNumber, Sha};
 use crate::webhooks::events::GitHubEvent;
 use crate::webhooks::priority::EventPriority;
+
+/// Condition being waited for during non-blocking polling.
+///
+/// When the bot needs to wait for GitHub state to propagate, it records
+/// what condition it's waiting for and schedules timer-based re-checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WaitCondition {
+    /// Waiting for headRefOid to match after a push.
+    HeadRefOid { pr: PrNumber, expected: Sha },
+
+    /// Waiting for mergeStateStatus to change from a specific value.
+    MergeStateStatus { pr: PrNumber, not: MergeStateStatus },
+
+    /// Waiting for check suite to complete for a specific SHA.
+    CheckSuiteCompleted { sha: Sha },
+}
 
 /// An entry in the priority queue.
 ///
@@ -169,6 +185,12 @@ pub enum QueuedEventPayload {
 
     /// Internal: poll active trains for missed webhook recovery.
     PollActiveTrains,
+
+    /// Internal: timer-based re-evaluation for non-blocking waits.
+    TimerReEval {
+        train_root: PrNumber,
+        condition: WaitCondition,
+    },
 }
 
 #[cfg(test)]

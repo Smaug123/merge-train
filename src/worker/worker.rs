@@ -19,11 +19,23 @@
 //! A delivery's `.done` marker is only created after all state effects from
 //! that delivery are durably persisted (fsynced). This ensures correct replay
 //! on restart.
+//!
+//! # Async Event Loop
+//!
+//! The worker runs as a tokio task with an async event loop that handles:
+//! - Incoming webhook deliveries via message channel
+//! - Timer-based re-evaluation for non-blocking waits
+//! - Periodic polling for active trains (fallback for missed webhooks)
+//! - Graceful shutdown via cancellation token
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
-use tracing::{debug, info, instrument, trace, warn};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, instrument, trace, warn};
 
 use crate::persistence::event::StateEvent;
 use crate::persistence::log::{EventLog, EventLogError};
@@ -32,13 +44,15 @@ use crate::persistence::snapshot::{
 };
 use crate::spool::delivery::{SpoolError, SpooledDelivery, mark_done, mark_processing};
 use crate::spool::drain::{cleanup_interrupted_processing, drain_pending};
-use crate::types::{DeliveryId, RepoId};
+use crate::types::{DeliveryId, PrNumber, RepoId};
 use crate::webhooks::events::GitHubEvent;
 use crate::webhooks::handlers::{HandlerError, HandlerResult, handle_event};
 use crate::webhooks::parser::{ParseError, parse_webhook};
 use crate::webhooks::priority::{EventPriority, classify_priority_with_bot_name};
 
-use super::queue::EventQueue;
+use super::message::WorkerMessage;
+use super::poll::PollConfig;
+use super::queue::{EventQueue, WaitCondition};
 
 /// Default bot name for command parsing.
 const DEFAULT_BOT_NAME: &str = "merge-train";
@@ -108,10 +122,31 @@ impl WorkerConfig {
     }
 }
 
+/// A pending timer for non-blocking waits.
+#[derive(Debug)]
+struct PendingTimer {
+    /// When the timer fires.
+    fires_at: Instant,
+    /// The train this timer is for.
+    train_root: PrNumber,
+    /// The condition being waited for.
+    condition: WaitCondition,
+}
+
+impl PendingTimer {
+    fn new(fires_at: Instant, train_root: PrNumber, condition: WaitCondition) -> Self {
+        PendingTimer {
+            fires_at,
+            train_root,
+            condition,
+        }
+    }
+}
+
 /// Per-repo worker state.
 ///
 /// This struct encapsulates the state and resources needed to process events
-/// for a single repository.
+/// for a single repository. It runs as a tokio task with an async event loop.
 pub struct RepoWorker {
     /// Worker configuration.
     config: WorkerConfig,
@@ -127,6 +162,18 @@ pub struct RepoWorker {
 
     /// Set of delivery IDs with pending fsync (for batched writes).
     pending_batch: Vec<DeliveryId>,
+
+    /// Polling configuration.
+    poll_config: PollConfig,
+
+    /// Cancellation tokens for active stacks, keyed by root PR.
+    stack_tokens: HashMap<PrNumber, CancellationToken>,
+
+    /// Pending timers for non-blocking waits.
+    pending_timers: Vec<PendingTimer>,
+
+    /// Time of last poll for active trains.
+    last_poll: Option<Instant>,
 }
 
 impl RepoWorker {
@@ -206,6 +253,10 @@ impl RepoWorker {
             state,
             event_log,
             pending_batch: Vec::new(),
+            poll_config: PollConfig::from_env(),
+            stack_tokens: HashMap::new(),
+            pending_timers: Vec::new(),
+            last_poll: None,
         })
     }
 
@@ -373,6 +424,353 @@ impl RepoWorker {
 
         Ok(())
     }
+
+    // ─── Async Event Loop ─────────────────────────────────────────────────────────
+
+    /// Runs the worker event loop.
+    ///
+    /// This is the main entry point for the async worker. It processes messages
+    /// from the channel, handles timers, and responds to shutdown signals.
+    ///
+    /// # Arguments
+    ///
+    /// * `rx` - Channel receiver for incoming messages
+    /// * `shutdown` - Cancellation token for graceful shutdown
+    #[instrument(skip(self, rx, shutdown), fields(repo = %self.config.repo))]
+    pub async fn run(
+        mut self,
+        mut rx: mpsc::Receiver<WorkerMessage>,
+        shutdown: CancellationToken,
+    ) -> Result<()> {
+        info!("Worker event loop started");
+
+        // Schedule initial poll with jitter
+        let initial_delay = self.poll_config.initial_poll_delay(&self.config.repo);
+        self.last_poll = Some(Instant::now() - self.poll_config.poll_interval + initial_delay);
+
+        loop {
+            // Calculate time until next poll
+            let poll_delay = self.time_until_next_poll();
+
+            // Calculate time until next timer
+            let timer_delay = self.time_until_next_timer();
+
+            // Use the minimum of poll and timer delays
+            let next_wakeup = match (poll_delay, timer_delay) {
+                (Some(p), Some(t)) => Some(p.min(t)),
+                (Some(p), None) => Some(p),
+                (None, Some(t)) => Some(t),
+                (None, None) => None,
+            };
+
+            tokio::select! {
+                // Graceful shutdown
+                _ = shutdown.cancelled() => {
+                    info!("Shutdown signal received, stopping worker");
+                    break;
+                }
+
+                // Incoming message
+                msg = rx.recv() => {
+                    match msg {
+                        Some(WorkerMessage::Shutdown) => {
+                            info!("Shutdown message received");
+                            break;
+                        }
+                        Some(msg) => {
+                            if let Err(e) = self.handle_message(msg).await {
+                                error!(error = %e, "Error handling message");
+                            }
+                        }
+                        None => {
+                            // Channel closed, all senders dropped
+                            info!("Message channel closed");
+                            break;
+                        }
+                    }
+                }
+
+                // Timer wakeup (poll or pending timer)
+                _ = async {
+                    match next_wakeup {
+                        Some(delay) => tokio::time::sleep(delay).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    // Check if it's time for a poll
+                    if self.should_poll()
+                        && let Err(e) = self.handle_poll_active_trains().await
+                    {
+                        error!(error = %e, "Error during poll");
+                    }
+
+                    // Fire any expired timers
+                    if let Err(e) = self.fire_expired_timers().await {
+                        error!(error = %e, "Error firing timers");
+                    }
+                }
+            }
+        }
+
+        // Graceful shutdown: flush pending batch
+        if let Err(e) = self.flush_pending_batch() {
+            error!(error = %e, "Error flushing pending batch on shutdown");
+        }
+
+        info!("Worker event loop stopped");
+        Ok(())
+    }
+
+    /// Handles an incoming worker message.
+    async fn handle_message(&mut self, msg: WorkerMessage) -> Result<()> {
+        match msg {
+            WorkerMessage::Delivery(delivery) => {
+                self.handle_delivery(delivery)?;
+            }
+            WorkerMessage::CancelStack(pr) => {
+                self.handle_cancel_stack(pr);
+            }
+            WorkerMessage::PollActiveTrains => {
+                self.handle_poll_active_trains().await?;
+            }
+            WorkerMessage::TimerFired {
+                train_root,
+                condition,
+            } => {
+                self.handle_timer_fired(train_root, condition).await?;
+            }
+            WorkerMessage::Shutdown => {
+                // Handled in run() loop
+            }
+        }
+        Ok(())
+    }
+
+    /// Handles an incoming delivery.
+    fn handle_delivery(&mut self, delivery: SpooledDelivery) -> Result<()> {
+        // Enqueue the delivery
+        self.enqueue(delivery)?;
+
+        // Process all pending events (synchronously for now)
+        // In the future, this could be broken into smaller chunks
+        while self.process_next()? {}
+
+        // Flush pending batch
+        if !self.pending_batch.is_empty() {
+            self.flush_pending_batch()?;
+        }
+
+        Ok(())
+    }
+
+    /// Handles a stack cancellation request.
+    fn handle_cancel_stack(&mut self, pr: PrNumber) {
+        // Find the train root for this PR
+        let train_root = self.find_train_root(pr).unwrap_or(pr);
+
+        // Cancel the token if it exists
+        if let Some(token) = self.stack_tokens.get(&train_root) {
+            info!(train_root = %train_root, "Cancelling stack operations");
+            token.cancel();
+        }
+
+        // Remove the token (will be recreated if train restarts)
+        self.stack_tokens.remove(&train_root);
+
+        // Remove any pending timers for this train
+        self.pending_timers.retain(|t| t.train_root != train_root);
+    }
+
+    /// Handles the poll timer for active trains.
+    async fn handle_poll_active_trains(&mut self) -> Result<()> {
+        self.last_poll = Some(Instant::now());
+
+        let active_trains: Vec<_> = self.state.active_trains.keys().copied().collect();
+
+        if active_trains.is_empty() {
+            trace!("No active trains to poll");
+            return Ok(());
+        }
+
+        debug!(
+            count = active_trains.len(),
+            "Polling active trains for missed webhooks"
+        );
+
+        // For each active train, we would:
+        // 1. Check mergeStateStatus via GitHub API (RefetchPr effect)
+        // 2. Compare with cached state
+        // 3. Trigger cascade evaluation if changed
+        //
+        // This requires effect execution which is not fully implemented.
+        // For now, we just log that polling occurred.
+
+        for train_root in active_trains {
+            trace!(
+                train_root = %train_root,
+                trigger = "poll",
+                "Would poll train status"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Handles a timer firing for non-blocking wait re-evaluation.
+    async fn handle_timer_fired(
+        &mut self,
+        train_root: PrNumber,
+        condition: WaitCondition,
+    ) -> Result<()> {
+        trace!(
+            train_root = %train_root,
+            condition = ?condition,
+            "Timer fired for wait condition"
+        );
+
+        // Check if the train is still active
+        if !self.state.active_trains.contains_key(&train_root) {
+            debug!(
+                train_root = %train_root,
+                "Train no longer active, ignoring timer"
+            );
+            return Ok(());
+        }
+
+        // In a full implementation, we would:
+        // 1. Check the wait condition via GitHub API
+        // 2. If satisfied, proceed with cascade
+        // 3. If not satisfied, reschedule timer (with timeout check)
+        //
+        // For now, just log that the timer fired.
+
+        Ok(())
+    }
+
+    // ─── Timer Management ─────────────────────────────────────────────────────────
+
+    /// Schedules a timer for non-blocking wait re-evaluation.
+    #[allow(dead_code)]
+    pub fn schedule_wait_timer(&mut self, train_root: PrNumber, condition: WaitCondition) {
+        let delay = self.poll_config.recheck_interval;
+        let fires_at = Instant::now() + delay;
+
+        debug!(
+            train_root = %train_root,
+            delay_ms = delay.as_millis(),
+            "Scheduling wait timer"
+        );
+
+        self.pending_timers
+            .push(PendingTimer::new(fires_at, train_root, condition));
+    }
+
+    /// Returns time until the next timer fires, if any.
+    fn time_until_next_timer(&self) -> Option<Duration> {
+        self.pending_timers
+            .iter()
+            .map(|t| t.fires_at)
+            .min()
+            .map(|fires_at| {
+                let now = Instant::now();
+                if fires_at > now {
+                    fires_at - now
+                } else {
+                    Duration::ZERO
+                }
+            })
+    }
+
+    /// Fires all expired timers.
+    async fn fire_expired_timers(&mut self) -> Result<()> {
+        let now = Instant::now();
+
+        // Extract expired timers
+        let expired: Vec<_> = self
+            .pending_timers
+            .iter()
+            .filter(|t| t.fires_at <= now)
+            .map(|t| (t.train_root, t.condition.clone()))
+            .collect();
+
+        // Remove expired timers
+        self.pending_timers.retain(|t| t.fires_at > now);
+
+        // Fire each expired timer
+        for (train_root, condition) in expired {
+            self.handle_timer_fired(train_root, condition).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Returns time until next poll.
+    fn time_until_next_poll(&self) -> Option<Duration> {
+        // Only poll if we have active trains
+        if self.state.active_trains.is_empty() {
+            return None;
+        }
+
+        let interval = self
+            .poll_config
+            .poll_interval_with_jitter(&self.config.repo);
+
+        match self.last_poll {
+            Some(last) => {
+                let elapsed = last.elapsed();
+                if elapsed >= interval {
+                    Some(Duration::ZERO)
+                } else {
+                    Some(interval - elapsed)
+                }
+            }
+            None => Some(Duration::ZERO),
+        }
+    }
+
+    /// Returns true if it's time to poll.
+    fn should_poll(&self) -> bool {
+        if self.state.active_trains.is_empty() {
+            return false;
+        }
+
+        let interval = self
+            .poll_config
+            .poll_interval_with_jitter(&self.config.repo);
+
+        match self.last_poll {
+            Some(last) => last.elapsed() >= interval,
+            None => true,
+        }
+    }
+
+    // ─── Cancellation Token Management ────────────────────────────────────────────
+
+    /// Gets or creates a cancellation token for a stack.
+    #[allow(dead_code)]
+    pub fn get_or_create_stack_token(&mut self, train_root: PrNumber) -> CancellationToken {
+        self.stack_tokens.entry(train_root).or_default().clone()
+    }
+
+    /// Finds the train root for a PR.
+    fn find_train_root(&self, pr: PrNumber) -> Option<PrNumber> {
+        // Check if PR is itself a train root
+        if self.state.active_trains.contains_key(&pr) {
+            return Some(pr);
+        }
+
+        // Search active trains to find one containing this PR
+        for (root, train) in &self.state.active_trains {
+            if train.current_pr == pr {
+                return Some(*root);
+            }
+            // Could also check frozen_descendants if available
+        }
+
+        None
+    }
+
+    // ─── Internal Helpers ─────────────────────────────────────────────────────────
 
     /// Applies handler result to state and event log.
     ///

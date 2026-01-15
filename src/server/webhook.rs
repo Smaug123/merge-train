@@ -13,8 +13,8 @@ use thiserror::Error;
 use tracing::{debug, info, warn};
 
 use super::{AppState, InvalidPathComponent, validate_path_component};
-use crate::spool::delivery::{SpoolError, WebhookEnvelope, spool_webhook};
-use crate::types::DeliveryId;
+use crate::spool::delivery::{SpoolError, SpooledDelivery, WebhookEnvelope, spool_webhook};
+use crate::types::{DeliveryId, RepoId};
 use crate::webhooks::verify_signature;
 
 /// Header name for GitHub event type.
@@ -174,6 +174,24 @@ pub async fn webhook_handler(
                 event_type = %event_type,
                 "Webhook spooled successfully"
             );
+
+            // Dispatch to worker if dispatcher is configured.
+            // Fire-and-forget: don't block the 202 response.
+            if let Some(dispatcher) = app_state.dispatcher() {
+                let dispatcher = std::sync::Arc::clone(dispatcher);
+                let repo_id = RepoId::new(&owner, &repo);
+                let delivery = SpooledDelivery::new(&repo_spool_dir, delivery_id.clone());
+                tokio::spawn(async move {
+                    if let Err(e) = dispatcher.dispatch(&repo_id, delivery).await {
+                        warn!(
+                            repo = %repo_id,
+                            error = %e,
+                            "Failed to dispatch webhook to worker"
+                        );
+                    }
+                });
+            }
+
             Ok((StatusCode::ACCEPTED, "Accepted"))
         }
         Err(SpoolError::DuplicateDelivery(_)) => {
@@ -182,6 +200,23 @@ pub async fn webhook_handler(
                 delivery_id = %delivery_id,
                 "Duplicate webhook delivery (idempotent)"
             );
+
+            // Still dispatch for duplicates - the worker will handle deduplication
+            if let Some(dispatcher) = app_state.dispatcher() {
+                let dispatcher = std::sync::Arc::clone(dispatcher);
+                let repo_id = RepoId::new(&owner, &repo);
+                let delivery = SpooledDelivery::new(&repo_spool_dir, delivery_id.clone());
+                tokio::spawn(async move {
+                    if let Err(e) = dispatcher.dispatch(&repo_id, delivery).await {
+                        warn!(
+                            repo = %repo_id,
+                            error = %e,
+                            "Failed to dispatch webhook to worker"
+                        );
+                    }
+                });
+            }
+
             Ok((StatusCode::ACCEPTED, "Accepted (duplicate)"))
         }
         Err(e) => {

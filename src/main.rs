@@ -5,8 +5,11 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use merge_train::server::{AppState, build_router};
+use merge_train::worker::{Dispatcher, DispatcherConfig};
+use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Configuration for the merge train bot.
@@ -81,8 +84,27 @@ async fn main() {
         "Starting merge train bot"
     );
 
-    // Create application state
-    let app_state = AppState::new(config.spool_dir, config.state_dir, config.webhook_secret);
+    // Create shutdown token for graceful shutdown
+    let shutdown = CancellationToken::new();
+
+    // Create dispatcher for worker management
+    let dispatcher_config = DispatcherConfig::new(&config.spool_dir, &config.state_dir);
+    let dispatcher = Dispatcher::new_with_shutdown(dispatcher_config, shutdown.clone());
+    let dispatcher = Arc::new(dispatcher);
+
+    // Spawn dispatcher background task (handles periodic polling)
+    let dispatcher_for_task = Arc::clone(&dispatcher);
+    let dispatcher_task = tokio::spawn(async move {
+        dispatcher_for_task.run().await;
+    });
+
+    // Create application state with dispatcher
+    let app_state = AppState::new_with_dispatcher(
+        config.spool_dir,
+        config.state_dir,
+        config.webhook_secret,
+        Arc::clone(&dispatcher),
+    );
 
     // Build router
     let app = build_router(app_state);
@@ -93,7 +115,25 @@ async fn main() {
         .await
         .expect("Failed to bind to address");
 
+    // Run server with graceful shutdown
+    let shutdown_signal = shutdown.clone();
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl+C handler");
+        tracing::info!("Shutdown signal received, stopping gracefully...");
+        shutdown_signal.cancel();
+    });
+
     axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            shutdown.cancelled().await;
+        })
         .await
         .expect("Server failed to start");
+
+    // Wait for dispatcher to finish
+    tracing::info!("Waiting for dispatcher to shut down...");
+    let _ = dispatcher_task.await;
+    tracing::info!("Shutdown complete");
 }
