@@ -487,7 +487,7 @@ async fn refetch_pr(
     };
 
     Ok(GitHubResponse::PrRefetched {
-        data: pr_data,
+        pr: pr_data,
         merge_state,
     })
 }

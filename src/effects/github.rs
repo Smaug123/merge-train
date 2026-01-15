@@ -233,7 +233,7 @@ pub enum GitHubResponse {
     ///
     /// Contains both the PR data and its merge state.
     PrRefetched {
-        data: PrData,
+        pr: PrData,
         merge_state: MergeStateStatus,
     },
 
@@ -485,9 +485,8 @@ mod tests {
                 }
             ),
             arb_merge_state_status().prop_map(GitHubResponse::MergeState),
-            (arb_pr_data(), arb_merge_state_status()).prop_map(|(data, merge_state)| {
-                GitHubResponse::PrRefetched { data, merge_state }
-            }),
+            (arb_pr_data(), arb_merge_state_status())
+                .prop_map(|(pr, merge_state)| { GitHubResponse::PrRefetched { pr, merge_state } }),
             arb_sha().prop_map(|sha| GitHubResponse::Merged { sha }),
             Just(GitHubResponse::Retargeted),
             arb_comment_id().prop_map(|id| GitHubResponse::CommentPosted { id }),
