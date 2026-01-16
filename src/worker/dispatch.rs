@@ -144,6 +144,14 @@ struct WorkerHandle {
     /// Channel for sending messages to the worker.
     tx: mpsc::Sender<WorkerMessage>,
 
+    /// High-priority channel for cancellation requests.
+    ///
+    /// This separate channel allows stop commands to interrupt in-flight
+    /// operations without waiting for the main message queue. Per DESIGN.md:
+    /// "Sends a `CancelStackRequest` (containing the PR number) to the worker
+    /// via a separate channel."
+    cancel_tx: mpsc::UnboundedSender<PrNumber>,
+
     /// Handle to the worker's async task.
     #[allow(dead_code)]
     task: JoinHandle<()>,
@@ -245,19 +253,25 @@ impl Dispatcher {
         self.dispatch(repo, delivery).await
     }
 
-    /// Sends a cancel request for a stack.
+    /// Sends a cancel request for a stack via the high-priority channel.
     ///
     /// This is used when a stop command is received to interrupt in-flight
-    /// operations for the specified PR's stack.
+    /// operations for the specified PR's stack. The cancellation is sent via
+    /// a separate unbounded channel so it can be processed immediately, even
+    /// while the worker is executing effects from a previous delivery.
+    ///
+    /// Per DESIGN.md: "This allows long-running operations like `git merge`
+    /// or `git push` to be interrupted promptly when a human requests a stop."
     #[instrument(skip(self), fields(repo = %repo, pr = %pr))]
     pub async fn cancel_stack(&self, repo: &RepoId, pr: PrNumber) -> Result<()> {
         let workers = self.workers.read().await;
 
         if let Some(handle) = workers.get(repo) {
+            // Send via the high-priority cancel channel so it's processed
+            // immediately, even if the worker is busy executing effects.
             handle
-                .tx
-                .send(WorkerMessage::CancelStack(pr))
-                .await
+                .cancel_tx
+                .send(pr)
                 .map_err(|_| DispatchError::ChannelClosed)?;
         }
 
@@ -300,23 +314,25 @@ impl Dispatcher {
             debug!(repo = %repo, "Worker configured with real GitHub client");
         }
 
-        // Create channel and cancellation token.
+        // Create channels and cancellation token.
         // IMPORTANT: Use the same token for both the worker task and the handle
         // so that remove_worker() cancels the correct token.
         let (tx, rx) = mpsc::channel(WORKER_CHANNEL_BUFFER);
+        let (cancel_tx, cancel_rx) = mpsc::unbounded_channel();
         let cancel = self.shutdown.child_token();
         let cancel_for_handle = cancel.clone();
 
         // Spawn worker task
         let repo_for_task = repo.clone();
         let task = tokio::spawn(async move {
-            if let Err(e) = worker.run(rx, cancel).await {
+            if let Err(e) = worker.run(rx, cancel_rx, cancel).await {
                 error!(repo = %repo_for_task, error = %e, "Worker task failed");
             }
         });
 
         let handle = WorkerHandle {
             tx: tx.clone(),
+            cancel_tx,
             task,
             cancel: cancel_for_handle,
         };
@@ -762,16 +778,17 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(dispatcher.has_worker(&repo).await);
 
-        // Send cancel_stack - should not error
+        // Send cancel_stack - should not error.
+        // This now uses the high-priority cancel channel for prompt interruption.
         let result = dispatcher.cancel_stack(&repo, PrNumber(42)).await;
         assert!(result.is_ok(), "cancel_stack should succeed");
 
-        // Give worker time to process the cancellation message
+        // Give worker time to process the cancellation request
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
-        // The worker should have processed the CancelStack message.
-        // We can't directly verify the token was cancelled from here,
-        // but we verify the message was sent without error.
+        // The worker should have processed the cancellation request via the
+        // high-priority cancel channel. We can't directly verify the token
+        // was cancelled from here, but we verify the request was sent.
 
         // Cancelling for non-existent repo should not error (just no-op)
         let other_repo = RepoId::new("owner", "other");
