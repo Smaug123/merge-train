@@ -267,6 +267,15 @@ impl RepoWorker {
             }
         }
 
+        // Step 6: Create cancellation tokens for any existing active trains.
+        // This ensures stop commands can interrupt in-flight operations for trains
+        // that were active when the previous worker instance stopped.
+        let mut stack_tokens = HashMap::new();
+        for root_pr in state.active_trains.keys() {
+            debug!(root_pr = %root_pr, "Creating cancellation token for existing train");
+            stack_tokens.insert(*root_pr, CancellationToken::new());
+        }
+
         Ok(RepoWorker {
             config,
             queue,
@@ -274,7 +283,7 @@ impl RepoWorker {
             event_log,
             pending_batch: Vec::new(),
             poll_config: PollConfig::from_env(),
-            stack_tokens: HashMap::new(),
+            stack_tokens,
             pending_timers: Vec::new(),
             last_poll: None,
         })
@@ -655,7 +664,27 @@ impl RepoWorker {
     /// Handles an incoming delivery.
     ///
     /// For stop commands, immediately cancels in-flight operations before processing.
-    /// Then processes events synchronously, and executes effects asynchronously.
+    /// Then processes events synchronously, and executes effects inline.
+    ///
+    /// # Effect Execution Model
+    ///
+    /// Effects are executed inline (sequentially within this function). This means:
+    /// - Long-running effects will block message handling for this worker
+    /// - New webhook deliveries queue up in the channel but aren't processed until
+    ///   effect execution completes
+    /// - Stop commands received during effect execution won't interrupt until the
+    ///   current effect batch completes (though cancellation tokens allow individual
+    ///   effects to check for cancellation before starting)
+    ///
+    /// This design is intentional for Stage 17: it ensures correctness by preventing
+    /// interleaving of event processing. The cancellation token mechanism allows
+    /// stop commands to interrupt at effect boundaries.
+    ///
+    /// # Stage 18 Consideration
+    ///
+    /// Stage 18 may introduce chunked effect execution (process N effects, then check
+    /// messages) for better stop-command responsiveness. This requires careful handling
+    /// of partial effect completion.
     async fn handle_delivery(
         &mut self,
         delivery: SpooledDelivery,
@@ -728,9 +757,13 @@ impl RepoWorker {
 
     /// Executes a list of effects, respecting cancellation.
     ///
-    /// This method processes effects in order, checking for cancellation before
-    /// each effect. Effect execution uses the `EffectExecutor` which integrates
-    /// with the GitHub interpreter.
+    /// This method processes effects **inline** (sequentially within the caller's
+    /// execution context). While effects are executing, no other messages can be
+    /// processed by this worker. Cancellation is checked before each effect, so
+    /// stop commands can interrupt at effect boundaries, but not mid-effect.
+    ///
+    /// Effect execution uses the `EffectExecutor` which integrates with the
+    /// GitHub interpreter (or a logging stub in Stage 17).
     ///
     /// # Effect Types
     ///
@@ -1237,7 +1270,10 @@ impl RepoWorker {
     // ─── Cancellation Token Management ────────────────────────────────────────────
 
     /// Gets or creates a cancellation token for a stack.
-    #[allow(dead_code)]
+    ///
+    /// Tokens are automatically created when trains start (in `apply_handler_result`)
+    /// and when loading existing trains from snapshots (in `new`). This method is
+    /// useful for tests and for getting a token reference when one is expected to exist.
     pub fn get_or_create_stack_token(&mut self, train_root: PrNumber) -> CancellationToken {
         self.stack_tokens.entry(train_root).or_default().clone()
     }
@@ -1283,6 +1319,14 @@ impl RepoWorker {
         let mut has_critical = false;
 
         for payload in &result.state_events {
+            // Create cancellation token when a train starts.
+            // This allows stop commands to interrupt in-flight operations for this train.
+            if let StateEventPayload::TrainStarted { root_pr, .. } = payload {
+                debug!(root_pr = %root_pr, "Creating cancellation token for new train");
+                // Insert a fresh token for this train (or get existing if somehow already present)
+                self.stack_tokens.entry(*root_pr).or_default();
+            }
+
             // Before applying TrainStopped/TrainAborted, cancel any in-flight operations.
             // This must happen BEFORE we apply to state so we can still find the train.
             match payload {
@@ -2384,6 +2428,122 @@ mod tests {
         assert!(
             token.is_cancelled(),
             "Token should be cancelled after stop command"
+        );
+    }
+
+    #[test]
+    fn train_started_creates_cancellation_token() {
+        // End-to-end test: TrainStarted event creates a cancellation token
+        // that can be cancelled by a subsequent TrainStopped event.
+        //
+        // This tests the full flow without manually creating tokens.
+        use crate::persistence::event::StateEventPayload;
+        use crate::webhooks::handlers::HandlerResult;
+
+        let dir = tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        let state_dir = dir.path().join("state");
+
+        let config = WorkerConfig::new(RepoId::new("owner", "repo"), &spool_dir, &state_dir);
+        let mut worker = RepoWorker::new(config).unwrap();
+
+        // Verify no token exists initially
+        assert!(
+            !worker.stack_tokens.contains_key(&PrNumber(42)),
+            "Token should not exist before train starts"
+        );
+
+        // Simulate processing a TrainStarted event
+        let handler_result = HandlerResult {
+            state_events: vec![StateEventPayload::TrainStarted {
+                root_pr: PrNumber(42),
+                current_pr: PrNumber(42),
+            }],
+            effects: vec![],
+        };
+        worker.apply_handler_result(&handler_result).unwrap();
+
+        // Verify token was created
+        assert!(
+            worker.stack_tokens.contains_key(&PrNumber(42)),
+            "Token should exist after train starts"
+        );
+        let token = worker.stack_tokens.get(&PrNumber(42)).unwrap().clone();
+        assert!(
+            !token.is_cancelled(),
+            "Token should not be cancelled after train starts"
+        );
+
+        // Simulate processing a TrainStopped event
+        let stop_result = HandlerResult {
+            state_events: vec![StateEventPayload::TrainStopped {
+                root_pr: PrNumber(42),
+            }],
+            effects: vec![],
+        };
+        worker.apply_handler_result(&stop_result).unwrap();
+
+        // Verify token was cancelled and removed
+        assert!(
+            token.is_cancelled(),
+            "Token should be cancelled after train stops"
+        );
+        assert!(
+            !worker.stack_tokens.contains_key(&PrNumber(42)),
+            "Token should be removed after train stops"
+        );
+    }
+
+    #[test]
+    fn existing_trains_get_tokens_at_startup() {
+        // Test that trains loaded from snapshot get cancellation tokens at startup
+        use crate::types::TrainRecord;
+
+        let dir = tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        let state_dir = dir.path().join("state");
+
+        // Create a snapshot with an active train
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let mut snapshot = PersistedRepoSnapshot::new("main");
+        snapshot
+            .active_trains
+            .insert(PrNumber(42), TrainRecord::new(PrNumber(42)));
+        snapshot
+            .active_trains
+            .insert(PrNumber(99), TrainRecord::new(PrNumber(99)));
+        save_snapshot_atomic(&state_dir.join("snapshot.0.json"), &snapshot).unwrap();
+
+        // Create worker - it should load the snapshot and create tokens
+        let config = WorkerConfig::new(RepoId::new("owner", "repo"), &spool_dir, &state_dir);
+        let worker = RepoWorker::new(config).unwrap();
+
+        // Verify tokens were created for existing trains
+        assert!(
+            worker.stack_tokens.contains_key(&PrNumber(42)),
+            "Token should exist for train 42 loaded from snapshot"
+        );
+        assert!(
+            worker.stack_tokens.contains_key(&PrNumber(99)),
+            "Token should exist for train 99 loaded from snapshot"
+        );
+
+        // Tokens should not be cancelled initially
+        assert!(
+            !worker
+                .stack_tokens
+                .get(&PrNumber(42))
+                .unwrap()
+                .is_cancelled(),
+            "Token for train 42 should not be cancelled initially"
+        );
+        assert!(
+            !worker
+                .stack_tokens
+                .get(&PrNumber(99))
+                .unwrap()
+                .is_cancelled(),
+            "Token for train 99 should not be cancelled initially"
         );
     }
 }

@@ -7,7 +7,7 @@
 //! # Polling Strategy
 //!
 //! - **Poll interval**: 10 minutes by default (configurable via `MERGE_TRAIN_POLL_INTERVAL_MINS`)
-//! - **Jitter**: 0-20% added to prevent thundering herd on restart
+//! - **Jitter**: ±20% applied symmetrically (8-12 minutes) to prevent thundering herd on restart
 //! - **Initial stagger**: Based on repo ID hash to distribute load
 //!
 //! # Non-blocking Waits
@@ -54,10 +54,10 @@ pub struct PollConfig {
     /// Default: 5 seconds.
     pub recheck_interval: Duration,
 
-    /// Jitter percentage to add to poll interval (0-100).
+    /// Jitter percentage applied symmetrically around poll interval (0-100).
     ///
     /// Used to prevent thundering herd when multiple bot instances restart.
-    /// Default: 20 (meaning 0-20% jitter).
+    /// Default: 20 (meaning ±20% jitter, so 8-12 minutes for a 10-minute base).
     pub jitter_percent: u8,
 }
 
@@ -125,14 +125,22 @@ impl PollConfig {
 
     /// Computes the jitter factor for a repository.
     ///
-    /// Returns a value between 1.0 and 1.0 + (jitter_percent / 100).
+    /// Returns a value centered around 1.0, with ± jitter_percent variation.
+    /// For example, with 20% jitter, returns values between 0.8 and 1.2.
+    ///
+    /// The jitter is deterministic based on repo ID hash, ensuring the same
+    /// repo always gets the same jitter.
     fn jitter_factor(&self, repo: &RepoId) -> f64 {
         if self.jitter_percent == 0 {
             return 1.0;
         }
         let hash = self.repo_hash(repo);
-        let jitter = (hash % self.jitter_percent as u64) as f64 / 100.0;
-        1.0 + jitter
+        // Map hash to range [0, 2 * jitter_percent), then center around 1.0
+        // This gives us ± jitter_percent variation (e.g., 0.8-1.2 for 20%)
+        let jitter_range = 2 * self.jitter_percent as u64;
+        let raw_jitter = (hash % jitter_range) as f64 / 100.0;
+        // raw_jitter is in [0, 0.4) for 20% jitter; center it to [-0.2, 0.2)
+        1.0 + raw_jitter - (self.jitter_percent as f64 / 100.0)
     }
 
     /// Computes a hash of the repository ID.
@@ -179,11 +187,11 @@ mod tests {
 
         // Different repos should likely get different jitter
         // (not guaranteed, but highly probable with good hash)
-        // At minimum, both should be within expected range
-        assert!(jitter_a >= config.poll_interval);
-        assert!(jitter_a <= config.poll_interval.mul_f64(1.2));
-        assert!(jitter_b >= config.poll_interval);
-        assert!(jitter_b <= config.poll_interval.mul_f64(1.2));
+        // At minimum, both should be within expected range (±20% = 0.8-1.2)
+        assert!(jitter_a >= config.poll_interval.mul_f64(0.8));
+        assert!(jitter_a < config.poll_interval.mul_f64(1.2));
+        assert!(jitter_b >= config.poll_interval.mul_f64(0.8));
+        assert!(jitter_b < config.poll_interval.mul_f64(1.2));
     }
 
     #[test]
