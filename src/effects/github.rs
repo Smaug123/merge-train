@@ -116,6 +116,32 @@ pub enum GitHubEffect {
     GetRepoSettings,
 }
 
+impl GitHubEffect {
+    /// Returns the PR number this effect operates on, if any.
+    ///
+    /// This is used for stack-scoped cancellation: effects for a cancelled
+    /// train's PRs can be skipped without affecting other trains.
+    pub fn pr_number(&self) -> Option<PrNumber> {
+        match self {
+            GitHubEffect::GetPr { pr } => Some(*pr),
+            GitHubEffect::GetMergeState { pr } => Some(*pr),
+            GitHubEffect::RefetchPr { pr } => Some(*pr),
+            GitHubEffect::SquashMerge { pr, .. } => Some(*pr),
+            GitHubEffect::RetargetPr { pr, .. } => Some(*pr),
+            GitHubEffect::PostComment { pr, .. } => Some(*pr),
+            GitHubEffect::ListComments { pr } => Some(*pr),
+            // These operations are not PR-specific
+            GitHubEffect::ListOpenPrs
+            | GitHubEffect::ListRecentlyMergedPrs { .. }
+            | GitHubEffect::UpdateComment { .. }
+            | GitHubEffect::AddReaction { .. }
+            | GitHubEffect::GetBranchProtection { .. }
+            | GitHubEffect::GetRulesets
+            | GitHubEffect::GetRepoSettings => None,
+        }
+    }
+}
+
 // ─── Response Types ───────────────────────────────────────────────────────────
 
 /// PR data returned from the GitHub API.

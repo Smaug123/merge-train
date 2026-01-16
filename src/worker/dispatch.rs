@@ -761,6 +761,23 @@ mod tests {
         // This test verifies:
         // 1. Only ONE worker is created for same-repo events
         // 2. All events are eventually processed (marked done)
+        //
+        // # Limitation
+        //
+        // This test does NOT directly assert that events were processed in FIFO
+        // order or that processing was strictly serial. It only verifies:
+        // - Single worker creation (structural guarantee)
+        // - All events marked done (completion guarantee)
+        //
+        // Verifying actual processing order would require either:
+        // - Instrumenting the worker with a processing log
+        // - Using deterministic scheduling (difficult with async)
+        // - Property-based testing with slow-processing effects
+        //
+        // The single-worker guarantee provides serialization by construction:
+        // the worker's event loop processes one event at a time from its queue.
+        // This test verifies the prerequisite (single worker) rather than the
+        // consequence (serial processing).
         let dir = tempdir().unwrap();
         let config = DispatcherConfig::new(dir.path().join("spool"), dir.path().join("state"));
 
@@ -832,6 +849,27 @@ mod tests {
         // This test verifies:
         // 1. N repos create N workers (not 1)
         // 2. All events across all repos are processed
+        //
+        // # Limitation
+        //
+        // This test does NOT directly assert that workers actually run
+        // concurrently. It only verifies:
+        // - Multiple worker creation (structural guarantee)
+        // - All events marked done (completion guarantee)
+        //
+        // Verifying actual concurrency would require timing instrumentation:
+        // - Add timestamps when each worker starts/ends processing
+        // - Assert overlap in processing windows
+        //
+        // This is challenging because:
+        // - Async tasks may run on the same thread
+        // - Processing is fast so timing windows are small
+        // - Tokio's scheduler is non-deterministic
+        //
+        // The multiple-worker guarantee provides concurrency by construction:
+        // separate workers are independent async tasks that can be scheduled
+        // concurrently by the Tokio runtime. This test verifies the prerequisite
+        // (separate workers) rather than the consequence (concurrent execution).
         let dir = tempdir().unwrap();
         let config = DispatcherConfig::new(dir.path().join("spool"), dir.path().join("state"));
 

@@ -48,6 +48,20 @@ pub enum Effect {
     },
 }
 
+impl Effect {
+    /// Returns the PR number this effect operates on, if any.
+    ///
+    /// This is used for stack-scoped cancellation: effects for a cancelled
+    /// train's PRs can be skipped without affecting other trains.
+    pub fn pr_number(&self) -> Option<PrNumber> {
+        match self {
+            Effect::Git(_) => None, // Git effects don't have PR numbers
+            Effect::GitHub(github_effect) => github_effect.pr_number(),
+            Effect::RecordReconciliation { pr, .. } => Some(*pr),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

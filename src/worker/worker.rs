@@ -448,6 +448,20 @@ impl RepoWorker {
     /// - Before any irreversible operation (e.g., GitHub API call)
     /// - Periodically to limit data loss window
     /// - On shutdown
+    ///
+    /// # Performance Note
+    ///
+    /// Each `mark_done` call currently fsyncs the spool directory individually
+    /// (via `create_marker_file`). This is correct but suboptimal for batches.
+    ///
+    /// A future optimization could batch the fsync: create all `.done.tmp` files,
+    /// fsync each, rename all to `.done`, then fsync the directory once. However,
+    /// this requires careful handling of crash semantics (partial batch completion)
+    /// and refactoring the atomic marker creation pattern in `delivery.rs`.
+    ///
+    /// For now, the per-marker fsync ensures correctness at the cost of extra
+    /// syscalls. In practice, the batch size is bounded by the event loop's
+    /// processing rate, so the overhead is modest.
     pub fn flush_pending_batch(&mut self) -> Result<()> {
         if self.pending_batch.is_empty() {
             return Ok(());
@@ -456,7 +470,9 @@ impl RepoWorker {
         // fsync the event log
         self.event_log.sync()?;
 
-        // Create done markers for all pending deliveries
+        // Create done markers for all pending deliveries.
+        // Note: Each mark_done currently fsyncs the spool directory individually.
+        // See doc comment above for optimization discussion.
         for delivery_id in &self.pending_batch {
             let delivery = SpooledDelivery::new(&self.config.spool_dir, delivery_id.clone());
             mark_done(&delivery)?;
@@ -730,10 +746,13 @@ impl RepoWorker {
     ///
     /// # Cancellation
     ///
-    /// The shutdown token is checked before each effect. If cancelled:
-    /// - The current effect completes (effects should be designed to be interruptible)
-    /// - Remaining effects are skipped
-    /// - The method returns Ok(()) - cancellation is not an error
+    /// Two levels of cancellation are checked before each effect:
+    /// 1. Global shutdown - stops all effect processing
+    /// 2. Stack-scoped cancellation - stops effects for a specific train
+    ///
+    /// Stack-scoped cancellation allows stop commands to immediately interrupt
+    /// in-flight operations for a specific train without affecting other trains.
+    /// The stack token is looked up based on the PR number in the effect.
     ///
     /// # Stage 18 Integration
     ///
@@ -760,10 +779,25 @@ impl RepoWorker {
         let executor = EffectExecutor::new(logging_interpreter, shutdown.clone());
 
         for effect in effects {
-            // Check for shutdown before each effect
+            // Check for global shutdown before each effect
             if shutdown.is_cancelled() {
                 debug!("Shutdown requested, skipping remaining effects");
                 break;
+            }
+
+            // Check for stack-scoped cancellation.
+            // If this effect is for a PR that belongs to a cancelled train, skip it.
+            if let Some(pr) = effect.pr_number()
+                && let Some(train_root) = self.find_train_root(pr)
+                && let Some(token) = self.stack_tokens.get(&train_root)
+                && token.is_cancelled()
+            {
+                debug!(
+                    train_root = %train_root,
+                    pr = %pr,
+                    "Stack cancelled, skipping effect"
+                );
+                continue;
             }
 
             // Handle RecordReconciliation effects locally (no external calls needed)
@@ -783,8 +817,24 @@ impl RepoWorker {
             match executor.execute(effect, &mut self.state).await {
                 Ok(result) => {
                     trace!(?result, "Effect executed successfully");
-                    // TODO(Stage 18): Process result to update cached state
-                    // e.g., GitHubResponse::PrRefetched updates self.state.prs
+                    // TODO(Stage 18): Process result to update cached state.
+                    //
+                    // Currently, the LoggingGitHubInterpreter returns placeholder
+                    // responses (e.g., RefetchPr returns a dummy PrData). This means:
+                    //
+                    // 1. Poll fallback doesn't advance trains: handle_poll_active_trains
+                    //    generates RefetchPr effects, but the responses are placeholders
+                    //    that don't update self.state.prs with real GitHub data.
+                    //
+                    // 2. Cascade progression relies on webhooks: Without real API data,
+                    //    the cascade engine can't detect when CI passes or PRs become
+                    //    mergeable. Only incoming webhooks provide the state updates
+                    //    needed to advance trains.
+                    //
+                    // Stage 18 must:
+                    // - Replace LoggingGitHubInterpreter with a real GitHub client
+                    // - Process GitHubResponse variants to update self.state.prs
+                    // - Trigger cascade re-evaluation when RefetchPr reveals state changes
                 }
                 Err(EffectError::Cancelled) => {
                     debug!("Effect execution cancelled");
@@ -827,15 +877,33 @@ impl RepoWorker {
     /// For each active train, generates a `RefetchPr` effect to check the current
     /// PR's merge state. If the merge state has changed (e.g., CI completed,
     /// review approved), the cascade will be re-evaluated on the next event.
+    ///
+    /// # Stage 18 Limitation
+    ///
+    /// Currently, poll fallback does NOT advance trains because:
+    /// - Effects are executed via `LoggingGitHubInterpreter` which returns placeholders
+    /// - Placeholder responses don't update `self.state.prs` with real GitHub data
+    /// - Without real data, the cascade engine can't detect state changes
+    ///
+    /// This means the bot relies solely on webhooks for cascade progression in Stage 17.
+    /// The poll mechanism is infrastructure for Stage 18, which will:
+    /// - Use a real GitHub client to execute RefetchPr effects
+    /// - Update cached PR state from API responses
+    /// - Trigger cascade re-evaluation when state changes are detected
     async fn handle_poll_active_trains(&mut self) -> Result<()> {
         use crate::effects::{Effect, GitHubEffect};
 
         self.last_poll = Some(Instant::now());
 
+        // Create a cancellation token for effect execution in this poll cycle.
+        // This is a local token; for stack-scoped cancellation, execute_effects
+        // checks the individual train tokens as well.
+        let shutdown = CancellationToken::new();
+
         // First, drain any pending deliveries from the spool.
         // This catches deliveries that may have been spooled but not dispatched
         // (e.g., dispatcher failure, network issue, race condition).
-        let drained = self.drain_spool_periodic()?;
+        let drained = self.drain_spool_periodic(&shutdown).await?;
         if drained > 0 {
             debug!(
                 drained = drained,
@@ -875,8 +943,6 @@ impl RepoWorker {
         // The RefetchPr responses would be processed by the event handlers
         // to update cached state and trigger cascade re-evaluation.
         if !effects.is_empty() {
-            // Get shutdown token for effect execution
-            let shutdown = CancellationToken::new();
             self.execute_effects(effects, &shutdown).await?;
         }
 
@@ -888,7 +954,10 @@ impl RepoWorker {
     /// This catches deliveries that may have been spooled but not dispatched.
     /// Unlike startup drain, this doesn't clean up .proc markers since a concurrent
     /// process might legitimately own them.
-    fn drain_spool_periodic(&mut self) -> Result<usize> {
+    ///
+    /// Any effects generated from processing recovered deliveries are executed,
+    /// ensuring that GitHub/git operations are not silently dropped.
+    async fn drain_spool_periodic(&mut self, shutdown: &CancellationToken) -> Result<usize> {
         let deliveries = drain_pending(&self.config.spool_dir)?;
         let mut enqueued = 0;
 
@@ -901,12 +970,18 @@ impl RepoWorker {
 
         // Process any newly enqueued deliveries
         if enqueued > 0 {
-            let (processed, _effects) = self.process_all()?;
+            let (processed, effects) = self.process_all()?;
             trace!(
                 enqueued = enqueued,
                 processed = processed,
+                effects_count = effects.len(),
                 "Processed drained deliveries"
             );
+
+            // Execute the effects (not silently discard them!)
+            if !effects.is_empty() {
+                self.execute_effects(effects, shutdown).await?;
+            }
         }
 
         Ok(enqueued)
@@ -1042,6 +1117,29 @@ impl RepoWorker {
     // ─── Timer Management ─────────────────────────────────────────────────────────
 
     /// Schedules a timer for non-blocking wait re-evaluation.
+    ///
+    /// # Stage 18 Work Required
+    ///
+    /// This function is currently dead code because the non-blocking polling
+    /// infrastructure is not yet integrated:
+    ///
+    /// 1. **No callers**: The cascade engine doesn't yet emit "wait for condition"
+    ///    effects that would trigger timer scheduling. Currently, the bot relies
+    ///    solely on webhooks to drive cascade progression.
+    ///
+    /// 2. **In-memory only**: Wait conditions are stored in `pending_timers` which
+    ///    is not persisted. On crash recovery, all pending waits would be lost.
+    ///    Stage 18 should either:
+    ///    - Persist wait conditions in `TrainState` (adds complexity)
+    ///    - OR rely on the periodic poll fallback to recover (simpler but slower)
+    ///
+    /// 3. **No event loop integration**: The main event loop in `run()` doesn't
+    ///    check for timer expiration. `fire_expired_timers()` exists but isn't
+    ///    called from the event loop.
+    ///
+    /// For Stage 17, the periodic poll (`handle_poll_active_trains`) serves as a
+    /// coarse-grained fallback that re-checks all active trains on a timer.
+    /// Stage 18 should wire up the more precise per-condition timers.
     #[allow(dead_code)]
     pub fn schedule_wait_timer(&mut self, train_root: PrNumber, condition: WaitCondition) {
         let delay = self.poll_config.recheck_interval;
@@ -1815,6 +1913,25 @@ mod tests {
         //
         // This ensures that on crash recovery, any delivery without a .done marker
         // will be reprocessed, and its events will be re-applied to the log.
+        //
+        // # Limitation
+        //
+        // This test verifies the SEQUENCE of operations (log write → flush → done
+        // marker) but does NOT verify actual durability guarantees:
+        //
+        // - We cannot inject fsync failures to verify the code handles them
+        // - We cannot simulate power loss to verify data survives
+        // - The test runs on a normal filesystem, not a failure-injecting one
+        //
+        // Truly testing durability would require either:
+        // 1. Fault injection (libfiu, custom VFS, or mocking the fsync syscall)
+        // 2. Crash recovery tests (spawn subprocess, kill it, verify state)
+        // 3. Hardware-level testing (actual power cycling)
+        //
+        // These are impractical for standard unit tests. Instead, we rely on:
+        // - Code review to verify fsync is called at the right points
+        // - The sequence test here to verify the ordering invariant
+        // - Integration tests with actual crash scenarios (manual or CI)
 
         let dir = tempdir().unwrap();
         let spool_dir = dir.path().join("spool");
@@ -2174,8 +2291,8 @@ mod tests {
 
     // ─── Stage 17: Spool Drain During Operation Tests ───
 
-    #[test]
-    fn drain_spool_periodic_picks_up_missed_deliveries() {
+    #[tokio::test]
+    async fn drain_spool_periodic_picks_up_missed_deliveries() {
         // Test that drain_spool_periodic can recover missed deliveries
         let dir = tempdir().unwrap();
         let spool_dir = dir.path().join("spool");
@@ -2194,7 +2311,8 @@ mod tests {
         spool_webhook(&spool_dir, &delivery_id, &envelope).unwrap();
 
         // Run periodic drain
-        let drained = worker.drain_spool_periodic().unwrap();
+        let shutdown = CancellationToken::new();
+        let drained = worker.drain_spool_periodic(&shutdown).await.unwrap();
         assert_eq!(drained, 1, "Should have drained the missed delivery");
 
         // Delivery should be processed and marked done after flush
@@ -2203,8 +2321,8 @@ mod tests {
         assert!(delivery.is_done(), "Drained delivery should be marked done");
     }
 
-    #[test]
-    fn drain_spool_periodic_skips_already_done() {
+    #[tokio::test]
+    async fn drain_spool_periodic_skips_already_done() {
         // Test that drain_spool_periodic doesn't re-process done deliveries
         let dir = tempdir().unwrap();
         let spool_dir = dir.path().join("spool");
@@ -2223,7 +2341,8 @@ mod tests {
         assert_eq!(count, 1);
 
         // Now run periodic drain - should not pick it up again
-        let drained = worker.drain_spool_periodic().unwrap();
+        let shutdown = CancellationToken::new();
+        let drained = worker.drain_spool_periodic(&shutdown).await.unwrap();
         assert_eq!(drained, 0, "Already-done delivery should not be re-drained");
     }
 
