@@ -94,6 +94,12 @@ impl PollConfig {
         }
     }
 
+    /// Sets the wait timeout for GitHub state propagation.
+    pub fn with_wait_timeout(mut self, timeout: Duration) -> Self {
+        self.wait_timeout = timeout;
+        self
+    }
+
     /// Returns the poll interval with jitter added for a specific repository.
     ///
     /// The jitter is deterministic based on the repo ID hash, ensuring the same

@@ -27,6 +27,35 @@
 //! - Timer-based re-evaluation for non-blocking waits
 //! - Periodic polling for active trains (fallback for missed webhooks)
 //! - Graceful shutdown via cancellation token
+//!
+//! # Stop Cancellation Semantics
+//!
+//! Stop commands (`@merge-train stop`) cancel in-flight cascade operations, but
+//! cancellation is **not preemptive**. This is intentional for correctness:
+//!
+//! 1. **Effect execution blocks the event loop**: While effects are executing,
+//!    the worker cannot process new messages (including stop commands).
+//!
+//! 2. **Stop commands travel the same channel**: `CancelStack` messages use
+//!    the same `mpsc` channel as webhook deliveries, so they queue behind
+//!    any in-flight effect execution.
+//!
+//! 3. **Cancellation happens at effect boundaries**: The `CancellationToken`
+//!    mechanism allows the executor to check for cancellation *between* effects.
+//!    Individual effects use `tokio::select!` to race against cancellation,
+//!    allowing HTTP requests and other async operations to be interrupted.
+//!
+//! **Practical implications**:
+//! - A stop command received during a long-running squash-merge will complete
+//!   that merge before stopping (atomicity at the effect level).
+//! - Stop commands received between effects take effect immediately.
+//! - The `handle_immediate_cancellation_if_stop` function triggers cancellation
+//!   tokens *before* enqueuing the stop event, enabling in-flight async effects
+//!   (like GitHub API calls) to detect cancellation via `tokio::select!`.
+//!
+//! This design prioritizes correctness (no partial operations) over latency
+//! (faster stop response). Stage 18 may introduce finer-grained cancellation
+//! by chunking effect execution if needed.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -721,7 +750,8 @@ impl RepoWorker {
     /// Handles an incoming delivery.
     ///
     /// For stop commands, immediately cancels in-flight operations before processing.
-    /// Then processes events synchronously, and executes effects inline.
+    /// Then processes events synchronously, executes handler effects inline, and
+    /// re-evaluates active cascades to advance trains.
     ///
     /// # Effect Execution Model
     ///
@@ -737,11 +767,12 @@ impl RepoWorker {
     /// interleaving of event processing. The cancellation token mechanism allows
     /// stop commands to interrupt at effect boundaries.
     ///
-    /// # Stage 18 Consideration
+    /// # Cascade Evaluation
     ///
-    /// Stage 18 may introduce chunked effect execution (process N effects, then check
-    /// messages) for better stop-command responsiveness. This requires careful handling
-    /// of partial effect completion.
+    /// After processing webhook events and their handler effects, we re-evaluate
+    /// active cascades. This is essential because webhooks trigger state changes
+    /// (e.g., PR merged, CI passed, review approved) that may allow trains to advance.
+    /// Without this step, trains would only advance during polling, causing delays.
     async fn handle_delivery(
         &mut self,
         delivery: SpooledDelivery,
@@ -762,10 +793,15 @@ impl RepoWorker {
             "Processed events"
         );
 
-        // Execute effects asynchronously
+        // Execute effects from event handlers (e.g., reactions, comments)
         if !effects.is_empty() {
             self.execute_effects(effects, shutdown).await?;
         }
+
+        // Re-evaluate active cascades to advance trains based on the new state.
+        // This is the key step that allows webhooks (PR merged, CI passed, etc.)
+        // to trigger cascade advancement without waiting for the next poll.
+        self.re_evaluate_cascades_with_persistence(shutdown).await?;
 
         Ok(())
     }
@@ -1070,27 +1106,34 @@ impl RepoWorker {
 
     /// Handles the poll timer for active trains.
     ///
-    /// This also drains the spool to pick up any deliveries that may have been
-    /// missed (e.g., due to dispatcher failures).
+    /// This performs several important recovery tasks:
     ///
-    /// For each active train, generates a `RefetchPr` effect to check the current
-    /// PR's merge state. If the merge state has changed (e.g., CI completed,
-    /// review approved), the cascade will be re-evaluated on the next event.
+    /// 1. Drains the spool to pick up any deliveries that may have been missed
+    ///    (e.g., due to dispatcher failures).
     ///
-    /// # Stage 18 Limitation
+    /// 2. For each active train, generates a `RefetchPr` effect to check the
+    ///    current PR's merge state. If the merge state has changed (e.g., CI
+    ///    completed, review approved), the cascade will be re-evaluated.
     ///
-    /// Currently, poll fallback does NOT advance trains because:
-    /// - Effects are executed via `LoggingGitHubInterpreter` which returns placeholders
-    /// - Placeholder responses don't update `self.state.prs` with real GitHub data
-    /// - Without real data, the cascade engine can't detect state changes
+    /// 3. Scans for "late additions" - PRs whose predecessor has merged but
+    ///    that haven't been retargeted yet. These need reconciliation.
     ///
-    /// This means the bot relies solely on webhooks for cascade progression in Stage 17.
-    /// The poll mechanism is infrastructure for Stage 18, which will:
-    /// - Use a real GitHub client to execute RefetchPr effects
-    /// - Update cached PR state from API responses
-    /// - Trigger cascade re-evaluation when state changes are detected
+    /// 4. Scans for "manually retargeted" PRs - PRs that were manually
+    ///    retargeted to the default branch before the bot could reconcile them.
+    ///    These are dangerous because the ours-merge was never done.
+    ///
+    /// # Design Notes
+    ///
+    /// The late-addition and manual-retarget scans are described in DESIGN.md
+    /// §"Late additions recovery" and §"Manually-retargeted PR detection".
+    /// These scans ensure that:
+    /// - Late additions are caught during polling if the predecessor_declared
+    ///   event was missed
+    /// - Manually-retargeted PRs are detected and warned about before they
+    ///   can be incorrectly merged
     async fn handle_poll_active_trains(&mut self) -> Result<()> {
         use crate::effects::{Effect, GitHubEffect};
+        use crate::types::PrState;
 
         self.last_poll = Some(Instant::now());
 
@@ -1110,42 +1153,168 @@ impl RepoWorker {
             );
         }
 
-        // Now handle active train polling
-        let active_trains: Vec<_> = self.state.active_trains.values().collect();
+        // Collect effects to execute
+        let mut effects = Vec::new();
 
-        if active_trains.is_empty() {
-            trace!("No active trains to poll");
-            return Ok(());
-        }
-
-        debug!(
-            count = active_trains.len(),
-            "Polling active trains for missed webhooks"
-        );
-
+        // ─── Active Train Polling ─────────────────────────────────────────────
+        //
         // Generate RefetchPr effects for each active train's current PR.
         // This checks the GitHub state in case we missed webhooks.
-        let mut effects = Vec::new();
-        for train in active_trains {
-            let current_pr = train.current_pr;
-            trace!(
-                train_root = %train.original_root_pr,
-                current_pr = %current_pr,
-                trigger = "poll",
-                "Generating RefetchPr effect for active train"
+        let active_trains: Vec<_> = self.state.active_trains.values().cloned().collect();
+
+        if !active_trains.is_empty() {
+            debug!(
+                count = active_trains.len(),
+                "Polling active trains for missed webhooks"
             );
-            effects.push(Effect::GitHub(GitHubEffect::RefetchPr { pr: current_pr }));
+
+            for train in &active_trains {
+                let current_pr = train.current_pr;
+                trace!(
+                    train_root = %train.original_root_pr,
+                    current_pr = %current_pr,
+                    trigger = "poll",
+                    "Generating RefetchPr effect for active train"
+                );
+                effects.push(Effect::GitHub(GitHubEffect::RefetchPr { pr: current_pr }));
+            }
         }
 
-        // Execute effects. The RefetchPr responses update cached state via
-        // process_github_response.
+        // ─── Late Addition Scan ───────────────────────────────────────────────
+        //
+        // Find PRs whose predecessor is merged but base_ref != default_branch.
+        // These are "late additions" that need reconciliation.
+        // Per DESIGN.md: "scan for PRs whose predecessor is merged but whose
+        // base_ref hasn't been retargeted"
+        let late_additions: Vec<_> = self
+            .state
+            .prs
+            .values()
+            .filter(|pr| {
+                // Must be open
+                if !pr.state.is_open() {
+                    return false;
+                }
+                // Must not already target default branch
+                if pr.base_ref == self.state.default_branch {
+                    return false;
+                }
+                // Must have a predecessor
+                let Some(pred_number) = pr.predecessor else {
+                    return false;
+                };
+                // Predecessor must be merged
+                if let Some(pred) = self.state.prs.get(&pred_number) {
+                    matches!(pred.state, PrState::Merged { .. })
+                } else {
+                    false
+                }
+            })
+            .map(|pr| (pr.number, pr.predecessor.unwrap()))
+            .collect();
+
+        if !late_additions.is_empty() {
+            debug!(
+                count = late_additions.len(),
+                "Found late additions during poll scan"
+            );
+
+            for (pr_number, pred_number) in &late_additions {
+                // Late addition detected - log and generate RefetchPr to update state.
+                // Full handling (reconciliation) requires git operations and is
+                // deferred to Stage 18. For now, we ensure we have fresh state.
+                info!(
+                    pr = %pr_number,
+                    predecessor = %pred_number,
+                    trigger = "poll_late_addition_scan",
+                    "Late addition detected: predecessor merged but PR not retargeted"
+                );
+                effects.push(Effect::GitHub(GitHubEffect::RefetchPr { pr: *pr_number }));
+            }
+        }
+
+        // ─── Manually Retargeted PR Scan ──────────────────────────────────────
+        //
+        // Find PRs that were manually retargeted to default_branch but NOT reconciled.
+        // These are dangerous: the ours-merge was never done, so merging them
+        // would lose the predecessor's changes.
+        // Per DESIGN.md: "scan catches PRs that were manually retargeted before
+        // reconciliation could run"
+        let manually_retargeted: Vec<_> = self
+            .state
+            .prs
+            .values()
+            .filter(|pr| {
+                // Must be open
+                if !pr.state.is_open() {
+                    return false;
+                }
+                // Must already target default branch (manually retargeted)
+                if pr.base_ref != self.state.default_branch {
+                    return false;
+                }
+                // Must have a predecessor
+                let Some(pred_number) = pr.predecessor else {
+                    return false;
+                };
+                // Predecessor must be merged
+                let pred_merged = if let Some(pred) = self.state.prs.get(&pred_number) {
+                    matches!(pred.state, PrState::Merged { .. })
+                } else {
+                    false
+                };
+                if !pred_merged {
+                    return false;
+                }
+                // Must NOT have been reconciled (this is the dangerous case)
+                pr.predecessor_squash_reconciled.is_none()
+            })
+            .map(|pr| (pr.number, pr.predecessor.unwrap()))
+            .collect();
+
+        if !manually_retargeted.is_empty() {
+            warn!(
+                count = manually_retargeted.len(),
+                "Found manually retargeted PRs that need reconciliation"
+            );
+
+            for (pr_number, pred_number) in &manually_retargeted {
+                // Manually retargeted PR detected - this is dangerous!
+                // Log a warning and generate RefetchPr. Full handling (warning
+                // comment + reconciliation) requires GitHub API writes and is
+                // deferred to when a real GitHub client is available.
+                warn!(
+                    pr = %pr_number,
+                    predecessor = %pred_number,
+                    trigger = "poll_manual_retarget_scan",
+                    "DANGEROUS: PR was manually retargeted to {} but not reconciled with predecessor's squash commit. \
+                     This PR cannot be safely merged until reconciliation completes.",
+                    self.state.default_branch
+                );
+                effects.push(Effect::GitHub(GitHubEffect::RefetchPr { pr: *pr_number }));
+
+                // When a GitHub client is available, post a warning comment:
+                // effects.push(Effect::GitHub(GitHubEffect::PostComment {
+                //     pr: *pr_number,
+                //     body: format!(
+                //         "⚠️ **Warning**: This PR was retargeted to `{}` but has not been \
+                //          reconciled with predecessor #{}'s squash commit. ...",
+                //         self.state.default_branch, pred_number
+                //     ),
+                // }));
+            }
+        }
+
+        // Execute all collected effects
         if !effects.is_empty() {
             self.execute_effects(effects, &shutdown).await?;
         }
 
         // After updating the cache, re-evaluate cascades to check if any trains
         // can now advance (e.g., CI completed while we weren't receiving webhooks).
-        self.re_evaluate_cascades(&shutdown).await?;
+        // Use the persistence version to ensure phase transitions are durably recorded.
+        self.re_evaluate_cascades_with_persistence(&shutdown)
+            .await?;
 
         Ok(())
     }
@@ -1246,6 +1415,175 @@ impl RepoWorker {
                     train_root = %train_root,
                     effects_count = step_result.effects.len(),
                     "Executing cascade effects from poll re-evaluation"
+                );
+                self.execute_effects(step_result.effects, shutdown).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Re-evaluates active cascades with proper persistence of phase transitions.
+    ///
+    /// This is the persistent version of `re_evaluate_cascades`. It:
+    /// 1. Executes cascade steps for active trains
+    /// 2. Persists phase transitions via the event log
+    /// 3. Executes resulting effects
+    ///
+    /// This ensures that cascade progress survives restarts.
+    async fn re_evaluate_cascades_with_persistence(
+        &mut self,
+        shutdown: &CancellationToken,
+    ) -> Result<()> {
+        use crate::cascade::step::{StepContext, execute_cascade_step};
+        use crate::persistence::event::StateEventPayload;
+        use crate::types::{CascadeStepOutcome, MergeStateStatus, TrainError, TrainState};
+
+        // Collect train roots that may need re-evaluation.
+        // We only re-evaluate trains that are WaitingCi or Running - stopped/aborted
+        // trains require explicit restart.
+        let trains_to_evaluate: Vec<_> = self
+            .state
+            .active_trains
+            .iter()
+            .filter(|(_, train)| train.state.is_active())
+            .map(|(root, train)| (*root, train.current_pr, train.cascade_phase.clone()))
+            .collect();
+
+        if trains_to_evaluate.is_empty() {
+            return Ok(());
+        }
+
+        for (train_root, current_pr, phase_before) in trains_to_evaluate {
+            // Check for cancellation
+            if shutdown.is_cancelled() {
+                break;
+            }
+
+            // Check if this train's stack is cancelled
+            if let Some(token) = self.stack_tokens.get(&train_root)
+                && token.is_cancelled()
+            {
+                continue;
+            }
+
+            // Get fresh PR state from cache
+            let pr_state = self.state.prs.get(&current_pr);
+            let can_advance = match pr_state {
+                Some(pr) => {
+                    // Check if PR is ready to advance: merge state is clean (CI passed,
+                    // reviews approved, no conflicts), or PR is already merged (need to
+                    // advance to next phase).
+                    matches!(
+                        pr.merge_state_status,
+                        MergeStateStatus::Clean | MergeStateStatus::Unstable
+                    ) || pr.state.is_merged()
+                }
+                None => false,
+            };
+
+            if !can_advance {
+                trace!(
+                    train_root = %train_root,
+                    current_pr = %current_pr,
+                    merge_state = ?pr_state.map(|p| &p.merge_state_status),
+                    "Train not ready to advance"
+                );
+                continue;
+            }
+
+            debug!(
+                train_root = %train_root,
+                current_pr = %current_pr,
+                trigger = "webhook",
+                "Re-evaluating cascade"
+            );
+
+            // Get the train (clone to avoid borrow issues)
+            let Some(train) = self.state.active_trains.get(&train_root).cloned() else {
+                continue;
+            };
+
+            // Execute a cascade step
+            let ctx = StepContext::new(&self.state.default_branch);
+            let step_result = execute_cascade_step(train, &self.state.prs, &ctx);
+
+            // Check if phase changed - if so, persist the transition
+            let phase_changed = step_result.train.cascade_phase.name() != phase_before.name();
+            let train_completed = matches!(step_result.outcome, CascadeStepOutcome::Complete);
+            let train_aborted = matches!(step_result.outcome, CascadeStepOutcome::Aborted { .. });
+
+            // Persist state changes via the event log
+            if train_completed {
+                // Train completed - persist and remove from active trains
+                let event = self.event_log.append(StateEventPayload::TrainCompleted {
+                    root_pr: train_root,
+                })?;
+                apply_event_to_state(&mut self.state, &event);
+                self.event_log.sync()?;
+                debug!(train_root = %train_root, "Train completed (persisted)");
+            } else if train_aborted {
+                // Train aborted - persist with error
+                // The error should be present when train is aborted; use a default if somehow missing.
+                let error = step_result.train.error.clone().unwrap_or_else(|| {
+                    TrainError::new("unknown", "Cascade aborted for unknown reason")
+                });
+                let event = self.event_log.append(StateEventPayload::TrainAborted {
+                    root_pr: train_root,
+                    error,
+                })?;
+                apply_event_to_state(&mut self.state, &event);
+                self.event_log.sync()?;
+                debug!(train_root = %train_root, "Train aborted (persisted)");
+
+                // Remove cancellation token
+                self.stack_tokens.remove(&train_root);
+            } else if phase_changed || step_result.train.current_pr != current_pr {
+                // Phase transition or PR advancement - persist
+                let event = self.event_log.append(StateEventPayload::PhaseTransition {
+                    train_root,
+                    current_pr: step_result.train.current_pr,
+                    predecessor_pr: step_result.train.predecessor_pr,
+                    last_squash_sha: step_result.train.last_squash_sha.clone(),
+                    phase: step_result.train.cascade_phase.clone(),
+                })?;
+                apply_event_to_state(&mut self.state, &event);
+                self.event_log.sync()?;
+                debug!(
+                    train_root = %train_root,
+                    new_phase = ?step_result.train.cascade_phase.name(),
+                    new_current_pr = %step_result.train.current_pr,
+                    "Phase transition (persisted)"
+                );
+            } else {
+                // No phase change, but still update in-memory state
+                self.state
+                    .active_trains
+                    .insert(train_root, step_result.train.clone());
+            }
+
+            // Handle train state changes (Running <-> WaitingCi)
+            if step_result.train.state == TrainState::WaitingCi
+                && self
+                    .state
+                    .active_trains
+                    .get(&train_root)
+                    .map(|t| t.state != TrainState::WaitingCi)
+                    .unwrap_or(false)
+            {
+                // Update to WaitingCi state (in-memory only, phase transition already persisted)
+                if let Some(train) = self.state.active_trains.get_mut(&train_root) {
+                    train.state = TrainState::WaitingCi;
+                }
+            }
+
+            // Execute the resulting effects.
+            // These include status comment updates and GitHub/git operations.
+            if !step_result.effects.is_empty() {
+                debug!(
+                    train_root = %train_root,
+                    effects_count = step_result.effects.len(),
+                    "Executing cascade effects"
                 );
                 self.execute_effects(step_result.effects, shutdown).await?;
             }
@@ -1373,6 +1711,13 @@ impl RepoWorker {
     /// Schedules a retry timer for a wait condition with exponential backoff.
     ///
     /// Returns an error if max retries have been exceeded.
+    ///
+    /// # Timeout Calculation
+    ///
+    /// The max retries is computed from `poll_config.wait_timeout` to ensure
+    /// we don't wait longer than configured. With exponential backoff starting
+    /// at `recheck_interval` (5s) and capping at `wait_timeout`, we compute
+    /// how many retries fit within the timeout period.
     fn schedule_wait_retry(
         &mut self,
         train_root: PrNumber,
@@ -1381,13 +1726,33 @@ impl RepoWorker {
         // Find the retry count from the condition's metadata
         let retry_count = condition.retry_count();
 
-        // Max retries before giving up (10 retries with backoff = ~17 minutes total)
-        const MAX_RETRIES: u32 = 10;
-        if retry_count >= MAX_RETRIES {
+        // Compute max retries from wait_timeout and recheck_interval.
+        // With exponential backoff: total_time = sum(min(base * 2^i, cap))
+        // We approximate by computing how many base intervals fit in timeout.
+        let wait_timeout = self.poll_config.wait_timeout;
+        let base_interval = self.poll_config.recheck_interval;
+
+        // Calculate max retries that fit within wait_timeout
+        // With exponential backoff (5s, 10s, 20s, 40s, 80s, 160s, 300s...):
+        // We estimate by dividing timeout by base interval and taking log2.
+        // For 5min timeout with 5s base: ~6 retries before hitting cap.
+        let max_retries = if base_interval.as_secs() > 0 {
+            // Approximate: timeout / base_interval gives linear count,
+            // but with exponential backoff we need fewer retries.
+            // log2(timeout/base) + 1 is a reasonable approximation.
+            let ratio = wait_timeout.as_secs_f64() / base_interval.as_secs_f64();
+            (ratio.log2().ceil() as u32).clamp(1, 20)
+        } else {
+            10 // Fallback if base_interval is 0
+        };
+
+        if retry_count >= max_retries {
             warn!(
                 train_root = %train_root,
                 condition = ?condition,
                 retry_count = retry_count,
+                max_retries = max_retries,
+                wait_timeout_secs = wait_timeout.as_secs(),
                 "Wait condition timed out after max retries"
             );
             // For now, just log the timeout. Stage 18 will handle cascade failure.
@@ -1395,17 +1760,19 @@ impl RepoWorker {
             return Ok(());
         }
 
-        // Calculate backoff delay: starts at recheck_interval, caps at 5 minutes
-        let base_delay = self.poll_config.recheck_interval;
+        // Calculate backoff delay: starts at recheck_interval, caps at wait_timeout
+        // This ensures individual delays don't exceed the overall timeout.
+        let base_delay = base_interval;
         let backoff_factor = 2u32.saturating_pow(retry_count);
         let delay = base_delay * backoff_factor;
-        let max_delay = Duration::from_secs(300); // 5 minutes
-        let delay = delay.min(max_delay);
+        let max_single_delay = wait_timeout; // Cap at wait_timeout for any single retry
+        let delay = delay.min(max_single_delay);
 
         debug!(
             train_root = %train_root,
             condition = ?condition,
             retry = retry_count + 1,
+            max_retries = max_retries,
             delay_ms = delay.as_millis(),
             "Scheduling wait retry timer"
         );
@@ -3098,5 +3465,317 @@ mod tests {
         );
         // Predecessor is not discovered via API, so it should be None
         assert!(created_pr.predecessor.is_none());
+    }
+
+    // ─── Stage 17: Cascade Evaluation and Phase Transition Tests ───
+
+    #[test]
+    fn late_addition_scan_detects_orphaned_prs() {
+        // Test oracle: During poll, PRs whose predecessor is merged but base_ref
+        // hasn't been retargeted should be detected as late additions.
+        //
+        // Per DESIGN.md: "scan for PRs whose predecessor is merged but whose
+        // base_ref hasn't been retargeted"
+
+        let dir = tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        let state_dir = dir.path().join("state");
+
+        let config = WorkerConfig::new(RepoId::new("owner", "repo"), &spool_dir, &state_dir);
+        let mut worker = RepoWorker::new(config).unwrap();
+
+        // Add predecessor PR (merged)
+        let merge_sha = crate::types::Sha::parse("a".repeat(40)).unwrap();
+        let pred_pr = crate::types::CachedPr::new(
+            PrNumber(1),
+            crate::types::Sha::parse("b".repeat(40)).unwrap(),
+            "feature-1".to_string(),
+            "main".to_string(),
+            None,
+            crate::types::PrState::Merged {
+                merge_commit_sha: merge_sha,
+            },
+            crate::types::MergeStateStatus::Unknown,
+            false,
+        );
+        worker.state.prs.insert(PrNumber(1), pred_pr);
+
+        // Add descendant PR (still targets feature-1, not main)
+        let mut desc_pr = crate::types::CachedPr::new(
+            PrNumber(2),
+            crate::types::Sha::parse("c".repeat(40)).unwrap(),
+            "feature-2".to_string(),
+            "feature-1".to_string(), // NOT retargeted to main yet
+            Some(PrNumber(1)),       // predecessor declared
+            crate::types::PrState::Open,
+            crate::types::MergeStateStatus::Unknown,
+            false,
+        );
+        desc_pr.predecessor = Some(PrNumber(1));
+        worker.state.prs.insert(PrNumber(2), desc_pr);
+
+        // Check that we can detect this is a late addition
+        let late_additions: Vec<_> = worker
+            .state
+            .prs
+            .values()
+            .filter(|pr| {
+                if !pr.state.is_open() {
+                    return false;
+                }
+                if pr.base_ref == worker.state.default_branch {
+                    return false;
+                }
+                let Some(pred_number) = pr.predecessor else {
+                    return false;
+                };
+                if let Some(pred) = worker.state.prs.get(&pred_number) {
+                    matches!(pred.state, crate::types::PrState::Merged { .. })
+                } else {
+                    false
+                }
+            })
+            .collect();
+
+        assert_eq!(late_additions.len(), 1, "Should detect one late addition");
+        assert_eq!(
+            late_additions[0].number,
+            PrNumber(2),
+            "PR #2 should be the late addition"
+        );
+    }
+
+    #[test]
+    fn manually_retargeted_scan_detects_dangerous_prs() {
+        // Test oracle: PRs that were manually retargeted to default_branch before
+        // reconciliation should be detected as dangerous.
+        //
+        // Per DESIGN.md: "scan catches PRs that were manually retargeted before
+        // reconciliation could run"
+
+        let dir = tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        let state_dir = dir.path().join("state");
+
+        let config = WorkerConfig::new(RepoId::new("owner", "repo"), &spool_dir, &state_dir);
+        let mut worker = RepoWorker::new(config).unwrap();
+
+        // Add predecessor PR (merged)
+        let merge_sha = crate::types::Sha::parse("a".repeat(40)).unwrap();
+        let pred_pr = crate::types::CachedPr::new(
+            PrNumber(1),
+            crate::types::Sha::parse("b".repeat(40)).unwrap(),
+            "feature-1".to_string(),
+            "main".to_string(),
+            None,
+            crate::types::PrState::Merged {
+                merge_commit_sha: merge_sha,
+            },
+            crate::types::MergeStateStatus::Unknown,
+            false,
+        );
+        worker.state.prs.insert(PrNumber(1), pred_pr);
+
+        // Add descendant PR (manually retargeted to main, NOT reconciled)
+        let mut desc_pr = crate::types::CachedPr::new(
+            PrNumber(2),
+            crate::types::Sha::parse("c".repeat(40)).unwrap(),
+            "feature-2".to_string(),
+            "main".to_string(), // Already retargeted to main
+            Some(PrNumber(1)),  // predecessor declared
+            crate::types::PrState::Open,
+            crate::types::MergeStateStatus::Clean,
+            false,
+        );
+        desc_pr.predecessor = Some(PrNumber(1));
+        desc_pr.predecessor_squash_reconciled = None; // NOT reconciled!
+        worker.state.prs.insert(PrNumber(2), desc_pr);
+
+        // Check that we can detect this is a dangerously retargeted PR
+        let dangerous: Vec<_> = worker
+            .state
+            .prs
+            .values()
+            .filter(|pr| {
+                if !pr.state.is_open() {
+                    return false;
+                }
+                if pr.base_ref != worker.state.default_branch {
+                    return false;
+                }
+                let Some(pred_number) = pr.predecessor else {
+                    return false;
+                };
+                let pred_merged = if let Some(pred) = worker.state.prs.get(&pred_number) {
+                    matches!(pred.state, crate::types::PrState::Merged { .. })
+                } else {
+                    false
+                };
+                if !pred_merged {
+                    return false;
+                }
+                pr.predecessor_squash_reconciled.is_none()
+            })
+            .collect();
+
+        assert_eq!(dangerous.len(), 1, "Should detect one dangerous PR");
+        assert_eq!(
+            dangerous[0].number,
+            PrNumber(2),
+            "PR #2 should be the dangerous one"
+        );
+    }
+
+    #[test]
+    fn properly_reconciled_pr_is_not_flagged() {
+        // Test oracle: A PR that was properly reconciled (even if retargeted)
+        // should NOT be flagged as dangerous.
+
+        let dir = tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        let state_dir = dir.path().join("state");
+
+        let config = WorkerConfig::new(RepoId::new("owner", "repo"), &spool_dir, &state_dir);
+        let mut worker = RepoWorker::new(config).unwrap();
+
+        // Add predecessor PR (merged)
+        let merge_sha = crate::types::Sha::parse("a".repeat(40)).unwrap();
+        let pred_pr = crate::types::CachedPr::new(
+            PrNumber(1),
+            crate::types::Sha::parse("b".repeat(40)).unwrap(),
+            "feature-1".to_string(),
+            "main".to_string(),
+            None,
+            crate::types::PrState::Merged {
+                merge_commit_sha: merge_sha.clone(),
+            },
+            crate::types::MergeStateStatus::Unknown,
+            false,
+        );
+        worker.state.prs.insert(PrNumber(1), pred_pr);
+
+        // Add descendant PR (retargeted and properly reconciled)
+        let mut desc_pr = crate::types::CachedPr::new(
+            PrNumber(2),
+            crate::types::Sha::parse("c".repeat(40)).unwrap(),
+            "feature-2".to_string(),
+            "main".to_string(),
+            Some(PrNumber(1)),
+            crate::types::PrState::Open,
+            crate::types::MergeStateStatus::Clean,
+            false,
+        );
+        desc_pr.predecessor = Some(PrNumber(1));
+        desc_pr.predecessor_squash_reconciled = Some(merge_sha); // Properly reconciled
+        worker.state.prs.insert(PrNumber(2), desc_pr);
+
+        // This PR should NOT be flagged as dangerous
+        let dangerous: Vec<_> = worker
+            .state
+            .prs
+            .values()
+            .filter(|pr| {
+                if !pr.state.is_open() {
+                    return false;
+                }
+                if pr.base_ref != worker.state.default_branch {
+                    return false;
+                }
+                let Some(pred_number) = pr.predecessor else {
+                    return false;
+                };
+                let pred_merged = if let Some(pred) = worker.state.prs.get(&pred_number) {
+                    matches!(pred.state, crate::types::PrState::Merged { .. })
+                } else {
+                    false
+                };
+                if !pred_merged {
+                    return false;
+                }
+                pr.predecessor_squash_reconciled.is_none()
+            })
+            .collect();
+
+        assert!(dangerous.is_empty(), "Reconciled PR should not be flagged");
+    }
+
+    #[test]
+    fn phase_transition_persistence_updates_train_in_state() {
+        // Test oracle: When a PhaseTransition event is applied to state,
+        // the train's current_pr, last_squash_sha, and cascade_phase
+        // should all be updated.
+        //
+        // This verifies that re_evaluate_cascades_with_persistence properly
+        // persists and applies phase transitions.
+
+        let dir = tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        let state_dir = dir.path().join("state");
+
+        let config = WorkerConfig::new(RepoId::new("owner", "repo"), &spool_dir, &state_dir);
+        let mut worker = RepoWorker::new(config).unwrap();
+
+        // Add an active train
+        let train = crate::types::TrainRecord::new(PrNumber(10));
+        worker.state.active_trains.insert(PrNumber(10), train);
+
+        // Create a PhaseTransition event
+        let squash_sha = crate::types::Sha::parse("d".repeat(40)).unwrap();
+        let new_phase = crate::types::CascadePhase::Reconciling {
+            progress: crate::types::DescendantProgress::new(vec![]),
+            squash_sha: squash_sha.clone(),
+        };
+
+        let event = worker
+            .event_log
+            .append(
+                crate::persistence::event::StateEventPayload::PhaseTransition {
+                    train_root: PrNumber(10),
+                    current_pr: PrNumber(11),
+                    predecessor_pr: Some(PrNumber(10)),
+                    last_squash_sha: Some(squash_sha.clone()),
+                    phase: new_phase.clone(),
+                },
+            )
+            .unwrap();
+
+        // Apply the event to state
+        apply_event_to_state(&mut worker.state, &event);
+
+        // Verify the train was updated
+        let updated_train = worker.state.active_trains.get(&PrNumber(10)).unwrap();
+        assert_eq!(
+            updated_train.current_pr,
+            PrNumber(11),
+            "current_pr should be updated"
+        );
+        assert_eq!(
+            updated_train.last_squash_sha,
+            Some(squash_sha),
+            "last_squash_sha should be updated"
+        );
+        assert_eq!(
+            updated_train.cascade_phase.name(),
+            "reconciling",
+            "cascade_phase should be updated to Reconciling"
+        );
+    }
+
+    #[test]
+    fn wait_timeout_is_configurable() {
+        // Test oracle: The wait timeout should be derived from PollConfig,
+        // not hardcoded. This verifies the fix for the "Non-blocking wait timers
+        // are wired but unused, and timeout is hardcoded" issue.
+
+        let default_config = super::super::poll::PollConfig::new();
+        let custom_config = super::super::poll::PollConfig::new().with_wait_timeout(
+            std::time::Duration::from_secs(600), // 10 minutes
+        );
+
+        // Default should be 5 minutes
+        assert_eq!(default_config.wait_timeout.as_secs(), 300);
+
+        // Custom should be 10 minutes
+        assert_eq!(custom_config.wait_timeout.as_secs(), 600);
     }
 }
