@@ -244,6 +244,30 @@ pub async fn webhook_handler(
                 let repo_id = RepoId::new(&owner, &repo);
                 let delivery = SpooledDelivery::new(&repo_spool_dir, delivery_id.clone());
 
+                // Check for immediate cancellation on duplicate deliveries too.
+                // A redelivered stop command should still trigger immediate cancellation.
+                if let Some(pr) =
+                    detect_stop_command(&event_type, &envelope.body, app_state.bot_name())
+                {
+                    info!(
+                        delivery_id = %delivery_id,
+                        pr = %pr,
+                        "Stop command detected in duplicate delivery, triggering immediate stack cancellation"
+                    );
+                    let dispatcher_cancel = std::sync::Arc::clone(&dispatcher);
+                    let repo_id_cancel = repo_id.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = dispatcher_cancel.cancel_stack(&repo_id_cancel, pr).await {
+                            warn!(
+                                repo = %repo_id_cancel,
+                                pr = %pr,
+                                error = %e,
+                                "Failed to cancel stack"
+                            );
+                        }
+                    });
+                }
+
                 tokio::spawn(async move {
                     if let Err(e) = dispatcher.dispatch(&repo_id, delivery).await {
                         warn!(

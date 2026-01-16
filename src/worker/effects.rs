@@ -145,14 +145,42 @@ where
         effect: Effect,
         state: &mut PersistedRepoSnapshot,
     ) -> Result<EffectResult, EffectError> {
+        self.execute_with_stack_token(effect, state, None).await
+    }
+
+    /// Executes an effect with optional stack-scoped cancellation.
+    ///
+    /// In addition to checking the global shutdown token, this method also
+    /// checks an optional stack-specific token. This allows stop commands
+    /// to interrupt in-flight effects for a specific train without affecting
+    /// other trains.
+    ///
+    /// Returns `Err(EffectError::Cancelled)` if either the global shutdown
+    /// token or the stack token was triggered before or during execution.
+    #[instrument(skip(self, state, stack_token), fields(effect = ?effect))]
+    pub async fn execute_with_stack_token(
+        &self,
+        effect: Effect,
+        state: &mut PersistedRepoSnapshot,
+        stack_token: Option<&CancellationToken>,
+    ) -> Result<EffectResult, EffectError> {
         // Check cancellation before starting
         if self.cancel.is_cancelled() {
             debug!("Cancellation detected before effect execution");
             return Err(EffectError::Cancelled);
         }
+        if let Some(token) = stack_token
+            && token.is_cancelled()
+        {
+            debug!("Stack cancellation detected before effect execution");
+            return Err(EffectError::Cancelled);
+        }
 
         let result = match effect {
-            Effect::GitHub(github_effect) => self.execute_github(github_effect).await?,
+            Effect::GitHub(github_effect) => {
+                self.execute_github_with_stack_token(github_effect, stack_token)
+                    .await?
+            }
             Effect::Git(git_effect) => self.execute_git(git_effect).await?,
             Effect::RecordReconciliation { pr, squash_sha } => {
                 self.record_reconciliation(state, pr, squash_sha)?
@@ -169,14 +197,42 @@ where
         Ok(result)
     }
 
-    /// Executes a GitHub effect with cancellation support.
-    async fn execute_github(&self, effect: GitHubEffect) -> Result<EffectResult, EffectError> {
+    /// Executes a GitHub effect with both global and stack-scoped cancellation support.
+    ///
+    /// This method races the effect execution against multiple cancellation sources:
+    /// 1. Global shutdown token (always checked)
+    /// 2. Stack-specific token (checked if provided)
+    ///
+    /// If either token is cancelled during execution, the effect is interrupted
+    /// and `EffectError::Cancelled` is returned.
+    async fn execute_github_with_stack_token(
+        &self,
+        effect: GitHubEffect,
+        stack_token: Option<&CancellationToken>,
+    ) -> Result<EffectResult, EffectError> {
         trace!(?effect, "Executing GitHub effect");
 
-        // Use select to race between the effect and cancellation
+        // Create a future that completes when either cancellation source fires.
+        // We use a helper async block to combine the two token cancellations.
+        let any_cancelled = async {
+            if let Some(stack) = stack_token {
+                // Race between global shutdown and stack cancellation
+                tokio::select! {
+                    _ = self.cancel.cancelled() => {}
+                    _ = stack.cancelled() => {}
+                }
+            } else {
+                // Only global shutdown
+                self.cancel.cancelled().await;
+            }
+        };
+
+        // Use select to race between the effect and any cancellation
         tokio::select! {
-            _ = self.cancel.cancelled() => {
-                debug!("GitHub effect cancelled");
+            biased;
+
+            _ = any_cancelled => {
+                debug!("GitHub effect cancelled (global or stack)");
                 Err(EffectError::Cancelled)
             }
             result = self.github.interpret(effect) => {
@@ -257,6 +313,7 @@ where
 /// - `RefetchPr`: Returns a placeholder PR with Unknown merge state
 /// - `GetRepoSettings`: Returns settings with squash merge enabled
 /// - Other effects: Return appropriate placeholder responses
+#[derive(Clone)]
 pub struct LoggingGitHubInterpreter {
     /// Placeholder SHA for responses that need one.
     placeholder_sha: Sha,
@@ -450,5 +507,101 @@ mod tests {
 
         let result = executor.execute(effect, &mut state).await;
         assert!(matches!(result, Err(EffectError::PrNotFound(_))));
+    }
+
+    /// Mock interpreter that delays before returning, allowing cancellation to happen during execution.
+    #[derive(Clone)]
+    struct DelayingGitHubInterpreter {
+        delay_ms: u64,
+    }
+
+    impl GitHubInterpreter for DelayingGitHubInterpreter {
+        type Error = String;
+
+        fn interpret(
+            &self,
+            _effect: GitHubEffect,
+        ) -> impl Future<Output = Result<GitHubResponse, Self::Error>> + Send {
+            let delay_ms = self.delay_ms;
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                Ok(GitHubResponse::Retargeted)
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stack_cancellation_interrupts_inflight_effect() {
+        // Test oracle: When a stack token is cancelled during effect execution,
+        // the effect should be interrupted and return EffectError::Cancelled.
+        //
+        // This tests the stack-scoped cancellation feature that allows stop
+        // commands to interrupt in-flight operations for a specific train.
+        let mock = DelayingGitHubInterpreter { delay_ms: 1000 };
+        let global_shutdown = CancellationToken::new();
+        let stack_token = CancellationToken::new();
+
+        let executor = EffectExecutor::new(mock, global_shutdown);
+
+        let mut state = PersistedRepoSnapshot::new("main");
+        let effect = Effect::GitHub(GitHubEffect::GetRepoSettings);
+
+        // Start the effect execution
+        let stack_ref = &stack_token;
+        let result = tokio::select! {
+            result = executor.execute_with_stack_token(effect, &mut state, Some(stack_ref)) => {
+                result
+            }
+            _ = async {
+                // Cancel the stack token after a short delay
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                stack_token.cancel();
+                // Wait for the select to pick up the cancellation
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            } => {
+                unreachable!("The effect should be cancelled before this completes")
+            }
+        };
+
+        assert!(
+            matches!(result, Err(EffectError::Cancelled)),
+            "Effect should be cancelled when stack token is cancelled: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn global_shutdown_interrupts_even_without_stack_token() {
+        // Test oracle: Global shutdown should interrupt effects even when
+        // no stack token is provided (for effects not associated with a train).
+        let mock = DelayingGitHubInterpreter { delay_ms: 1000 };
+        let global_shutdown = CancellationToken::new();
+
+        let executor = EffectExecutor::new(mock, global_shutdown.clone());
+
+        let mut state = PersistedRepoSnapshot::new("main");
+        let effect = Effect::GitHub(GitHubEffect::GetRepoSettings);
+
+        // Start the effect execution without a stack token
+        let result = tokio::select! {
+            result = executor.execute_with_stack_token(effect, &mut state, None) => {
+                result
+            }
+            _ = async {
+                // Cancel the global shutdown token after a short delay
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                global_shutdown.cancel();
+                // Wait for the select to pick up the cancellation
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            } => {
+                unreachable!("The effect should be cancelled before this completes")
+            }
+        };
+
+        assert!(
+            matches!(result, Err(EffectError::Cancelled)),
+            "Effect should be cancelled when global shutdown is triggered: {:?}",
+            result
+        );
     }
 }

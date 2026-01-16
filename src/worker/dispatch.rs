@@ -30,13 +30,16 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use octocrab::Octocrab;
 use thiserror::Error;
 use tokio::sync::{RwLock, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, trace};
 
+use crate::github::OctocrabClient;
 use crate::spool::delivery::SpooledDelivery;
 use crate::types::{DeliveryId, PrNumber, RepoId};
 
@@ -63,7 +66,7 @@ pub enum DispatchError {
 pub type Result<T> = std::result::Result<T, DispatchError>;
 
 /// Configuration for the dispatcher.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DispatcherConfig {
     /// Base directory for webhook spool files.
     /// Per-repo directories are created under `<spool_base>/<owner>/<repo>/`.
@@ -75,6 +78,22 @@ pub struct DispatcherConfig {
 
     /// Bot name for command parsing (e.g., "merge-train").
     pub bot_name: String,
+
+    /// Optional GitHub client for executing GitHub effects.
+    /// If None, workers use a logging interpreter (dry-run mode).
+    /// If Some, workers execute effects against the real GitHub API.
+    pub github_client: Option<Arc<Octocrab>>,
+}
+
+impl std::fmt::Debug for DispatcherConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DispatcherConfig")
+            .field("spool_base", &self.spool_base)
+            .field("state_base", &self.state_base)
+            .field("bot_name", &self.bot_name)
+            .field("github_client", &self.github_client.as_ref().map(|_| "..."))
+            .finish()
+    }
 }
 
 impl DispatcherConfig {
@@ -84,12 +103,22 @@ impl DispatcherConfig {
             spool_base: spool_base.into(),
             state_base: state_base.into(),
             bot_name: "merge-train".to_string(),
+            github_client: None,
         }
     }
 
     /// Sets a custom bot name for command parsing.
     pub fn with_bot_name(mut self, bot_name: impl Into<String>) -> Self {
         self.bot_name = bot_name.into();
+        self
+    }
+
+    /// Sets the GitHub client for executing GitHub effects.
+    ///
+    /// If not set, workers use a logging interpreter that logs effects but
+    /// doesn't execute them (useful for testing/dry-run mode).
+    pub fn with_github_client(mut self, client: Arc<Octocrab>) -> Self {
+        self.github_client = Some(client);
         self
     }
 
@@ -262,7 +291,14 @@ impl Dispatcher {
         )
         .with_bot_name(&self.config.bot_name);
 
-        let worker = RepoWorker::new(worker_config)?;
+        let mut worker = RepoWorker::new(worker_config)?;
+
+        // If a GitHub client is configured, create a repo-scoped client for this worker.
+        if let Some(ref octocrab) = self.config.github_client {
+            let github_client = OctocrabClient::from_octocrab((**octocrab).clone(), repo.clone());
+            worker = worker.with_github_client(github_client);
+            debug!(repo = %repo, "Worker configured with real GitHub client");
+        }
 
         // Create channel and cancellation token.
         // IMPORTANT: Use the same token for both the worker task and the handle
