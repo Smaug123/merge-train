@@ -782,38 +782,37 @@ mod tests {
         );
     }
 
-    // ─── Stage 17: Same-repo serialization and cross-repo concurrency ───
+    // ─── Stage 17: Worker routing guarantees ───
+    //
+    // These tests verify the structural properties that ENABLE serial/concurrent
+    // processing. They do NOT directly verify timing behavior because:
+    // - Async scheduling is non-deterministic
+    // - Processing is too fast for reliable timing assertions
+    // - Tokio tasks may run on the same thread
+    //
+    // The properties tested (single/multiple workers) provide the guarantees
+    // BY CONSTRUCTION: a single worker processes events sequentially from its
+    // queue, while multiple workers are independent async tasks.
 
     #[tokio::test]
-    async fn same_repo_events_processed_serially() {
-        // Test oracle: Multiple events for the same repo go to the same worker
-        // and are processed serially (one worker handles all).
+    async fn same_repo_events_use_single_worker() {
+        // Test: Multiple events for the same repo all route to ONE worker.
         //
-        // The serialization guarantee means:
-        // 1. All events for a repo go through a single worker
-        // 2. The worker processes events one-at-a-time from its queue
-        // 3. Processing order follows queue priority (stop > normal, then FIFO)
+        // This structural property ENABLES serial processing: a single worker
+        // processes events one-at-a-time from its queue (FIFO within priority).
         //
-        // This test verifies:
+        // # What this test verifies
+        //
         // 1. Only ONE worker is created for same-repo events
         // 2. All events are eventually processed (marked done)
         //
-        // # Limitation
+        // # What this test does NOT verify
         //
-        // This test does NOT directly assert that events were processed in FIFO
-        // order or that processing was strictly serial. It only verifies:
-        // - Single worker creation (structural guarantee)
-        // - All events marked done (completion guarantee)
+        // - Processing order (would require instrumenting the worker with timestamps)
+        // - Strict FIFO ordering (would require deterministic scheduling)
         //
-        // Verifying actual processing order would require either:
-        // - Instrumenting the worker with a processing log
-        // - Using deterministic scheduling (difficult with async)
-        // - Property-based testing with slow-processing effects
-        //
-        // The single-worker guarantee provides serialization by construction:
-        // the worker's event loop processes one event at a time from its queue.
-        // This test verifies the prerequisite (single worker) rather than the
-        // consequence (serial processing).
+        // The single-worker guarantee is sufficient because the worker's event
+        // loop processes events sequentially by design (`process_next()` in a loop).
         let dir = tempdir().unwrap();
         let config = DispatcherConfig::new(dir.path().join("spool"), dir.path().join("state"));
 
@@ -851,61 +850,41 @@ mod tests {
         // Wait for processing to complete (worker processes events serially)
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        // Oracle 1: Only ONE worker should exist (same repo = serial processing)
+        // Assert: Only ONE worker exists (enables serial processing)
         assert_eq!(
             dispatcher.worker_count().await,
             1,
-            "Same-repo events should all go to the same worker"
+            "Same-repo events must route to a single worker"
         );
 
-        // Oracle 2: All events should be processed (marked done)
-        // This verifies the single worker handled all events serially
+        // Assert: All events processed
         let spool_dir = config.spool_dir(&repo);
         for i in 0..num_events {
             let delivery =
                 SpooledDelivery::new(&spool_dir, DeliveryId::new(format!("delivery-{}", i)));
-            assert!(
-                delivery.is_done(),
-                "Delivery {} should be marked done after serial processing",
-                i
-            );
+            assert!(delivery.is_done(), "Delivery {} should be marked done", i);
         }
     }
 
     #[tokio::test]
-    async fn cross_repo_events_processed_concurrently() {
-        // Test oracle: Events for different repos create separate workers
-        // that can process concurrently.
+    async fn cross_repo_events_use_separate_workers() {
+        // Test: Events for different repos route to SEPARATE workers.
         //
-        // The concurrency guarantee means:
-        // 1. Each repo gets its own worker
-        // 2. Workers run as separate async tasks
-        // 3. Events for different repos can be processed in parallel
+        // This structural property ENABLES concurrent processing: separate
+        // workers are independent async tasks that can be scheduled in parallel.
         //
-        // This test verifies:
+        // # What this test verifies
+        //
         // 1. N repos create N workers (not 1)
         // 2. All events across all repos are processed
         //
-        // # Limitation
+        // # What this test does NOT verify
         //
-        // This test does NOT directly assert that workers actually run
-        // concurrently. It only verifies:
-        // - Multiple worker creation (structural guarantee)
-        // - All events marked done (completion guarantee)
+        // - Actual concurrent execution (would require timing instrumentation)
+        // - Overlap in processing windows (async scheduling is non-deterministic)
         //
-        // Verifying actual concurrency would require timing instrumentation:
-        // - Add timestamps when each worker starts/ends processing
-        // - Assert overlap in processing windows
-        //
-        // This is challenging because:
-        // - Async tasks may run on the same thread
-        // - Processing is fast so timing windows are small
-        // - Tokio's scheduler is non-deterministic
-        //
-        // The multiple-worker guarantee provides concurrency by construction:
-        // separate workers are independent async tasks that can be scheduled
-        // concurrently by the Tokio runtime. This test verifies the prerequisite
-        // (separate workers) rather than the consequence (concurrent execution).
+        // The separate-worker guarantee is sufficient because Tokio schedules
+        // independent tasks concurrently when resources allow.
         let dir = tempdir().unwrap();
         let config = DispatcherConfig::new(dir.path().join("spool"), dir.path().join("state"));
 
@@ -940,14 +919,14 @@ mod tests {
         // Wait for processing to complete
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        // Oracle 1: Each repo should have its own worker
+        // Assert: Each repo has its own worker (enables concurrent processing)
         assert_eq!(
             dispatcher.worker_count().await,
             num_repos,
-            "Different repos should have separate workers for concurrent processing"
+            "Different repos must have separate workers"
         );
 
-        // Oracle 2: All events across all repos should be processed
+        // Assert: All events processed
         for (i, repo) in repos.iter().enumerate() {
             let spool_dir = config.spool_dir(repo);
             let delivery =

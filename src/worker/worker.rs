@@ -196,6 +196,11 @@ pub struct RepoWorker {
     /// Time of last poll for active trains.
     last_poll: Option<Instant>,
 
+    /// Time of last periodic spool drain.
+    /// This runs independently of active trains to catch deliveries that
+    /// were spooled but not dispatched (e.g., dispatcher failure).
+    last_spool_drain: Option<Instant>,
+
     /// Optional GitHub client for executing GitHub effects.
     /// If None, effects are logged but not executed (testing/dry-run mode).
     github_client: Option<OctocrabClient>,
@@ -291,6 +296,7 @@ impl RepoWorker {
             stack_tokens,
             pending_timers: Vec::new(),
             last_poll: None,
+            last_spool_drain: None,
             github_client: None,
         })
     }
@@ -603,19 +609,20 @@ impl RepoWorker {
         self.last_poll = Some(Instant::now() - self.poll_config.poll_interval + initial_delay);
 
         loop {
-            // Calculate time until next poll
+            // Calculate time until next poll (only if active trains)
             let poll_delay = self.time_until_next_poll();
 
             // Calculate time until next timer
             let timer_delay = self.time_until_next_timer();
 
-            // Use the minimum of poll and timer delays
-            let next_wakeup = match (poll_delay, timer_delay) {
-                (Some(p), Some(t)) => Some(p.min(t)),
-                (Some(p), None) => Some(p),
-                (None, Some(t)) => Some(t),
-                (None, None) => None,
-            };
+            // Calculate time until next spool drain (always active)
+            let spool_drain_delay = self.time_until_next_spool_drain();
+
+            // Use the minimum of all delays
+            let next_wakeup = [poll_delay, timer_delay, spool_drain_delay]
+                .into_iter()
+                .flatten()
+                .min();
 
             tokio::select! {
                 // Graceful shutdown
@@ -644,18 +651,25 @@ impl RepoWorker {
                     }
                 }
 
-                // Timer wakeup (poll or pending timer)
+                // Timer wakeup (poll, spool drain, or pending timer)
                 _ = async {
                     match next_wakeup {
                         Some(delay) => tokio::time::sleep(delay).await,
                         None => std::future::pending().await,
                     }
                 } => {
-                    // Check if it's time for a poll
+                    // Check if it's time for a poll (requires active trains)
                     if self.should_poll()
                         && let Err(e) = self.handle_poll_active_trains().await
                     {
                         error!(error = %e, "Error during poll");
+                    }
+
+                    // Check if it's time for periodic spool drain (always active)
+                    if self.should_drain_spool()
+                        && let Err(e) = self.handle_periodic_spool_drain(&shutdown).await
+                    {
+                        error!(error = %e, "Error during periodic spool drain");
                     }
 
                     // Fire any expired timers
@@ -1123,12 +1137,118 @@ impl RepoWorker {
             effects.push(Effect::GitHub(GitHubEffect::RefetchPr { pr: current_pr }));
         }
 
-        // Execute effects (requires GitHub interpreter from Stage 18).
-        // For now, effects are logged but not executed against GitHub.
-        // The RefetchPr responses would be processed by the event handlers
-        // to update cached state and trigger cascade re-evaluation.
+        // Execute effects. The RefetchPr responses update cached state via
+        // process_github_response.
         if !effects.is_empty() {
             self.execute_effects(effects, &shutdown).await?;
+        }
+
+        // After updating the cache, re-evaluate cascades to check if any trains
+        // can now advance (e.g., CI completed while we weren't receiving webhooks).
+        self.re_evaluate_cascades(&shutdown).await?;
+
+        Ok(())
+    }
+
+    /// Re-evaluates active cascades after cache updates.
+    ///
+    /// This is called after poll updates the cache with fresh GitHub state.
+    /// For each active train, if the current PR's state allows the cascade to
+    /// advance, we execute a cascade step and run any resulting effects.
+    ///
+    /// This is the key mechanism that allows poll fallback to actually advance
+    /// trains when webhooks are missed.
+    async fn re_evaluate_cascades(&mut self, shutdown: &CancellationToken) -> Result<()> {
+        use crate::cascade::step::{StepContext, execute_cascade_step};
+        use crate::types::MergeStateStatus;
+
+        // Collect train roots that may need re-evaluation.
+        // We only re-evaluate trains that are WaitingCi or Running - stopped/aborted
+        // trains require explicit restart.
+        let trains_to_evaluate: Vec<_> = self
+            .state
+            .active_trains
+            .iter()
+            .filter(|(_, train)| train.state.is_active())
+            .map(|(root, train)| (*root, train.current_pr))
+            .collect();
+
+        if trains_to_evaluate.is_empty() {
+            return Ok(());
+        }
+
+        for (train_root, current_pr) in trains_to_evaluate {
+            // Check for cancellation
+            if shutdown.is_cancelled() {
+                break;
+            }
+
+            // Check if this train's stack is cancelled
+            if let Some(token) = self.stack_tokens.get(&train_root)
+                && token.is_cancelled()
+            {
+                continue;
+            }
+
+            // Get fresh PR state from cache
+            let pr_state = self.state.prs.get(&current_pr);
+            let can_advance = match pr_state {
+                Some(pr) => {
+                    // Check if PR is ready to advance: merge state is clean (CI passed,
+                    // reviews approved, no conflicts), or PR is already merged (need to
+                    // advance to next phase).
+                    matches!(
+                        pr.merge_state_status,
+                        MergeStateStatus::Clean | MergeStateStatus::Unstable
+                    ) || pr.state.is_merged()
+                }
+                None => false,
+            };
+
+            if !can_advance {
+                trace!(
+                    train_root = %train_root,
+                    current_pr = %current_pr,
+                    merge_state = ?pr_state.map(|p| &p.merge_state_status),
+                    "Train not ready to advance"
+                );
+                continue;
+            }
+
+            debug!(
+                train_root = %train_root,
+                current_pr = %current_pr,
+                "Re-evaluating cascade after poll"
+            );
+
+            // Get the train (clone to avoid borrow issues)
+            let Some(train) = self.state.active_trains.get(&train_root).cloned() else {
+                continue;
+            };
+
+            // Execute a cascade step
+            let ctx = StepContext::new(&self.state.default_branch);
+            let step_result = execute_cascade_step(train, &self.state.prs, &ctx);
+
+            // Update the train in state.
+            // Note: Phase transitions and other critical events are recorded through
+            // the effects generated by execute_cascade_step. The step itself updates
+            // the TrainRecord which we persist here.
+            self.state
+                .active_trains
+                .insert(train_root, step_result.train);
+
+            // Execute the resulting effects.
+            // These effects include phase transition events, status comment updates,
+            // and the actual GitHub/git operations needed to advance the cascade.
+            if !step_result.effects.is_empty() {
+                debug!(
+                    train_root = %train_root,
+                    effects_count = step_result.effects.len(),
+                    "Executing cascade effects from poll re-evaluation"
+                );
+                self.execute_effects(step_result.effects, shutdown).await?;
+            }
         }
 
         Ok(())
@@ -1175,8 +1295,8 @@ impl RepoWorker {
     /// Handles a timer firing for non-blocking wait re-evaluation.
     ///
     /// Generates a `RefetchPr` effect to get the latest state from GitHub,
-    /// then checks if the wait condition is satisfied. If not satisfied,
-    /// reschedules the timer with exponential backoff.
+    /// then re-evaluates the cascade. If the train advanced, the timer is not
+    /// rescheduled. If still waiting, reschedules with exponential backoff.
     async fn handle_timer_fired(
         &mut self,
         train_root: PrNumber,
@@ -1202,6 +1322,9 @@ impl RepoWorker {
             }
         };
 
+        // Capture current phase to detect advancement after re-evaluation
+        let phase_before = train.cascade_phase.name();
+
         debug!(
             train_root = %train_root,
             current_pr = %train.current_pr,
@@ -1210,14 +1333,11 @@ impl RepoWorker {
         );
 
         // Generate a RefetchPr effect to get the latest state from GitHub.
-        // The wait condition typically involves checking if a previous operation
-        // (push, merge) has propagated to GitHub's API.
         let effects = vec![Effect::GitHub(GitHubEffect::RefetchPr {
             pr: train.current_pr,
         })];
 
-        // Execute the effect (requires GitHub interpreter from Stage 18).
-        // The response would update cached PR state and allow us to check the condition.
+        // Execute the effect to update cached state
         let shutdown = CancellationToken::new();
         if let Err(e) = self.execute_effects(effects, &shutdown).await {
             warn!(
@@ -1227,26 +1347,25 @@ impl RepoWorker {
             );
         }
 
-        // Check if the wait condition is now satisfied based on updated state.
-        //
-        // TODO(Stage 18): Process RefetchPr response and check condition:
-        // - HeadShaMatches: Compare PR headRefOid with expected SHA
-        // - MergeCompleted: Check if PR state is Merged
-        // - CiPassing: Check mergeStateStatus == Clean
-        //
-        // For now, the condition cannot be checked without GitHub responses.
-        // In practice, webhooks should arrive to trigger cascade progression.
-        // The timer is a fallback mechanism in case webhooks are missed.
-        trace!(
-            train_root = %train_root,
-            condition = ?condition,
-            "Condition check requires GitHub interpreter (Stage 18)"
-        );
+        // Re-evaluate the cascade with updated state.
+        // This uses the same logic as poll fallback to check if the train can advance.
+        self.re_evaluate_cascades(&shutdown).await?;
 
-        // Reschedule timer for retry (with backoff) if condition not satisfied.
-        // Without Stage 18 GitHub integration, we can't verify the condition,
-        // so we reschedule to continue polling.
-        self.schedule_wait_retry(train_root, condition)?;
+        // Check if the train advanced (phase changed or train completed/stopped)
+        let train_advanced = match self.state.active_trains.get(&train_root) {
+            Some(train) => train.cascade_phase.name() != phase_before,
+            None => true, // Train no longer active = it advanced (completed/stopped)
+        };
+
+        if train_advanced {
+            debug!(
+                train_root = %train_root,
+                "Train advanced after timer re-evaluation, not rescheduling"
+            );
+        } else {
+            // Still waiting - reschedule with backoff
+            self.schedule_wait_retry(train_root, condition)?;
+        }
 
         Ok(())
     }
@@ -1303,28 +1422,28 @@ impl RepoWorker {
 
     /// Schedules a timer for non-blocking wait re-evaluation.
     ///
+    /// The timer infrastructure is fully wired up:
+    /// - Timers are stored in `pending_timers`
+    /// - The event loop checks for expired timers via `fire_expired_timers()`
+    /// - When fired, `handle_timer_fired()` refetches PR state and re-evaluates
+    ///
     /// # Stage 18 Work Required
     ///
-    /// This function is currently dead code because the non-blocking polling
-    /// infrastructure is not yet integrated:
+    /// This function is currently unused because the cascade engine doesn't yet
+    /// emit "schedule wait" effects. To complete the non-blocking wait feature:
     ///
-    /// 1. **No callers**: The cascade engine doesn't yet emit "wait for condition"
-    ///    effects that would trigger timer scheduling. Currently, the bot relies
-    ///    solely on webhooks to drive cascade progression.
+    /// 1. **Add callers**: The cascade engine should emit effects that trigger
+    ///    timer scheduling after operations like push or squash-merge, when the
+    ///    bot needs to wait for GitHub's API to reflect the change.
     ///
-    /// 2. **In-memory only**: Wait conditions are stored in `pending_timers` which
-    ///    is not persisted. On crash recovery, all pending waits would be lost.
-    ///    Stage 18 should either:
-    ///    - Persist wait conditions in `TrainState` (adds complexity)
-    ///    - OR rely on the periodic poll fallback to recover (simpler but slower)
+    /// 2. **Consider persistence**: Wait conditions are in-memory only. On crash
+    ///    recovery, pending waits are lost. The periodic poll fallback (60s
+    ///    interval) will eventually recover, but explicit waits are faster.
+    ///    Persisting waits in `TrainState` is optional but would speed recovery.
     ///
-    /// 3. **No event loop integration**: The main event loop in `run()` doesn't
-    ///    check for timer expiration. `fire_expired_timers()` exists but isn't
-    ///    called from the event loop.
-    ///
-    /// For Stage 17, the periodic poll (`handle_poll_active_trains`) serves as a
-    /// coarse-grained fallback that re-checks all active trains on a timer.
-    /// Stage 18 should wire up the more precise per-condition timers.
+    /// For now, cascade progression relies on:
+    /// - Webhooks for immediate notification of state changes
+    /// - Periodic poll (60s) as fallback when webhooks are missed
     #[allow(dead_code)]
     pub fn schedule_wait_timer(&mut self, train_root: PrNumber, condition: WaitCondition) {
         let delay = self.poll_config.recheck_interval;
@@ -1417,6 +1536,86 @@ impl RepoWorker {
             Some(last) => last.elapsed() >= interval,
             None => true,
         }
+    }
+
+    // ─── Spool Drain Timer Management ─────────────────────────────────────────────
+
+    /// Interval for periodic spool draining (independent of active train polling).
+    const SPOOL_DRAIN_INTERVAL: Duration = Duration::from_secs(60);
+
+    /// Returns time until next spool drain.
+    ///
+    /// This runs independently of active trains to catch deliveries that were
+    /// spooled but not dispatched (e.g., due to dispatcher failure or race conditions).
+    fn time_until_next_spool_drain(&self) -> Option<Duration> {
+        let interval = Self::SPOOL_DRAIN_INTERVAL;
+
+        match self.last_spool_drain {
+            Some(last) => {
+                let elapsed = last.elapsed();
+                if elapsed >= interval {
+                    Some(Duration::ZERO)
+                } else {
+                    Some(interval - elapsed)
+                }
+            }
+            // On first call, delay briefly to avoid immediate drain (startup already drained)
+            None => Some(interval),
+        }
+    }
+
+    /// Returns true if it's time to drain the spool.
+    fn should_drain_spool(&self) -> bool {
+        match self.last_spool_drain {
+            Some(last) => last.elapsed() >= Self::SPOOL_DRAIN_INTERVAL,
+            // On first call, don't drain immediately (startup already drained)
+            None => false,
+        }
+    }
+
+    /// Handles periodic spool draining.
+    ///
+    /// This runs independently of active trains to catch deliveries that were
+    /// spooled but not dispatched. Unlike `drain_spool_periodic` (called during
+    /// poll), this method runs even when there are no active trains.
+    async fn handle_periodic_spool_drain(&mut self, shutdown: &CancellationToken) -> Result<()> {
+        self.last_spool_drain = Some(Instant::now());
+
+        let deliveries = drain_pending(&self.config.spool_dir)?;
+        if deliveries.is_empty() {
+            trace!("No pending deliveries during periodic drain");
+            return Ok(());
+        }
+
+        debug!(
+            count = deliveries.len(),
+            "Draining spool during periodic drain"
+        );
+
+        let mut enqueued = 0;
+        for delivery in deliveries {
+            if self.enqueue(delivery).is_ok() {
+                enqueued += 1;
+            }
+        }
+
+        if enqueued > 0 {
+            // Process newly enqueued deliveries
+            let (processed, effects) = self.process_all()?;
+            debug!(
+                enqueued = enqueued,
+                processed = processed,
+                effects_count = effects.len(),
+                "Processed deliveries from periodic spool drain"
+            );
+
+            // Execute effects
+            if !effects.is_empty() {
+                self.execute_effects(effects, shutdown).await?;
+            }
+        }
+
+        Ok(())
     }
 
     // ─── Cancellation Token Management ────────────────────────────────────────────
