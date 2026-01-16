@@ -13,8 +13,9 @@ use thiserror::Error;
 use tracing::{debug, info, warn};
 
 use super::{AppState, InvalidPathComponent, validate_path_component};
+use crate::commands::{Command, parse_command};
 use crate::spool::delivery::{SpoolError, SpooledDelivery, WebhookEnvelope, spool_webhook};
-use crate::types::{DeliveryId, RepoId};
+use crate::types::{DeliveryId, PrNumber, RepoId};
 use crate::webhooks::verify_signature;
 
 /// Header name for GitHub event type.
@@ -181,6 +182,33 @@ pub async fn webhook_handler(
                 let dispatcher = std::sync::Arc::clone(dispatcher);
                 let repo_id = RepoId::new(&owner, &repo);
                 let delivery = SpooledDelivery::new(&repo_spool_dir, delivery_id.clone());
+
+                // Check for immediate cancellation: if this is a stop command,
+                // trigger stack cancellation before dispatching. This ensures
+                // in-flight operations are interrupted promptly, even if the
+                // worker's queue has other events ahead of this one.
+                if let Some(pr) =
+                    detect_stop_command(&event_type, &envelope.body, app_state.bot_name())
+                {
+                    info!(
+                        delivery_id = %delivery_id,
+                        pr = %pr,
+                        "Stop command detected, triggering immediate stack cancellation"
+                    );
+                    let dispatcher_cancel = std::sync::Arc::clone(&dispatcher);
+                    let repo_id_cancel = repo_id.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = dispatcher_cancel.cancel_stack(&repo_id_cancel, pr).await {
+                            warn!(
+                                repo = %repo_id_cancel,
+                                pr = %pr,
+                                error = %e,
+                                "Failed to cancel stack"
+                            );
+                        }
+                    });
+                }
+
                 tokio::spawn(async move {
                     if let Err(e) = dispatcher.dispatch(&repo_id, delivery).await {
                         warn!(
@@ -261,6 +289,51 @@ fn extract_headers(headers: &HeaderMap) -> HashMap<String, String> {
                 .map(|v| (name.to_string(), v.to_string()))
         })
         .collect()
+}
+
+/// Detects if a webhook is a stop command and extracts the PR number.
+///
+/// This enables immediate stack cancellation from the webhook handler,
+/// before the event is processed by the worker. Stop commands get
+/// highest priority, and cancelling immediately ensures in-flight
+/// operations are interrupted as soon as possible.
+///
+/// Returns `Some(pr_number)` if this is a stop command for a PR,
+/// or `None` if it's not a stop command.
+fn detect_stop_command(
+    event_type: &str,
+    body: &serde_json::Value,
+    bot_name: &str,
+) -> Option<PrNumber> {
+    // Only issue_comment events can contain stop commands
+    if event_type != "issue_comment" {
+        return None;
+    }
+
+    // Only "created" actions are relevant (not "edited" or "deleted")
+    let action = body.get("action")?.as_str()?;
+    if action != "created" {
+        return None;
+    }
+
+    // Must be a comment on a PR, not a regular issue
+    // GitHub includes "pull_request" field in issue for PR comments
+    body.get("issue")?.get("pull_request")?;
+
+    // Extract the PR number
+    let pr_number = body.get("issue")?.get("number")?.as_u64()?;
+
+    // Extract the comment body
+    let comment_body = body.get("comment")?.get("body")?.as_str()?;
+
+    // Check if it's a stop command
+    if let Some(cmd) = parse_command(comment_body, bot_name)
+        && matches!(cmd, Command::Stop | Command::StopForce)
+    {
+        return Some(PrNumber(pr_number));
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -357,5 +430,133 @@ mod tests {
 
         // Invalid UTF-8 header should be filtered out
         assert!(!result.contains_key("invalid-header"));
+    }
+
+    // ─── detect_stop_command tests ───
+
+    #[test]
+    fn detect_stop_command_with_stop() {
+        let body = json!({
+            "action": "created",
+            "issue": {
+                "number": 42,
+                "pull_request": {}
+            },
+            "comment": {
+                "body": "@merge-train stop"
+            }
+        });
+
+        let result = detect_stop_command("issue_comment", &body, "merge-train");
+        assert_eq!(result, Some(PrNumber(42)));
+    }
+
+    #[test]
+    fn detect_stop_command_with_stop_force() {
+        let body = json!({
+            "action": "created",
+            "issue": {
+                "number": 99,
+                "pull_request": {}
+            },
+            "comment": {
+                "body": "@merge-train stop --force"
+            }
+        });
+
+        let result = detect_stop_command("issue_comment", &body, "merge-train");
+        assert_eq!(result, Some(PrNumber(99)));
+    }
+
+    #[test]
+    fn detect_stop_command_wrong_event_type() {
+        let body = json!({
+            "action": "created",
+            "issue": {
+                "number": 42,
+                "pull_request": {}
+            },
+            "comment": {
+                "body": "@merge-train stop"
+            }
+        });
+
+        // Wrong event type
+        let result = detect_stop_command("pull_request", &body, "merge-train");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn detect_stop_command_not_a_stop() {
+        let body = json!({
+            "action": "created",
+            "issue": {
+                "number": 42,
+                "pull_request": {}
+            },
+            "comment": {
+                "body": "@merge-train start"
+            }
+        });
+
+        // Start command, not stop
+        let result = detect_stop_command("issue_comment", &body, "merge-train");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn detect_stop_command_regular_issue_not_pr() {
+        let body = json!({
+            "action": "created",
+            "issue": {
+                "number": 42
+                // No pull_request field - this is a regular issue
+            },
+            "comment": {
+                "body": "@merge-train stop"
+            }
+        });
+
+        let result = detect_stop_command("issue_comment", &body, "merge-train");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn detect_stop_command_edited_action() {
+        let body = json!({
+            "action": "edited",  // Not "created"
+            "issue": {
+                "number": 42,
+                "pull_request": {}
+            },
+            "comment": {
+                "body": "@merge-train stop"
+            }
+        });
+
+        let result = detect_stop_command("issue_comment", &body, "merge-train");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn detect_stop_command_custom_bot_name() {
+        let body = json!({
+            "action": "created",
+            "issue": {
+                "number": 42,
+                "pull_request": {}
+            },
+            "comment": {
+                "body": "@custom-bot stop"
+            }
+        });
+
+        // With default bot name
+        let result = detect_stop_command("issue_comment", &body, "merge-train");
+        assert_eq!(result, None);
+
+        // With matching bot name
+        let result = detect_stop_command("issue_comment", &body, "custom-bot");
+        assert_eq!(result, Some(PrNumber(42)));
     }
 }

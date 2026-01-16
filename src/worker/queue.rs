@@ -22,16 +22,93 @@ use crate::webhooks::priority::EventPriority;
 ///
 /// When the bot needs to wait for GitHub state to propagate, it records
 /// what condition it's waiting for and schedules timer-based re-checks.
+///
+/// Each variant includes a retry count for exponential backoff.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WaitCondition {
     /// Waiting for headRefOid to match after a push.
-    HeadRefOid { pr: PrNumber, expected: Sha },
+    HeadRefOid {
+        pr: PrNumber,
+        expected: Sha,
+        retry_count: u32,
+    },
 
     /// Waiting for mergeStateStatus to change from a specific value.
-    MergeStateStatus { pr: PrNumber, not: MergeStateStatus },
+    MergeStateStatus {
+        pr: PrNumber,
+        not: MergeStateStatus,
+        retry_count: u32,
+    },
 
     /// Waiting for check suite to complete for a specific SHA.
-    CheckSuiteCompleted { sha: Sha },
+    CheckSuiteCompleted { sha: Sha, retry_count: u32 },
+}
+
+impl WaitCondition {
+    /// Creates a new HeadRefOid wait condition with retry count 0.
+    pub fn head_ref_oid(pr: PrNumber, expected: Sha) -> Self {
+        WaitCondition::HeadRefOid {
+            pr,
+            expected,
+            retry_count: 0,
+        }
+    }
+
+    /// Creates a new MergeStateStatus wait condition with retry count 0.
+    pub fn merge_state_status(pr: PrNumber, not: MergeStateStatus) -> Self {
+        WaitCondition::MergeStateStatus {
+            pr,
+            not,
+            retry_count: 0,
+        }
+    }
+
+    /// Creates a new CheckSuiteCompleted wait condition with retry count 0.
+    pub fn check_suite_completed(sha: Sha) -> Self {
+        WaitCondition::CheckSuiteCompleted {
+            sha,
+            retry_count: 0,
+        }
+    }
+
+    /// Returns the current retry count.
+    pub fn retry_count(&self) -> u32 {
+        match self {
+            WaitCondition::HeadRefOid { retry_count, .. } => *retry_count,
+            WaitCondition::MergeStateStatus { retry_count, .. } => *retry_count,
+            WaitCondition::CheckSuiteCompleted { retry_count, .. } => *retry_count,
+        }
+    }
+
+    /// Returns a new condition with the retry count incremented.
+    pub fn with_incremented_retry(&self) -> Self {
+        match self {
+            WaitCondition::HeadRefOid {
+                pr,
+                expected,
+                retry_count,
+            } => WaitCondition::HeadRefOid {
+                pr: *pr,
+                expected: expected.clone(),
+                retry_count: retry_count + 1,
+            },
+            WaitCondition::MergeStateStatus {
+                pr,
+                not,
+                retry_count,
+            } => WaitCondition::MergeStateStatus {
+                pr: *pr,
+                not: *not,
+                retry_count: retry_count + 1,
+            },
+            WaitCondition::CheckSuiteCompleted { sha, retry_count } => {
+                WaitCondition::CheckSuiteCompleted {
+                    sha: sha.clone(),
+                    retry_count: retry_count + 1,
+                }
+            }
+        }
+    }
 }
 
 /// An entry in the priority queue.

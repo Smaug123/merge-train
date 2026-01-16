@@ -105,6 +105,9 @@ struct AppStateInner {
 
     /// Event dispatcher for routing webhooks to per-repo workers.
     dispatcher: Option<StdArc<Dispatcher>>,
+
+    /// Bot name for command parsing (e.g., "merge-train").
+    bot_name: String,
 }
 
 impl AppState {
@@ -126,6 +129,7 @@ impl AppState {
                 state_dir: state_dir.into(),
                 webhook_secret: webhook_secret.into(),
                 dispatcher: None,
+                bot_name: "merge-train".to_string(),
             }),
         }
     }
@@ -150,6 +154,34 @@ impl AppState {
                 state_dir: state_dir.into(),
                 webhook_secret: webhook_secret.into(),
                 dispatcher: Some(dispatcher),
+                bot_name: "merge-train".to_string(),
+            }),
+        }
+    }
+
+    /// Creates a new `AppState` with a custom bot name and dispatcher.
+    ///
+    /// # Arguments
+    ///
+    /// * `spool_dir` - Directory for spooling webhook deliveries
+    /// * `state_dir` - Directory for persisted repository state
+    /// * `webhook_secret` - Secret for verifying webhook signatures
+    /// * `dispatcher` - Event dispatcher for routing webhooks to workers
+    /// * `bot_name` - Bot name for command parsing
+    pub fn new_with_bot_name(
+        spool_dir: impl Into<PathBuf>,
+        state_dir: impl Into<PathBuf>,
+        webhook_secret: impl Into<Vec<u8>>,
+        dispatcher: StdArc<Dispatcher>,
+        bot_name: impl Into<String>,
+    ) -> Self {
+        AppState {
+            inner: Arc::new(AppStateInner {
+                spool_dir: spool_dir.into(),
+                state_dir: state_dir.into(),
+                webhook_secret: webhook_secret.into(),
+                dispatcher: Some(dispatcher),
+                bot_name: bot_name.into(),
             }),
         }
     }
@@ -172,6 +204,11 @@ impl AppState {
     /// Returns the dispatcher, if configured.
     pub fn dispatcher(&self) -> Option<&StdArc<Dispatcher>> {
         self.inner.dispatcher.as_ref()
+    }
+
+    /// Returns the bot name for command parsing.
+    pub fn bot_name(&self) -> &str {
+        &self.inner.bot_name
     }
 }
 

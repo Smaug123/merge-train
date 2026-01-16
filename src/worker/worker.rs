@@ -710,42 +710,92 @@ impl RepoWorker {
         Ok(())
     }
 
-    /// Executes a batch of effects asynchronously.
+    /// Executes a list of effects, respecting cancellation.
     ///
-    /// Effects are executed sequentially with cancellation support. If the shutdown
-    /// token is triggered, remaining effects are skipped.
+    /// This method processes effects in order, checking for cancellation before
+    /// each effect. Effect execution uses the `EffectExecutor` which integrates
+    /// with the GitHub interpreter.
     ///
-    /// Note: This currently logs effects rather than executing them, as GitHub
-    /// interpreter integration is handled in Stage 18 (Bootstrap). The logging
-    /// ensures effects are not silently ignored.
+    /// # Effect Types
+    ///
+    /// - `RecordReconciliation`: Handled locally by updating the cached PR state.
+    ///   These effects are pure state updates and don't require external API calls.
+    ///
+    /// - `GitHub(*)`: Executed via the GitHub interpreter when available.
+    ///   In Stage 17, effects are logged but not executed (awaiting Stage 18 integration).
+    ///   The logging ensures effects are not silently ignored and aids debugging.
+    ///
+    /// - `Git(*)`: Executed via the Git interpreter when available.
+    ///   In Stage 17, effects are logged but not executed.
+    ///
+    /// # Cancellation
+    ///
+    /// The shutdown token is checked before each effect. If cancelled:
+    /// - The current effect completes (effects should be designed to be interruptible)
+    /// - Remaining effects are skipped
+    /// - The method returns Ok(()) - cancellation is not an error
+    ///
+    /// # Stage 18 Integration
+    ///
+    /// When Stage 18 provides the GitHub client, this method will:
+    /// 1. Create an `EffectExecutor` with the GitHub interpreter
+    /// 2. Execute each effect and handle the response
+    /// 3. Update cached state based on GitHub responses (e.g., PrRefetched)
     async fn execute_effects(
         &mut self,
         effects: Vec<Effect>,
         shutdown: &CancellationToken,
     ) -> Result<()> {
+        use crate::worker::effects::{EffectError, EffectExecutor, LoggingGitHubInterpreter};
+
+        if effects.is_empty() {
+            return Ok(());
+        }
+
+        debug!(count = effects.len(), "Executing effects");
+
+        // Create an executor with a logging interpreter.
+        // Stage 18 will replace this with the real GitHub client.
+        let logging_interpreter = LoggingGitHubInterpreter::new();
+        let executor = EffectExecutor::new(logging_interpreter, shutdown.clone());
+
         for effect in effects {
             // Check for shutdown before each effect
             if shutdown.is_cancelled() {
-                debug!(
-                    remaining = 1,
-                    "Shutdown requested, skipping remaining effects"
-                );
+                debug!("Shutdown requested, skipping remaining effects");
                 break;
             }
 
-            // Log the effect (actual execution requires GitHub interpreter from Stage 18)
-            debug!(?effect, "Effect pending execution");
-
             // Handle RecordReconciliation effects locally (no external calls needed)
-            if let Effect::RecordReconciliation { pr, squash_sha } = effect
-                && let Some(cached_pr) = self.state.prs.get_mut(&pr)
+            if let Effect::RecordReconciliation {
+                ref pr,
+                ref squash_sha,
+            } = effect
             {
-                cached_pr.predecessor_squash_reconciled = Some(squash_sha.clone());
-                trace!(?pr, ?squash_sha, "Recorded reconciliation in state");
+                if let Some(cached_pr) = self.state.prs.get_mut(pr) {
+                    cached_pr.predecessor_squash_reconciled = Some(squash_sha.clone());
+                    trace!(?pr, ?squash_sha, "Recorded reconciliation in state");
+                }
+                continue;
             }
 
-            // GitHub and Git effects are logged but not executed without an interpreter.
-            // This will be wired up in Stage 18 when the GitHub client is integrated.
+            // Execute the effect using the executor
+            match executor.execute(effect, &mut self.state).await {
+                Ok(result) => {
+                    trace!(?result, "Effect executed successfully");
+                    // TODO(Stage 18): Process result to update cached state
+                    // e.g., GitHubResponse::PrRefetched updates self.state.prs
+                }
+                Err(EffectError::Cancelled) => {
+                    debug!("Effect execution cancelled");
+                    break;
+                }
+                Err(e) => {
+                    // Log error but continue with remaining effects.
+                    // Individual effect failures shouldn't stop the whole batch.
+                    warn!(error = %e, "Effect execution failed");
+                }
+            }
         }
 
         Ok(())
@@ -773,7 +823,13 @@ impl RepoWorker {
     ///
     /// This also drains the spool to pick up any deliveries that may have been
     /// missed (e.g., due to dispatcher failures).
+    ///
+    /// For each active train, generates a `RefetchPr` effect to check the current
+    /// PR's merge state. If the merge state has changed (e.g., CI completed,
+    /// review approved), the cascade will be re-evaluated on the next event.
     async fn handle_poll_active_trains(&mut self) -> Result<()> {
+        use crate::effects::{Effect, GitHubEffect};
+
         self.last_poll = Some(Instant::now());
 
         // First, drain any pending deliveries from the spool.
@@ -788,7 +844,7 @@ impl RepoWorker {
         }
 
         // Now handle active train polling
-        let active_trains: Vec<_> = self.state.active_trains.keys().copied().collect();
+        let active_trains: Vec<_> = self.state.active_trains.values().collect();
 
         if active_trains.is_empty() {
             trace!("No active trains to poll");
@@ -800,20 +856,28 @@ impl RepoWorker {
             "Polling active trains for missed webhooks"
         );
 
-        // For each active train, we would:
-        // 1. Check mergeStateStatus via GitHub API (RefetchPr effect)
-        // 2. Compare with cached state
-        // 3. Trigger cascade evaluation if changed
-        //
-        // This requires effect execution which is not fully implemented.
-        // For now, we just log that polling occurred.
-
-        for train_root in active_trains {
+        // Generate RefetchPr effects for each active train's current PR.
+        // This checks the GitHub state in case we missed webhooks.
+        let mut effects = Vec::new();
+        for train in active_trains {
+            let current_pr = train.current_pr;
             trace!(
-                train_root = %train_root,
+                train_root = %train.original_root_pr,
+                current_pr = %current_pr,
                 trigger = "poll",
-                "Would poll train status"
+                "Generating RefetchPr effect for active train"
             );
+            effects.push(Effect::GitHub(GitHubEffect::RefetchPr { pr: current_pr }));
+        }
+
+        // Execute effects (requires GitHub interpreter from Stage 18).
+        // For now, effects are logged but not executed against GitHub.
+        // The RefetchPr responses would be processed by the event handlers
+        // to update cached state and trigger cascade re-evaluation.
+        if !effects.is_empty() {
+            // Get shutdown token for effect execution
+            let shutdown = CancellationToken::new();
+            self.execute_effects(effects, &shutdown).await?;
         }
 
         Ok(())
@@ -849,32 +913,128 @@ impl RepoWorker {
     }
 
     /// Handles a timer firing for non-blocking wait re-evaluation.
+    ///
+    /// Generates a `RefetchPr` effect to get the latest state from GitHub,
+    /// then checks if the wait condition is satisfied. If not satisfied,
+    /// reschedules the timer with exponential backoff.
     async fn handle_timer_fired(
         &mut self,
         train_root: PrNumber,
         condition: WaitCondition,
     ) -> Result<()> {
+        use crate::effects::{Effect, GitHubEffect};
+
         trace!(
             train_root = %train_root,
             condition = ?condition,
             "Timer fired for wait condition"
         );
 
-        // Check if the train is still active
-        if !self.state.active_trains.contains_key(&train_root) {
-            debug!(
+        // Check if the train is still active and get its current PR
+        let train = match self.state.active_trains.get(&train_root) {
+            Some(t) => t.clone(),
+            None => {
+                debug!(
+                    train_root = %train_root,
+                    "Train no longer active, ignoring timer"
+                );
+                return Ok(());
+            }
+        };
+
+        debug!(
+            train_root = %train_root,
+            current_pr = %train.current_pr,
+            condition = ?condition,
+            "Re-evaluating wait condition"
+        );
+
+        // Generate a RefetchPr effect to get the latest state from GitHub.
+        // The wait condition typically involves checking if a previous operation
+        // (push, merge) has propagated to GitHub's API.
+        let effects = vec![Effect::GitHub(GitHubEffect::RefetchPr {
+            pr: train.current_pr,
+        })];
+
+        // Execute the effect (requires GitHub interpreter from Stage 18).
+        // The response would update cached PR state and allow us to check the condition.
+        let shutdown = CancellationToken::new();
+        if let Err(e) = self.execute_effects(effects, &shutdown).await {
+            warn!(
                 train_root = %train_root,
-                "Train no longer active, ignoring timer"
+                error = %e,
+                "Failed to execute effects for timer re-evaluation"
             );
+        }
+
+        // Check if the wait condition is now satisfied based on updated state.
+        //
+        // TODO(Stage 18): Process RefetchPr response and check condition:
+        // - HeadShaMatches: Compare PR headRefOid with expected SHA
+        // - MergeCompleted: Check if PR state is Merged
+        // - CiPassing: Check mergeStateStatus == Clean
+        //
+        // For now, the condition cannot be checked without GitHub responses.
+        // In practice, webhooks should arrive to trigger cascade progression.
+        // The timer is a fallback mechanism in case webhooks are missed.
+        trace!(
+            train_root = %train_root,
+            condition = ?condition,
+            "Condition check requires GitHub interpreter (Stage 18)"
+        );
+
+        // Reschedule timer for retry (with backoff) if condition not satisfied.
+        // Without Stage 18 GitHub integration, we can't verify the condition,
+        // so we reschedule to continue polling.
+        self.schedule_wait_retry(train_root, condition)?;
+
+        Ok(())
+    }
+
+    /// Schedules a retry timer for a wait condition with exponential backoff.
+    ///
+    /// Returns an error if max retries have been exceeded.
+    fn schedule_wait_retry(
+        &mut self,
+        train_root: PrNumber,
+        condition: WaitCondition,
+    ) -> Result<()> {
+        // Find the retry count from the condition's metadata
+        let retry_count = condition.retry_count();
+
+        // Max retries before giving up (10 retries with backoff = ~17 minutes total)
+        const MAX_RETRIES: u32 = 10;
+        if retry_count >= MAX_RETRIES {
+            warn!(
+                train_root = %train_root,
+                condition = ?condition,
+                retry_count = retry_count,
+                "Wait condition timed out after max retries"
+            );
+            // For now, just log the timeout. Stage 18 will handle cascade failure.
+            // TODO(Stage 18): Transition cascade to Failed state with timeout error
             return Ok(());
         }
 
-        // In a full implementation, we would:
-        // 1. Check the wait condition via GitHub API
-        // 2. If satisfied, proceed with cascade
-        // 3. If not satisfied, reschedule timer (with timeout check)
-        //
-        // For now, just log that the timer fired.
+        // Calculate backoff delay: starts at recheck_interval, caps at 5 minutes
+        let base_delay = self.poll_config.recheck_interval;
+        let backoff_factor = 2u32.saturating_pow(retry_count);
+        let delay = base_delay * backoff_factor;
+        let max_delay = Duration::from_secs(300); // 5 minutes
+        let delay = delay.min(max_delay);
+
+        debug!(
+            train_root = %train_root,
+            condition = ?condition,
+            retry = retry_count + 1,
+            delay_ms = delay.as_millis(),
+            "Scheduling wait retry timer"
+        );
+
+        let fires_at = Instant::now() + delay;
+        let new_condition = condition.with_incremented_retry();
+        self.pending_timers
+            .push(PendingTimer::new(fires_at, train_root, new_condition));
 
         Ok(())
     }
@@ -1647,7 +1807,15 @@ mod tests {
 
     #[test]
     fn done_marker_only_created_after_flush() {
-        // Test oracle: .done marker is only created AFTER fsync
+        // Test oracle: .done marker is only created AFTER state is durably persisted.
+        // The durability guarantee is:
+        // 1. Events are appended to the log
+        // 2. flush_pending_batch() calls event_log.sync() to fsync the log
+        // 3. Only THEN are .done markers created
+        //
+        // This ensures that on crash recovery, any delivery without a .done marker
+        // will be reprocessed, and its events will be re-applied to the log.
+
         let dir = tempdir().unwrap();
         let spool_dir = dir.path().join("spool");
         let state_dir = dir.path().join("state");
@@ -1660,19 +1828,46 @@ mod tests {
         let config = WorkerConfig::new(RepoId::new("owner", "repo"), &spool_dir, &state_dir);
         let mut worker = RepoWorker::new(config).unwrap();
 
+        // Record the initial log position
+        let initial_position = worker.event_log.position().unwrap();
+
         // Process the event
-        worker.process_next().unwrap();
+        let result = worker.process_next().unwrap();
+        assert!(result.processed, "Event should be processed");
+
+        // After processing: log should have advanced (events written)
+        let post_process_position = worker.event_log.position().unwrap();
+        assert!(
+            post_process_position > initial_position,
+            "Event log should have events written after processing"
+        );
 
         // Before flush: .done marker should NOT exist
         let delivery = SpooledDelivery::new(&spool_dir, delivery_id.clone());
         assert!(
             !delivery.is_done(),
-            "Done marker should not exist before flush"
+            "Done marker should not exist before flush (events written but not synced)"
         );
 
-        // After flush: .done marker should exist
+        // After flush: event_log.sync() is called, THEN .done marker is created
         worker.flush_pending_batch().unwrap();
-        assert!(delivery.is_done(), "Done marker should exist after flush");
+        assert!(
+            delivery.is_done(),
+            "Done marker should exist after flush (log synced)"
+        );
+
+        // Verify the event log file actually exists and has content
+        let log_path = state_dir.join(format!("events.{}.log", worker.state.log_generation));
+        assert!(log_path.exists(), "Event log file should exist");
+        let log_content = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            !log_content.is_empty(),
+            "Event log should contain the persisted event"
+        );
+        assert!(
+            log_content.contains("pr_opened"),
+            "Event log should contain the PrOpened event"
+        );
     }
 
     #[test]
@@ -1927,6 +2122,33 @@ mod tests {
 
         // No active trains means no polling needed
         assert!(worker.state.active_trains.is_empty());
+
+        // time_until_next_poll should return None when there are no active trains
+        assert!(
+            worker.time_until_next_poll().is_none(),
+            "time_until_next_poll should return None when no trains are active"
+        );
+    }
+
+    #[test]
+    fn time_until_next_poll_returns_some_when_trains_active() {
+        // When there are active trains, polling should be scheduled
+        let dir = tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        let state_dir = dir.path().join("state");
+
+        let config = WorkerConfig::new(RepoId::new("owner", "repo"), &spool_dir, &state_dir);
+        let mut worker = RepoWorker::new(config).unwrap();
+
+        // Add an active train
+        let train = crate::types::TrainRecord::new(PrNumber(10));
+        worker.state.active_trains.insert(PrNumber(10), train);
+
+        // time_until_next_poll should return Some duration when trains are active
+        assert!(
+            worker.time_until_next_poll().is_some(),
+            "time_until_next_poll should return Some when trains are active"
+        );
     }
 
     #[test]

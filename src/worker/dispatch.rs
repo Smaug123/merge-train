@@ -752,21 +752,31 @@ mod tests {
     async fn same_repo_events_processed_serially() {
         // Test oracle: Multiple events for the same repo go to the same worker
         // and are processed serially (one worker handles all).
+        //
+        // The serialization guarantee means:
+        // 1. All events for a repo go through a single worker
+        // 2. The worker processes events one-at-a-time from its queue
+        // 3. Processing order follows queue priority (stop > normal, then FIFO)
+        //
+        // This test verifies:
+        // 1. Only ONE worker is created for same-repo events
+        // 2. All events are eventually processed (marked done)
         let dir = tempdir().unwrap();
         let config = DispatcherConfig::new(dir.path().join("spool"), dir.path().join("state"));
 
         let dispatcher = Arc::new(Dispatcher::new(config.clone()));
         let repo = RepoId::new("owner", "repo");
+        let num_events = 10;
 
         // Spool multiple events for the same repo
-        for i in 0..10 {
+        for i in 0..num_events {
             let envelope = make_pr_opened_envelope(i);
             let delivery_id = DeliveryId::new(format!("delivery-{}", i));
             spool_webhook(&config.spool_dir(&repo), &delivery_id, &envelope).unwrap();
         }
 
         // Dispatch all events concurrently from different tasks
-        let handles: Vec<_> = (0..10)
+        let handles: Vec<_> = (0..num_events)
             .map(|i| {
                 let dispatcher = Arc::clone(&dispatcher);
                 let repo = repo.clone();
@@ -785,20 +795,43 @@ mod tests {
             assert!(result.is_ok(), "dispatch should succeed");
         }
 
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Wait for processing to complete (worker processes events serially)
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        // Key oracle: Only ONE worker should exist (same repo = serial processing)
+        // Oracle 1: Only ONE worker should exist (same repo = serial processing)
         assert_eq!(
             dispatcher.worker_count().await,
             1,
             "Same-repo events should all go to the same worker"
         );
+
+        // Oracle 2: All events should be processed (marked done)
+        // This verifies the single worker handled all events serially
+        let spool_dir = config.spool_dir(&repo);
+        for i in 0..num_events {
+            let delivery =
+                SpooledDelivery::new(&spool_dir, DeliveryId::new(format!("delivery-{}", i)));
+            assert!(
+                delivery.is_done(),
+                "Delivery {} should be marked done after serial processing",
+                i
+            );
+        }
     }
 
     #[tokio::test]
     async fn cross_repo_events_processed_concurrently() {
         // Test oracle: Events for different repos create separate workers
         // that can process concurrently.
+        //
+        // The concurrency guarantee means:
+        // 1. Each repo gets its own worker
+        // 2. Workers run as separate async tasks
+        // 3. Events for different repos can be processed in parallel
+        //
+        // This test verifies:
+        // 1. N repos create N workers (not 1)
+        // 2. All events across all repos are processed
         let dir = tempdir().unwrap();
         let config = DispatcherConfig::new(dir.path().join("spool"), dir.path().join("state"));
 
@@ -816,24 +849,40 @@ mod tests {
                     let delivery_id = DeliveryId::new(format!("delivery-repo-{}", i));
                     spool_webhook(&config.spool_dir(&repo), &delivery_id, &envelope).unwrap();
                     let delivery = SpooledDelivery::new(&config.spool_dir(&repo), delivery_id);
-                    dispatcher.dispatch(&repo, delivery).await
+                    let result = dispatcher.dispatch(&repo, delivery).await;
+                    (i, repo, result)
                 })
             })
             .collect();
 
         // All dispatches should succeed
+        let mut repos = Vec::new();
         for handle in handles {
-            let result = handle.await.unwrap();
-            assert!(result.is_ok(), "dispatch should succeed");
+            let (i, repo, result) = handle.await.unwrap();
+            assert!(result.is_ok(), "dispatch to repo-{} should succeed", i);
+            repos.push(repo);
         }
 
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Wait for processing to complete
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        // Key oracle: Each repo should have its own worker
+        // Oracle 1: Each repo should have its own worker
         assert_eq!(
             dispatcher.worker_count().await,
             num_repos,
             "Different repos should have separate workers for concurrent processing"
         );
+
+        // Oracle 2: All events across all repos should be processed
+        for (i, repo) in repos.iter().enumerate() {
+            let spool_dir = config.spool_dir(repo);
+            let delivery =
+                SpooledDelivery::new(&spool_dir, DeliveryId::new(format!("delivery-repo-{}", i)));
+            assert!(
+                delivery.is_done(),
+                "Delivery for repo-{} should be marked done",
+                i
+            );
+        }
     }
 }

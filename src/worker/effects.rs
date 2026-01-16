@@ -19,9 +19,11 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, instrument, trace, warn};
 
-use crate::effects::{Effect, GitEffect, GitHubEffect, GitHubInterpreter, GitHubResponse};
+use crate::effects::{
+    Effect, GitEffect, GitHubEffect, GitHubInterpreter, GitHubResponse, PrData, RepoSettingsData,
+};
 use crate::persistence::snapshot::PersistedRepoSnapshot;
-use crate::types::{PrNumber, Sha};
+use crate::types::{MergeStateStatus, PrNumber, PrState, Sha};
 
 /// Result of executing an effect.
 #[derive(Debug)]
@@ -239,6 +241,99 @@ where
         cached_pr.predecessor_squash_reconciled = Some(squash_sha);
 
         Ok(EffectResult::RecordReconciliation)
+    }
+}
+
+// ─── Logging Interpreter ───────────────────────────────────────────────────────
+
+/// A GitHub interpreter that logs effects without executing them.
+///
+/// This is used as a placeholder in Stage 17 until the real GitHub client
+/// is integrated in Stage 18. It returns plausible placeholder responses
+/// so the effect execution flow can be tested without actual API calls.
+///
+/// # Responses
+///
+/// - `RefetchPr`: Returns a placeholder PR with Unknown merge state
+/// - `GetRepoSettings`: Returns settings with squash merge enabled
+/// - Other effects: Return appropriate placeholder responses
+pub struct LoggingGitHubInterpreter {
+    /// Placeholder SHA for responses that need one.
+    placeholder_sha: Sha,
+}
+
+impl LoggingGitHubInterpreter {
+    /// Creates a new logging interpreter.
+    pub fn new() -> Self {
+        LoggingGitHubInterpreter {
+            placeholder_sha: Sha::parse("0".repeat(40)).expect("valid placeholder sha"),
+        }
+    }
+}
+
+impl Default for LoggingGitHubInterpreter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GitHubInterpreter for LoggingGitHubInterpreter {
+    type Error = std::convert::Infallible;
+
+    fn interpret(
+        &self,
+        effect: GitHubEffect,
+    ) -> impl std::future::Future<Output = Result<GitHubResponse, Self::Error>> + Send {
+        // Log the effect for debugging
+        debug!(
+            ?effect,
+            "LoggingGitHubInterpreter: effect logged (not executed)"
+        );
+
+        // Return a plausible placeholder response based on the effect type
+        let response = match effect {
+            GitHubEffect::GetPr { pr } | GitHubEffect::RefetchPr { pr } => {
+                GitHubResponse::PrRefetched {
+                    pr: PrData {
+                        number: pr,
+                        head_sha: self.placeholder_sha.clone(),
+                        head_ref: "feature".to_string(),
+                        base_ref: "main".to_string(),
+                        state: PrState::Open,
+                        is_draft: false,
+                    },
+                    merge_state: MergeStateStatus::Unknown,
+                }
+            }
+            GitHubEffect::ListOpenPrs => GitHubResponse::PrList(vec![]),
+            GitHubEffect::ListRecentlyMergedPrs { .. } => GitHubResponse::RecentlyMergedPrList {
+                prs: vec![],
+                may_be_incomplete: false,
+            },
+            GitHubEffect::GetMergeState { .. } => {
+                GitHubResponse::MergeState(MergeStateStatus::Unknown)
+            }
+            GitHubEffect::SquashMerge { .. } => GitHubResponse::Merged {
+                sha: self.placeholder_sha.clone(),
+            },
+            GitHubEffect::RetargetPr { .. } => GitHubResponse::Retargeted,
+            GitHubEffect::PostComment { .. } => GitHubResponse::CommentPosted {
+                id: crate::types::CommentId(0),
+            },
+            GitHubEffect::UpdateComment { .. } => GitHubResponse::CommentUpdated,
+            GitHubEffect::AddReaction { .. } => GitHubResponse::ReactionAdded,
+            GitHubEffect::ListComments { .. } => GitHubResponse::Comments(vec![]),
+            GitHubEffect::GetBranchProtection { .. } => GitHubResponse::BranchProtectionUnknown,
+            GitHubEffect::GetRulesets => GitHubResponse::RulesetsUnknown,
+            GitHubEffect::GetRepoSettings => GitHubResponse::RepoSettings(RepoSettingsData {
+                default_branch: "main".to_string(),
+                allow_squash_merge: true,
+                allow_merge_commit: false,
+                allow_rebase_merge: false,
+            }),
+        };
+
+        async move { Ok(response) }
     }
 }
 
