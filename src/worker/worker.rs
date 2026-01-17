@@ -845,8 +845,13 @@ impl RepoWorker {
             Err(_) => return Ok(()),   // Can't parse, skip immediate cancellation
         };
 
-        // Check if it's an issue comment with a stop command
+        // Check if it's a CREATED issue comment with a stop command.
+        // We only act on 'created' actions because the webhook handler ignores
+        // edited/deleted comments for start/stop commands. Without this check,
+        // editing or deleting a comment containing "@merge-train stop" would
+        // incorrectly cancel the stack.
         if let GitHubEvent::IssueComment(comment) = event
+            && comment.action == crate::webhooks::events::CommentAction::Created
             && let Some(pr_number) = comment.pr_number
             && let Some(cmd) = parse_command(&comment.body, &self.config.bot_name)
             && matches!(cmd, Command::Stop | Command::StopForce)
@@ -1104,18 +1109,33 @@ impl RepoWorker {
     }
 
     /// Handles a stack cancellation request.
+    ///
+    /// # Token Lifecycle
+    ///
+    /// When cancelling, we mark the token as cancelled but **do not remove it**.
+    /// This is critical because effects may still be in-flight or pending:
+    ///
+    /// 1. `handle_immediate_cancellation_if_stop` cancels the token
+    /// 2. `handle_delivery` then processes the stop event and executes effects
+    /// 3. `execute_effects` checks `token.is_cancelled()` before each effect
+    ///
+    /// If we removed the token in step 1, step 3 wouldn't find it and couldn't
+    /// skip the remaining effects for this train.
+    ///
+    /// The token is only removed when the train is actually removed from
+    /// `active_trains` (via `TrainStopped`, `TrainCompleted`, or `TrainAborted`
+    /// events applied in `apply_event`).
     fn handle_cancel_stack(&mut self, pr: PrNumber) {
         // Find the train root for this PR
         let train_root = self.find_train_root(pr).unwrap_or(pr);
 
-        // Cancel the token if it exists
+        // Cancel the token if it exists, but DO NOT remove it.
+        // The token must remain so that in-flight/pending effects can check
+        // is_cancelled() and skip execution.
         if let Some(token) = self.stack_tokens.get(&train_root) {
             info!(train_root = %train_root, "Cancelling stack operations");
             token.cancel();
         }
-
-        // Remove the token (will be recreated if train restarts)
-        self.stack_tokens.remove(&train_root);
 
         // Remove any pending timers for this train
         self.pending_timers.retain(|t| t.train_root != train_root);
@@ -1202,6 +1222,13 @@ impl RepoWorker {
         // These are "late additions" that need reconciliation.
         // Per DESIGN.md: "scan for PRs whose predecessor is merged but whose
         // base_ref hasn't been retargeted"
+        //
+        // NOTE(Stage 17): This scan DETECTS late additions and updates cached
+        // state via RefetchPr, but does NOT perform reconciliation (git merge
+        // with ours strategy) or retargeting (GitHub API call). Full handling
+        // requires git worktree operations implemented in Stage 18's bootstrap/
+        // recovery module. The detection infrastructure is in place; the recovery
+        // path will be completed when bootstrap recovery is implemented.
         let late_additions = self.find_late_additions();
 
         if !late_additions.is_empty() {
@@ -1231,6 +1258,14 @@ impl RepoWorker {
         // would lose the predecessor's changes.
         // Per DESIGN.md: "scan catches PRs that were manually retargeted before
         // reconciliation could run"
+        //
+        // NOTE(Stage 17): This scan DETECTS and WARNS about dangerous manual
+        // retargets, but does NOT perform automatic reconciliation. The warning
+        // comment alerts users to the danger. Full reconciliation requires:
+        // 1. Finding the predecessor's squash_sha (from train state or git history)
+        // 2. Running git merge with ours strategy in a worktree
+        // 3. Pushing the reconciled branch
+        // These git operations are implemented in Stage 18's bootstrap/recovery.
         let manually_retargeted = self.find_manually_retargeted();
 
         if !manually_retargeted.is_empty() {
@@ -1551,6 +1586,16 @@ impl RepoWorker {
             // This enables non-blocking polling: instead of relying solely on
             // webhooks or the 10-minute poll interval, we schedule a 5-second
             // recheck to detect GitHub state propagation.
+            //
+            // NOTE(Stage 17): Currently only `WaitingOnCi` triggers timer scheduling.
+            // Other wait conditions (HeadRefOid, MergeStateStatus) are defined in
+            // queue.rs but aren't used until Stage 18+ adds eventual consistency
+            // handling for bot-initiated pushes. The timer mechanism is generic;
+            // extending to other conditions just requires calling schedule_wait_timer
+            // with the appropriate WaitCondition variant.
+            //
+            // NOTE(Stage 17): Wait timers are in-memory only and lost on crash.
+            // Recovery relies on the 60s poll fallback (see handle_poll_active_trains).
             if let CascadeStepOutcome::WaitingOnCi { pr_number } = &step_result.outcome {
                 use super::queue::WaitCondition;
                 // Get the PR's current head SHA for the wait condition.
@@ -1621,6 +1666,19 @@ impl RepoWorker {
     /// Generates a `RefetchPr` effect to get the latest state from GitHub,
     /// then re-evaluates the cascade. If the train advanced, the timer is not
     /// rescheduled. If still waiting, reschedules with exponential backoff.
+    ///
+    /// # Generic Re-evaluation
+    ///
+    /// This method uses `RefetchPr` to update the PR's cached state regardless
+    /// of the specific wait condition type. This works because:
+    /// - `RefetchPr` returns the PR's current `mergeStateStatus` from GitHub
+    /// - The cascade re-evaluation checks this status to decide if the train can advance
+    /// - Whether we're waiting for CI, reviews, or merge state, the decision is based
+    ///   on the same `mergeStateStatus` check
+    ///
+    /// The condition type is preserved for retry counting and logging, but doesn't
+    /// change what data is fetched. This is intentional: GitHub's `mergeStateStatus`
+    /// is the single source of truth for whether a PR is ready to merge.
     async fn handle_timer_fired(
         &mut self,
         train_root: PrNumber,
@@ -2028,20 +2086,21 @@ impl RepoWorker {
                 self.stack_tokens.entry(*root_pr).or_default();
             }
 
-            // Before applying TrainStopped/TrainAborted, cancel any in-flight operations.
+            // Before applying train termination events, cancel and clean up resources.
             // This must happen BEFORE we apply to state so we can still find the train.
             match payload {
                 StateEventPayload::TrainStopped { root_pr }
-                | StateEventPayload::TrainAborted { root_pr, .. } => {
-                    // Cancel in-flight operations for this train
+                | StateEventPayload::TrainAborted { root_pr, .. }
+                | StateEventPayload::TrainCompleted { root_pr } => {
+                    // Cancel in-flight operations for this train (idempotent if already cancelled)
                     if let Some(token) = self.stack_tokens.get(root_pr) {
                         debug!(
                             root_pr = %root_pr,
-                            "Cancelling in-flight operations for stopped/aborted train"
+                            "Cleaning up token for terminated train"
                         );
                         token.cancel();
                     }
-                    // Remove the token
+                    // Remove the token - train is done
                     self.stack_tokens.remove(root_pr);
                     // Remove any pending timers for this train
                     self.pending_timers.retain(|t| &t.train_root != root_pr);
@@ -3447,6 +3506,24 @@ mod tests {
         // The fix separates the concerns:
         // 1. For critical events: sync log unconditionally, then mark done
         // 2. For non-critical: batch, and flush batch syncs + marks done
+        //
+        // # What this test verifies
+        //
+        // - Log position advances after processing (events written)
+        // - Done marker exists after processing
+        // - Train state was updated (event applied)
+        // - Log file contains the TrainStarted event
+        //
+        // # What this test does NOT verify
+        //
+        // - Actual fsync syscall ordering (would require filesystem instrumentation
+        //   or crash simulation with process kill)
+        // - That done marker creation happens strictly AFTER fsync completes
+        //
+        // The ordering guarantee comes from code review of the implementation:
+        // `apply_handler_result` calls `event_log.sync()` for critical events
+        // BEFORE calling `mark_done()`. This test verifies the observable
+        // consequences; the actual fsync ordering is a code-level invariant.
 
         let dir = tempdir().unwrap();
         let spool_dir = dir.path().join("spool");

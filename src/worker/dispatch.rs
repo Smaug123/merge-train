@@ -801,15 +801,32 @@ mod tests {
 
     // ─── Stage 17: Worker routing guarantees ───
     //
-    // These tests verify the structural properties that ENABLE serial/concurrent
-    // processing. They do NOT directly verify timing behavior because:
-    // - Async scheduling is non-deterministic
+    // These tests verify the STRUCTURAL properties that ENABLE serial/concurrent
+    // processing. They do NOT directly verify BEHAVIORAL timing guarantees because:
+    // - Async scheduling is non-deterministic (tokio runtime decides task order)
     // - Processing is too fast for reliable timing assertions
-    // - Tokio tasks may run on the same thread
+    // - Tokio tasks may run on the same thread (no actual parallelism)
     //
-    // The properties tested (single/multiple workers) provide the guarantees
-    // BY CONSTRUCTION: a single worker processes events sequentially from its
-    // queue, while multiple workers are independent async tasks.
+    // # What these tests verify
+    //
+    // 1. Same-repo events route to a single worker (structural prerequisite for serial)
+    // 2. Cross-repo events route to separate workers (structural prerequisite for concurrent)
+    // 3. All events are eventually processed (marked done)
+    //
+    // # What these tests do NOT verify
+    //
+    // - Strict FIFO ordering within a repo (would require timestamp instrumentation)
+    // - Actual concurrent execution across repos (would require timing windows)
+    // - Mutual exclusion during event processing (implied by single-worker routing)
+    //
+    // # Why structural testing is sufficient
+    //
+    // The serial/concurrent guarantees follow BY CONSTRUCTION:
+    // - Single worker = sequential `process_next()` loop = serial processing
+    // - Separate workers = independent tokio tasks = concurrent scheduling
+    //
+    // Verifying the structural property (worker count) is sufficient because the
+    // behavioral guarantee is an automatic consequence of the implementation design.
 
     #[tokio::test]
     async fn same_repo_events_use_single_worker() {
