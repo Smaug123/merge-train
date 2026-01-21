@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 use super::ids::{CommentId, PrNumber, Sha};
+use super::pr::MergeStateStatus;
 
 /// The high-level state of a train.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -251,6 +252,31 @@ impl CascadePhase {
     }
 }
 
+/// A wait condition persisted for recovery.
+///
+/// When a train is waiting for a condition to be met (e.g., CI to pass),
+/// this records what we're waiting for so the timer can be restored after restart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PersistedWaitCondition {
+    /// Waiting for headRefOid to match after a push.
+    HeadRefOid {
+        pr: PrNumber,
+        expected: Sha,
+        retry_count: u32,
+    },
+
+    /// Waiting for mergeStateStatus to change from a specific value.
+    MergeStateStatus {
+        pr: PrNumber,
+        not: MergeStateStatus,
+        retry_count: u32,
+    },
+
+    /// Waiting for check suite to complete for a specific SHA.
+    CheckSuiteCompleted { sha: Sha, retry_count: u32 },
+}
+
 /// Error details when a train is aborted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrainError {
@@ -337,6 +363,14 @@ pub struct TrainRecord {
     /// appear as "null" in the JSON when set to None.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub status_comment_id: Option<CommentId>,
+
+    /// Wait condition for recovery.
+    ///
+    /// When a train is waiting for a condition to be met (e.g., CI to pass),
+    /// this records what we're waiting for so the timer can be restored after restart.
+    /// Set when entering a wait state, cleared when the condition is met.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub wait_condition: Option<PersistedWaitCondition>,
 }
 
 impl TrainRecord {
@@ -356,6 +390,7 @@ impl TrainRecord {
             ended_at: None,
             error: None,
             status_comment_id: None,
+            wait_condition: None,
         }
     }
 
@@ -738,6 +773,7 @@ mod tests {
                             ended_at,
                             error,
                             status_comment_id,
+                            wait_condition: None, // TODO: Add arbitrary wait condition generator
                         }
                     },
                 )

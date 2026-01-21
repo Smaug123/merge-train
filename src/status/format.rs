@@ -255,6 +255,7 @@ mod tests {
                         ended_at,
                         error,
                         status_comment_id,
+                        wait_condition: None,
                     }
                 },
             )
@@ -307,6 +308,7 @@ mod tests {
                         ended_at: None,
                         error: None,
                         status_comment_id: None,
+                        wait_condition: None,
                     }
                 },
             )

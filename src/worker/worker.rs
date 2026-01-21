@@ -41,15 +41,24 @@
 //! 2. **Immediate token cancellation**: When a cancellation request is received,
 //!    the worker immediately cancels the stack's `CancellationToken`.
 //!
-//! 3. **In-flight effect interruption**: Individual effects use `tokio::select!`
-//!    to race against cancellation tokens. When the token is cancelled, HTTP
-//!    requests and other async operations are interrupted at the next yield point.
+//! 3. **Effect-level cancellation checking**: Effects check the token's cancelled
+//!    state before each effect execution. This means:
+//!    - Effects that haven't started yet will be skipped
+//!    - An effect that's currently executing will complete before the next check
 //!
 //! **Practical implications**:
-//! - Stop commands are processed promptly even while effects are executing
-//! - In-flight GitHub API calls are interrupted within ~1 yield point
-//! - Git operations check cancellation before and after execution
+//! - Stop commands from `cancel_rx` are processed after the current delivery completes
+//!   (the event loop can only poll `cancel_rx` between deliveries)
+//! - Stop commands detected in `handle_immediate_cancellation_if_stop` trigger
+//!   token cancellation before effect execution begins
+//! - Each effect batch checks the token before each effect, not within effects
 //! - Each stack has its own token, so stopping one train doesn't affect others
+//!
+//! **Known limitation**: When effects are executing, the worker cannot poll `cancel_rx`
+//! until the effect batch completes. Cancellation requests via `cancel_rx` are processed
+//! at the next select loop iteration, not mid-effect. For truly prompt cancellation,
+//! the stop command must be the delivery being processed (detected in
+//! `handle_immediate_cancellation_if_stop`).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -309,15 +318,60 @@ impl RepoWorker {
             stack_tokens.insert(*root_pr, CancellationToken::new());
         }
 
+        // Step 7: Restore wait timers from persisted wait conditions.
+        // Trains that were waiting when the previous instance stopped need
+        // their timers restored so they can resume waiting.
+        let poll_config = PollConfig::from_env();
+        let mut pending_timers = Vec::new();
+        for (root_pr, train) in &state.active_trains {
+            if let Some(ref wait_condition) = train.wait_condition {
+                use crate::types::PersistedWaitCondition;
+                let condition = match wait_condition {
+                    PersistedWaitCondition::HeadRefOid {
+                        pr,
+                        expected,
+                        retry_count,
+                    } => WaitCondition::HeadRefOid {
+                        pr: *pr,
+                        expected: expected.clone(),
+                        retry_count: *retry_count,
+                    },
+                    PersistedWaitCondition::MergeStateStatus {
+                        pr,
+                        not,
+                        retry_count,
+                    } => WaitCondition::MergeStateStatus {
+                        pr: *pr,
+                        not: *not,
+                        retry_count: *retry_count,
+                    },
+                    PersistedWaitCondition::CheckSuiteCompleted { sha, retry_count } => {
+                        WaitCondition::CheckSuiteCompleted {
+                            sha: sha.clone(),
+                            retry_count: *retry_count,
+                        }
+                    }
+                };
+                // Schedule timer to fire immediately on restart to re-check condition
+                let fires_at = Instant::now() + poll_config.recheck_interval;
+                debug!(
+                    root_pr = %root_pr,
+                    condition = ?condition,
+                    "Restoring wait timer from persisted condition"
+                );
+                pending_timers.push(PendingTimer::new(fires_at, *root_pr, condition));
+            }
+        }
+
         Ok(RepoWorker {
             config,
             queue,
             state,
             event_log,
             pending_batch: Vec::new(),
-            poll_config: PollConfig::from_env(),
+            poll_config,
             stack_tokens,
-            pending_timers: Vec::new(),
+            pending_timers,
             last_poll: None,
             last_spool_drain: None,
             github_client: None,
@@ -364,11 +418,15 @@ impl RepoWorker {
     /// The delivery is NOT enqueued if:
     /// - It's already marked as done (`.done` marker exists)
     /// - It's already in the queue (same delivery ID)
+    /// - The logical event was already processed (dedupe key in `seen_dedupe_keys`)
     ///
     /// This prevents duplicate processing when:
     /// - A redelivery arrives for an already-processed webhook
     /// - The same delivery is dispatched multiple times (e.g., on restart)
+    /// - GitHub redelivers a webhook with a new `X-GitHub-Delivery` ID
     pub fn enqueue(&mut self, delivery: SpooledDelivery) -> Result<()> {
+        use crate::spool::dedupe::is_duplicate;
+
         // Skip if already done
         if delivery.is_done() {
             trace!(
@@ -388,6 +446,21 @@ impl RepoWorker {
         }
 
         if let Some((event, priority)) = parse_and_classify(&delivery, &self.config.bot_name)? {
+            // Check for logical duplicate using dedupe key from snapshot.
+            // This catches GitHub redeliveries that have a new X-GitHub-Delivery ID
+            // but represent the same logical event.
+            if let Some(dedupe_key) = event.dedupe_key()
+                && is_duplicate(&self.state.seen_dedupe_keys, &dedupe_key)
+            {
+                trace!(
+                    delivery_id = %delivery.delivery_id,
+                    dedupe_key = %dedupe_key,
+                    "Skipping duplicate event (dedupe key seen)"
+                );
+                mark_done(&delivery)?;
+                return Ok(());
+            }
+
             self.queue.push(event, delivery.delivery_id, priority);
         } else {
             // Event type not recognized - mark as done immediately
@@ -445,6 +518,14 @@ impl RepoWorker {
 
         // Step 4 & 5: Append state events and apply to state
         let has_critical = self.apply_handler_result(&result)?;
+
+        // Mark dedupe key as seen to prevent reprocessing of GitHub redeliveries.
+        // This is done after apply_handler_result so the key is only recorded
+        // for successfully processed events.
+        if let Some(dedupe_key) = queued.event.dedupe_key() {
+            crate::spool::dedupe::mark_seen(&mut self.state.seen_dedupe_keys, &dedupe_key);
+            trace!(dedupe_key = %dedupe_key, "Marked dedupe key as seen");
+        }
 
         // Step 6 & 7: Handle fsync based on criticality
         if has_critical {
@@ -1324,7 +1405,7 @@ impl RepoWorker {
         Ok(())
     }
 
-    /// Re-evaluates active cascades after cache updates.
+    /// Re-evaluates active cascades with proper persistence of phase transitions.
     ///
     /// This is called after poll updates the cache with fresh GitHub state.
     /// For each active train, if the current PR's state allows the cascade to
@@ -1332,105 +1413,8 @@ impl RepoWorker {
     ///
     /// This is the key mechanism that allows poll fallback to actually advance
     /// trains when webhooks are missed.
-    async fn re_evaluate_cascades(&mut self, shutdown: &CancellationToken) -> Result<()> {
-        use crate::cascade::step::{StepContext, execute_cascade_step};
-        use crate::types::MergeStateStatus;
-
-        // Collect train roots that may need re-evaluation.
-        // We only re-evaluate trains that are WaitingCi or Running - stopped/aborted
-        // trains require explicit restart.
-        let trains_to_evaluate: Vec<_> = self
-            .state
-            .active_trains
-            .iter()
-            .filter(|(_, train)| train.state.is_active())
-            .map(|(root, train)| (*root, train.current_pr))
-            .collect();
-
-        if trains_to_evaluate.is_empty() {
-            return Ok(());
-        }
-
-        for (train_root, current_pr) in trains_to_evaluate {
-            // Check for cancellation
-            if shutdown.is_cancelled() {
-                break;
-            }
-
-            // Check if this train's stack is cancelled
-            if let Some(token) = self.stack_tokens.get(&train_root)
-                && token.is_cancelled()
-            {
-                continue;
-            }
-
-            // Get fresh PR state from cache
-            let pr_state = self.state.prs.get(&current_pr);
-            let can_advance = match pr_state {
-                Some(pr) => {
-                    // Check if PR is ready to advance: merge state is clean (CI passed,
-                    // reviews approved, no conflicts), or PR is already merged (need to
-                    // advance to next phase).
-                    matches!(
-                        pr.merge_state_status,
-                        MergeStateStatus::Clean | MergeStateStatus::Unstable
-                    ) || pr.state.is_merged()
-                }
-                None => false,
-            };
-
-            if !can_advance {
-                trace!(
-                    train_root = %train_root,
-                    current_pr = %current_pr,
-                    merge_state = ?pr_state.map(|p| &p.merge_state_status),
-                    "Train not ready to advance"
-                );
-                continue;
-            }
-
-            debug!(
-                train_root = %train_root,
-                current_pr = %current_pr,
-                "Re-evaluating cascade after poll"
-            );
-
-            // Get the train (clone to avoid borrow issues)
-            let Some(train) = self.state.active_trains.get(&train_root).cloned() else {
-                continue;
-            };
-
-            // Execute a cascade step
-            let ctx = StepContext::new(&self.state.default_branch);
-            let step_result = execute_cascade_step(train, &self.state.prs, &ctx);
-
-            // Update the train in state.
-            // Note: Phase transitions and other critical events are recorded through
-            // the effects generated by execute_cascade_step. The step itself updates
-            // the TrainRecord which we persist here.
-            self.state
-                .active_trains
-                .insert(train_root, step_result.train);
-
-            // Execute the resulting effects.
-            // These effects include phase transition events, status comment updates,
-            // and the actual GitHub/git operations needed to advance the cascade.
-            if !step_result.effects.is_empty() {
-                debug!(
-                    train_root = %train_root,
-                    effects_count = step_result.effects.len(),
-                    "Executing cascade effects from poll re-evaluation"
-                );
-                self.execute_effects(step_result.effects, shutdown).await?;
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Re-evaluates active cascades with proper persistence of phase transitions.
     ///
-    /// This is the persistent version of `re_evaluate_cascades`. It:
+    /// The method:
     /// 1. Executes cascade steps for active trains
     /// 2. Persists phase transitions via the event log
     /// 3. Executes resulting effects
@@ -1729,9 +1713,11 @@ impl RepoWorker {
             );
         }
 
-        // Re-evaluate the cascade with updated state.
-        // This uses the same logic as poll fallback to check if the train can advance.
-        self.re_evaluate_cascades(&shutdown).await?;
+        // Re-evaluate the cascade with updated state and persist phase transitions.
+        // This uses the persistent version to ensure phase transitions are durably
+        // recorded, preventing replay of side effects after a crash.
+        self.re_evaluate_cascades_with_persistence(&shutdown)
+            .await?;
 
         // Check if the train advanced (phase changed or train completed/stopped)
         let train_advanced = match self.state.active_trains.get(&train_root) {
@@ -1744,6 +1730,10 @@ impl RepoWorker {
                 train_root = %train_root,
                 "Train advanced after timer re-evaluation, not rescheduling"
             );
+            // Clear the wait condition since we're no longer waiting
+            if let Some(train) = self.state.active_trains.get_mut(&train_root) {
+                train.wait_condition = None;
+            }
         } else {
             // Still waiting - reschedule with backoff
             self.schedule_wait_retry(train_root, condition)?;
@@ -1857,6 +1847,39 @@ impl RepoWorker {
             delay_ms = delay.as_millis(),
             "Scheduling wait timer"
         );
+
+        // Persist the wait condition in the train record for recovery after restart.
+        // Convert WaitCondition to PersistedWaitCondition.
+        if let Some(train) = self.state.active_trains.get_mut(&train_root) {
+            use crate::types::PersistedWaitCondition;
+            let persisted = match &condition {
+                WaitCondition::HeadRefOid {
+                    pr,
+                    expected,
+                    retry_count,
+                } => PersistedWaitCondition::HeadRefOid {
+                    pr: *pr,
+                    expected: expected.clone(),
+                    retry_count: *retry_count,
+                },
+                WaitCondition::MergeStateStatus {
+                    pr,
+                    not,
+                    retry_count,
+                } => PersistedWaitCondition::MergeStateStatus {
+                    pr: *pr,
+                    not: *not,
+                    retry_count: *retry_count,
+                },
+                WaitCondition::CheckSuiteCompleted { sha, retry_count } => {
+                    PersistedWaitCondition::CheckSuiteCompleted {
+                        sha: sha.clone(),
+                        retry_count: *retry_count,
+                    }
+                }
+            };
+            train.wait_condition = Some(persisted);
+        }
 
         self.pending_timers
             .push(PendingTimer::new(fires_at, train_root, condition));
@@ -2203,22 +2226,90 @@ impl RepoWorker {
 
     /// Cancels operations for a stack by root PR.
     ///
-    /// This cancels the token and removes any pending timers.
+    /// This cancels the token and removes any pending timers. The token itself
+    /// is NOT removed here - it remains in `stack_tokens` so that subsequent
+    /// effects for this train will see `is_cancelled()` and skip execution.
+    /// The token is removed later when `TrainStopped` is processed in
+    /// `apply_handler_result`.
     pub fn cancel_stack(&mut self, root_pr: PrNumber) {
         if let Some(token) = self.stack_tokens.get(&root_pr) {
             info!(root_pr = %root_pr, "Cancelling stack operations");
             token.cancel();
         }
-        self.stack_tokens.remove(&root_pr);
+        // Note: Do NOT remove the token here. It must remain so that
+        // subsequent effects can check is_cancelled(). The token is
+        // removed when TrainStopped/TrainCompleted/TrainAborted is processed.
         self.pending_timers.retain(|t| t.train_root != root_pr);
     }
 }
 
-/// Finds the latest snapshot file in a directory.
+/// Finds the latest snapshot file in a directory using the generation-based
+/// compaction scheme.
 ///
-/// Looks for files matching `snapshot.<gen>.json` and returns the path
-/// with the highest generation number.
+/// This function properly handles crash recovery by:
+/// 1. Calling `cleanup_stale_generations` to ensure consistency (handles crashes
+///    during compaction where the generation file may be stale)
+/// 2. Reading the generation file to get the authoritative generation number
+/// 3. Returning the snapshot path for that generation
+///
+/// This is the correct way to find the snapshot, as opposed to just picking
+/// the highest-numbered snapshot file (which could pick the wrong generation
+/// after a compaction crash).
 fn find_latest_snapshot(state_dir: &Path) -> Result<Option<PathBuf>> {
+    use crate::persistence::{cleanup_stale_generations, read_generation, snapshot_path};
+
+    if !state_dir.exists() {
+        return Ok(None);
+    }
+
+    // First, clean up any stale generation files from interrupted compaction.
+    // This ensures the generation file is consistent with existing snapshots.
+    if let Err(e) = cleanup_stale_generations(state_dir) {
+        warn!(
+            state_dir = %state_dir.display(),
+            error = %e,
+            "Failed to cleanup stale generations, falling back to scan"
+        );
+        // Fall back to scanning for highest snapshot if cleanup fails
+        return find_latest_snapshot_by_scan(state_dir);
+    }
+
+    // Read the authoritative generation from the generation file.
+    let generation = match read_generation(state_dir) {
+        Ok(g) => g,
+        Err(e) => {
+            warn!(
+                state_dir = %state_dir.display(),
+                error = %e,
+                "Failed to read generation file, falling back to scan"
+            );
+            return find_latest_snapshot_by_scan(state_dir);
+        }
+    };
+
+    // Check if the snapshot for this generation exists
+    let path = snapshot_path(state_dir, generation);
+    if path.exists() {
+        Ok(Some(path))
+    } else if generation == 0 {
+        // Generation 0 with no snapshot means fresh state
+        Ok(None)
+    } else {
+        // Snapshot should exist for non-zero generation - fall back to scan
+        warn!(
+            state_dir = %state_dir.display(),
+            generation = generation,
+            "Snapshot missing for generation, falling back to scan"
+        );
+        find_latest_snapshot_by_scan(state_dir)
+    }
+}
+
+/// Fallback: finds the latest snapshot by scanning the directory.
+///
+/// This is used when the generation file is unavailable or inconsistent.
+/// It picks the highest-numbered snapshot file.
+fn find_latest_snapshot_by_scan(state_dir: &Path) -> Result<Option<PathBuf>> {
     if !state_dir.exists() {
         return Ok(None);
     }
@@ -2312,13 +2403,19 @@ fn apply_event_to_state(state: &mut PersistedRepoSnapshot, event: &StateEvent) {
         }
 
         StateEventPayload::TrainStopped { root_pr } => {
-            // Update train state before removing so that if this event is
-            // replayed during recovery, the state is consistent.
+            // Update train state to Stopped. Unlike completed trains, stopped trains
+            // remain in active_trains so that:
+            // 1. The stopped state is persisted in snapshots for recovery
+            // 2. The status comment can reflect the stopped state
+            // 3. The system knows a restart (`@merge-train start`) is needed
+            //
+            // Per DESIGN.md: stopped trains "require explicit restart" and the status
+            // comment should "reflect `stopped` state (required for recovery consistency)".
             if let Some(train) = state.active_trains.get_mut(root_pr) {
                 train.stop();
             }
-            // Stopped trains are removed from active_trains (like completed trains)
-            state.active_trains.remove(root_pr);
+            // Note: Do NOT remove stopped trains from active_trains.
+            // They remain until explicitly restarted via `@merge-train start`.
             trace!(root_pr = %root_pr, "Train stopped");
         }
 

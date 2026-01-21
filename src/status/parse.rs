@@ -123,6 +123,8 @@ mod tests {
                         error,
                         // Exclude status_comment_id since it's not serialized
                         status_comment_id: None,
+                        // wait_condition is local-only, not serialized in status comments
+                        wait_condition: None,
                     }
                 },
             )

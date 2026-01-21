@@ -60,6 +60,82 @@ impl GitHubEvent {
             GitHubEvent::PullRequestReview(e) => &e.repo,
         }
     }
+
+    /// Extracts a dedupe key from this event if possible.
+    ///
+    /// Returns `Some(key)` for events where we have enough data to generate
+    /// a stable dedupe key that identifies the logical event (independent of
+    /// the `X-GitHub-Delivery` header).
+    ///
+    /// Returns `None` for events where we can't generate a complete key:
+    /// - `issue_comment.edited` (needs `updated_at` timestamp)
+    /// - `pull_request.edited` (needs `updated_at` timestamp)
+    /// - `check_suite.*` (needs `suite_id` and `updated_at`)
+    /// - `pull_request_review.*` (needs `review_id`)
+    ///
+    /// For these events, deduplication relies on the delivery ID and `.done`
+    /// marker checks.
+    pub fn dedupe_key(&self) -> Option<crate::spool::dedupe::DedupeKey> {
+        use crate::spool::dedupe::DedupeKey;
+
+        match self {
+            GitHubEvent::IssueComment(e) => {
+                // We can generate keys for created and deleted, but not edited
+                // (edited would need the updated_at timestamp).
+                let pr = e.pr_number?; // Skip if not on a PR
+                match e.action {
+                    CommentAction::Created => {
+                        Some(DedupeKey::issue_comment_created(pr, e.comment_id))
+                    }
+                    CommentAction::Deleted => {
+                        Some(DedupeKey::issue_comment_deleted(pr, e.comment_id))
+                    }
+                    CommentAction::Edited => None, // Would need updated_at
+                }
+            }
+            GitHubEvent::PullRequest(e) => {
+                // We can generate keys for all actions except edited
+                // (edited would need the updated_at timestamp).
+                match e.action {
+                    PrAction::Edited => None, // Would need updated_at
+                    action => {
+                        let action_str = match action {
+                            PrAction::Opened => "opened",
+                            PrAction::Closed => "closed",
+                            PrAction::Synchronize => "synchronize",
+                            PrAction::Reopened => "reopened",
+                            PrAction::ConvertedToDraft => "converted_to_draft",
+                            PrAction::ReadyForReview => "ready_for_review",
+                            PrAction::Edited => unreachable!(),
+                        };
+                        Some(DedupeKey::pull_request(
+                            e.pr_number,
+                            action_str,
+                            &e.head_sha,
+                        ))
+                    }
+                }
+            }
+            GitHubEvent::Status(e) => {
+                // Status events have all the data we need.
+                let state_str = match e.state {
+                    StatusState::Pending => "pending",
+                    StatusState::Success => "success",
+                    StatusState::Failure => "failure",
+                    StatusState::Error => "error",
+                };
+                Some(DedupeKey::status(&e.sha, &e.context, state_str))
+            }
+            GitHubEvent::CheckSuite(_) => {
+                // Would need suite_id and updated_at, which we don't have
+                None
+            }
+            GitHubEvent::PullRequestReview(_) => {
+                // Would need review_id, which we don't have in the parsed event
+                None
+            }
+        }
+    }
 }
 
 /// Action performed on an issue comment.

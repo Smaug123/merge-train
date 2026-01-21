@@ -24,7 +24,11 @@ use crate::webhooks::priority::EventPriority;
 /// what condition it's waiting for and schedules timer-based re-checks.
 ///
 /// Each variant includes a retry count for exponential backoff.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// This type is serializable so it can be persisted in the train record
+/// for recovery after restart.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum WaitCondition {
     /// Waiting for headRefOid to match after a push.
     HeadRefOid {
