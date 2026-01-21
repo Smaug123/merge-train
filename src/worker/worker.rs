@@ -60,7 +60,7 @@
 //! the stop command must be the delivery being processed (detected in
 //! `handle_immediate_cancellation_if_stop`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -236,6 +236,11 @@ pub struct RepoWorker {
     /// Optional GitHub client for executing GitHub effects.
     /// If None, effects are logged but not executed (testing/dry-run mode).
     github_client: Option<OctocrabClient>,
+
+    /// PRs that have been warned about manual retargeting.
+    /// Used to dedupe warning comments - we only post once per PR.
+    /// In-memory only; cleared on restart (acceptable to re-warn once).
+    warned_manual_retargets: HashSet<PrNumber>,
 }
 
 impl RepoWorker {
@@ -375,6 +380,7 @@ impl RepoWorker {
             last_poll: None,
             last_spool_drain: None,
             github_client: None,
+            warned_manual_retargets: HashSet::new(),
         })
     }
 
@@ -1349,13 +1355,20 @@ impl RepoWorker {
         // These git operations are implemented in Stage 18's bootstrap/recovery.
         let manually_retargeted = self.find_manually_retargeted();
 
-        if !manually_retargeted.is_empty() {
+        // Filter out PRs we've already warned about to avoid spamming.
+        // The set is cleared on restart, so we may re-warn once per restart.
+        let new_warnings: Vec<_> = manually_retargeted
+            .into_iter()
+            .filter(|(pr, _)| !self.warned_manual_retargets.contains(pr))
+            .collect();
+
+        if !new_warnings.is_empty() {
             warn!(
-                count = manually_retargeted.len(),
+                count = new_warnings.len(),
                 "Found manually retargeted PRs that need reconciliation"
             );
 
-            for (pr_number, pred_number) in &manually_retargeted {
+            for (pr_number, pred_number) in &new_warnings {
                 // Manually retargeted PR detected - this is dangerous!
                 // Per DESIGN.md: "Post warning and trigger reconciliation."
                 warn!(
@@ -1384,6 +1397,9 @@ impl RepoWorker {
                         self.state.default_branch, pred_number
                     ),
                 }));
+
+                // Mark as warned to avoid repeating on next poll
+                self.warned_manual_retargets.insert(*pr_number);
 
                 // Note: Full reconciliation (git operations) is deferred to Stage 18.
                 // The warning comment alerts the user to the danger while reconciliation
@@ -1426,7 +1442,7 @@ impl RepoWorker {
     ) -> Result<()> {
         use crate::cascade::step::{StepContext, execute_cascade_step};
         use crate::persistence::event::StateEventPayload;
-        use crate::types::{CascadeStepOutcome, MergeStateStatus, TrainError, TrainState};
+        use crate::types::{CascadeStepOutcome, MergeStateStatus, TrainError};
 
         // Collect train roots that may need re-evaluation.
         // We only re-evaluate trains that are WaitingCi or Running - stopped/aborted
@@ -1436,14 +1452,21 @@ impl RepoWorker {
             .active_trains
             .iter()
             .filter(|(_, train)| train.state.is_active())
-            .map(|(root, train)| (*root, train.current_pr, train.cascade_phase.clone()))
+            .map(|(root, train)| {
+                (
+                    *root,
+                    train.current_pr,
+                    train.cascade_phase.clone(),
+                    train.state,
+                )
+            })
             .collect();
 
         if trains_to_evaluate.is_empty() {
             return Ok(());
         }
 
-        for (train_root, current_pr, phase_before) in trains_to_evaluate {
+        for (train_root, current_pr, phase_before, state_before) in trains_to_evaluate {
             // Check for cancellation
             if shutdown.is_cancelled() {
                 break;
@@ -1497,8 +1520,11 @@ impl RepoWorker {
             let ctx = StepContext::new(&self.state.default_branch);
             let step_result = execute_cascade_step(train, &self.state.prs, &ctx);
 
-            // Check if phase changed - if so, persist the transition
-            let phase_changed = step_result.train.cascade_phase.name() != phase_before.name();
+            // Check if phase changed - if so, persist the transition.
+            // Use full equality (not just name) to catch progress changes within
+            // phases (e.g., marking a descendant as completed in Preparing).
+            // Without this, a restart would lose progress and re-run completed work.
+            let phase_changed = step_result.train.cascade_phase != phase_before;
             let train_completed = matches!(step_result.outcome, CascadeStepOutcome::Complete);
             let train_aborted = matches!(step_result.outcome, CascadeStepOutcome::Aborted { .. });
 
@@ -1527,14 +1553,36 @@ impl RepoWorker {
 
                 // Remove cancellation token
                 self.stack_tokens.remove(&train_root);
-            } else if phase_changed || step_result.train.current_pr != current_pr {
-                // Phase transition or PR advancement - persist
+            } else if phase_changed
+                || step_result.train.current_pr != current_pr
+                || step_result.train.state != state_before
+            {
+                // Phase transition, PR advancement, or state change - persist.
+                // We persist state changes (e.g., Running -> WaitingCi) so that
+                // after restart we know we were waiting and can restore timers.
+
+                // Compute wait_condition if we're entering WaitingCi state.
+                // This must happen BEFORE persistence so it's captured in the event.
+                let wait_condition =
+                    if let CascadeStepOutcome::WaitingOnCi { pr_number } = &step_result.outcome {
+                        self.state.prs.get(pr_number).map(|pr| {
+                            crate::types::PersistedWaitCondition::CheckSuiteCompleted {
+                                sha: pr.head_sha.clone(),
+                                retry_count: 0,
+                            }
+                        })
+                    } else {
+                        None
+                    };
+
                 let event = self.event_log.append(StateEventPayload::PhaseTransition {
                     train_root,
                     current_pr: step_result.train.current_pr,
                     predecessor_pr: step_result.train.predecessor_pr,
                     last_squash_sha: step_result.train.last_squash_sha.clone(),
                     phase: step_result.train.cascade_phase.clone(),
+                    state: Some(step_result.train.state),
+                    wait_condition: wait_condition.clone(),
                 })?;
                 apply_event_to_state(&mut self.state, &event);
                 self.event_log.sync()?;
@@ -1542,54 +1590,47 @@ impl RepoWorker {
                     train_root = %train_root,
                     new_phase = ?step_result.train.cascade_phase.name(),
                     new_current_pr = %step_result.train.current_pr,
+                    new_state = ?step_result.train.state,
                     "Phase transition (persisted)"
                 );
+
+                // Schedule wait timer if we computed a wait condition.
+                // This enables non-blocking polling: instead of relying solely on
+                // webhooks or the 10-minute poll interval, we schedule a 5-second
+                // recheck to detect GitHub state propagation.
+                if let Some(wc) = wait_condition {
+                    use super::queue::WaitCondition;
+                    let condition = match wc {
+                        crate::types::PersistedWaitCondition::CheckSuiteCompleted {
+                            sha,
+                            retry_count,
+                        } => WaitCondition::CheckSuiteCompleted { sha, retry_count },
+                        crate::types::PersistedWaitCondition::HeadRefOid {
+                            pr,
+                            expected,
+                            retry_count,
+                        } => WaitCondition::HeadRefOid {
+                            pr,
+                            expected,
+                            retry_count,
+                        },
+                        crate::types::PersistedWaitCondition::MergeStateStatus {
+                            pr,
+                            not,
+                            retry_count,
+                        } => WaitCondition::MergeStateStatus {
+                            pr,
+                            not,
+                            retry_count,
+                        },
+                    };
+                    self.schedule_wait_timer_without_persist(train_root, condition);
+                }
             } else {
                 // No phase change, but still update in-memory state
                 self.state
                     .active_trains
                     .insert(train_root, step_result.train.clone());
-            }
-
-            // Handle train state changes (Running <-> WaitingCi)
-            if step_result.train.state == TrainState::WaitingCi
-                && self
-                    .state
-                    .active_trains
-                    .get(&train_root)
-                    .map(|t| t.state != TrainState::WaitingCi)
-                    .unwrap_or(false)
-            {
-                // Update to WaitingCi state (in-memory only, phase transition already persisted)
-                if let Some(train) = self.state.active_trains.get_mut(&train_root) {
-                    train.state = TrainState::WaitingCi;
-                }
-            }
-
-            // Schedule wait timer if the cascade is waiting on CI.
-            // This enables non-blocking polling: instead of relying solely on
-            // webhooks or the 10-minute poll interval, we schedule a 5-second
-            // recheck to detect GitHub state propagation.
-            //
-            // NOTE(Stage 17): Currently only `WaitingOnCi` triggers timer scheduling.
-            // Other wait conditions (HeadRefOid, MergeStateStatus) are defined in
-            // queue.rs but aren't used until Stage 18+ adds eventual consistency
-            // handling for bot-initiated pushes. The timer mechanism is generic;
-            // extending to other conditions just requires calling schedule_wait_timer
-            // with the appropriate WaitCondition variant.
-            //
-            // NOTE(Stage 17): Wait timers are in-memory only and lost on crash.
-            // Recovery relies on the 60s poll fallback (see handle_poll_active_trains).
-            if let CascadeStepOutcome::WaitingOnCi { pr_number } = &step_result.outcome {
-                use super::queue::WaitCondition;
-                // Get the PR's current head SHA for the wait condition.
-                // We wait for the check suite on this SHA to complete.
-                if let Some(pr) = self.state.prs.get(pr_number) {
-                    self.schedule_wait_timer(
-                        train_root,
-                        WaitCondition::check_suite_completed(pr.head_sha.clone()),
-                    );
-                }
             }
 
             // Execute the resulting effects.
@@ -1833,23 +1874,14 @@ impl RepoWorker {
     /// - The event loop checks for expired timers via `fire_expired_timers()`
     /// - When fired, `handle_timer_fired()` refetches PR state and re-evaluates
     ///
-    /// # Persistence Note
+    /// # Persistence
     ///
-    /// Wait conditions are in-memory only. On crash recovery, pending waits are
-    /// lost. The periodic poll fallback (60s interval) will eventually recover,
-    /// but explicit waits provide faster state propagation detection.
+    /// Wait conditions are persisted via the PhaseTransition event when
+    /// entering WaitingCi state. This method also updates the in-memory train
+    /// record with the wait condition for consistency.
     pub fn schedule_wait_timer(&mut self, train_root: PrNumber, condition: WaitCondition) {
-        let delay = self.poll_config.recheck_interval;
-        let fires_at = Instant::now() + delay;
-
-        debug!(
-            train_root = %train_root,
-            delay_ms = delay.as_millis(),
-            "Scheduling wait timer"
-        );
-
-        // Persist the wait condition in the train record for recovery after restart.
-        // Convert WaitCondition to PersistedWaitCondition.
+        // Update in-memory train record with the wait condition.
+        // This keeps the in-memory state consistent with what we're waiting for.
         if let Some(train) = self.state.active_trains.get_mut(&train_root) {
             use crate::types::PersistedWaitCondition;
             let persisted = match &condition {
@@ -1880,6 +1912,27 @@ impl RepoWorker {
             };
             train.wait_condition = Some(persisted);
         }
+
+        self.schedule_wait_timer_without_persist(train_root, condition);
+    }
+
+    /// Schedules a wait timer without updating the in-memory wait_condition.
+    ///
+    /// Use this when the wait_condition has already been set (e.g., via event
+    /// replay or when it was just persisted in a PhaseTransition event).
+    fn schedule_wait_timer_without_persist(
+        &mut self,
+        train_root: PrNumber,
+        condition: WaitCondition,
+    ) {
+        let delay = self.poll_config.recheck_interval;
+        let fires_at = Instant::now() + delay;
+
+        debug!(
+            train_root = %train_root,
+            delay_ms = delay.as_millis(),
+            "Scheduling wait timer"
+        );
 
         self.pending_timers
             .push(PendingTimer::new(fires_at, train_root, condition));
@@ -2438,16 +2491,25 @@ fn apply_event_to_state(state: &mut PersistedRepoSnapshot, event: &StateEvent) {
             predecessor_pr: _,
             last_squash_sha,
             phase,
+            state: train_state,
+            wait_condition,
         } => {
             if let Some(train) = state.active_trains.get_mut(train_root) {
                 train.current_pr = *current_pr;
                 train.last_squash_sha = last_squash_sha.clone();
                 train.cascade_phase = phase.clone();
+                // Restore train state if present (backwards compat: defaults to Running)
+                if let Some(ts) = train_state {
+                    train.state = *ts;
+                }
+                // Restore wait condition for timer recovery
+                train.wait_condition = wait_condition.clone();
             }
             trace!(
                 train_root = %train_root,
                 current_pr = %current_pr,
                 phase = ?phase,
+                train_state = ?train_state,
                 "Phase transition"
             );
         }
@@ -4026,6 +4088,8 @@ mod tests {
                     predecessor_pr: Some(PrNumber(10)),
                     last_squash_sha: Some(squash_sha.clone()),
                     phase: new_phase.clone(),
+                    state: None,
+                    wait_condition: None,
                 },
             )
             .unwrap();

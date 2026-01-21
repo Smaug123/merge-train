@@ -6,7 +6,9 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::types::{CascadePhase, CommentId, PrNumber, Sha, TrainError};
+use crate::types::{
+    CascadePhase, CommentId, PersistedWaitCondition, PrNumber, Sha, TrainError, TrainState,
+};
 
 /// An event in the event log.
 ///
@@ -104,6 +106,8 @@ pub enum StateEventPayload {
     /// - predecessor_pr: for fetching via refs/pull/<n>/head during recovery
     /// - last_squash_sha: for reconciliation recovery
     /// - phase: the CascadePhase including completed descendant lists
+    /// - state: the train state (Running, WaitingCi, etc.)
+    /// - wait_condition: what we're waiting for (if state is WaitingCi)
     #[serde(rename = "phase_transition")]
     PhaseTransition {
         /// The original root PR of the train.
@@ -116,6 +120,14 @@ pub enum StateEventPayload {
         last_squash_sha: Option<Sha>,
         /// The new cascade phase with descendant tracking.
         phase: CascadePhase,
+        /// The train state (Running, WaitingCi, etc.).
+        /// Optional for backwards compatibility with old events.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        state: Option<TrainState>,
+        /// What we're waiting for (if state is WaitingCi).
+        /// Used to restore wait timers after restart.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        wait_condition: Option<PersistedWaitCondition>,
     },
 
     /// A PR has been squash-merged to the default branch.
@@ -513,6 +525,8 @@ mod tests {
                 predecessor_pr: None,
                 last_squash_sha: None,
                 phase: CascadePhase::Idle,
+                state: None,
+                wait_condition: None,
             },
             StateEventPayload::SquashCommitted {
                 train_root: PrNumber(1),

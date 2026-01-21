@@ -87,7 +87,9 @@ pub fn arb_state_event_payload() -> impl Strategy<Value = StateEventPayload> {
                 current_pr: cp,
                 predecessor_pr: pp,
                 last_squash_sha: ls,
-                phase: ph
+                phase: ph,
+                state: None,          // Optional for backwards compat
+                wait_condition: None, // Optional for backwards compat
             }),
         (arb_pr_number(), arb_pr_number(), arb_sha()).prop_map(|(tr, pr, sh)| {
             StateEventPayload::SquashCommitted {

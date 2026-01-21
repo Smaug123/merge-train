@@ -841,6 +841,8 @@ mod tests {
                 progress: DescendantProgress::new(vec![PrNumber(201), PrNumber(202)]),
                 squash_sha: sha,
             },
+            state: None,
+            wait_condition: None,
         };
 
         log.append(payload.clone()).unwrap();
