@@ -718,7 +718,7 @@ impl RepoWorker {
             // Re-evaluate active cascades after processing startup backlog.
             // This ensures that replayed deliveries (e.g., PR merged, CI passed)
             // advance trains without waiting for a later poll or webhook.
-            self.re_evaluate_cascades_with_persistence(&shutdown)
+            self.re_evaluate_cascades_with_persistence(&shutdown, "startup")
                 .await?;
         }
 
@@ -868,8 +868,21 @@ impl RepoWorker {
     ///   effects to check for cancellation before starting)
     ///
     /// This design is intentional for Stage 17: it ensures correctness by preventing
-    /// interleaving of event processing. The cancellation token mechanism allows
-    /// stop commands to interrupt at effect boundaries.
+    /// interleaving of event processing.
+    ///
+    /// # Cancellation Guarantees
+    ///
+    /// The "prompt interruption" goal from DESIGN.md is achieved at effect boundaries:
+    /// - Stop commands trigger immediate cancellation of the stack's token via
+    ///   `handle_immediate_cancellation_if_stop` (called before enqueueing)
+    /// - Cancellation is checked before each effect, so pending effects are skipped
+    /// - Individual effects (like `git push`) run to completion once started
+    ///
+    /// This means latency between stop command and actual interruption is bounded by
+    /// the duration of a single effect (typically seconds for git operations), not
+    /// the entire batch. This tradeoff prioritizes correctness (no partial effects)
+    /// over absolute promptness (sub-effect interruption would require async
+    /// cancellation within git/GitHub clients).
     ///
     /// # Cascade Evaluation
     ///
@@ -905,7 +918,8 @@ impl RepoWorker {
         // Re-evaluate active cascades to advance trains based on the new state.
         // This is the key step that allows webhooks (PR merged, CI passed, etc.)
         // to trigger cascade advancement without waiting for the next poll.
-        self.re_evaluate_cascades_with_persistence(shutdown).await?;
+        self.re_evaluate_cascades_with_persistence(shutdown, "webhook")
+            .await?;
 
         Ok(())
     }
@@ -979,15 +993,21 @@ impl RepoWorker {
     /// - `Git(*)`: Executed via the Git interpreter when available.
     ///   In Stage 17, effects are logged but not executed.
     ///
-    /// # Cancellation
+    /// # Cancellation Design
     ///
-    /// Two levels of cancellation are checked before each effect:
+    /// Two levels of cancellation are checked **before** each effect:
     /// 1. Global shutdown - stops all effect processing
     /// 2. Stack-scoped cancellation - stops effects for a specific train
     ///
-    /// Stack-scoped cancellation allows stop commands to immediately interrupt
-    /// in-flight operations for a specific train without affecting other trains.
-    /// The stack token is looked up based on the PR number in the effect.
+    /// Stack-scoped cancellation allows stop commands to interrupt a batch at
+    /// effect boundaries without affecting other trains. The key constraint is:
+    /// - Cancellation is **cooperative**, not preemptive
+    /// - Once an effect starts (e.g., `git push`, `GitHub API call`), it runs to completion
+    /// - The next effect in the batch will see the cancellation and be skipped
+    ///
+    /// This design ensures no partial effects (which could leave inconsistent state)
+    /// while still providing prompt interruption. Individual effects should be fast
+    /// (seconds), so worst-case latency is bounded by single-effect duration.
     ///
     /// # Stage 18 Integration
     ///
@@ -1415,7 +1435,7 @@ impl RepoWorker {
         // After updating the cache, re-evaluate cascades to check if any trains
         // can now advance (e.g., CI completed while we weren't receiving webhooks).
         // Use the persistence version to ensure phase transitions are durably recorded.
-        self.re_evaluate_cascades_with_persistence(&shutdown)
+        self.re_evaluate_cascades_with_persistence(&shutdown, "poll")
             .await?;
 
         Ok(())
@@ -1423,26 +1443,37 @@ impl RepoWorker {
 
     /// Re-evaluates active cascades with proper persistence of phase transitions.
     ///
-    /// This is called after poll updates the cache with fresh GitHub state.
-    /// For each active train, if the current PR's state allows the cascade to
-    /// advance, we execute a cascade step and run any resulting effects.
+    /// This is called after processing events that may change cascade state:
+    /// - After webhook delivery (trigger="webhook")
+    /// - After poll updates the cache (trigger="poll")
+    /// - After timer fires (trigger="timer")
+    /// - After spool drain (trigger="spool_drain")
+    /// - After startup backlog processing (trigger="startup")
     ///
-    /// This is the key mechanism that allows poll fallback to actually advance
-    /// trains when webhooks are missed.
+    /// For each active train, we execute a cascade step and run any resulting
+    /// effects. The cascade step function handles all merge states:
+    /// - Clean/Unstable: can proceed to merge
+    /// - Blocked: sets up waiting state and updates status
+    /// - Unknown: sets up waiting state for state propagation
+    /// - Draft: waits for PR to be marked ready
+    ///
+    /// This is the key mechanism that allows webhooks and poll fallback to
+    /// advance trains, detect blocking conditions, and update status comments.
     ///
     /// The method:
     /// 1. Executes cascade steps for active trains
     /// 2. Persists phase transitions via the event log
-    /// 3. Executes resulting effects
+    /// 3. Executes resulting effects (status updates, git operations, etc.)
     ///
     /// This ensures that cascade progress survives restarts.
     async fn re_evaluate_cascades_with_persistence(
         &mut self,
         shutdown: &CancellationToken,
+        trigger: &str,
     ) -> Result<()> {
         use crate::cascade::step::{StepContext, execute_cascade_step};
         use crate::persistence::event::StateEventPayload;
-        use crate::types::{CascadeStepOutcome, MergeStateStatus, TrainError};
+        use crate::types::{CascadeStepOutcome, TrainError};
 
         // Collect train roots that may need re-evaluation.
         // We only re-evaluate trains that are WaitingCi or Running - stopped/aborted
@@ -1479,35 +1510,14 @@ impl RepoWorker {
                 continue;
             }
 
-            // Get fresh PR state from cache
+            // Get fresh PR state from cache for logging
             let pr_state = self.state.prs.get(&current_pr);
-            let can_advance = match pr_state {
-                Some(pr) => {
-                    // Check if PR is ready to advance: merge state is clean (CI passed,
-                    // reviews approved, no conflicts), or PR is already merged (need to
-                    // advance to next phase).
-                    matches!(
-                        pr.merge_state_status,
-                        MergeStateStatus::Clean | MergeStateStatus::Unstable
-                    ) || pr.state.is_merged()
-                }
-                None => false,
-            };
-
-            if !can_advance {
-                trace!(
-                    train_root = %train_root,
-                    current_pr = %current_pr,
-                    merge_state = ?pr_state.map(|p| &p.merge_state_status),
-                    "Train not ready to advance"
-                );
-                continue;
-            }
 
             debug!(
                 train_root = %train_root,
                 current_pr = %current_pr,
-                trigger = "webhook",
+                merge_state = ?pr_state.map(|p| &p.merge_state_status),
+                trigger = trigger,
                 "Re-evaluating cascade"
             );
 
@@ -1563,6 +1573,17 @@ impl RepoWorker {
 
                 // Compute wait_condition if we're entering WaitingCi state.
                 // This must happen BEFORE persistence so it's captured in the event.
+                //
+                // Currently only CheckSuiteCompleted is scheduled. HeadRefOid and
+                // MergeStateStatus wait conditions are defined in queue.rs for future
+                // use but not yet implemented:
+                // - HeadRefOid: Needed after git push to wait for GitHub to update
+                //   PR headRefOid (eventual consistency handling)
+                // - MergeStateStatus: Needed when merge state is Unknown to wait for
+                //   GitHub to compute mergeable status
+                //
+                // Until these are implemented, the poll fallback (10-minute interval)
+                // handles eventual consistency cases. See queue.rs WaitCondition docs.
                 let wait_condition =
                     if let CascadeStepOutcome::WaitingOnCi { pr_number } = &step_result.outcome {
                         self.state.prs.get(pr_number).map(|pr| {
@@ -1757,7 +1778,7 @@ impl RepoWorker {
         // Re-evaluate the cascade with updated state and persist phase transitions.
         // This uses the persistent version to ensure phase transitions are durably
         // recorded, preventing replay of side effects after a crash.
-        self.re_evaluate_cascades_with_persistence(&shutdown)
+        self.re_evaluate_cascades_with_persistence(&shutdown, "timer")
             .await?;
 
         // Check if the train advanced (phase changed or train completed/stopped)
@@ -2096,7 +2117,8 @@ impl RepoWorker {
             // Re-evaluate active cascades after processing recovered deliveries.
             // This ensures that missed webhooks (e.g., PR merged, CI passed) caught
             // during periodic spool drain advance trains without waiting for a later poll.
-            self.re_evaluate_cascades_with_persistence(shutdown).await?;
+            self.re_evaluate_cascades_with_persistence(shutdown, "spool_drain")
+                .await?;
         }
 
         Ok(())
@@ -3429,7 +3451,7 @@ mod tests {
 
         // Re-evaluate cascades (the key behavior we're testing)
         let result = worker
-            .re_evaluate_cascades_with_persistence(&shutdown)
+            .re_evaluate_cascades_with_persistence(&shutdown, "test")
             .await;
         assert!(result.is_ok(), "Cascade re-evaluation should not error");
 
