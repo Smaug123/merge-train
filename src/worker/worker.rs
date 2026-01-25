@@ -330,13 +330,30 @@ impl RepoWorker {
         let pending = drain_pending(&config.spool_dir)?;
         debug!(pending = pending.len(), "Drained spool");
 
-        // Enqueue pending deliveries
+        // Enqueue pending deliveries.
+        // Parse errors are handled gracefully to prevent a single malformed delivery
+        // from wedging the worker. Malformed deliveries are marked as done and skipped.
         for delivery in pending {
-            if let Some((event, priority)) = parse_and_classify(&delivery, &config.bot_name)? {
-                queue.push(event, delivery.delivery_id, priority);
-            } else {
-                // Event type not recognized or not relevant - mark as done
-                mark_done(&delivery)?;
+            match parse_and_classify(&delivery, &config.bot_name) {
+                Ok(Some((event, priority))) => {
+                    queue.push(event, delivery.delivery_id, priority);
+                }
+                Ok(None) => {
+                    // Event type not recognized or not relevant - mark as done
+                    mark_done(&delivery)?;
+                }
+                Err(e) => {
+                    // Malformed delivery: log error and mark as done to prevent
+                    // this delivery from blocking startup or being retried forever.
+                    // This is a recoverable error - the delivery is corrupt and
+                    // retrying won't help.
+                    warn!(
+                        delivery_id = %delivery.delivery_id,
+                        error = %e,
+                        "Malformed delivery at startup, marking as done and skipping"
+                    );
+                    mark_done(&delivery)?;
+                }
             }
         }
 
@@ -545,6 +562,51 @@ impl RepoWorker {
         // Step 2: Create `.proc` marker
         mark_processing(&delivery)?;
 
+        // After creating the `.proc` marker, we must handle errors carefully:
+        // - Persistence failures: propagate error, leave `.proc` for restart recovery
+        // - Recoverable failures (handler, parse): mark as done, return success
+        //
+        // This prevents recoverable errors from leaving deliveries stuck with
+        // a `.proc` marker but no `.done` marker (which would prevent retries
+        // until restart).
+        match self.process_event_after_proc_marker(&queued, &delivery) {
+            Ok(result) => Ok(result),
+            Err(e) if e.is_persistence_failure() => {
+                // Fatal: persistence failure. Leave `.proc` marker so the
+                // delivery is re-processed after restart.
+                Err(e)
+            }
+            Err(e) => {
+                // Recoverable error (handler logic, parsing).
+                // Mark as done to prevent the delivery from being stuck.
+                // Log the error but don't propagate it - the delivery is "handled"
+                // even though it failed, because retrying won't help.
+                warn!(
+                    delivery_id = %delivery_id,
+                    error = %e,
+                    "Recoverable error processing event, marking as done"
+                );
+                mark_done(&delivery)?;
+                Ok(ProcessResult {
+                    processed: true,
+                    effects: Vec::new(),
+                    delivery_id: Some(delivery_id),
+                })
+            }
+        }
+    }
+
+    /// Inner processing logic after `.proc` marker is created.
+    ///
+    /// Separated from `process_next` to enable proper error handling:
+    /// persistence failures propagate, recoverable failures mark done.
+    fn process_event_after_proc_marker(
+        &mut self,
+        queued: &super::queue::QueuedEvent,
+        delivery: &SpooledDelivery,
+    ) -> Result<ProcessResult> {
+        let delivery_id = queued.delivery_id.clone();
+
         // Step 3: Call event handler
         let result = handle_event(&queued.event, &self.state, &self.config.bot_name)?;
 
@@ -566,7 +628,7 @@ impl RepoWorker {
             // this critical event was just appended to the log.
             self.event_log.sync()?;
             self.flush_pending_batch_done_markers()?;
-            mark_done(&delivery)?;
+            mark_done(delivery)?;
             trace!(delivery_id = %delivery_id, "Marked done (critical)");
         } else {
             // Non-critical: add to pending batch

@@ -1158,14 +1158,21 @@ Each per-repo worker loop:
 
 **Critical invariant:** A delivery's `.done` marker is only created after all state effects from that delivery are durably persisted (fsynced). This ensures that on restart, unprocessed deliveries are replayed correctly. For batched events, `.done` is deferred until the batch fsync completes.
 
-**Priority ordering**: Stop commands (`@merge-train stop`) are processed before all other events within that repo's queue. This ensures that a human request to halt the cascade takes effect promptly.
+**Priority ordering**: Stop commands (`@merge-train stop`) are processed before all other events within that repo's queue. This ensures that a human request to halt the cascade is handled before subsequent webhook events in the queue.
 
-**Cancellation**: Cancellation is **stack-scoped**. Each stack has its own `CancellationToken`, managed by the worker. When a stop command arrives, the dispatcher:
-1. Sends a `CancelStackRequest` (containing the PR number) to the worker via a separate channel
-2. The worker resolves the PR to its stack root and cancels that stack's token
-3. Enqueues the stop event (which will be processed immediately due to priority)
+**Cancellation**: Cancellation is **stack-scoped**. Each stack has its own `CancellationToken`, managed by the worker. The cancellation flow is:
 
-This allows long-running operations like `git merge` or `git push` to be interrupted promptly when a human requests a stop — **without affecting other stacks in the same repo**.
+1. Stop command arrives as webhook, gets spooled and dispatched
+2. Stop command is queued with high priority (processed before other events)
+3. Handler validates the command (checks authorization) and produces a `TrainStopped` event
+4. When `TrainStopped` is applied to state, the token is cancelled synchronously
+5. Subsequent effects see the cancelled token and skip execution
+
+This design ensures **authorization before cancellation** — unauthorized commenters cannot interrupt in-flight operations by posting `@merge-train stop`. The tradeoff is that effects already executing (e.g., `git push` in progress) will complete before the next cancellation check. This is acceptable because individual git operations are short-lived; the priority queue ensures cancellation happens between operations, not during them.
+
+Stop commands only affect the targeted stack — **without affecting other stacks in the same repo**.
+
+**Future extension**: The worker infrastructure includes a dedicated high-priority cancel channel (`cancel_rx`) that could bypass the normal queue for immediate token cancellation. This channel is currently unused but exists to support future features like admin-level emergency cancellation that bypasses authorization. Any such feature would need to define its own access control (e.g., restricted to server operators, audited, etc.).
 
 **Non-blocking polling**: When the bot needs to wait for GitHub state to propagate (e.g., `headRefOid` to match after a push, or `mergeStateStatus` to transition from `UNKNOWN`), it does **not** block the event queue:
 
