@@ -47,18 +47,15 @@
 //!    - An effect that's currently executing will complete before the next check
 //!
 //! **Practical implications**:
-//! - Stop commands from `cancel_rx` are processed after the current delivery completes
-//!   (the event loop can only poll `cancel_rx` between deliveries)
-//! - Stop commands detected in `handle_immediate_cancellation_if_stop` trigger
-//!   token cancellation before effect execution begins
+//! - Stop commands get high priority in the queue, ensuring prompt processing
+//! - Token cancellation only happens AFTER the handler validates the stop command
+//!   and produces a TrainStopped event - this prevents unauthorized cancellation
 //! - Each effect batch checks the token before each effect, not within effects
 //! - Each stack has its own token, so stopping one train doesn't affect others
 //!
 //! **Known limitation**: When effects are executing, the worker cannot poll `cancel_rx`
-//! until the effect batch completes. Cancellation requests via `cancel_rx` are processed
-//! at the next select loop iteration, not mid-effect. For truly prompt cancellation,
-//! the stop command must be the delivery being processed (detected in
-//! `handle_immediate_cancellation_if_stop`).
+//! until the effect batch completes. Cancellation is checked at effect boundaries but
+//! cannot interrupt long-running individual effects.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -177,13 +174,13 @@ impl WorkerConfig {
 
 /// A pending timer for non-blocking waits.
 #[derive(Debug)]
-struct PendingTimer {
+pub(crate) struct PendingTimer {
     /// When the timer fires.
-    fires_at: Instant,
+    pub(crate) fires_at: Instant,
     /// The train this timer is for.
-    train_root: PrNumber,
+    pub(crate) train_root: PrNumber,
     /// The condition being waited for.
-    condition: WaitCondition,
+    pub(crate) condition: WaitCondition,
 }
 
 impl PendingTimer {
@@ -202,45 +199,45 @@ impl PendingTimer {
 /// for a single repository. It runs as a tokio task with an async event loop.
 pub struct RepoWorker {
     /// Worker configuration.
-    config: WorkerConfig,
+    pub(crate) config: WorkerConfig,
 
     /// Priority queue for pending events.
-    queue: EventQueue,
+    pub(crate) queue: EventQueue,
 
     /// Repository state snapshot.
-    state: PersistedRepoSnapshot,
+    pub(crate) state: PersistedRepoSnapshot,
 
     /// Event log for durability.
-    event_log: EventLog,
+    pub(crate) event_log: EventLog,
 
     /// Set of delivery IDs with pending fsync (for batched writes).
-    pending_batch: Vec<DeliveryId>,
+    pub(crate) pending_batch: Vec<DeliveryId>,
 
     /// Polling configuration.
-    poll_config: PollConfig,
+    pub(crate) poll_config: PollConfig,
 
     /// Cancellation tokens for active stacks, keyed by root PR.
-    stack_tokens: HashMap<PrNumber, CancellationToken>,
+    pub(crate) stack_tokens: HashMap<PrNumber, CancellationToken>,
 
     /// Pending timers for non-blocking waits.
-    pending_timers: Vec<PendingTimer>,
+    pub(crate) pending_timers: Vec<PendingTimer>,
 
     /// Time of last poll for active trains.
-    last_poll: Option<Instant>,
+    pub(crate) last_poll: Option<Instant>,
 
     /// Time of last periodic spool drain.
     /// This runs independently of active trains to catch deliveries that
     /// were spooled but not dispatched (e.g., dispatcher failure).
-    last_spool_drain: Option<Instant>,
+    pub(crate) last_spool_drain: Option<Instant>,
 
     /// Optional GitHub client for executing GitHub effects.
     /// If None, effects are logged but not executed (testing/dry-run mode).
-    github_client: Option<OctocrabClient>,
+    pub(crate) github_client: Option<OctocrabClient>,
 
     /// PRs that have been warned about manual retargeting.
     /// Used to dedupe warning comments - we only post once per PR.
     /// In-memory only; cleared on restart (acceptable to re-warn once).
-    warned_manual_retargets: HashSet<PrNumber>,
+    pub(crate) warned_manual_retargets: HashSet<PrNumber>,
 }
 
 impl RepoWorker {
@@ -801,7 +798,7 @@ impl RepoWorker {
                     }
 
                     // Fire any expired timers
-                    if let Err(e) = self.fire_expired_timers().await {
+                    if let Err(e) = self.fire_expired_timers(&shutdown).await {
                         error!(error = %e, "Error firing timers");
                     }
                 }
@@ -842,7 +839,8 @@ impl RepoWorker {
                 train_root,
                 condition,
             } => {
-                self.handle_timer_fired(train_root, condition).await?;
+                self.handle_timer_fired(train_root, condition, shutdown)
+                    .await?;
             }
             WorkerMessage::Shutdown => {
                 // Handled in run() loop
@@ -872,17 +870,18 @@ impl RepoWorker {
     ///
     /// # Cancellation Guarantees
     ///
-    /// The "prompt interruption" goal from DESIGN.md is achieved at effect boundaries:
-    /// - Stop commands trigger immediate cancellation of the stack's token via
-    ///   `handle_immediate_cancellation_if_stop` (called before enqueueing)
+    /// Stop commands get high priority in the queue and trigger token cancellation
+    /// AFTER the handler validates the command and produces a TrainStopped event.
+    /// This prevents unauthorized commenters from cancelling in-flight operations.
+    ///
+    /// At effect boundaries:
     /// - Cancellation is checked before each effect, so pending effects are skipped
     /// - Individual effects (like `git push`) run to completion once started
     ///
     /// This means latency between stop command and actual interruption is bounded by
-    /// the duration of a single effect (typically seconds for git operations), not
-    /// the entire batch. This tradeoff prioritizes correctness (no partial effects)
-    /// over absolute promptness (sub-effect interruption would require async
-    /// cancellation within git/GitHub clients).
+    /// queue processing time plus the duration of a single effect (typically seconds
+    /// for git operations). This tradeoff prioritizes correctness (authorization
+    /// before cancellation, no partial effects) over absolute promptness.
     ///
     /// # Cascade Evaluation
     ///
@@ -895,9 +894,13 @@ impl RepoWorker {
         delivery: SpooledDelivery,
         shutdown: &CancellationToken,
     ) -> Result<()> {
-        // Before enqueuing, check if this is a stop command.
-        // If so, immediately cancel the relevant stack to interrupt in-flight operations.
-        self.handle_immediate_cancellation_if_stop(&delivery)?;
+        // Note: We intentionally do NOT cancel stacks immediately when detecting stop
+        // commands. Cancellation only happens AFTER the handler validates the stop
+        // command and produces a TrainStopped event. This prevents unauthorized
+        // commenters from cancelling in-flight operations.
+        //
+        // Stop commands still get high priority in the queue, ensuring they're
+        // processed promptly after validation.
 
         // Enqueue the delivery
         self.enqueue(delivery)?;
@@ -920,53 +923,6 @@ impl RepoWorker {
         // to trigger cascade advancement without waiting for the next poll.
         self.re_evaluate_cascades_with_persistence(shutdown, "webhook")
             .await?;
-
-        Ok(())
-    }
-
-    /// If the delivery is a stop command, immediately cancel the relevant stack.
-    ///
-    /// This ensures in-flight operations are interrupted before the stop command
-    /// is even enqueued, providing faster response to stop requests.
-    fn handle_immediate_cancellation_if_stop(&mut self, delivery: &SpooledDelivery) -> Result<()> {
-        use crate::commands::{Command, parse_command};
-        use crate::webhooks::parser::parse_webhook;
-
-        // Try to load and parse the webhook
-        let envelope = match delivery.read_webhook() {
-            Ok(env) => env,
-            Err(_) => return Ok(()), // Can't load, skip immediate cancellation
-        };
-
-        // Parse the webhook event
-        let body_bytes = serde_json::to_vec(&envelope.body).unwrap_or_default();
-        let event = match parse_webhook(&envelope.event_type, &body_bytes) {
-            Ok(Some(ev)) => ev,
-            Ok(None) => return Ok(()), // Not a supported event type
-            Err(_) => return Ok(()),   // Can't parse, skip immediate cancellation
-        };
-
-        // Check if it's a CREATED issue comment with a stop command.
-        // We only act on 'created' actions because the webhook handler ignores
-        // edited/deleted comments for start/stop commands. Without this check,
-        // editing or deleting a comment containing "@merge-train stop" would
-        // incorrectly cancel the stack.
-        if let GitHubEvent::IssueComment(comment) = event
-            && comment.action == crate::webhooks::events::CommentAction::Created
-            && let Some(pr_number) = comment.pr_number
-            && let Some(cmd) = parse_command(&comment.body, &self.config.bot_name)
-            && matches!(cmd, Command::Stop | Command::StopForce)
-        {
-            // Find the train root for this PR and cancel immediately
-            if let Some(train_root) = self.find_train_root(pr_number) {
-                info!(
-                    train_root = %train_root,
-                    pr = %pr_number,
-                    "Stop command detected, immediately cancelling stack"
-                );
-                self.cancel_stack(train_root);
-            }
-        }
 
         Ok(())
     }
@@ -1015,7 +971,7 @@ impl RepoWorker {
     /// 1. Create an `EffectExecutor` with the GitHub interpreter
     /// 2. Execute each effect and handle the response
     /// 3. Update cached state based on GitHub responses (e.g., PrRefetched)
-    async fn execute_effects(
+    pub(crate) async fn execute_effects(
         &mut self,
         effects: Vec<Effect>,
         shutdown: &CancellationToken,
@@ -1135,7 +1091,7 @@ impl RepoWorker {
     /// cache stays in sync with GitHub. This is essential for:
     /// - Poll-based state refresh (`RefetchPr` effects)
     /// - Keeping merge state status up-to-date
-    fn process_github_response(&mut self, response: GitHubResponse) {
+    pub(crate) fn process_github_response(&mut self, response: GitHubResponse) {
         match response {
             GitHubResponse::PrRefetched { pr, merge_state } => {
                 // Update the cached PR with fresh data from GitHub
@@ -1215,23 +1171,19 @@ impl RepoWorker {
         }
     }
 
-    /// Handles a stack cancellation request.
+    /// Handles a stack cancellation request from external sources (e.g., `cancel_rx`).
     ///
     /// # Token Lifecycle
     ///
     /// When cancelling, we mark the token as cancelled but **do not remove it**.
     /// This is critical because effects may still be in-flight or pending:
     ///
-    /// 1. `handle_immediate_cancellation_if_stop` cancels the token
-    /// 2. `handle_delivery` then processes the stop event and executes effects
-    /// 3. `execute_effects` checks `token.is_cancelled()` before each effect
+    /// 1. External request or TrainStopped event triggers cancellation
+    /// 2. `execute_effects` checks `token.is_cancelled()` before each effect
+    /// 3. Remaining effects for this train are skipped
     ///
-    /// If we removed the token in step 1, step 3 wouldn't find it and couldn't
-    /// skip the remaining effects for this train.
-    ///
-    /// The token is only removed when the train is actually removed from
-    /// `active_trains` (via `TrainStopped`, `TrainCompleted`, or `TrainAborted`
-    /// events applied in `apply_event`).
+    /// The token is only removed when the train termination event is processed
+    /// (TrainStopped, TrainCompleted, or TrainAborted in `apply_handler_result`).
     fn handle_cancel_stack(&mut self, pr: PrNumber) {
         // Find the train root for this PR
         let train_root = self.find_train_root(pr).unwrap_or(pr);
@@ -1277,8 +1229,16 @@ impl RepoWorker {
     ///   can be incorrectly merged
     async fn handle_poll_active_trains(&mut self) -> Result<()> {
         use crate::effects::{Effect, GitHubEffect};
+        use crate::spool::dedupe::prune_expired_keys_default;
 
         self.last_poll = Some(Instant::now());
+
+        // Prune expired dedupe keys to prevent unbounded growth.
+        // This runs during each poll cycle (every 10 minutes by default).
+        let pruned = prune_expired_keys_default(&mut self.state.seen_dedupe_keys);
+        if pruned > 0 {
+            debug!(pruned = pruned, "Pruned expired dedupe keys");
+        }
 
         // Create a cancellation token for effect execution in this poll cycle.
         // This is a local token; for stack-scoped cancellation, execute_effects
@@ -1466,7 +1426,7 @@ impl RepoWorker {
     /// 3. Executes resulting effects (status updates, git operations, etc.)
     ///
     /// This ensures that cascade progress survives restarts.
-    async fn re_evaluate_cascades_with_persistence(
+    pub(crate) async fn re_evaluate_cascades_with_persistence(
         &mut self,
         shutdown: &CancellationToken,
         trigger: &str,
@@ -1677,7 +1637,10 @@ impl RepoWorker {
     ///
     /// Any effects generated from processing recovered deliveries are executed,
     /// ensuring that GitHub/git operations are not silently dropped.
-    async fn drain_spool_periodic(&mut self, shutdown: &CancellationToken) -> Result<usize> {
+    pub(crate) async fn drain_spool_periodic(
+        &mut self,
+        shutdown: &CancellationToken,
+    ) -> Result<usize> {
         let deliveries = drain_pending(&self.config.spool_dir)?;
         let mut enqueued = 0;
 
@@ -1729,6 +1692,7 @@ impl RepoWorker {
         &mut self,
         train_root: PrNumber,
         condition: WaitCondition,
+        shutdown: &CancellationToken,
     ) -> Result<()> {
         use crate::effects::{Effect, GitHubEffect};
 
@@ -1750,8 +1714,12 @@ impl RepoWorker {
             }
         };
 
-        // Capture current phase to detect advancement after re-evaluation
+        // Capture current state to detect advancement after re-evaluation.
+        // We check both phase name and train state to catch state-only changes
+        // (e.g., Running -> WaitingCi might not change phase name but indicates progress).
         let phase_before = train.cascade_phase.name();
+        let state_before = train.state;
+        let current_pr_before = train.current_pr;
 
         debug!(
             train_root = %train_root,
@@ -1765,9 +1733,9 @@ impl RepoWorker {
             pr: train.current_pr,
         })];
 
-        // Execute the effect to update cached state
-        let shutdown = CancellationToken::new();
-        if let Err(e) = self.execute_effects(effects, &shutdown).await {
+        // Execute the effect to update cached state.
+        // Use the passed shutdown token so global shutdown can cancel execution.
+        if let Err(e) = self.execute_effects(effects, shutdown).await {
             warn!(
                 train_root = %train_root,
                 error = %e,
@@ -1778,12 +1746,21 @@ impl RepoWorker {
         // Re-evaluate the cascade with updated state and persist phase transitions.
         // This uses the persistent version to ensure phase transitions are durably
         // recorded, preventing replay of side effects after a crash.
-        self.re_evaluate_cascades_with_persistence(&shutdown, "timer")
+        self.re_evaluate_cascades_with_persistence(shutdown, "timer")
             .await?;
 
-        // Check if the train advanced (phase changed or train completed/stopped)
+        // Check if the train advanced.
+        // Train is considered "advanced" if:
+        // - Phase name changed
+        // - Train state changed
+        // - Current PR changed (moved to next in stack)
+        // - Train is no longer active (completed/stopped/aborted)
         let train_advanced = match self.state.active_trains.get(&train_root) {
-            Some(train) => train.cascade_phase.name() != phase_before,
+            Some(train) => {
+                train.cascade_phase.name() != phase_before
+                    || train.state != state_before
+                    || train.current_pr != current_pr_before
+            }
             None => true, // Train no longer active = it advanced (completed/stopped)
         };
 
@@ -1976,7 +1953,9 @@ impl RepoWorker {
     }
 
     /// Fires all expired timers.
-    async fn fire_expired_timers(&mut self) -> Result<()> {
+    ///
+    /// Uses the provided shutdown token so global shutdown can cancel timer effect execution.
+    async fn fire_expired_timers(&mut self, shutdown: &CancellationToken) -> Result<()> {
         let now = Instant::now();
 
         // Extract expired timers
@@ -1992,14 +1971,15 @@ impl RepoWorker {
 
         // Fire each expired timer
         for (train_root, condition) in expired {
-            self.handle_timer_fired(train_root, condition).await?;
+            self.handle_timer_fired(train_root, condition, shutdown)
+                .await?;
         }
 
         Ok(())
     }
 
     /// Returns time until next poll.
-    fn time_until_next_poll(&self) -> Option<Duration> {
+    pub(crate) fn time_until_next_poll(&self) -> Option<Duration> {
         // Only poll if we have active trains
         if self.state.active_trains.is_empty() {
             return None;
@@ -2078,7 +2058,10 @@ impl RepoWorker {
     /// This runs independently of active trains to catch deliveries that were
     /// spooled but not dispatched. Unlike `drain_spool_periodic` (called during
     /// poll), this method runs even when there are no active trains.
-    async fn handle_periodic_spool_drain(&mut self, shutdown: &CancellationToken) -> Result<()> {
+    pub(crate) async fn handle_periodic_spool_drain(
+        &mut self,
+        shutdown: &CancellationToken,
+    ) -> Result<()> {
         self.last_spool_drain = Some(Instant::now());
 
         let deliveries = drain_pending(&self.config.spool_dir)?;
@@ -2141,7 +2124,7 @@ impl RepoWorker {
     /// 1. A train root itself
     /// 2. The current PR being processed
     /// 3. In the frozen_descendants of an active train
-    fn find_train_root(&self, pr: PrNumber) -> Option<PrNumber> {
+    pub(crate) fn find_train_root(&self, pr: PrNumber) -> Option<PrNumber> {
         // Check if PR is itself a train root
         if self.state.active_trains.contains_key(&pr) {
             return Some(pr);
@@ -2330,7 +2313,7 @@ impl RepoWorker {
 /// This is the correct way to find the snapshot, as opposed to just picking
 /// the highest-numbered snapshot file (which could pick the wrong generation
 /// after a compaction crash).
-fn find_latest_snapshot(state_dir: &Path) -> Result<Option<PathBuf>> {
+pub(crate) fn find_latest_snapshot(state_dir: &Path) -> Result<Option<PathBuf>> {
     use crate::persistence::{cleanup_stale_generations, read_generation, snapshot_path};
 
     if !state_dir.exists() {
@@ -2384,7 +2367,7 @@ fn find_latest_snapshot(state_dir: &Path) -> Result<Option<PathBuf>> {
 ///
 /// This is used when the generation file is unavailable or inconsistent.
 /// It picks the highest-numbered snapshot file.
-fn find_latest_snapshot_by_scan(state_dir: &Path) -> Result<Option<PathBuf>> {
+pub(crate) fn find_latest_snapshot_by_scan(state_dir: &Path) -> Result<Option<PathBuf>> {
     if !state_dir.exists() {
         return Ok(None);
     }
@@ -2408,7 +2391,7 @@ fn find_latest_snapshot_by_scan(state_dir: &Path) -> Result<Option<PathBuf>> {
 /// Parses the generation number from a snapshot filename.
 ///
 /// Expected format: `snapshot.<gen>.json`
-fn parse_snapshot_generation(path: &Path) -> Option<u64> {
+pub(crate) fn parse_snapshot_generation(path: &Path) -> Option<u64> {
     let name = path.file_name()?.to_str()?;
     if !name.starts_with("snapshot.") || !name.ends_with(".json") {
         return None;
@@ -2463,7 +2446,7 @@ fn parse_and_classify(
 /// Applies a state event to the snapshot.
 ///
 /// This updates the in-memory state based on the event payload.
-fn apply_event_to_state(state: &mut PersistedRepoSnapshot, event: &StateEvent) {
+pub(crate) fn apply_event_to_state(state: &mut PersistedRepoSnapshot, event: &StateEvent) {
     use crate::persistence::event::StateEventPayload;
     use crate::types::{CachedPr, MergeStateStatus, PrState};
 
@@ -2725,6 +2708,10 @@ fn apply_event_to_state(state: &mut PersistedRepoSnapshot, event: &StateEvent) {
     }
 }
 
+/// Core spec tests for worker behavior.
+///
+/// These tests verify the fundamental invariants and behaviors of the worker.
+/// Edge-case and regression tests are in the separate `tests` module.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2733,7 +2720,7 @@ mod tests {
     use std::collections::HashMap;
     use tempfile::tempdir;
 
-    fn make_pr_opened_envelope(pr_number: u64) -> WebhookEnvelope {
+    pub(crate) fn make_pr_opened_envelope(pr_number: u64) -> WebhookEnvelope {
         let body = serde_json::json!({
             "action": "opened",
             "number": pr_number,
@@ -2769,7 +2756,7 @@ mod tests {
         }
     }
 
-    fn make_comment_envelope(pr_number: u64, body_text: &str) -> WebhookEnvelope {
+    pub(crate) fn make_comment_envelope(pr_number: u64, body_text: &str) -> WebhookEnvelope {
         let body = serde_json::json!({
             "action": "created",
             "issue": {
@@ -2799,7 +2786,7 @@ mod tests {
         }
     }
 
-    // ─── Basic worker tests ───
+    // ─── Core behavior spec tests ───
 
     #[test]
     fn worker_new_creates_empty_state() {
@@ -2865,8 +2852,6 @@ mod tests {
         assert!(delivery.is_done());
     }
 
-    // ─── Priority ordering tests ───
-
     #[test]
     fn stop_command_processed_before_normal_events() {
         let dir = tempdir().unwrap();
@@ -2899,672 +2884,10 @@ mod tests {
         assert_eq!(first.delivery_id.as_str(), "stop-delivery");
     }
 
-    // ─── Snapshot generation parsing tests ───
-
-    #[test]
-    fn parse_snapshot_generation_valid() {
-        let path = PathBuf::from("snapshot.0.json");
-        assert_eq!(parse_snapshot_generation(&path), Some(0));
-
-        let path = PathBuf::from("snapshot.42.json");
-        assert_eq!(parse_snapshot_generation(&path), Some(42));
-
-        let path = PathBuf::from("snapshot.12345.json");
-        assert_eq!(parse_snapshot_generation(&path), Some(12345));
-    }
-
-    #[test]
-    fn parse_snapshot_generation_invalid() {
-        assert_eq!(
-            parse_snapshot_generation(&PathBuf::from("events.0.log")),
-            None
-        );
-        assert_eq!(
-            parse_snapshot_generation(&PathBuf::from("snapshot.json")),
-            None
-        );
-        assert_eq!(
-            parse_snapshot_generation(&PathBuf::from("snapshot.abc.json")),
-            None
-        );
-        assert_eq!(
-            parse_snapshot_generation(&PathBuf::from("other.0.json")),
-            None
-        );
-    }
-
-    #[test]
-    fn find_latest_snapshot_returns_highest_generation() {
-        let dir = tempdir().unwrap();
-        let state_dir = dir.path();
-
-        // Create multiple snapshots
-        let snapshot = PersistedRepoSnapshot::new("main");
-        save_snapshot_atomic(&state_dir.join("snapshot.0.json"), &snapshot).unwrap();
-        save_snapshot_atomic(&state_dir.join("snapshot.5.json"), &snapshot).unwrap();
-        save_snapshot_atomic(&state_dir.join("snapshot.2.json"), &snapshot).unwrap();
-
-        let latest = find_latest_snapshot(state_dir).unwrap().unwrap();
-        assert!(latest.ends_with("snapshot.5.json"));
-    }
-
-    #[test]
-    fn find_latest_snapshot_nonexistent_dir() {
-        let dir = tempdir().unwrap();
-        let state_dir = dir.path().join("nonexistent");
-
-        let result = find_latest_snapshot(&state_dir).unwrap();
-        assert!(result.is_none());
-    }
-
-    // ─── Stage 17 Integration Tests ───
-    //
-    // These tests verify the key oracles for the per-repo worker system:
-    // - Spool → worker processing
-    // - Stop priority ordering
-    // - Serial processing within a repo
-    // - .done only after fsync
-    // - Deduplication of already-done deliveries
-
-    #[test]
-    fn done_marker_only_created_after_flush() {
-        // Test oracle: .done marker is only created AFTER state is durably persisted.
-        // The durability guarantee is:
-        // 1. Events are appended to the log
-        // 2. flush_pending_batch() calls event_log.sync() to fsync the log
-        // 3. Only THEN are .done markers created
-        //
-        // This ensures that on crash recovery, any delivery without a .done marker
-        // will be reprocessed, and its events will be re-applied to the log.
-        //
-        // # Limitation
-        //
-        // This test verifies the SEQUENCE of operations (log write → flush → done
-        // marker) but does NOT verify actual durability guarantees:
-        //
-        // - We cannot inject fsync failures to verify the code handles them
-        // - We cannot simulate power loss to verify data survives
-        // - The test runs on a normal filesystem, not a failure-injecting one
-        //
-        // Truly testing durability would require either:
-        // 1. Fault injection (libfiu, custom VFS, or mocking the fsync syscall)
-        // 2. Crash recovery tests (spawn subprocess, kill it, verify state)
-        // 3. Hardware-level testing (actual power cycling)
-        //
-        // These are impractical for standard unit tests. Instead, we rely on:
-        // - Code review to verify fsync is called at the right points
-        // - The sequence test here to verify the ordering invariant
-        // - Integration tests with actual crash scenarios (manual or CI)
-
-        let dir = tempdir().unwrap();
-        let spool_dir = dir.path().join("spool");
-        let state_dir = dir.path().join("state");
-
-        // Spool an event
-        let envelope = make_pr_opened_envelope(42);
-        let delivery_id = DeliveryId::new("test-delivery");
-        spool_webhook(&spool_dir, &delivery_id, &envelope).unwrap();
-
-        let config = WorkerConfig::new(RepoId::new("owner", "repo"), &spool_dir, &state_dir);
-        let mut worker = RepoWorker::new(config).unwrap();
-
-        // Record the initial log position
-        let initial_position = worker.event_log.position().unwrap();
-
-        // Process the event
-        let result = worker.process_next().unwrap();
-        assert!(result.processed, "Event should be processed");
-
-        // After processing: log should have advanced (events written)
-        let post_process_position = worker.event_log.position().unwrap();
-        assert!(
-            post_process_position > initial_position,
-            "Event log should have events written after processing"
-        );
-
-        // Before flush: .done marker should NOT exist
-        let delivery = SpooledDelivery::new(&spool_dir, delivery_id.clone());
-        assert!(
-            !delivery.is_done(),
-            "Done marker should not exist before flush (events written but not synced)"
-        );
-
-        // After flush: event_log.sync() is called, THEN .done marker is created
-        worker.flush_pending_batch().unwrap();
-        assert!(
-            delivery.is_done(),
-            "Done marker should exist after flush (log synced)"
-        );
-
-        // Verify the event log file actually exists and has content
-        let log_path = state_dir.join(format!("events.{}.log", worker.state.log_generation));
-        assert!(log_path.exists(), "Event log file should exist");
-        let log_content = std::fs::read_to_string(&log_path).unwrap();
-        assert!(
-            !log_content.is_empty(),
-            "Event log should contain the persisted event"
-        );
-        assert!(
-            log_content.contains("pr_opened"),
-            "Event log should contain the PrOpened event"
-        );
-    }
-
-    #[test]
-    fn enqueue_skips_already_done_deliveries() {
-        // Test oracle: Deduplication - already-done deliveries are skipped
-        let dir = tempdir().unwrap();
-        let spool_dir = dir.path().join("spool");
-        let state_dir = dir.path().join("state");
-
-        // Spool and process an event
-        let envelope = make_pr_opened_envelope(42);
-        let delivery_id = DeliveryId::new("already-processed");
-        spool_webhook(&spool_dir, &delivery_id, &envelope).unwrap();
-
-        let config = WorkerConfig::new(RepoId::new("owner", "repo"), &spool_dir, &state_dir);
-        let mut worker = RepoWorker::new(config).unwrap();
-
-        // Process and flush
-        let (count, _effects) = worker.process_all().unwrap();
-        assert_eq!(count, 1);
-        assert!(worker.queue_is_empty());
-
-        // Manually construct a delivery for the same ID
-        let delivery = SpooledDelivery::new(&spool_dir, delivery_id.clone());
-        assert!(delivery.is_done(), "Delivery should be marked done");
-
-        // Try to enqueue it again - should be skipped
-        worker.enqueue(delivery).unwrap();
-        assert!(
-            worker.queue_is_empty(),
-            "Already-done delivery should not be enqueued"
-        );
-    }
-
-    #[test]
-    fn enqueue_skips_duplicate_deliveries_in_queue() {
-        // Test oracle: Deduplication - deliveries already in queue are skipped
-        let dir = tempdir().unwrap();
-        let spool_dir = dir.path().join("spool");
-        let state_dir = dir.path().join("state");
-
-        // Spool an event
-        let envelope = make_pr_opened_envelope(42);
-        let delivery_id = DeliveryId::new("test-delivery");
-        spool_webhook(&spool_dir, &delivery_id, &envelope).unwrap();
-
-        let config = WorkerConfig::new(RepoId::new("owner", "repo"), &spool_dir, &state_dir);
-        let mut worker = RepoWorker::new(config).unwrap();
-
-        // Queue should have 1 item from startup drain
-        assert_eq!(worker.queue_len(), 1);
-
-        // Try to enqueue the same delivery again
-        let delivery = SpooledDelivery::new(&spool_dir, delivery_id);
-        worker.enqueue(delivery).unwrap();
-
-        // Queue should still have only 1 item (duplicate was skipped)
-        assert_eq!(
-            worker.queue_len(),
-            1,
-            "Duplicate delivery should be skipped"
-        );
-    }
-
-    #[test]
-    fn multiple_stop_commands_maintain_fifo_order() {
-        // Test oracle: Multiple high-priority events maintain FIFO order
-        let dir = tempdir().unwrap();
-        let spool_dir = dir.path().join("spool");
-        let state_dir = dir.path().join("state");
-
-        // Spool multiple stop commands
-        for i in 0..3 {
-            let envelope = make_comment_envelope(42, "@merge-train stop");
-            let delivery_id = DeliveryId::new(format!("stop-{}", i));
-            spool_webhook(&spool_dir, &delivery_id, &envelope).unwrap();
-        }
-
-        let config = WorkerConfig::new(RepoId::new("owner", "repo"), &spool_dir, &state_dir);
-        let mut worker = RepoWorker::new(config).unwrap();
-
-        assert_eq!(worker.queue_len(), 3);
-
-        // All should be high priority and in FIFO order
-        let first = worker.queue.pop().unwrap();
-        assert_eq!(first.priority, EventPriority::High);
-        assert_eq!(first.delivery_id.as_str(), "stop-0");
-
-        let second = worker.queue.pop().unwrap();
-        assert_eq!(second.priority, EventPriority::High);
-        assert_eq!(second.delivery_id.as_str(), "stop-1");
-
-        let third = worker.queue.pop().unwrap();
-        assert_eq!(third.priority, EventPriority::High);
-        assert_eq!(third.delivery_id.as_str(), "stop-2");
-    }
-
-    #[test]
-    fn worker_processes_backlog_serially() {
-        // Test oracle: Events are processed serially (one at a time)
-        let dir = tempdir().unwrap();
-        let spool_dir = dir.path().join("spool");
-        let state_dir = dir.path().join("state");
-
-        // Spool multiple events
-        for i in 0..5 {
-            let envelope = make_pr_opened_envelope(i);
-            let delivery_id = DeliveryId::new(format!("delivery-{}", i));
-            spool_webhook(&spool_dir, &delivery_id, &envelope).unwrap();
-        }
-
-        let config = WorkerConfig::new(RepoId::new("owner", "repo"), &spool_dir, &state_dir);
-        let mut worker = RepoWorker::new(config).unwrap();
-
-        assert_eq!(worker.queue_len(), 5);
-
-        // Process one at a time and verify queue decreases
-        for remaining in (0..5).rev() {
-            let result = worker.process_next().unwrap();
-            assert!(result.processed);
-            assert_eq!(worker.queue_len(), remaining);
-        }
-
-        // Queue should be empty
-        assert!(worker.queue_is_empty());
-
-        // All deliveries should be marked done after flush
-        worker.flush_pending_batch().unwrap();
-
-        for i in 0..5 {
-            let delivery =
-                SpooledDelivery::new(&spool_dir, DeliveryId::new(format!("delivery-{}", i)));
-            assert!(delivery.is_done(), "Delivery {} should be marked done", i);
-        }
-    }
-
-    #[test]
-    fn process_all_handles_empty_queue() {
-        // Test that process_all gracefully handles empty queue
-        let dir = tempdir().unwrap();
-        let spool_dir = dir.path().join("spool");
-        let state_dir = dir.path().join("state");
-
-        let config = WorkerConfig::new(RepoId::new("owner", "repo"), &spool_dir, &state_dir);
-        let mut worker = RepoWorker::new(config).unwrap();
-
-        // Queue should be empty
-        assert!(worker.queue_is_empty());
-
-        // process_all should return (0, empty effects) without error
-        let (count, effects) = worker.process_all().unwrap();
-        assert_eq!(count, 0);
-        assert!(effects.is_empty());
-    }
-
-    #[test]
-    fn queue_push_returns_false_for_duplicates() {
-        // Test the EventQueue deduplication at the queue level
-        use crate::types::Sha;
-        use crate::webhooks::events::{GitHubEvent, PrAction, PullRequestEvent};
-
-        let mut queue = super::super::queue::EventQueue::new();
-
-        let event = GitHubEvent::PullRequest(PullRequestEvent {
-            repo: RepoId::new("owner", "repo"),
-            action: PrAction::Opened,
-            pr_number: PrNumber(42),
-            merged: false,
-            merge_commit_sha: None,
-            head_sha: Sha::parse("a".repeat(40)).unwrap(),
-            base_branch: "main".to_string(),
-            head_branch: "feature".to_string(),
-            is_draft: false,
-            author_id: 1,
-        });
-
-        // First push should succeed
-        let first = queue.push(
-            event.clone(),
-            DeliveryId::new("test-id"),
-            EventPriority::Normal,
-        );
-        assert!(first, "First push should succeed");
-
-        // Second push with same ID should fail
-        let second = queue.push(event, DeliveryId::new("test-id"), EventPriority::Normal);
-        assert!(!second, "Second push with same ID should fail");
-
-        // Queue should only have 1 item
-        assert_eq!(queue.len(), 1);
-    }
-
-    #[test]
-    fn queue_contains_tracks_queued_ids() {
-        use crate::types::Sha;
-        use crate::webhooks::events::{GitHubEvent, PrAction, PullRequestEvent};
-
-        let mut queue = super::super::queue::EventQueue::new();
-
-        let event = GitHubEvent::PullRequest(PullRequestEvent {
-            repo: RepoId::new("owner", "repo"),
-            action: PrAction::Opened,
-            pr_number: PrNumber(42),
-            merged: false,
-            merge_commit_sha: None,
-            head_sha: Sha::parse("a".repeat(40)).unwrap(),
-            base_branch: "main".to_string(),
-            head_branch: "feature".to_string(),
-            is_draft: false,
-            author_id: 1,
-        });
-
-        let delivery_id = DeliveryId::new("test-id");
-
-        // Before push: should not contain
-        assert!(!queue.contains(&delivery_id));
-
-        // After push: should contain
-        queue.push(event, delivery_id.clone(), EventPriority::Normal);
-        assert!(queue.contains(&delivery_id));
-
-        // After pop: should not contain
-        let _ = queue.pop();
-        assert!(!queue.contains(&delivery_id));
-    }
-
-    // ─── Stage 17: Polling and Timer Tests ───
-
-    #[test]
-    fn poll_config_has_sane_defaults() {
-        let config = super::super::poll::PollConfig::new();
-
-        // 10 minute poll interval
-        assert_eq!(config.poll_interval.as_secs(), 600);
-        // 5 minute wait timeout
-        assert_eq!(config.wait_timeout.as_secs(), 300);
-        // 5 second recheck interval
-        assert_eq!(config.recheck_interval.as_secs(), 5);
-        // 20% jitter
-        assert_eq!(config.jitter_percent, 20);
-    }
-
-    #[test]
-    fn time_until_next_poll_returns_none_when_no_trains() {
-        // When there are no active trains, polling shouldn't be scheduled
-        let dir = tempdir().unwrap();
-        let spool_dir = dir.path().join("spool");
-        let state_dir = dir.path().join("state");
-
-        let config = WorkerConfig::new(RepoId::new("owner", "repo"), &spool_dir, &state_dir);
-        let worker = RepoWorker::new(config).unwrap();
-
-        // No active trains means no polling needed
-        assert!(worker.state.active_trains.is_empty());
-
-        // time_until_next_poll should return None when there are no active trains
-        assert!(
-            worker.time_until_next_poll().is_none(),
-            "time_until_next_poll should return None when no trains are active"
-        );
-    }
-
-    #[test]
-    fn time_until_next_poll_returns_some_when_trains_active() {
-        // When there are active trains, polling should be scheduled
-        let dir = tempdir().unwrap();
-        let spool_dir = dir.path().join("spool");
-        let state_dir = dir.path().join("state");
-
-        let config = WorkerConfig::new(RepoId::new("owner", "repo"), &spool_dir, &state_dir);
-        let mut worker = RepoWorker::new(config).unwrap();
-
-        // Add an active train
-        let train = crate::types::TrainRecord::new(PrNumber(10));
-        worker.state.active_trains.insert(PrNumber(10), train);
-
-        // time_until_next_poll should return Some duration when trains are active
-        assert!(
-            worker.time_until_next_poll().is_some(),
-            "time_until_next_poll should return Some when trains are active"
-        );
-    }
-
-    #[test]
-    fn find_train_root_finds_root_by_current_pr() {
-        // Test that find_train_root can find a train by its current_pr
-        let dir = tempdir().unwrap();
-        let spool_dir = dir.path().join("spool");
-        let state_dir = dir.path().join("state");
-
-        let config = WorkerConfig::new(RepoId::new("owner", "repo"), &spool_dir, &state_dir);
-        let mut worker = RepoWorker::new(config).unwrap();
-
-        // Add an active train
-        let train = crate::types::TrainRecord::new(PrNumber(10));
-        worker.state.active_trains.insert(PrNumber(10), train);
-
-        // Train root should be found by root PR
-        assert_eq!(worker.find_train_root(PrNumber(10)), Some(PrNumber(10)));
-
-        // Non-existent PR should not be found
-        assert_eq!(worker.find_train_root(PrNumber(99)), None);
-    }
-
-    // ─── Stage 17: Spool Drain During Operation Tests ───
-
-    #[tokio::test]
-    async fn drain_spool_periodic_picks_up_missed_deliveries() {
-        // Test that drain_spool_periodic can recover missed deliveries
-        let dir = tempdir().unwrap();
-        let spool_dir = dir.path().join("spool");
-        let state_dir = dir.path().join("state");
-
-        let config = WorkerConfig::new(RepoId::new("owner", "repo"), &spool_dir, &state_dir);
-        let mut worker = RepoWorker::new(config).unwrap();
-
-        // Process any startup deliveries
-        let (initial_count, _) = worker.process_all().unwrap();
-        assert_eq!(initial_count, 0, "Should start empty");
-
-        // Now spool a new delivery (simulating one that was missed)
-        let envelope = make_pr_opened_envelope(99);
-        let delivery_id = DeliveryId::new("missed-delivery");
-        spool_webhook(&spool_dir, &delivery_id, &envelope).unwrap();
-
-        // Run periodic drain
-        let shutdown = CancellationToken::new();
-        let drained = worker.drain_spool_periodic(&shutdown).await.unwrap();
-        assert_eq!(drained, 1, "Should have drained the missed delivery");
-
-        // Delivery should be processed and marked done after flush
-        worker.flush_pending_batch().unwrap();
-        let delivery = SpooledDelivery::new(&spool_dir, delivery_id);
-        assert!(delivery.is_done(), "Drained delivery should be marked done");
-    }
-
-    #[tokio::test]
-    async fn drain_spool_periodic_skips_already_done() {
-        // Test that drain_spool_periodic doesn't re-process done deliveries
-        let dir = tempdir().unwrap();
-        let spool_dir = dir.path().join("spool");
-        let state_dir = dir.path().join("state");
-
-        // Spool and process a delivery first
-        let envelope = make_pr_opened_envelope(42);
-        let delivery_id = DeliveryId::new("already-done");
-        spool_webhook(&spool_dir, &delivery_id, &envelope).unwrap();
-
-        let config = WorkerConfig::new(RepoId::new("owner", "repo"), &spool_dir, &state_dir);
-        let mut worker = RepoWorker::new(config).unwrap();
-
-        // Process it
-        let (count, _) = worker.process_all().unwrap();
-        assert_eq!(count, 1);
-
-        // Now run periodic drain - should not pick it up again
-        let shutdown = CancellationToken::new();
-        let drained = worker.drain_spool_periodic(&shutdown).await.unwrap();
-        assert_eq!(drained, 0, "Already-done delivery should not be re-drained");
-    }
-
-    #[tokio::test]
-    async fn startup_backlog_re_evaluates_cascades() {
-        // Test oracle: After processing startup backlog, cascades should be
-        // re-evaluated so that replayed deliveries advance trains.
-        //
-        // This test verifies that re_evaluate_cascades_with_persistence is called
-        // after startup backlog processing. The cascade step execution is partially
-        // implemented in Stage 17, so we verify the path doesn't error and that
-        // active trains are considered.
-        let dir = tempdir().unwrap();
-        let spool_dir = dir.path().join("spool");
-        let state_dir = dir.path().join("state");
-
-        // Spool a delivery that will be in the startup backlog
-        let envelope = make_pr_opened_envelope(42);
-        let delivery_id = DeliveryId::new("startup-backlog");
-        spool_webhook(&spool_dir, &delivery_id, &envelope).unwrap();
-
-        let config = WorkerConfig::new(RepoId::new("owner", "repo"), &spool_dir, &state_dir);
-        let mut worker = RepoWorker::new(config).unwrap();
-
-        // Add an active train to verify cascade re-evaluation considers it.
-        // The train is in Running state so it will be evaluated.
-        let mut train = crate::types::TrainRecord::new(PrNumber(10));
-        train.state = crate::types::TrainState::Running;
-        worker.state.active_trains.insert(PrNumber(10), train);
-
-        // Create the stack token that would normally be created on train start
-        worker.get_or_create_stack_token(PrNumber(10));
-
-        // Process the startup backlog (simulating what happens in run())
-        let shutdown = CancellationToken::new();
-        let (count, effects) = worker.process_all().unwrap();
-        assert_eq!(count, 1, "Should process one delivery from startup backlog");
-
-        // Execute effects (which may update state)
-        if !effects.is_empty() {
-            worker.execute_effects(effects, &shutdown).await.unwrap();
-        }
-
-        // Re-evaluate cascades (the key behavior we're testing)
-        let result = worker
-            .re_evaluate_cascades_with_persistence(&shutdown, "test")
-            .await;
-        assert!(result.is_ok(), "Cascade re-evaluation should not error");
-
-        // The train should still exist (re-evaluation doesn't remove it)
-        assert!(
-            worker.state.active_trains.contains_key(&PrNumber(10)),
-            "Active train should still exist after re-evaluation"
-        );
-    }
-
-    #[tokio::test]
-    async fn periodic_spool_drain_re_evaluates_cascades() {
-        // Test oracle: After periodic spool drain processes recovered deliveries,
-        // cascades should be re-evaluated so that missed webhooks advance trains.
-        //
-        // This test uses handle_periodic_spool_drain which now includes the
-        // cascade re-evaluation call.
-        let dir = tempdir().unwrap();
-        let spool_dir = dir.path().join("spool");
-        let state_dir = dir.path().join("state");
-
-        let config = WorkerConfig::new(RepoId::new("owner", "repo"), &spool_dir, &state_dir);
-        let mut worker = RepoWorker::new(config).unwrap();
-
-        // Process any existing deliveries
-        let (initial_count, _) = worker.process_all().unwrap();
-        assert_eq!(initial_count, 0, "Should start empty");
-
-        // Add an active train
-        let mut train = crate::types::TrainRecord::new(PrNumber(10));
-        train.state = crate::types::TrainState::Running;
-        worker.state.active_trains.insert(PrNumber(10), train);
-        worker.get_or_create_stack_token(PrNumber(10));
-
-        // Now spool a new delivery (simulating one that was missed)
-        let envelope = make_pr_opened_envelope(99);
-        let delivery_id = DeliveryId::new("missed-delivery-cascade-test");
-        spool_webhook(&spool_dir, &delivery_id, &envelope).unwrap();
-
-        // Run handle_periodic_spool_drain - this should:
-        // 1. Drain the missed delivery
-        // 2. Process it
-        // 3. Execute effects
-        // 4. Re-evaluate cascades (the key behavior)
-        let shutdown = CancellationToken::new();
-        let result = worker.handle_periodic_spool_drain(&shutdown).await;
-        assert!(
-            result.is_ok(),
-            "Periodic spool drain with cascade re-evaluation should not error"
-        );
-
-        // Verify the delivery was processed
-        worker.flush_pending_batch().unwrap();
-        let delivery = SpooledDelivery::new(&spool_dir, delivery_id);
-        assert!(
-            delivery.is_done(),
-            "Drained delivery should be marked done after cascade re-evaluation"
-        );
-
-        // The active train should still exist
-        assert!(
-            worker.state.active_trains.contains_key(&PrNumber(10)),
-            "Active train should still exist after periodic drain with cascade re-evaluation"
-        );
-    }
-
-    #[test]
-    fn stop_command_immediate_cancellation() {
-        // Test that stop commands trigger immediate cancellation
-        // by checking token is cancelled after handle_immediate_cancellation_if_stop
-        let dir = tempdir().unwrap();
-        let spool_dir = dir.path().join("spool");
-        let state_dir = dir.path().join("state");
-
-        // Create a stop command delivery
-        let stop_envelope = make_comment_envelope(42, "@merge-train stop");
-        let delivery_id = DeliveryId::new("stop-command");
-        spool_webhook(&spool_dir, &delivery_id, &stop_envelope).unwrap();
-
-        let config = WorkerConfig::new(RepoId::new("owner", "repo"), &spool_dir, &state_dir)
-            .with_bot_name("merge-train");
-        let mut worker = RepoWorker::new(config).unwrap();
-
-        // Add a train that we can cancel
-        let train = crate::types::TrainRecord::new(PrNumber(42));
-        worker.state.active_trains.insert(PrNumber(42), train);
-
-        // Create a cancellation token for the train
-        let token = worker.get_or_create_stack_token(PrNumber(42));
-        assert!(
-            !token.is_cancelled(),
-            "Token should not be cancelled initially"
-        );
-
-        // Process the stop command delivery
-        let delivery = SpooledDelivery::new(&spool_dir, delivery_id);
-        worker
-            .handle_immediate_cancellation_if_stop(&delivery)
-            .unwrap();
-
-        // Token should now be cancelled
-        assert!(
-            token.is_cancelled(),
-            "Token should be cancelled after stop command"
-        );
-    }
-
     #[test]
     fn train_started_creates_cancellation_token() {
         // End-to-end test: TrainStarted event creates a cancellation token
         // that can be cancelled by a subsequent TrainStopped event.
-        //
-        // This tests the full flow without manually creating tokens.
         use crate::persistence::event::StateEventPayload;
         use crate::webhooks::handlers::HandlerResult;
 
@@ -3620,539 +2943,5 @@ mod tests {
             !worker.stack_tokens.contains_key(&PrNumber(42)),
             "Token should be removed after train stops"
         );
-    }
-
-    #[test]
-    fn existing_trains_get_tokens_at_startup() {
-        // Test that trains loaded from snapshot get cancellation tokens at startup
-        use crate::types::TrainRecord;
-
-        let dir = tempdir().unwrap();
-        let spool_dir = dir.path().join("spool");
-        let state_dir = dir.path().join("state");
-
-        // Create a snapshot with an active train
-        std::fs::create_dir_all(&state_dir).unwrap();
-        let mut snapshot = PersistedRepoSnapshot::new("main");
-        snapshot
-            .active_trains
-            .insert(PrNumber(42), TrainRecord::new(PrNumber(42)));
-        snapshot
-            .active_trains
-            .insert(PrNumber(99), TrainRecord::new(PrNumber(99)));
-        save_snapshot_atomic(&state_dir.join("snapshot.0.json"), &snapshot).unwrap();
-
-        // Create worker - it should load the snapshot and create tokens
-        let config = WorkerConfig::new(RepoId::new("owner", "repo"), &spool_dir, &state_dir);
-        let worker = RepoWorker::new(config).unwrap();
-
-        // Verify tokens were created for existing trains
-        assert!(
-            worker.stack_tokens.contains_key(&PrNumber(42)),
-            "Token should exist for train 42 loaded from snapshot"
-        );
-        assert!(
-            worker.stack_tokens.contains_key(&PrNumber(99)),
-            "Token should exist for train 99 loaded from snapshot"
-        );
-
-        // Tokens should not be cancelled initially
-        assert!(
-            !worker
-                .stack_tokens
-                .get(&PrNumber(42))
-                .unwrap()
-                .is_cancelled(),
-            "Token for train 42 should not be cancelled initially"
-        );
-        assert!(
-            !worker
-                .stack_tokens
-                .get(&PrNumber(99))
-                .unwrap()
-                .is_cancelled(),
-            "Token for train 99 should not be cancelled initially"
-        );
-    }
-
-    #[test]
-    fn critical_event_syncs_log_before_done_marker_even_when_no_pending_batch() {
-        // Test oracle: Critical events must sync the log before creating the done marker,
-        // even when pending_batch is empty. This ensures durability - if we crash after
-        // the done marker is created but before fsync, we might lose the critical event.
-        //
-        // This test verifies the fix for the bug where flush_pending_batch() early-returned
-        // when pending_batch was empty, bypassing the event_log.sync() call.
-        //
-        // The fix separates the concerns:
-        // 1. For critical events: sync log unconditionally, then mark done
-        // 2. For non-critical: batch, and flush batch syncs + marks done
-        //
-        // # What this test verifies
-        //
-        // - Log position advances after processing (events written)
-        // - Done marker exists after processing
-        // - Train state was updated (event applied)
-        // - Log file contains the TrainStarted event
-        //
-        // # What this test does NOT verify
-        //
-        // - Actual fsync syscall ordering (would require filesystem instrumentation
-        //   or crash simulation with process kill)
-        // - That done marker creation happens strictly AFTER fsync completes
-        //
-        // The ordering guarantee comes from code review of the implementation:
-        // `apply_handler_result` calls `event_log.sync()` for critical events
-        // BEFORE calling `mark_done()`. This test verifies the observable
-        // consequences; the actual fsync ordering is a code-level invariant.
-
-        let dir = tempdir().unwrap();
-        let spool_dir = dir.path().join("spool");
-        let state_dir = dir.path().join("state");
-
-        // Create a start command envelope that will trigger TrainStarted (critical)
-        let envelope = make_comment_envelope(42, "@merge-train start");
-        let delivery_id = DeliveryId::new("critical-test");
-        spool_webhook(&spool_dir, &delivery_id, &envelope).unwrap();
-
-        // We also need a PR in state for the start command to work
-        let config = WorkerConfig::new(RepoId::new("owner", "repo"), &spool_dir, &state_dir)
-            .with_bot_name("merge-train");
-        let mut worker = RepoWorker::new(config).unwrap();
-
-        // Add a PR to state so the start command can work
-        let cached_pr = crate::types::CachedPr::new(
-            PrNumber(42),
-            crate::types::Sha::parse("a".repeat(40)).unwrap(),
-            "feature".to_string(),
-            "main".to_string(), // targets main, so it's a root
-            None,               // no predecessor
-            crate::types::PrState::Open,
-            crate::types::MergeStateStatus::Clean,
-            false,
-        );
-        worker.state.prs.insert(PrNumber(42), cached_pr);
-
-        // Ensure pending_batch is empty before we start
-        assert!(
-            worker.pending_batch.is_empty(),
-            "pending_batch should be empty initially"
-        );
-
-        // Record the initial log position
-        let initial_position = worker.event_log.position().unwrap();
-
-        // Process the event
-        let result = worker.process_next().unwrap();
-        assert!(result.processed, "Event should be processed");
-
-        // After processing: log should have advanced (events written)
-        let post_process_position = worker.event_log.position().unwrap();
-        assert!(
-            post_process_position > initial_position,
-            "Event log should have events written after processing"
-        );
-
-        // For critical events, the done marker should be created immediately
-        // (no batching), and the log should have been synced before that.
-        let delivery = SpooledDelivery::new(&spool_dir, delivery_id.clone());
-        assert!(
-            delivery.is_done(),
-            "Done marker should exist immediately after critical event is processed"
-        );
-
-        // Verify the train was actually started (the critical event was applied)
-        assert!(
-            worker.state.active_trains.contains_key(&PrNumber(42)),
-            "Train should be active after start command (TrainStarted event applied)"
-        );
-
-        // Verify the event log contains the TrainStarted event
-        let log_path = state_dir.join(format!("events.{}.log", worker.state.log_generation));
-        assert!(log_path.exists(), "Event log file should exist");
-        let log_content = std::fs::read_to_string(&log_path).unwrap();
-        assert!(
-            log_content.contains("train_started"),
-            "Event log should contain the TrainStarted event: {}",
-            log_content
-        );
-    }
-
-    #[test]
-    fn poll_response_updates_cached_pr_state() {
-        // Test oracle: When process_github_response receives a PrRefetched response,
-        // the cached PR should be updated with the new data from GitHub.
-        //
-        // This is essential for poll-based recovery: when webhooks are missed,
-        // polling refetches PR data and the response updates local state.
-        use crate::effects::PrData;
-
-        let dir = tempdir().unwrap();
-        let spool_dir = dir.path().join("spool");
-        let state_dir = dir.path().join("state");
-
-        let config = WorkerConfig::new(RepoId::new("owner", "repo"), &spool_dir, &state_dir);
-        let mut worker = RepoWorker::new(config).unwrap();
-
-        // Add a PR to state with initial values
-        let initial_sha = crate::types::Sha::parse("a".repeat(40)).unwrap();
-        let cached_pr = crate::types::CachedPr::new(
-            PrNumber(42),
-            initial_sha.clone(),
-            "feature".to_string(),
-            "main".to_string(),
-            None,
-            crate::types::PrState::Open,
-            crate::types::MergeStateStatus::Unknown,
-            false,
-        );
-        worker.state.prs.insert(PrNumber(42), cached_pr);
-
-        // Simulate a PrRefetched response with updated data
-        let new_sha = crate::types::Sha::parse("b".repeat(40)).unwrap();
-        let response = crate::effects::GitHubResponse::PrRefetched {
-            pr: PrData {
-                number: PrNumber(42),
-                head_sha: new_sha.clone(),
-                head_ref: "feature-updated".to_string(),
-                base_ref: "develop".to_string(),
-                state: crate::types::PrState::Open,
-                is_draft: true,
-            },
-            merge_state: crate::types::MergeStateStatus::Clean,
-        };
-
-        // Process the response
-        worker.process_github_response(response);
-
-        // Verify the cached PR was updated
-        let updated_pr = worker.state.prs.get(&PrNumber(42)).unwrap();
-        assert_eq!(updated_pr.head_sha, new_sha, "head_sha should be updated");
-        assert_eq!(
-            updated_pr.head_ref, "feature-updated",
-            "head_ref should be updated"
-        );
-        assert_eq!(updated_pr.base_ref, "develop", "base_ref should be updated");
-        assert!(updated_pr.is_draft, "is_draft should be updated");
-        assert_eq!(
-            updated_pr.merge_state_status,
-            crate::types::MergeStateStatus::Clean,
-            "merge_state_status should be updated"
-        );
-    }
-
-    #[test]
-    fn poll_response_creates_new_pr_if_not_cached() {
-        // Test oracle: When process_github_response receives a PrRefetched response
-        // for a PR that isn't in the cache, it should create a new entry.
-        //
-        // This can happen during bootstrap or if a PR was created while
-        // the bot was offline.
-        use crate::effects::PrData;
-
-        let dir = tempdir().unwrap();
-        let spool_dir = dir.path().join("spool");
-        let state_dir = dir.path().join("state");
-
-        let config = WorkerConfig::new(RepoId::new("owner", "repo"), &spool_dir, &state_dir);
-        let mut worker = RepoWorker::new(config).unwrap();
-
-        // Verify PR 42 doesn't exist initially
-        assert!(!worker.state.prs.contains_key(&PrNumber(42)));
-
-        // Simulate a PrRefetched response for a new PR
-        let sha = crate::types::Sha::parse("c".repeat(40)).unwrap();
-        let response = crate::effects::GitHubResponse::PrRefetched {
-            pr: PrData {
-                number: PrNumber(42),
-                head_sha: sha.clone(),
-                head_ref: "new-feature".to_string(),
-                base_ref: "main".to_string(),
-                state: crate::types::PrState::Open,
-                is_draft: false,
-            },
-            merge_state: crate::types::MergeStateStatus::Clean,
-        };
-
-        // Process the response
-        worker.process_github_response(response);
-
-        // Verify the PR was created
-        assert!(
-            worker.state.prs.contains_key(&PrNumber(42)),
-            "PR should be created"
-        );
-        let created_pr = worker.state.prs.get(&PrNumber(42)).unwrap();
-        assert_eq!(created_pr.head_sha, sha);
-        assert_eq!(created_pr.head_ref, "new-feature");
-        assert_eq!(created_pr.base_ref, "main");
-        assert!(!created_pr.is_draft);
-        assert_eq!(
-            created_pr.merge_state_status,
-            crate::types::MergeStateStatus::Clean
-        );
-        // Predecessor is not discovered via API, so it should be None
-        assert!(created_pr.predecessor.is_none());
-    }
-
-    // ─── Stage 17: Cascade Evaluation and Phase Transition Tests ───
-
-    #[test]
-    fn late_addition_scan_detects_orphaned_prs() {
-        // Test oracle: During poll, PRs whose predecessor is merged but base_ref
-        // hasn't been retargeted should be detected as late additions.
-        //
-        // Per DESIGN.md: "scan for PRs whose predecessor is merged but whose
-        // base_ref hasn't been retargeted"
-        //
-        // This test uses the actual find_late_additions() helper that
-        // handle_poll_active_trains uses, ensuring we test the real code path.
-
-        let dir = tempdir().unwrap();
-        let spool_dir = dir.path().join("spool");
-        let state_dir = dir.path().join("state");
-
-        let config = WorkerConfig::new(RepoId::new("owner", "repo"), &spool_dir, &state_dir);
-        let mut worker = RepoWorker::new(config).unwrap();
-
-        // Add predecessor PR (merged)
-        let merge_sha = crate::types::Sha::parse("a".repeat(40)).unwrap();
-        let pred_pr = crate::types::CachedPr::new(
-            PrNumber(1),
-            crate::types::Sha::parse("b".repeat(40)).unwrap(),
-            "feature-1".to_string(),
-            "main".to_string(),
-            None,
-            crate::types::PrState::Merged {
-                merge_commit_sha: merge_sha,
-            },
-            crate::types::MergeStateStatus::Unknown,
-            false,
-        );
-        worker.state.prs.insert(PrNumber(1), pred_pr);
-
-        // Add descendant PR (still targets feature-1, not main)
-        let mut desc_pr = crate::types::CachedPr::new(
-            PrNumber(2),
-            crate::types::Sha::parse("c".repeat(40)).unwrap(),
-            "feature-2".to_string(),
-            "feature-1".to_string(), // NOT retargeted to main yet
-            Some(PrNumber(1)),       // predecessor declared
-            crate::types::PrState::Open,
-            crate::types::MergeStateStatus::Unknown,
-            false,
-        );
-        desc_pr.predecessor = Some(PrNumber(1));
-        worker.state.prs.insert(PrNumber(2), desc_pr);
-
-        // Use the actual helper function that handle_poll_active_trains uses
-        let late_additions = worker.find_late_additions();
-
-        assert_eq!(late_additions.len(), 1, "Should detect one late addition");
-        assert_eq!(
-            late_additions[0].0,
-            PrNumber(2),
-            "PR #2 should be the late addition"
-        );
-        assert_eq!(
-            late_additions[0].1,
-            PrNumber(1),
-            "Predecessor should be PR #1"
-        );
-    }
-
-    #[test]
-    fn manually_retargeted_scan_detects_dangerous_prs() {
-        // Test oracle: PRs that were manually retargeted to default_branch before
-        // reconciliation should be detected as dangerous.
-        //
-        // Per DESIGN.md: "scan catches PRs that were manually retargeted before
-        // reconciliation could run"
-        //
-        // This test uses the actual find_manually_retargeted() helper that
-        // handle_poll_active_trains uses, ensuring we test the real code path.
-
-        let dir = tempdir().unwrap();
-        let spool_dir = dir.path().join("spool");
-        let state_dir = dir.path().join("state");
-
-        let config = WorkerConfig::new(RepoId::new("owner", "repo"), &spool_dir, &state_dir);
-        let mut worker = RepoWorker::new(config).unwrap();
-
-        // Add predecessor PR (merged)
-        let merge_sha = crate::types::Sha::parse("a".repeat(40)).unwrap();
-        let pred_pr = crate::types::CachedPr::new(
-            PrNumber(1),
-            crate::types::Sha::parse("b".repeat(40)).unwrap(),
-            "feature-1".to_string(),
-            "main".to_string(),
-            None,
-            crate::types::PrState::Merged {
-                merge_commit_sha: merge_sha,
-            },
-            crate::types::MergeStateStatus::Unknown,
-            false,
-        );
-        worker.state.prs.insert(PrNumber(1), pred_pr);
-
-        // Add descendant PR (manually retargeted to main, NOT reconciled)
-        let mut desc_pr = crate::types::CachedPr::new(
-            PrNumber(2),
-            crate::types::Sha::parse("c".repeat(40)).unwrap(),
-            "feature-2".to_string(),
-            "main".to_string(), // Already retargeted to main
-            Some(PrNumber(1)),  // predecessor declared
-            crate::types::PrState::Open,
-            crate::types::MergeStateStatus::Clean,
-            false,
-        );
-        desc_pr.predecessor = Some(PrNumber(1));
-        desc_pr.predecessor_squash_reconciled = None; // NOT reconciled!
-        worker.state.prs.insert(PrNumber(2), desc_pr);
-
-        // Use the actual helper function that handle_poll_active_trains uses
-        let dangerous = worker.find_manually_retargeted();
-
-        assert_eq!(dangerous.len(), 1, "Should detect one dangerous PR");
-        assert_eq!(
-            dangerous[0].0,
-            PrNumber(2),
-            "PR #2 should be the dangerous one"
-        );
-        assert_eq!(dangerous[0].1, PrNumber(1), "Predecessor should be PR #1");
-    }
-
-    #[test]
-    fn properly_reconciled_pr_is_not_flagged() {
-        // Test oracle: A PR that was properly reconciled (even if retargeted)
-        // should NOT be flagged as dangerous.
-        //
-        // This test uses the actual find_manually_retargeted() helper that
-        // handle_poll_active_trains uses, ensuring we test the real code path.
-
-        let dir = tempdir().unwrap();
-        let spool_dir = dir.path().join("spool");
-        let state_dir = dir.path().join("state");
-
-        let config = WorkerConfig::new(RepoId::new("owner", "repo"), &spool_dir, &state_dir);
-        let mut worker = RepoWorker::new(config).unwrap();
-
-        // Add predecessor PR (merged)
-        let merge_sha = crate::types::Sha::parse("a".repeat(40)).unwrap();
-        let pred_pr = crate::types::CachedPr::new(
-            PrNumber(1),
-            crate::types::Sha::parse("b".repeat(40)).unwrap(),
-            "feature-1".to_string(),
-            "main".to_string(),
-            None,
-            crate::types::PrState::Merged {
-                merge_commit_sha: merge_sha.clone(),
-            },
-            crate::types::MergeStateStatus::Unknown,
-            false,
-        );
-        worker.state.prs.insert(PrNumber(1), pred_pr);
-
-        // Add descendant PR (retargeted and properly reconciled)
-        let mut desc_pr = crate::types::CachedPr::new(
-            PrNumber(2),
-            crate::types::Sha::parse("c".repeat(40)).unwrap(),
-            "feature-2".to_string(),
-            "main".to_string(),
-            Some(PrNumber(1)),
-            crate::types::PrState::Open,
-            crate::types::MergeStateStatus::Clean,
-            false,
-        );
-        desc_pr.predecessor = Some(PrNumber(1));
-        desc_pr.predecessor_squash_reconciled = Some(merge_sha); // Properly reconciled
-        worker.state.prs.insert(PrNumber(2), desc_pr);
-
-        // Use the actual helper function - this PR should NOT be flagged
-        let dangerous = worker.find_manually_retargeted();
-
-        assert!(dangerous.is_empty(), "Reconciled PR should not be flagged");
-    }
-
-    #[test]
-    fn phase_transition_persistence_updates_train_in_state() {
-        // Test oracle: When a PhaseTransition event is applied to state,
-        // the train's current_pr, last_squash_sha, and cascade_phase
-        // should all be updated.
-        //
-        // This verifies that re_evaluate_cascades_with_persistence properly
-        // persists and applies phase transitions.
-
-        let dir = tempdir().unwrap();
-        let spool_dir = dir.path().join("spool");
-        let state_dir = dir.path().join("state");
-
-        let config = WorkerConfig::new(RepoId::new("owner", "repo"), &spool_dir, &state_dir);
-        let mut worker = RepoWorker::new(config).unwrap();
-
-        // Add an active train
-        let train = crate::types::TrainRecord::new(PrNumber(10));
-        worker.state.active_trains.insert(PrNumber(10), train);
-
-        // Create a PhaseTransition event
-        let squash_sha = crate::types::Sha::parse("d".repeat(40)).unwrap();
-        let new_phase = crate::types::CascadePhase::Reconciling {
-            progress: crate::types::DescendantProgress::new(vec![]),
-            squash_sha: squash_sha.clone(),
-        };
-
-        let event = worker
-            .event_log
-            .append(
-                crate::persistence::event::StateEventPayload::PhaseTransition {
-                    train_root: PrNumber(10),
-                    current_pr: PrNumber(11),
-                    predecessor_pr: Some(PrNumber(10)),
-                    last_squash_sha: Some(squash_sha.clone()),
-                    phase: new_phase.clone(),
-                    state: None,
-                    wait_condition: None,
-                },
-            )
-            .unwrap();
-
-        // Apply the event to state
-        apply_event_to_state(&mut worker.state, &event);
-
-        // Verify the train was updated
-        let updated_train = worker.state.active_trains.get(&PrNumber(10)).unwrap();
-        assert_eq!(
-            updated_train.current_pr,
-            PrNumber(11),
-            "current_pr should be updated"
-        );
-        assert_eq!(
-            updated_train.last_squash_sha,
-            Some(squash_sha),
-            "last_squash_sha should be updated"
-        );
-        assert_eq!(
-            updated_train.cascade_phase.name(),
-            "reconciling",
-            "cascade_phase should be updated to Reconciling"
-        );
-    }
-
-    #[test]
-    fn wait_timeout_is_configurable() {
-        // Test oracle: The wait timeout should be derived from PollConfig,
-        // not hardcoded. This verifies the fix for the "Non-blocking wait timers
-        // are wired but unused, and timeout is hardcoded" issue.
-
-        let default_config = super::super::poll::PollConfig::new();
-        let custom_config = super::super::poll::PollConfig::new().with_wait_timeout(
-            std::time::Duration::from_secs(600), // 10 minutes
-        );
-
-        // Default should be 5 minutes
-        assert_eq!(default_config.wait_timeout.as_secs(), 300);
-
-        // Custom should be 10 minutes
-        assert_eq!(custom_config.wait_timeout.as_secs(), 600);
     }
 }

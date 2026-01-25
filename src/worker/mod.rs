@@ -31,6 +31,9 @@ mod queue;
 #[allow(clippy::module_inception)]
 mod worker;
 
+#[cfg(test)]
+mod tests;
+
 pub use dispatch::{Dispatcher, DispatcherConfig};
 pub use effects::{EffectError, EffectExecutor, EffectResult};
 pub use message::WorkerMessage;
