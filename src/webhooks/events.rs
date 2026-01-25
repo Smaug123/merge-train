@@ -70,8 +70,6 @@ impl GitHubEvent {
     /// Returns `None` for events where we can't generate a complete key:
     /// - `issue_comment.edited` (needs `updated_at` timestamp)
     /// - `pull_request.edited` (needs `updated_at` timestamp)
-    /// - `check_suite.*` (needs `suite_id` and `updated_at`)
-    /// - `pull_request_review.*` (needs `review_id`)
     ///
     /// For these events, deduplication relies on the delivery ID and `.done`
     /// marker checks.
@@ -126,13 +124,30 @@ impl GitHubEvent {
                 };
                 Some(DedupeKey::status(&e.sha, &e.context, state_str))
             }
-            GitHubEvent::CheckSuite(_) => {
-                // Would need suite_id and updated_at, which we don't have
-                None
+            GitHubEvent::CheckSuite(e) => {
+                let action_str = match e.action {
+                    CheckSuiteAction::Created => "created",
+                    CheckSuiteAction::Requested => "requested",
+                    CheckSuiteAction::Rerequested => "rerequested",
+                    CheckSuiteAction::Completed => "completed",
+                };
+                Some(DedupeKey::check_suite(
+                    e.suite_id,
+                    action_str,
+                    &e.updated_at,
+                ))
             }
-            GitHubEvent::PullRequestReview(_) => {
-                // Would need review_id, which we don't have in the parsed event
-                None
+            GitHubEvent::PullRequestReview(e) => {
+                let action_str = match e.action {
+                    ReviewAction::Submitted => "submitted",
+                    ReviewAction::Dismissed => "dismissed",
+                    ReviewAction::Edited => "edited",
+                };
+                Some(DedupeKey::pull_request_review(
+                    e.pr_number,
+                    e.review_id,
+                    action_str,
+                ))
             }
         }
     }
@@ -251,6 +266,9 @@ pub struct CheckSuiteEvent {
     /// The action that triggered this event.
     pub action: CheckSuiteAction,
 
+    /// The check suite's unique ID.
+    pub suite_id: u64,
+
     /// The head SHA this check suite is for.
     pub head_sha: Sha,
 
@@ -265,6 +283,12 @@ pub struct CheckSuiteEvent {
     /// A check suite can be associated with multiple PRs if the same commit
     /// is the head of multiple PRs.
     pub pull_requests: Vec<PrNumber>,
+
+    /// When the check suite was last updated.
+    ///
+    /// Used for deduplication: reruns of a suite share the same ID, so
+    /// `updated_at` distinguishes different runs.
+    pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Action for check suite events.
@@ -371,6 +395,11 @@ pub struct PullRequestReviewEvent {
 
     /// The PR number.
     pub pr_number: PrNumber,
+
+    /// The review's unique ID.
+    ///
+    /// Used for deduplication: each review submission has a unique ID.
+    pub review_id: u64,
 
     /// The state of the review.
     pub state: ReviewState,
@@ -530,19 +559,22 @@ mod tests {
         (
             arb_repo_id(),
             arb_check_suite_action(),
+            1u64..1000000u64,
             arb_sha(),
             proptest::option::of("[a-z_]{1,20}"),
             proptest::collection::vec(1u64..10000u64, 0..3),
         )
-            .prop_map(
-                |(repo, action, head_sha, conclusion, prs)| CheckSuiteEvent {
+            .prop_map(|(repo, action, suite_id, head_sha, conclusion, prs)| {
+                CheckSuiteEvent {
                     repo,
                     action,
+                    suite_id,
                     head_sha,
                     conclusion,
                     pull_requests: prs.into_iter().map(PrNumber).collect(),
-                },
-            )
+                    updated_at: chrono::Utc::now(),
+                }
+            })
     }
 
     fn arb_status_event() -> impl Strategy<Value = StatusEvent> {
@@ -571,17 +603,19 @@ mod tests {
             arb_repo_id(),
             arb_review_action(),
             1u64..10000u64,
+            1u64..1000000u64,
             arb_review_state(),
             1u64..1000000u64,
             "[a-z][a-z0-9]{0,15}",
             "[a-zA-Z0-9 ]{0,100}",
         )
             .prop_map(
-                |(repo, action, pr_number, state, reviewer_id, reviewer_login, body)| {
+                |(repo, action, pr_number, review_id, state, reviewer_id, reviewer_login, body)| {
                     PullRequestReviewEvent {
                         repo,
                         action,
                         pr_number: PrNumber(pr_number),
+                        review_id,
                         state,
                         reviewer_id,
                         reviewer_login,

@@ -30,29 +30,27 @@ use crate::webhooks::priority::EventPriority;
 ///
 /// # Implemented vs Planned
 ///
-/// Currently only `CheckSuiteCompleted` is scheduled by the worker when entering
-/// the `WaitingCi` state. The other variants are defined for future use:
+/// - `CheckSuiteCompleted`: **Implemented.** Scheduled when entering the
+///   `WaitingCi` state after a cascade step. Enables 5-second re-checks
+///   for CI completion detection.
 ///
-/// - `HeadRefOid`: Will be scheduled after push operations to wait for GitHub
-///   to update the PR's headRefOid. This handles eventual consistency where
-///   GitHub's API may return stale data immediately after a push.
+/// - `MergeStateStatus`: **Implemented.** Scheduled when the train is blocked
+///   with `BlockReason::Unknown` (GitHub hasn't computed merge state yet).
+///   Enables rapid re-checking until GitHub computes the mergeable status.
 ///
-/// - `MergeStateStatus`: Will be scheduled when merge state is `Unknown` to
-///   wait for GitHub to compute the mergeable status. This handles the delay
-///   between PR updates and GitHub's merge conflict computation.
-///
-/// These wait conditions are not yet scheduled because:
-/// 1. Stage 17 focuses on correctness of the core cascade logic
-/// 2. The poll fallback (10-minute interval) catches these cases eventually
-/// 3. Full implementation requires integration with Stage 18's git operations
+/// - `HeadRefOid`: **Planned (Stage 18).** Will be scheduled after push
+///   operations to wait for GitHub to update the PR's headRefOid. This
+///   handles eventual consistency where GitHub's API may return stale data
+///   immediately after a push. Until implemented, the poll fallback
+///   (10-minute interval) handles this case.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WaitCondition {
     /// Waiting for headRefOid to match after a push.
     ///
-    /// **Status**: Defined but not yet scheduled. The infrastructure exists for
-    /// persistence and timer handling, but no code path currently creates this
-    /// condition. Rely on poll fallback until Stage 18 git integration.
+    /// **Status**: Planned (Stage 18). The infrastructure exists for persistence
+    /// and timer handling, but no code path currently creates this condition.
+    /// Rely on poll fallback until Stage 18 git integration.
     HeadRefOid {
         pr: PrNumber,
         expected: Sha,
@@ -61,9 +59,9 @@ pub enum WaitCondition {
 
     /// Waiting for mergeStateStatus to change from a specific value.
     ///
-    /// **Status**: Defined but not yet scheduled. Would be useful after detecting
-    /// `Unknown` merge state to expedite re-evaluation, but currently relies on
-    /// poll fallback and webhook-triggered re-evaluation.
+    /// **Status**: Implemented. Scheduled when a train is blocked with
+    /// `BlockReason::Unknown` (GitHub hasn't computed merge state yet).
+    /// Enables rapid re-checking until GitHub computes the mergeable status.
     MergeStateStatus {
         pr: PrNumber,
         not: MergeStateStatus,
@@ -72,7 +70,7 @@ pub enum WaitCondition {
 
     /// Waiting for check suite to complete for a specific SHA.
     ///
-    /// **Status**: Actively used. Scheduled when entering `WaitingCi` state after
+    /// **Status**: Implemented. Scheduled when entering `WaitingCi` state after
     /// a cascade step. Enables 5-second re-checks for CI completion detection.
     CheckSuiteCompleted { sha: Sha, retry_count: u32 },
 }

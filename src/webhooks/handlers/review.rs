@@ -161,6 +161,7 @@ mod tests {
             repo: RepoId::new("owner", "repo"),
             action,
             pr_number: PrNumber(pr_number),
+            review_id: 67890,
             state,
             reviewer_id: 12345,
             reviewer_login: "reviewer".to_string(),

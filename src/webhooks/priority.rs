@@ -159,9 +159,11 @@ mod tests {
         GitHubEvent::CheckSuite(CheckSuiteEvent {
             repo: RepoId::new("owner", "repo"),
             action: CheckSuiteAction::Completed,
+            suite_id: 12345,
             head_sha: Sha::parse("c".repeat(40)).unwrap(),
             conclusion: Some("success".to_string()),
             pull_requests: vec![PrNumber(42)],
+            updated_at: chrono::Utc::now(),
         })
     }
 
@@ -181,6 +183,7 @@ mod tests {
             repo: RepoId::new("owner", "repo"),
             action: ReviewAction::Submitted,
             pr_number: PrNumber(42),
+            review_id: 67890,
             state: ReviewState::Approved,
             reviewer_id: 100,
             reviewer_login: "reviewer".to_string(),

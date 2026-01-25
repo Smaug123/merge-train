@@ -30,32 +30,43 @@
 //!
 //! # Stop Cancellation Semantics
 //!
-//! Stop commands (`@merge-train stop`) cancel in-flight cascade operations via
-//! out-of-band cancellation. Per DESIGN.md: "Sends a `CancelStackRequest`
-//! (containing the PR number) to the worker via a separate channel."
+//! Stop commands (`@merge-train stop`) cancel cascade operations via token
+//! cancellation. There are two paths:
 //!
-//! 1. **Separate high-priority channel**: The dispatcher sends cancellation
-//!    requests via an unbounded channel (`cancel_rx`) that's checked in the
-//!    worker's event loop separately from the main message channel.
+//! ## Normal Stop Flow (via webhook)
 //!
-//! 2. **Immediate token cancellation**: When a cancellation request is received,
-//!    the worker immediately cancels the stack's `CancellationToken`.
+//! 1. Stop command arrives as webhook, gets spooled and dispatched
+//! 2. Handler validates the command and produces `TrainStopped` event
+//! 3. In `apply_handler_result`, when `TrainStopped` is processed, the token
+//!    is cancelled synchronously
+//! 4. Effects are executed AFTER step 3, so they see the cancelled token
+//!    and skip execution
 //!
-//! 3. **Effect-level cancellation checking**: Effects check the token's cancelled
-//!    state before each effect execution. This means:
-//!    - Effects that haven't started yet will be skipped
-//!    - An effect that's currently executing will complete before the next check
+//! This ensures authorization before cancellation - unauthorized commenters
+//! cannot interrupt operations.
 //!
-//! **Practical implications**:
-//! - Stop commands get high priority in the queue, ensuring prompt processing
-//! - Token cancellation only happens AFTER the handler validates the stop command
-//!   and produces a TrainStopped event - this prevents unauthorized cancellation
-//! - Each effect batch checks the token before each effect, not within effects
+//! ## External Cancellation (via cancel channel)
+//!
+//! A separate high-priority channel (`cancel_rx`) exists for out-of-band
+//! cancellation. When a request arrives on this channel:
+//! 1. The worker immediately cancels the stack's `CancellationToken`
+//! 2. No validation is performed (caller is trusted)
+//!
+//! This channel is currently unused in the normal webhook flow but is
+//! available for:
+//! - Admin-level emergency cancellation
+//! - Testing scenarios
+//! - Future features requiring immediate cancellation
+//!
+//! ## Cancellation Behavior
+//!
+//! - Effects check `is_cancelled()` before each effect, not mid-effect
+//! - An effect that's executing will complete before the next check
 //! - Each stack has its own token, so stopping one train doesn't affect others
 //!
-//! **Known limitation**: When effects are executing, the worker cannot poll `cancel_rx`
-//! until the effect batch completes. Cancellation is checked at effect boundaries but
-//! cannot interrupt long-running individual effects.
+//! **Known limitation**: When effects are executing, the worker cannot poll
+//! messages until the effect batch completes. Individual effects (like git push)
+//! run to completion once started.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -120,6 +131,24 @@ pub enum WorkerError {
     /// IO error.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+impl WorkerError {
+    /// Returns true if this is a persistence failure that requires fail-stop.
+    ///
+    /// Persistence failures (event log, snapshot) are fatal because continuing
+    /// without durable state could lead to incorrect behavior on restart.
+    /// The worker should stop and leave `.proc` markers in place so the
+    /// delivery is re-processed after restart.
+    ///
+    /// Non-persistence failures (handler logic, parsing, effects) are
+    /// recoverable - the delivery is marked done and processing continues.
+    pub fn is_persistence_failure(&self) -> bool {
+        matches!(
+            self,
+            WorkerError::EventLog(_) | WorkerError::Snapshot(_) | WorkerError::Io(_)
+        )
+    }
 }
 
 /// Result type for worker operations.
@@ -765,7 +794,14 @@ impl RepoWorker {
                         }
                         Some(msg) => {
                             if let Err(e) = self.handle_message(msg, &shutdown).await {
-                                error!(error = %e, "Error handling message");
+                                if e.is_persistence_failure() {
+                                    // Fatal: persistence failure means we can't guarantee
+                                    // correctness after restart. Stop the worker and leave
+                                    // .proc markers so deliveries are re-processed.
+                                    error!(error = %e, "Persistence failure, stopping worker");
+                                    return Err(e);
+                                }
+                                error!(error = %e, "Error handling message (continuing)");
                             }
                         }
                         None => {
@@ -787,19 +823,31 @@ impl RepoWorker {
                     if self.should_poll()
                         && let Err(e) = self.handle_poll_active_trains().await
                     {
-                        error!(error = %e, "Error during poll");
+                        if e.is_persistence_failure() {
+                            error!(error = %e, "Persistence failure during poll, stopping worker");
+                            return Err(e);
+                        }
+                        error!(error = %e, "Error during poll (continuing)");
                     }
 
                     // Check if it's time for periodic spool drain (always active)
                     if self.should_drain_spool()
                         && let Err(e) = self.handle_periodic_spool_drain(&shutdown).await
                     {
-                        error!(error = %e, "Error during periodic spool drain");
+                        if e.is_persistence_failure() {
+                            error!(error = %e, "Persistence failure during spool drain, stopping worker");
+                            return Err(e);
+                        }
+                        error!(error = %e, "Error during periodic spool drain (continuing)");
                     }
 
                     // Fire any expired timers
                     if let Err(e) = self.fire_expired_timers(&shutdown).await {
-                        error!(error = %e, "Error firing timers");
+                        if e.is_persistence_failure() {
+                            error!(error = %e, "Persistence failure firing timers, stopping worker");
+                            return Err(e);
+                        }
+                        error!(error = %e, "Error firing timers (continuing)");
                     }
                 }
             }
@@ -1507,6 +1555,10 @@ impl RepoWorker {
                 apply_event_to_state(&mut self.state, &event);
                 self.event_log.sync()?;
                 debug!(train_root = %train_root, "Train completed (persisted)");
+
+                // Remove cancellation token and timers for completed train
+                self.stack_tokens.remove(&train_root);
+                self.pending_timers.retain(|t| t.train_root != train_root);
             } else if train_aborted {
                 // Train aborted - persist with error
                 // The error should be present when train is aborted; use a default if somehow missing.
@@ -1531,30 +1583,38 @@ impl RepoWorker {
                 // We persist state changes (e.g., Running -> WaitingCi) so that
                 // after restart we know we were waiting and can restore timers.
 
-                // Compute wait_condition if we're entering WaitingCi state.
+                // Compute wait_condition based on the step outcome.
                 // This must happen BEFORE persistence so it's captured in the event.
                 //
-                // Currently only CheckSuiteCompleted is scheduled. HeadRefOid and
-                // MergeStateStatus wait conditions are defined in queue.rs for future
-                // use but not yet implemented:
-                // - HeadRefOid: Needed after git push to wait for GitHub to update
-                //   PR headRefOid (eventual consistency handling)
-                // - MergeStateStatus: Needed when merge state is Unknown to wait for
-                //   GitHub to compute mergeable status
+                // Wait conditions enable non-blocking polling: instead of relying solely
+                // on webhooks or the 10-minute poll interval, we schedule short-interval
+                // rechecks to detect GitHub state propagation.
                 //
-                // Until these are implemented, the poll fallback (10-minute interval)
-                // handles eventual consistency cases. See queue.rs WaitCondition docs.
-                let wait_condition =
-                    if let CascadeStepOutcome::WaitingOnCi { pr_number } = &step_result.outcome {
+                // - CheckSuiteCompleted: Scheduled when entering WaitingCi state
+                // - MergeStateStatus: Scheduled when blocked with Unknown merge state
+                // - HeadRefOid: Not yet implemented (needs Stage 18 git integration)
+                //
+                // See queue.rs WaitCondition docs for implementation status.
+                use crate::types::{BlockReason, MergeStateStatus};
+                let wait_condition = match &step_result.outcome {
+                    CascadeStepOutcome::WaitingOnCi { pr_number } => {
                         self.state.prs.get(pr_number).map(|pr| {
                             crate::types::PersistedWaitCondition::CheckSuiteCompleted {
                                 sha: pr.head_sha.clone(),
                                 retry_count: 0,
                             }
                         })
-                    } else {
-                        None
-                    };
+                    }
+                    CascadeStepOutcome::Blocked {
+                        pr_number,
+                        reason: BlockReason::Unknown,
+                    } => Some(crate::types::PersistedWaitCondition::MergeStateStatus {
+                        pr: *pr_number,
+                        not: MergeStateStatus::Unknown,
+                        retry_count: 0,
+                    }),
+                    _ => None,
+                };
 
                 let event = self.event_log.append(StateEventPayload::PhaseTransition {
                     train_root,

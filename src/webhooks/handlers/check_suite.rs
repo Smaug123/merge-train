@@ -125,6 +125,7 @@ mod tests {
         CheckSuiteEvent {
             repo: RepoId::new("owner", "repo"),
             action,
+            suite_id: 12345,
             head_sha: Sha::parse(sha).unwrap(),
             conclusion: if action == CheckSuiteAction::Completed {
                 Some("success".to_string())
@@ -132,6 +133,7 @@ mod tests {
                 None
             },
             pull_requests: prs.into_iter().map(PrNumber).collect(),
+            updated_at: chrono::Utc::now(),
         }
     }
 

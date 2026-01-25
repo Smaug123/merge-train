@@ -280,9 +280,11 @@ struct RawCheckSuitePayload {
 
 #[derive(Debug, Deserialize)]
 struct RawCheckSuite {
+    id: u64,
     head_sha: String,
     conclusion: Option<String>,
     pull_requests: Vec<RawCheckSuitePr>,
+    updated_at: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -311,9 +313,18 @@ fn parse_check_suite(payload: &[u8]) -> Result<CheckSuiteEvent, ParseError> {
         value: raw.check_suite.head_sha.clone(),
     })?;
 
+    let updated_at =
+        chrono::DateTime::parse_from_rfc3339(&raw.check_suite.updated_at).map_err(|_| {
+            ParseError::InvalidField {
+                field: "check_suite.updated_at",
+                value: raw.check_suite.updated_at.clone(),
+            }
+        })?;
+
     Ok(CheckSuiteEvent {
         repo: RepoId::new(raw.repository.owner.login, raw.repository.name),
         action,
+        suite_id: raw.check_suite.id,
         head_sha,
         conclusion: raw.check_suite.conclusion,
         pull_requests: raw
@@ -322,6 +333,7 @@ fn parse_check_suite(payload: &[u8]) -> Result<CheckSuiteEvent, ParseError> {
             .into_iter()
             .map(|pr| PrNumber(pr.number))
             .collect(),
+        updated_at: updated_at.with_timezone(&chrono::Utc),
     })
 }
 
@@ -384,6 +396,7 @@ struct RawPullRequestReviewPayload {
 
 #[derive(Debug, Deserialize)]
 struct RawReview {
+    id: u64,
     user: RawUser,
     state: String,
     body: Option<String>,
@@ -429,6 +442,7 @@ fn parse_pull_request_review(payload: &[u8]) -> Result<PullRequestReviewEvent, P
         repo: RepoId::new(raw.repository.owner.login, raw.repository.name),
         action,
         pr_number: PrNumber(raw.pull_request.number),
+        review_id: raw.review.id,
         state,
         reviewer_id: raw.review.user.id,
         reviewer_login: raw.review.user.login,
@@ -698,12 +712,14 @@ mod tests {
         let payload = r#"{
             "action": "completed",
             "check_suite": {
+                "id": 12345678,
                 "head_sha": "deadbeef1234567890abcdef1234567890abcdef",
                 "conclusion": "success",
                 "pull_requests": [
                     { "number": 10 },
                     { "number": 20 }
-                ]
+                ],
+                "updated_at": "2024-01-15T10:30:00Z"
             },
             "repository": {
                 "owner": { "login": "org" },
@@ -717,6 +733,7 @@ mod tests {
         match event {
             GitHubEvent::CheckSuite(e) => {
                 assert_eq!(e.action, CheckSuiteAction::Completed);
+                assert_eq!(e.suite_id, 12345678);
                 assert_eq!(
                     e.head_sha,
                     Sha::parse("deadbeef1234567890abcdef1234567890abcdef").unwrap()
@@ -733,8 +750,10 @@ mod tests {
         let payload = r#"{
             "action": "requested",
             "check_suite": {
+                "id": 87654321,
                 "head_sha": "1111111111111111111111111111111111111111",
-                "pull_requests": []
+                "pull_requests": [],
+                "updated_at": "2024-01-15T09:00:00Z"
             },
             "repository": {
                 "owner": { "login": "org" },
@@ -748,6 +767,7 @@ mod tests {
         match event {
             GitHubEvent::CheckSuite(e) => {
                 assert_eq!(e.action, CheckSuiteAction::Requested);
+                assert_eq!(e.suite_id, 87654321);
                 assert!(e.conclusion.is_none());
                 assert!(e.pull_requests.is_empty());
             }
@@ -820,6 +840,7 @@ mod tests {
         let payload = r#"{
             "action": "submitted",
             "review": {
+                "id": 98765432,
                 "user": { "id": 555, "login": "reviewer" },
                 "state": "approved",
                 "body": "LGTM!"
@@ -841,6 +862,7 @@ mod tests {
                 assert_eq!(e.action, ReviewAction::Submitted);
                 assert_eq!(e.state, ReviewState::Approved);
                 assert_eq!(e.pr_number, PrNumber(77));
+                assert_eq!(e.review_id, 98765432);
                 assert_eq!(e.reviewer_id, 555);
                 assert_eq!(e.reviewer_login, "reviewer");
                 assert_eq!(e.body, "LGTM!");
@@ -854,6 +876,7 @@ mod tests {
         let payload = r#"{
             "action": "dismissed",
             "review": {
+                "id": 11111111,
                 "user": { "id": 1, "login": "admin" },
                 "state": "dismissed"
             },
@@ -873,6 +896,7 @@ mod tests {
             GitHubEvent::PullRequestReview(e) => {
                 assert_eq!(e.action, ReviewAction::Dismissed);
                 assert_eq!(e.state, ReviewState::Dismissed);
+                assert_eq!(e.review_id, 11111111);
                 assert_eq!(e.body, "");
             }
             _ => panic!("expected PullRequestReview"),
@@ -884,6 +908,7 @@ mod tests {
         let payload = r#"{
             "action": "submitted",
             "review": {
+                "id": 22222222,
                 "user": { "id": 1, "login": "reviewer" },
                 "state": "changes_requested",
                 "body": "Please fix the bug"
@@ -903,6 +928,7 @@ mod tests {
         match event {
             GitHubEvent::PullRequestReview(e) => {
                 assert_eq!(e.state, ReviewState::ChangesRequested);
+                assert_eq!(e.review_id, 22222222);
             }
             _ => panic!("expected PullRequestReview"),
         }
@@ -1041,6 +1067,7 @@ mod tests {
                 r#"{{
                 "action": "submitted",
                 "review": {{
+                    "id": 12345,
                     "user": {{ "id": 1, "login": "u" }},
                     "state": "{}"
                 }},
