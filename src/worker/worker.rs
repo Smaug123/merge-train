@@ -485,6 +485,18 @@ impl RepoWorker {
             return Ok(());
         }
 
+        // Skip if currently being processed (.proc marker exists).
+        // This prevents double-processing when a redelivery arrives while the
+        // original is in-flight. The .proc marker indicates an in-flight delivery,
+        // so we must not enqueue again until it completes or is cleaned up on restart.
+        if delivery.is_processing() {
+            trace!(
+                delivery_id = %delivery.delivery_id,
+                "Skipping in-flight delivery (proc marker exists)"
+            );
+            return Ok(());
+        }
+
         // Skip if already in queue
         if self.queue.contains(&delivery.delivery_id) {
             trace!(
@@ -1096,27 +1108,37 @@ impl RepoWorker {
 
         // Execute effects with either the real GitHub client or a logging interpreter.
         // When a real client is available, responses are processed to update state.
+        // In dry-run mode (no GitHub client), we must NOT apply state updates since
+        // the logging interpreter returns placeholder/fake data that would corrupt state.
         if let Some(ref github_client) = self.github_client {
             let executor = EffectExecutor::new(github_client.clone(), shutdown.clone());
-            self.execute_effects_with_executor(effects, shutdown, &executor)
+            self.execute_effects_with_executor(effects, shutdown, &executor, true)
                 .await?;
         } else {
             // No GitHub client configured - use logging interpreter (for testing/dry-run).
+            // CRITICAL: Pass apply_state_updates=false to avoid corrupting state with
+            // placeholder data from the logging interpreter.
             let logging_interpreter = LoggingGitHubInterpreter::new();
             let executor = EffectExecutor::new(logging_interpreter, shutdown.clone());
-            self.execute_effects_with_executor(effects, shutdown, &executor)
+            self.execute_effects_with_executor(effects, shutdown, &executor, false)
                 .await?;
         }
 
         Ok(())
     }
 
-    /// Executes effects using the given executor and processes responses.
+    /// Executes effects using the given executor and optionally processes responses.
+    ///
+    /// # Parameters
+    ///
+    /// - `apply_state_updates`: If true, GitHub responses update cached state.
+    ///   Should be false in dry-run mode to avoid corrupting state with placeholder data.
     async fn execute_effects_with_executor<G>(
         &mut self,
         effects: Vec<Effect>,
         shutdown: &CancellationToken,
         executor: &crate::worker::effects::EffectExecutor<G>,
+        apply_state_updates: bool,
     ) -> Result<()>
     where
         G: crate::effects::GitHubInterpreter + Clone,
@@ -1176,7 +1198,8 @@ impl RepoWorker {
 
                     // Process responses to update cached state.
                     // This is essential for poll-based state refresh.
-                    if let EffectResult::GitHub(response) = result {
+                    // Skip in dry-run mode to avoid corrupting state with placeholder data.
+                    if apply_state_updates && let EffectResult::GitHub(response) = result {
                         self.process_github_response(response);
                     }
                 }
@@ -1607,6 +1630,7 @@ impl RepoWorker {
             let phase_changed = step_result.train.cascade_phase != phase_before;
             let train_completed = matches!(step_result.outcome, CascadeStepOutcome::Complete);
             let train_aborted = matches!(step_result.outcome, CascadeStepOutcome::Aborted { .. });
+            let train_fan_out = matches!(step_result.outcome, CascadeStepOutcome::FanOut { .. });
 
             // Persist state changes via the event log
             if train_completed {
@@ -1635,8 +1659,44 @@ impl RepoWorker {
                 self.event_log.sync()?;
                 debug!(train_root = %train_root, "Train aborted (persisted)");
 
-                // Remove cancellation token
+                // Remove cancellation token and timers for aborted train
                 self.stack_tokens.remove(&train_root);
+                self.pending_timers.retain(|t| t.train_root != train_root);
+            } else if train_fan_out {
+                // Fan-out: original train ends, descendants become new independent trains.
+                // Extract descendants from the outcome.
+                let descendants =
+                    if let CascadeStepOutcome::FanOut { descendants } = &step_result.outcome {
+                        descendants.clone()
+                    } else {
+                        // Should never happen given train_fan_out check, but be defensive
+                        vec![]
+                    };
+
+                if !descendants.is_empty() {
+                    // Persist the fan-out atomically: old train removed, new trains created
+                    let event = self.event_log.append(StateEventPayload::FanOutCompleted {
+                        old_root: train_root,
+                        new_roots: descendants.clone(),
+                        original_root_pr: step_result.train.original_root_pr,
+                    })?;
+                    apply_event_to_state(&mut self.state, &event);
+                    self.event_log.sync()?;
+                    debug!(
+                        train_root = %train_root,
+                        descendants = ?descendants,
+                        "Fan-out completed (persisted)"
+                    );
+
+                    // Clean up old train's resources
+                    self.stack_tokens.remove(&train_root);
+                    self.pending_timers.retain(|t| t.train_root != train_root);
+
+                    // Create cancellation tokens for new trains
+                    for &new_root in &descendants {
+                        self.stack_tokens.entry(new_root).or_default();
+                    }
+                }
             } else if phase_changed
                 || step_result.train.current_pr != current_pr
                 || step_result.train.state != state_before

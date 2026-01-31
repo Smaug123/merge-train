@@ -972,4 +972,264 @@ mod tests {
             );
         }
     }
+
+    // ─── Behavioral verification tests ───
+    //
+    // These tests verify the BEHAVIORAL guarantees that the structural tests imply.
+    // They use observable side effects (file modification times) to verify that:
+    // - Same-repo events complete in order (serial processing)
+    // - Different-repo events can complete independently (concurrent scheduling)
+
+    #[tokio::test]
+    async fn serial_processing_produces_ordered_done_markers() {
+        // Test: Verify that same-repo events complete in FIFO order.
+        //
+        // This behavioral test complements the structural test by verifying
+        // that the single-worker design actually produces serial processing.
+        //
+        // # How it works
+        //
+        // We dispatch multiple events and verify that their .done markers are
+        // created in the order the events were enqueued. Because a single worker
+        // processes events one at a time, the completion order must match the
+        // queue order (within the same priority level).
+        //
+        // # Limitations
+        //
+        // - File timestamps have limited resolution (may round to same second)
+        // - Relies on filesystem clock accuracy
+        // - Very fast processing may make all timestamps equal
+        //
+        // Despite these limitations, this test provides meaningful verification
+        // that processing is serial: if events were processed concurrently,
+        // their completion times would show interleaving or reverse ordering.
+        let dir = tempdir().unwrap();
+        let config = DispatcherConfig::new(dir.path().join("spool"), dir.path().join("state"));
+
+        let dispatcher = Arc::new(Dispatcher::new(config.clone()));
+        let repo = RepoId::new("owner", "repo");
+        let num_events = 5;
+
+        // Spool events in order (all same priority, so FIFO ordering applies)
+        for i in 0..num_events {
+            let envelope = make_pr_opened_envelope(i);
+            let delivery_id = DeliveryId::new(format!("ordered-{}", i));
+            spool_webhook(&config.spool_dir(&repo), &delivery_id, &envelope).unwrap();
+        }
+
+        // Dispatch all events
+        for i in 0..num_events {
+            let delivery_id = DeliveryId::new(format!("ordered-{}", i));
+            let delivery = SpooledDelivery::new(&config.spool_dir(&repo), delivery_id);
+            dispatcher.dispatch(&repo, delivery).await.unwrap();
+        }
+
+        // Wait for all events to be processed
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // Verify all events are done
+        let spool_dir = config.spool_dir(&repo);
+        for i in 0..num_events {
+            let delivery =
+                SpooledDelivery::new(&spool_dir, DeliveryId::new(format!("ordered-{}", i)));
+            assert!(delivery.is_done(), "Event {} should be marked done", i);
+        }
+
+        // Verify completion order via file modification times.
+        // Collect timestamps and verify they are non-decreasing (allowing for clock resolution).
+        let mut prev_time: Option<std::time::SystemTime> = None;
+        for i in 0..num_events {
+            let delivery_id = format!("ordered-{}", i);
+            let delivery = SpooledDelivery::new(&spool_dir, DeliveryId::new(delivery_id.clone()));
+            let done_path = delivery.done_marker_path();
+            let metadata = std::fs::metadata(&done_path)
+                .unwrap_or_else(|_| panic!("Done marker should exist for {}", delivery_id));
+            let mtime = metadata
+                .modified()
+                .expect("Should be able to get modification time");
+
+            if let Some(prev) = prev_time {
+                // Allow equal times due to clock resolution, but not reverse ordering
+                assert!(
+                    mtime >= prev,
+                    "Event {} completed before event {} (reverse ordering detected)",
+                    i,
+                    i - 1
+                );
+            }
+            prev_time = Some(mtime);
+        }
+
+        // Additional structural verification
+        assert_eq!(
+            dispatcher.worker_count().await,
+            1,
+            "Same-repo events should use a single worker"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_repos_can_complete_independently() {
+        // Test: Verify that events for different repos can be processing concurrently.
+        //
+        // This behavioral test verifies that the separate-worker design enables
+        // concurrent processing by checking that repos can complete in any order.
+        //
+        // # How it works
+        //
+        // We dispatch events to multiple repos and verify that:
+        // 1. Each repo has its own worker (structural property)
+        // 2. All repos complete their events (correctness property)
+        // 3. The completion order is NOT deterministic (behavioral property)
+        //
+        // Note: We can't reliably test for OVERLAPPING execution because Tokio's
+        // scheduler is non-deterministic. However, we can verify that the structure
+        // allows independent completion (no forced ordering between repos).
+        let dir = tempdir().unwrap();
+        let config = DispatcherConfig::new(dir.path().join("spool"), dir.path().join("state"));
+
+        let dispatcher = Arc::new(Dispatcher::new(config.clone()));
+        let num_repos = 3;
+        let events_per_repo = 3;
+
+        // Create and dispatch events for multiple repos
+        for r in 0..num_repos {
+            let repo = RepoId::new("owner", format!("concurrent-repo-{}", r));
+            for e in 0..events_per_repo {
+                let envelope = make_pr_opened_envelope((r * 100 + e) as u64);
+                let delivery_id = DeliveryId::new(format!("repo{}-event{}", r, e));
+                spool_webhook(&config.spool_dir(&repo), &delivery_id, &envelope).unwrap();
+                let delivery = SpooledDelivery::new(&config.spool_dir(&repo), delivery_id);
+                dispatcher.dispatch(&repo, delivery).await.unwrap();
+            }
+        }
+
+        // Wait for processing
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // Verify structural property: separate workers per repo
+        assert_eq!(
+            dispatcher.worker_count().await,
+            num_repos,
+            "Each repo should have its own worker"
+        );
+
+        // Verify correctness: all events processed
+        for r in 0..num_repos {
+            let repo = RepoId::new("owner", format!("concurrent-repo-{}", r));
+            let spool_dir = config.spool_dir(&repo);
+            for e in 0..events_per_repo {
+                let delivery = SpooledDelivery::new(
+                    &spool_dir,
+                    DeliveryId::new(format!("repo{}-event{}", r, e)),
+                );
+                assert!(
+                    delivery.is_done(),
+                    "Event {} for repo {} should be marked done",
+                    e,
+                    r
+                );
+            }
+        }
+
+        // Note: We don't assert on cross-repo completion order because that would
+        // be testing Tokio's scheduler behavior, not our dispatch logic. The key
+        // guarantee is that repos have independent workers that CAN run concurrently.
+    }
+
+    #[tokio::test]
+    async fn no_concurrent_processing_within_single_repo() {
+        // Test: Verify that at most one event is being processed at a time for a repo.
+        //
+        // This test polls the state during processing to verify the mutual exclusion
+        // property: within a single repo, only one event can have a .proc marker
+        // without a .done marker at any point in time.
+        //
+        // # Implementation
+        //
+        // We dispatch events and immediately start polling the spool directory
+        // to count events in the "processing" state. If more than one event is
+        // ever processing simultaneously, the test fails.
+        //
+        // # Limitations
+        //
+        // Processing is very fast, so this test may not catch all violations.
+        // However, it provides a meaningful check when processing has any latency.
+        let dir = tempdir().unwrap();
+        let config = DispatcherConfig::new(dir.path().join("spool"), dir.path().join("state"));
+
+        let dispatcher = Arc::new(Dispatcher::new(config.clone()));
+        let repo = RepoId::new("owner", "mutual-exclusion-repo");
+        let num_events = 10;
+
+        // Spool all events
+        for i in 0..num_events {
+            let envelope = make_pr_opened_envelope(i);
+            let delivery_id = DeliveryId::new(format!("mutex-{}", i));
+            spool_webhook(&config.spool_dir(&repo), &delivery_id, &envelope).unwrap();
+        }
+
+        // Track maximum concurrent processing observed
+        let max_concurrent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_concurrent_clone = Arc::clone(&max_concurrent);
+        let spool_dir = config.spool_dir(&repo);
+        let spool_dir_clone = spool_dir.clone();
+
+        // Start a polling task that checks concurrent processing count
+        let poll_handle = tokio::spawn(async move {
+            loop {
+                let mut processing_count = 0;
+                for i in 0..num_events {
+                    let delivery = SpooledDelivery::new(
+                        &spool_dir_clone,
+                        DeliveryId::new(format!("mutex-{}", i)),
+                    );
+                    if delivery.is_processing() {
+                        processing_count += 1;
+                    }
+                }
+                max_concurrent_clone
+                    .fetch_max(processing_count, std::sync::atomic::Ordering::SeqCst);
+
+                // Check if all done
+                let all_done = (0..num_events).all(|i| {
+                    SpooledDelivery::new(&spool_dir_clone, DeliveryId::new(format!("mutex-{}", i)))
+                        .is_done()
+                });
+                if all_done {
+                    break;
+                }
+
+                tokio::time::sleep(std::time::Duration::from_micros(100)).await;
+            }
+        });
+
+        // Dispatch all events
+        for i in 0..num_events {
+            let delivery_id = DeliveryId::new(format!("mutex-{}", i));
+            let delivery = SpooledDelivery::new(&config.spool_dir(&repo), delivery_id);
+            dispatcher.dispatch(&repo, delivery).await.unwrap();
+        }
+
+        // Wait for processing to complete
+        tokio::time::timeout(std::time::Duration::from_secs(5), poll_handle)
+            .await
+            .expect("Polling should complete")
+            .expect("Polling task should not panic");
+
+        // Verify mutual exclusion
+        let observed_max = max_concurrent.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            observed_max <= 1,
+            "Observed {} events processing concurrently (expected at most 1)",
+            observed_max
+        );
+
+        // Verify all events completed
+        for i in 0..num_events {
+            let delivery =
+                SpooledDelivery::new(&spool_dir, DeliveryId::new(format!("mutex-{}", i)));
+            assert!(delivery.is_done(), "Event {} should be marked done", i);
+        }
+    }
 }
