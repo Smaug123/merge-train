@@ -146,7 +146,10 @@ impl WorkerError {
     pub fn is_persistence_failure(&self) -> bool {
         matches!(
             self,
-            WorkerError::EventLog(_) | WorkerError::Snapshot(_) | WorkerError::Io(_)
+            WorkerError::EventLog(_)
+                | WorkerError::Snapshot(_)
+                | WorkerError::Io(_)
+                | WorkerError::Spool(SpoolError::Io(_))
         )
     }
 }
@@ -473,7 +476,9 @@ impl RepoWorker {
     /// - A redelivery arrives for an already-processed webhook
     /// - The same delivery is dispatched multiple times (e.g., on restart)
     /// - GitHub redelivers a webhook with a new `X-GitHub-Delivery` ID
-    pub fn enqueue(&mut self, delivery: SpooledDelivery) -> Result<()> {
+    ///
+    /// Returns `true` if the delivery was enqueued, `false` if it was skipped.
+    pub fn enqueue(&mut self, delivery: SpooledDelivery) -> Result<bool> {
         use crate::spool::dedupe::is_duplicate;
 
         // Skip if already done
@@ -482,7 +487,7 @@ impl RepoWorker {
                 delivery_id = %delivery.delivery_id,
                 "Skipping already-done delivery"
             );
-            return Ok(());
+            return Ok(false);
         }
 
         // Skip if currently being processed (.proc marker exists).
@@ -494,7 +499,7 @@ impl RepoWorker {
                 delivery_id = %delivery.delivery_id,
                 "Skipping in-flight delivery (proc marker exists)"
             );
-            return Ok(());
+            return Ok(false);
         }
 
         // Skip if already in queue
@@ -503,31 +508,59 @@ impl RepoWorker {
                 delivery_id = %delivery.delivery_id,
                 "Skipping already-queued delivery"
             );
-            return Ok(());
+            return Ok(false);
         }
 
-        if let Some((event, priority)) = parse_and_classify(&delivery, &self.config.bot_name)? {
-            // Check for logical duplicate using dedupe key from snapshot.
-            // This catches GitHub redeliveries that have a new X-GitHub-Delivery ID
-            // but represent the same logical event.
-            if let Some(dedupe_key) = event.dedupe_key()
-                && is_duplicate(&self.state.seen_dedupe_keys, &dedupe_key)
-            {
-                trace!(
-                    delivery_id = %delivery.delivery_id,
-                    dedupe_key = %dedupe_key,
-                    "Skipping duplicate event (dedupe key seen)"
-                );
-                mark_done(&delivery)?;
-                return Ok(());
+        // Compute what to do first, then apply side effects.
+        enum EnqueuePlan {
+            MarkDone,
+            Queue {
+                event: GitHubEvent,
+                priority: EventPriority,
+            },
+        }
+
+        let plan = match parse_and_classify(&delivery, &self.config.bot_name) {
+            Ok(Some((event, priority))) => {
+                // Check for logical duplicate using dedupe key from snapshot.
+                // This catches GitHub redeliveries that have a new X-GitHub-Delivery ID
+                // but represent the same logical event.
+                if let Some(dedupe_key) = event.dedupe_key()
+                    && is_duplicate(&self.state.seen_dedupe_keys, &dedupe_key)
+                {
+                    trace!(
+                        delivery_id = %delivery.delivery_id,
+                        dedupe_key = %dedupe_key,
+                        "Skipping duplicate event (dedupe key seen)"
+                    );
+                    EnqueuePlan::MarkDone
+                } else {
+                    EnqueuePlan::Queue { event, priority }
+                }
             }
+            Ok(None) => EnqueuePlan::MarkDone,
+            Err(e) => {
+                // Malformed or unreadable payloads are recoverable:
+                // mark done so periodic drains don't retry forever.
+                warn!(
+                    delivery_id = %delivery.delivery_id,
+                    error = %e,
+                    "Failed to parse/classify delivery, marking done and skipping"
+                );
+                EnqueuePlan::MarkDone
+            }
+        };
 
-            self.queue.push(event, delivery.delivery_id, priority);
-        } else {
-            // Event type not recognized - mark as done immediately
-            mark_done(&delivery)?;
+        match plan {
+            EnqueuePlan::MarkDone => {
+                mark_done(&delivery)?;
+                Ok(false)
+            }
+            EnqueuePlan::Queue { event, priority } => {
+                let enqueued = self.queue.push(event, delivery.delivery_id, priority);
+                Ok(enqueued)
+            }
         }
-        Ok(())
     }
 
     /// Processes the next event in the queue.
@@ -895,7 +928,7 @@ impl RepoWorker {
                 } => {
                     // Check if it's time for a poll (requires active trains)
                     if self.should_poll()
-                        && let Err(e) = self.handle_poll_active_trains().await
+                        && let Err(e) = self.handle_poll_active_trains(&shutdown).await
                     {
                         if e.is_persistence_failure() {
                             error!(error = %e, "Persistence failure during poll, stopping worker");
@@ -955,7 +988,7 @@ impl RepoWorker {
                 );
             }
             WorkerMessage::PollActiveTrains => {
-                self.handle_poll_active_trains().await?;
+                self.handle_poll_active_trains(shutdown).await?;
             }
             WorkerMessage::TimerFired {
                 train_root,
@@ -1025,7 +1058,7 @@ impl RepoWorker {
         // processed promptly after validation.
 
         // Enqueue the delivery
-        self.enqueue(delivery)?;
+        let _ = self.enqueue(delivery)?;
 
         // Process all pending events and collect effects
         let (count, effects) = self.process_all()?;
@@ -1360,7 +1393,7 @@ impl RepoWorker {
     ///   event was missed
     /// - Manually-retargeted PRs are detected and warned about before they
     ///   can be incorrectly merged
-    async fn handle_poll_active_trains(&mut self) -> Result<()> {
+    async fn handle_poll_active_trains(&mut self, shutdown: &CancellationToken) -> Result<()> {
         use crate::effects::{Effect, GitHubEffect};
         use crate::spool::dedupe::prune_expired_keys_default;
 
@@ -1373,15 +1406,10 @@ impl RepoWorker {
             debug!(pruned = pruned, "Pruned expired dedupe keys");
         }
 
-        // Create a cancellation token for effect execution in this poll cycle.
-        // This is a local token; for stack-scoped cancellation, execute_effects
-        // checks the individual train tokens as well.
-        let shutdown = CancellationToken::new();
-
         // First, drain any pending deliveries from the spool.
         // This catches deliveries that may have been spooled but not dispatched
         // (e.g., dispatcher failure, network issue, race condition).
-        let drained = self.drain_spool_periodic(&shutdown).await?;
+        let drained = self.drain_spool_periodic(shutdown).await?;
         if drained > 0 {
             debug!(
                 drained = drained,
@@ -1522,13 +1550,13 @@ impl RepoWorker {
 
         // Execute all collected effects
         if !effects.is_empty() {
-            self.execute_effects(effects, &shutdown).await?;
+            self.execute_effects(effects, shutdown).await?;
         }
 
         // After updating the cache, re-evaluate cascades to check if any trains
         // can now advance (e.g., CI completed while we weren't receiving webhooks).
         // Use the persistence version to ensure phase transitions are durably recorded.
-        self.re_evaluate_cascades_with_persistence(&shutdown, "poll")
+        self.re_evaluate_cascades_with_persistence(shutdown, "poll")
             .await?;
 
         Ok(())
@@ -1827,8 +1855,8 @@ impl RepoWorker {
         let mut enqueued = 0;
 
         for delivery in deliveries {
-            // Try to enqueue; skip if already queued or done
-            if self.enqueue(delivery).is_ok() {
+            // Try to enqueue; skip if already queued/done/invalid
+            if self.enqueue(delivery)? {
                 enqueued += 1;
             }
         }
@@ -2259,7 +2287,7 @@ impl RepoWorker {
 
         let mut enqueued = 0;
         for delivery in deliveries {
-            if self.enqueue(delivery).is_ok() {
+            if self.enqueue(delivery)? {
                 enqueued += 1;
             }
         }
@@ -2691,6 +2719,8 @@ pub(crate) fn apply_event_to_state(state: &mut PersistedRepoSnapshot, event: &St
                 }
                 // Restore wait condition for timer recovery
                 train.wait_condition = wait_condition.clone();
+                // Any phase transition represents forward progress for recovery.
+                train.increment_seq();
             }
             trace!(
                 train_root = %train_root,
@@ -2708,6 +2738,8 @@ pub(crate) fn apply_event_to_state(state: &mut PersistedRepoSnapshot, event: &St
         } => {
             if let Some(train) = state.active_trains.get_mut(train_root) {
                 train.last_squash_sha = Some(sha.clone());
+                // Record progress for recovery precedence.
+                train.increment_seq();
             }
             trace!(train_root = %train_root, pr = %pr, sha = %sha, "Squash committed");
         }
@@ -3124,6 +3156,60 @@ mod tests {
         assert!(
             !worker.stack_tokens.contains_key(&PrNumber(42)),
             "Token should be removed after train stops"
+        );
+    }
+
+    #[test]
+    fn spool_io_error_is_treated_as_persistence_failure() {
+        let io_err = std::io::Error::other("disk write failed");
+        let err = WorkerError::Spool(SpoolError::Io(io_err));
+
+        assert!(
+            err.is_persistence_failure(),
+            "Spool IO failures must fail-stop to preserve durability invariants"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_active_trains_honors_cancelled_shutdown() {
+        use crate::types::{TrainRecord, TrainState};
+
+        let dir = tempdir().unwrap();
+        let spool_dir = dir.path().join("spool");
+        let state_dir = dir.path().join("state");
+
+        let config = WorkerConfig::new(RepoId::new("owner", "repo"), &spool_dir, &state_dir);
+        let mut worker = RepoWorker::new(config).unwrap();
+
+        // Add a train that would be mutated by poll-driven re-evaluation if shutdown
+        // was ignored (no PR cached => cascade step would abort it).
+        worker
+            .state
+            .active_trains
+            .insert(PrNumber(10), TrainRecord::new(PrNumber(10)));
+        worker.get_or_create_stack_token(PrNumber(10));
+
+        let log_pos_before = worker.event_log.position().unwrap();
+
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+
+        worker
+            .handle_message(WorkerMessage::PollActiveTrains, &shutdown)
+            .await
+            .unwrap();
+
+        let log_pos_after = worker.event_log.position().unwrap();
+        assert_eq!(
+            log_pos_after, log_pos_before,
+            "Cancelled shutdown should prevent poll from persisting train mutations"
+        );
+
+        let train = worker.state.active_trains.get(&PrNumber(10)).unwrap();
+        assert_eq!(
+            train.state,
+            TrainState::Running,
+            "Cancelled shutdown should prevent poll from aborting active trains"
         );
     }
 }

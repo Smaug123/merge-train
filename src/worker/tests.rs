@@ -264,6 +264,77 @@ fn enqueue_skips_duplicate_deliveries_in_queue() {
     );
 }
 
+#[test]
+fn enqueue_marks_malformed_delivery_done() {
+    let dir = tempdir().unwrap();
+    let spool_dir = dir.path().join("spool");
+    let state_dir = dir.path().join("state");
+
+    let config = WorkerConfig::new(RepoId::new("owner", "repo"), &spool_dir, &state_dir);
+    let mut worker = RepoWorker::new(config).unwrap();
+
+    // Malformed pull_request payload (missing required pull_request + repository fields).
+    let malformed = WebhookEnvelope {
+        event_type: "pull_request".to_string(),
+        headers: HashMap::new(),
+        body: serde_json::json!({
+            "action": "opened"
+        }),
+    };
+    let delivery_id = DeliveryId::new("malformed-runtime-delivery");
+    spool_webhook(&spool_dir, &delivery_id, &malformed).unwrap();
+
+    let delivery = SpooledDelivery::new(&spool_dir, delivery_id.clone());
+    let enqueued = worker.enqueue(delivery).unwrap();
+
+    assert!(
+        !enqueued,
+        "Malformed delivery should be skipped, not enqueued"
+    );
+    assert!(
+        worker.queue_is_empty(),
+        "Malformed delivery should not remain in queue"
+    );
+    let delivery = SpooledDelivery::new(&spool_dir, delivery_id);
+    assert!(
+        delivery.is_done(),
+        "Malformed delivery should be marked done to avoid retry loops"
+    );
+}
+
+#[tokio::test]
+async fn drain_spool_periodic_does_not_count_already_queued_delivery() {
+    let dir = tempdir().unwrap();
+    let spool_dir = dir.path().join("spool");
+    let state_dir = dir.path().join("state");
+
+    let config = WorkerConfig::new(RepoId::new("owner", "repo"), &spool_dir, &state_dir);
+    let mut worker = RepoWorker::new(config).unwrap();
+
+    // Spool one valid delivery and enqueue it manually.
+    let envelope = make_pr_opened_envelope(42);
+    let delivery_id = DeliveryId::new("already-queued");
+    spool_webhook(&spool_dir, &delivery_id, &envelope).unwrap();
+
+    let delivery = SpooledDelivery::new(&spool_dir, delivery_id);
+    let enqueued = worker.enqueue(delivery).unwrap();
+    assert!(enqueued);
+    assert_eq!(worker.queue_len(), 1);
+
+    // Periodic drain sees the same spool file but should not count it as newly enqueued.
+    let shutdown = CancellationToken::new();
+    let drained = worker.drain_spool_periodic(&shutdown).await.unwrap();
+    assert_eq!(
+        drained, 0,
+        "Already-queued delivery should not be counted as newly drained"
+    );
+    assert_eq!(
+        worker.queue_len(),
+        1,
+        "Periodic drain should not mutate queue for already-queued deliveries"
+    );
+}
+
 // ─── Queue ordering tests ───
 
 #[test]
