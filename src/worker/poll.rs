@@ -7,7 +7,7 @@
 //! # Polling Strategy
 //!
 //! - **Poll interval**: 10 minutes by default (configurable via `MERGE_TRAIN_POLL_INTERVAL_MINS`)
-//! - **Jitter**: ±20% applied symmetrically (8-12 minutes) to prevent thundering herd on restart
+//! - **Jitter**: ±20% applied symmetrically (~8–12 minutes) to prevent thundering herd on restart
 //! - **Initial stagger**: Based on repo ID hash to distribute load
 //!
 //! # Non-blocking Waits
@@ -54,11 +54,12 @@ pub struct PollConfig {
     /// Default: 5 seconds.
     pub recheck_interval: Duration,
 
-    /// Jitter percentage applied symmetrically around poll interval (0-100).
+    /// Jitter percentage applied symmetrically around poll interval (0–100).
     ///
     /// Used to prevent thundering herd when multiple bot instances restart.
-    /// Default: 20 (meaning ±20% jitter, so 8-12 minutes for a 10-minute base).
-    pub jitter_percent: u8,
+    /// Default: 20 (meaning ±20% jitter, so ~8–12 minutes for a 10-minute base).
+    /// Clamped to 100 on construction.
+    jitter_percent: u8,
 }
 
 impl Default for PollConfig {
@@ -81,6 +82,7 @@ impl PollConfig {
     /// Creates a `PollConfig` from environment variables.
     ///
     /// Reads `MERGE_TRAIN_POLL_INTERVAL_MINS` for the poll interval.
+    /// The interval is clamped to a minimum of 1 minute.
     /// Other values use defaults.
     pub fn from_env() -> Self {
         let poll_mins = std::env::var("MERGE_TRAIN_POLL_INTERVAL_MINS")
@@ -88,8 +90,10 @@ impl PollConfig {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(DEFAULT_POLL_INTERVAL_SECS / 60);
 
+        let poll_secs = poll_mins.max(1).saturating_mul(60);
+
         PollConfig {
-            poll_interval: Duration::from_secs(poll_mins * 60),
+            poll_interval: Duration::from_secs(poll_secs),
             ..Self::new()
         }
     }
@@ -100,7 +104,13 @@ impl PollConfig {
         self
     }
 
-    /// Returns the poll interval with jitter added for a specific repository.
+    /// Sets the jitter percentage (clamped to 0–100).
+    pub fn with_jitter_percent(mut self, percent: u8) -> Self {
+        self.jitter_percent = percent.min(100);
+        self
+    }
+
+    /// Returns the poll interval with jitter applied for a specific repository.
     ///
     /// The jitter is deterministic based on the repo ID hash, ensuring the same
     /// repo always gets the same jitter. This prevents thundering herd while
@@ -108,7 +118,8 @@ impl PollConfig {
     ///
     /// # Formula
     ///
-    /// `interval * (1 + (hash(repo) % jitter_percent) / 100)`
+    /// `interval * jitter_factor(repo)` where `jitter_factor` is in
+    /// `[1 - jitter_percent/100, 1 + jitter_percent/100]`.
     pub fn poll_interval_with_jitter(&self, repo: &RepoId) -> Duration {
         let jitter_factor = self.jitter_factor(repo);
         Duration::from_secs_f64(self.poll_interval.as_secs_f64() * jitter_factor)
@@ -131,8 +142,8 @@ impl PollConfig {
 
     /// Computes the jitter factor for a repository.
     ///
-    /// Returns a value centered around 1.0, with ± jitter_percent variation.
-    /// For example, with 20% jitter, returns values between 0.8 and 1.2.
+    /// Returns a value in `[1 - jitter_percent/100, 1 + jitter_percent/100]`.
+    /// For example, with 20% jitter, returns values in `[0.8, 1.2]`.
     ///
     /// The jitter is deterministic based on repo ID hash, ensuring the same
     /// repo always gets the same jitter.
@@ -140,13 +151,14 @@ impl PollConfig {
         if self.jitter_percent == 0 {
             return 1.0;
         }
+        let jp = self.jitter_percent.min(100) as u64;
         let hash = self.repo_hash(repo);
-        // Map hash to range [0, 2 * jitter_percent), then center around 1.0
-        // This gives us ± jitter_percent variation (e.g., 0.8-1.2 for 20%)
-        let jitter_range = 2 * self.jitter_percent as u64;
+        // Map hash to range [0, 2 * jp] inclusive, then center around 1.0.
+        // This gives us ±jp% variation (e.g., [0.8, 1.2] for 20%).
+        let jitter_range = 2 * jp + 1;
         let raw_jitter = (hash % jitter_range) as f64 / 100.0;
-        // raw_jitter is in [0, 0.4) for 20% jitter; center it to [-0.2, 0.2)
-        1.0 + raw_jitter - (self.jitter_percent as f64 / 100.0)
+        // raw_jitter is in [0.0, 0.40] for 20% jitter; center to [-0.20, 0.20]
+        1.0 + raw_jitter - (jp as f64 / 100.0)
     }
 
     /// Computes a hash of the repository ID.
@@ -191,21 +203,20 @@ mod tests {
         let jitter_a = config.poll_interval_with_jitter(&repo_a);
         let jitter_b = config.poll_interval_with_jitter(&repo_b);
 
-        // Different repos should likely get different jitter
-        // (not guaranteed, but highly probable with good hash)
-        // At minimum, both should be within expected range (±20% = 0.8-1.2)
+        // Both should be within expected range (±20% = [0.8, 1.2])
         assert!(jitter_a >= config.poll_interval.mul_f64(0.8));
-        assert!(jitter_a < config.poll_interval.mul_f64(1.2));
+        assert!(jitter_a <= config.poll_interval.mul_f64(1.2));
         assert!(jitter_b >= config.poll_interval.mul_f64(0.8));
-        assert!(jitter_b < config.poll_interval.mul_f64(1.2));
+        assert!(jitter_b <= config.poll_interval.mul_f64(1.2));
+
+        // Different repos should get different jitter (not guaranteed for
+        // arbitrary inputs, but these specific repos do differ)
+        assert_ne!(jitter_a, jitter_b);
     }
 
     #[test]
     fn zero_jitter_returns_exact_interval() {
-        let config = PollConfig {
-            jitter_percent: 0,
-            ..PollConfig::new()
-        };
+        let config = PollConfig::new().with_jitter_percent(0);
         let repo = RepoId::new("owner", "repo");
 
         let interval = config.poll_interval_with_jitter(&repo);
