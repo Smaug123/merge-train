@@ -32,7 +32,7 @@ const DEFAULT_WAIT_TIMEOUT_SECS: u64 = 300;
 /// Default interval for rechecking wait conditions (5 seconds).
 const DEFAULT_RECHECK_INTERVAL_SECS: u64 = 5;
 
-/// Default jitter percentage (0-100).
+/// Default jitter percentage (0-99).
 const DEFAULT_JITTER_PERCENT: u8 = 20;
 
 /// Configuration for polling and non-blocking waits.
@@ -54,11 +54,11 @@ pub struct PollConfig {
     /// Default: 5 seconds.
     pub recheck_interval: Duration,
 
-    /// Jitter percentage applied symmetrically around poll interval (0–100).
+    /// Jitter percentage applied symmetrically around poll interval (0–99).
     ///
     /// Used to prevent thundering herd when multiple bot instances restart.
     /// Default: 20 (meaning ±20% jitter, so ~8–12 minutes for a 10-minute base).
-    /// Clamped to 100 on construction.
+    /// Clamped to 99 on construction (100 would allow a zero-duration interval).
     jitter_percent: u8,
 }
 
@@ -104,9 +104,12 @@ impl PollConfig {
         self
     }
 
-    /// Sets the jitter percentage (clamped to 0–100).
+    /// Sets the jitter percentage (clamped to 0–99).
+    ///
+    /// 100% jitter would allow a zero factor (producing `Duration::ZERO`),
+    /// which causes a busy-loop. 99% is the maximum.
     pub fn with_jitter_percent(mut self, percent: u8) -> Self {
-        self.jitter_percent = percent.min(100);
+        self.jitter_percent = percent.min(99);
         self
     }
 
@@ -151,7 +154,7 @@ impl PollConfig {
         if self.jitter_percent == 0 {
             return 1.0;
         }
-        let jp = self.jitter_percent.min(100) as u64;
+        let jp = self.jitter_percent as u64;
         let hash = self.repo_hash(repo);
         // Map hash to range [0, 2 * jp] inclusive, then center around 1.0.
         // This gives us ±jp% variation (e.g., [0.8, 1.2] for 20%).
@@ -195,23 +198,19 @@ mod tests {
     }
 
     #[test]
-    fn different_repos_get_different_jitter() {
+    fn jitter_is_within_expected_range() {
         let config = PollConfig::new();
         let repo_a = RepoId::new("owner", "repo-a");
         let repo_b = RepoId::new("owner", "repo-b");
 
-        let jitter_a = config.poll_interval_with_jitter(&repo_a);
-        let jitter_b = config.poll_interval_with_jitter(&repo_b);
+        for repo in [&repo_a, &repo_b] {
+            let jittered = config.poll_interval_with_jitter(repo);
 
-        // Both should be within expected range (±20% = [0.8, 1.2])
-        assert!(jitter_a >= config.poll_interval.mul_f64(0.8));
-        assert!(jitter_a <= config.poll_interval.mul_f64(1.2));
-        assert!(jitter_b >= config.poll_interval.mul_f64(0.8));
-        assert!(jitter_b <= config.poll_interval.mul_f64(1.2));
-
-        // Different repos should get different jitter (not guaranteed for
-        // arbitrary inputs, but these specific repos do differ)
-        assert_ne!(jitter_a, jitter_b);
+            assert!(jittered >= config.poll_interval.mul_f64(0.8));
+            assert!(jittered <= config.poll_interval.mul_f64(1.2));
+            // Must always be positive (no busy-loop)
+            assert!(!jittered.is_zero());
+        }
     }
 
     #[test]
