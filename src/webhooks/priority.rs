@@ -123,8 +123,9 @@ mod tests {
     use super::*;
     use crate::types::{CommentId, PrNumber, RepoId, Sha};
     use crate::webhooks::events::{
-        CheckSuiteAction, CheckSuiteEvent, PrAction, PullRequestEvent, PullRequestReviewEvent,
-        ReviewAction, ReviewState, StatusEvent, StatusState,
+        CheckSuiteAction, CheckSuiteConclusion, CheckSuiteEvent, MergeStatus, PrAction,
+        PullRequestEvent, PullRequestReviewEvent, ReviewAction, ReviewState, StatusEvent,
+        StatusState,
     };
     use proptest::prelude::*;
 
@@ -145,8 +146,9 @@ mod tests {
             repo: RepoId::new("owner", "repo"),
             action: PrAction::Closed,
             pr_number: PrNumber(42),
-            merged: true,
-            merge_commit_sha: Some(Sha::parse("a".repeat(40)).unwrap()),
+            merge_status: MergeStatus::Merged {
+                merge_commit_sha: Sha::parse("a".repeat(40)).unwrap(),
+            },
             head_sha: Sha::parse("b".repeat(40)).unwrap(),
             base_branch: "main".to_string(),
             head_branch: "feature".to_string(),
@@ -160,7 +162,7 @@ mod tests {
             repo: RepoId::new("owner", "repo"),
             action: CheckSuiteAction::Completed,
             head_sha: Sha::parse("c".repeat(40)).unwrap(),
-            conclusion: Some("success".to_string()),
+            conclusion: Some(CheckSuiteConclusion::Success),
             pull_requests: vec![PrNumber(42)],
         })
     }
@@ -251,6 +253,26 @@ mod tests {
     fn deleted_comment_is_normal_priority() {
         // Deleted comments have empty body, no command to parse
         let event = make_comment("", CommentAction::Deleted);
+        assert_eq!(classify_priority(&event), EventPriority::Normal);
+    }
+
+    #[test]
+    fn stop_command_in_code_fence_is_normal_priority() {
+        // is_stop_command delegates to the commands parser, which ignores
+        // commands inside fenced code blocks
+        let event = make_comment("```\n@merge-train stop\n```", CommentAction::Created);
+        assert_eq!(classify_priority(&event), EventPriority::Normal);
+    }
+
+    #[test]
+    fn stop_command_in_inline_code_is_normal_priority() {
+        let event = make_comment("use `@merge-train stop` to halt", CommentAction::Created);
+        assert_eq!(classify_priority(&event), EventPriority::Normal);
+    }
+
+    #[test]
+    fn stop_command_in_blockquote_is_normal_priority() {
+        let event = make_comment("> @merge-train stop", CommentAction::Created);
         assert_eq!(classify_priority(&event), EventPriority::Normal);
     }
 

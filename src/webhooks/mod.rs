@@ -38,8 +38,9 @@ pub mod signature;
 
 // Re-export commonly used types
 pub use events::{
-    CheckSuiteAction, CheckSuiteEvent, CommentAction, GitHubEvent, IssueCommentEvent, PrAction,
-    PullRequestEvent, PullRequestReviewEvent, ReviewAction, ReviewState, StatusEvent, StatusState,
+    CheckSuiteAction, CheckSuiteConclusion, CheckSuiteEvent, CommentAction, GitHubEvent,
+    IssueCommentEvent, MergeStatus, PrAction, PullRequestEvent, PullRequestReviewEvent,
+    ReviewAction, ReviewState, StatusEvent, StatusState,
 };
 pub use parser::{ParseError, parse_webhook};
 pub use priority::{EventPriority, classify_priority, classify_priority_with_bot_name};

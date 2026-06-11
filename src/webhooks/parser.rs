@@ -23,8 +23,9 @@ use thiserror::Error;
 use crate::types::{CommentId, PrNumber, RepoId, Sha};
 
 use super::events::{
-    CheckSuiteAction, CheckSuiteEvent, CommentAction, GitHubEvent, IssueCommentEvent, PrAction,
-    PullRequestEvent, PullRequestReviewEvent, ReviewAction, ReviewState, StatusEvent, StatusState,
+    CheckSuiteAction, CheckSuiteConclusion, CheckSuiteEvent, CommentAction, GitHubEvent,
+    IssueCommentEvent, MergeStatus, PrAction, PullRequestEvent, PullRequestReviewEvent,
+    ReviewAction, ReviewState, StatusEvent, StatusState,
 };
 
 /// Error type for webhook parsing failures.
@@ -231,34 +232,32 @@ fn parse_pull_request(payload: &[u8]) -> Result<Option<PullRequestEvent>, ParseE
             value: raw.pull_request.head.sha.clone(),
         })?;
 
-    // Only populate merge_commit_sha if the PR was actually merged.
-    // GitHub may populate this field speculatively before merge, but we only
-    // care about it when merged=true.
-    let merged = raw.pull_request.merged.unwrap_or(false);
-    let merge_commit_sha = if merged {
-        raw.pull_request
-            .merge_commit_sha
-            .as_ref()
-            .map(Sha::parse)
-            .transpose()
-            .map_err(|_| ParseError::InvalidField {
-                field: "pull_request.merge_commit_sha",
-                value: raw
-                    .pull_request
-                    .merge_commit_sha
-                    .clone()
-                    .unwrap_or_default(),
-            })?
+    // A merged PR always has a merge commit SHA on GitHub; a payload claiming
+    // merged=true without one is malformed. GitHub may populate the field
+    // speculatively before merge, so it is ignored when merged=false.
+    let merge_status = if raw.pull_request.merged.unwrap_or(false) {
+        let raw_sha =
+            raw.pull_request
+                .merge_commit_sha
+                .as_deref()
+                .ok_or(ParseError::InvalidField {
+                    field: "pull_request.merge_commit_sha",
+                    value: "null".to_string(),
+                })?;
+        let merge_commit_sha = Sha::parse(raw_sha).map_err(|_| ParseError::InvalidField {
+            field: "pull_request.merge_commit_sha",
+            value: raw_sha.to_string(),
+        })?;
+        MergeStatus::Merged { merge_commit_sha }
     } else {
-        None
+        MergeStatus::NotMerged
     };
 
     Ok(Some(PullRequestEvent {
         repo: RepoId::new(raw.repository.owner.login, raw.repository.name),
         action,
         pr_number: PrNumber(raw.pull_request.number),
-        merged,
-        merge_commit_sha,
+        merge_status,
         head_sha,
         base_branch: raw.pull_request.base.ref_name,
         head_branch: raw.pull_request.head.ref_name,
@@ -315,7 +314,11 @@ fn parse_check_suite(payload: &[u8]) -> Result<CheckSuiteEvent, ParseError> {
         repo: RepoId::new(raw.repository.owner.login, raw.repository.name),
         action,
         head_sha,
-        conclusion: raw.check_suite.conclusion,
+        conclusion: raw
+            .check_suite
+            .conclusion
+            .as_deref()
+            .map(CheckSuiteConclusion::parse),
         pull_requests: raw
             .check_suite
             .pull_requests
@@ -613,8 +616,7 @@ mod tests {
                 assert_eq!(e.base_branch, "main");
                 assert_eq!(e.head_branch, "feature-branch");
                 assert!(!e.is_draft);
-                assert!(!e.merged);
-                assert!(e.merge_commit_sha.is_none());
+                assert_eq!(e.merge_status, MergeStatus::NotMerged);
             }
             _ => panic!("expected PullRequest"),
         }
@@ -650,14 +652,110 @@ mod tests {
         match event {
             GitHubEvent::PullRequest(e) => {
                 assert_eq!(e.action, PrAction::Closed);
-                assert!(e.merged);
                 assert_eq!(
-                    e.merge_commit_sha,
-                    Some(Sha::parse("fedcba0987654321fedcba0987654321fedcba09").unwrap())
+                    e.merge_status,
+                    MergeStatus::Merged {
+                        merge_commit_sha: Sha::parse("fedcba0987654321fedcba0987654321fedcba09")
+                            .unwrap()
+                    }
                 );
             }
             _ => panic!("expected PullRequest"),
         }
+    }
+
+    #[test]
+    fn parse_pull_request_merged_without_sha_is_error() {
+        // GitHub guarantees a merge commit SHA for merged PRs; a payload
+        // claiming merged=true without one is malformed and must not parse.
+        let payload = r#"{
+            "action": "closed",
+            "pull_request": {
+                "number": 99,
+                "merged": true,
+                "head": {
+                    "sha": "1234567890abcdef1234567890abcdef12345678",
+                    "ref": "pr-branch"
+                },
+                "base": {
+                    "sha": "0000000000000000000000000000000000000000",
+                    "ref": "main"
+                },
+                "user": { "id": 1, "login": "author" }
+            },
+            "repository": {
+                "owner": { "login": "org" },
+                "name": "repo"
+            }
+        }"#;
+
+        let result = parse_webhook("pull_request", payload.as_bytes());
+        assert!(result.is_err(), "merged=true without sha must be an error");
+    }
+
+    #[test]
+    fn parse_pull_request_merged_with_null_sha_is_error() {
+        let payload = r#"{
+            "action": "closed",
+            "pull_request": {
+                "number": 99,
+                "merged": true,
+                "merge_commit_sha": null,
+                "head": {
+                    "sha": "1234567890abcdef1234567890abcdef12345678",
+                    "ref": "pr-branch"
+                },
+                "base": {
+                    "sha": "0000000000000000000000000000000000000000",
+                    "ref": "main"
+                },
+                "user": { "id": 1, "login": "author" }
+            },
+            "repository": {
+                "owner": { "login": "org" },
+                "name": "repo"
+            }
+        }"#;
+
+        let result = parse_webhook("pull_request", payload.as_bytes());
+        assert!(
+            result.is_err(),
+            "merged=true with null sha must be an error"
+        );
+    }
+
+    #[test]
+    fn parse_pull_request_merged_with_malformed_sha_is_error() {
+        let payload = r#"{
+            "action": "closed",
+            "pull_request": {
+                "number": 99,
+                "merged": true,
+                "merge_commit_sha": "not-a-sha",
+                "head": {
+                    "sha": "1234567890abcdef1234567890abcdef12345678",
+                    "ref": "pr-branch"
+                },
+                "base": {
+                    "sha": "0000000000000000000000000000000000000000",
+                    "ref": "main"
+                },
+                "user": { "id": 1, "login": "author" }
+            },
+            "repository": {
+                "owner": { "login": "org" },
+                "name": "repo"
+            }
+        }"#;
+
+        let result = parse_webhook("pull_request", payload.as_bytes());
+        assert!(matches!(
+            result,
+            Err(ParseError::InvalidField {
+                field: "pull_request.merge_commit_sha",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -721,7 +819,7 @@ mod tests {
                     e.head_sha,
                     Sha::parse("deadbeef1234567890abcdef1234567890abcdef").unwrap()
                 );
-                assert_eq!(e.conclusion, Some("success".to_string()));
+                assert_eq!(e.conclusion, Some(CheckSuiteConclusion::Success));
                 assert_eq!(e.pull_requests, vec![PrNumber(10), PrNumber(20)]);
             }
             _ => panic!("expected CheckSuite"),
@@ -750,6 +848,37 @@ mod tests {
                 assert_eq!(e.action, CheckSuiteAction::Requested);
                 assert!(e.conclusion.is_none());
                 assert!(e.pull_requests.is_empty());
+            }
+            _ => panic!("expected CheckSuite"),
+        }
+    }
+
+    #[test]
+    fn parse_check_suite_unknown_conclusion_is_preserved() {
+        // Forward compatibility: an unrecognised conclusion (e.g. GitHub's
+        // "startup_failure") must parse, preserving the raw string.
+        let payload = r#"{
+            "action": "completed",
+            "check_suite": {
+                "head_sha": "deadbeef1234567890abcdef1234567890abcdef",
+                "conclusion": "startup_failure",
+                "pull_requests": []
+            },
+            "repository": {
+                "owner": { "login": "org" },
+                "name": "repo"
+            }
+        }"#;
+
+        let result = parse_webhook("check_suite", payload.as_bytes()).unwrap();
+        let event = result.expect("should parse");
+
+        match event {
+            GitHubEvent::CheckSuite(e) => {
+                assert_eq!(
+                    e.conclusion,
+                    Some(CheckSuiteConclusion::Other("startup_failure".to_string()))
+                );
             }
             _ => panic!("expected CheckSuite"),
         }
