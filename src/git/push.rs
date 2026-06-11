@@ -60,8 +60,6 @@ pub fn push_head_to_branch(worktree: &Path, branch: &str) -> GitResult<PushResul
     let refspec = format!("HEAD:refs/heads/{}", branch);
     let head_sha = rev_parse(worktree, "HEAD")?;
 
-    // Use git_command for consistent, non-interactive, config-isolated environment.
-    // This prevents hangs on auth prompts and ensures reproducible behavior.
     let output = super::git_command(worktree)
         .args(["push", "origin", &refspec])
         .output()?;
@@ -69,6 +67,8 @@ pub fn push_head_to_branch(worktree: &Path, branch: &str) -> GitResult<PushResul
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
+    // String-matching git's output below is only sound because git_command
+    // pins LC_ALL=C; under other locales these messages are translated.
     if output.status.success() {
         // Check if it was already up-to-date
         if stdout.contains("Everything up-to-date") || stderr.contains("Everything up-to-date") {
@@ -100,8 +100,6 @@ pub fn push_head_to_branch(worktree: &Path, branch: &str) -> GitResult<PushResul
 ///
 /// Returns `None` if the branch doesn't exist on the remote.
 pub fn get_remote_ref(worktree: &Path, branch: &str) -> GitResult<Option<Sha>> {
-    // Use git_command for consistent, non-interactive, config-isolated environment.
-    // This prevents hangs on auth prompts and ensures reproducible behavior.
     let output = super::git_command(worktree)
         .args(["ls-remote", "origin", &format!("refs/heads/{}", branch)])
         .output()?;

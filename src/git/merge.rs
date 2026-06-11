@@ -25,8 +25,21 @@ use crate::types::Sha;
 
 use super::{
     CommitIdentity, GitError, GitResult, MergeResult, checkout_detached, fetch, get_parents,
-    git_commit_command, rev_parse, run_git_stdout, run_git_sync,
+    git_command, git_commit_command, rev_parse, run_git_stdout, run_git_sync,
 };
+
+/// Result of preparing a descendant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrepareResult {
+    /// The result of merging the predecessor into the descendant.
+    pub merge: MergeResult,
+
+    /// The exact predecessor commit that was merged (resolved from the PR ref
+    /// at fetch time, then pinned). [`reconcile_descendant`] requires this SHA
+    /// to be an ancestor of the descendant before it will perform the
+    /// irreversible ours-merge.
+    pub predecessor_head: Sha,
+}
 
 /// Prepare a descendant by merging the predecessor's head into it.
 ///
@@ -46,7 +59,7 @@ use super::{
 ///
 /// # Returns
 ///
-/// The result of the merge operation.
+/// The merge result plus the pinned predecessor head SHA that was merged.
 ///
 /// # Why PR refs?
 ///
@@ -63,7 +76,7 @@ pub fn prepare_descendant(
     descendant_branch: &str,
     predecessor_pr: u64,
     identity: &CommitIdentity,
-) -> GitResult<MergeResult> {
+) -> GitResult<PrepareResult> {
     // Construct the PR ref for the predecessor.
     // GitHub maintains refs/pull/<n>/head even after the PR branch is deleted.
     let pr_ref = format!("refs/pull/{}/head", predecessor_pr);
@@ -81,6 +94,8 @@ pub fn prepare_descendant(
         &["fetch", "origin", "--", descendant_branch, &fetch_refspec],
     )
     .map_err(|e| {
+        // String-matching git's output is only sound because git_command pins
+        // LC_ALL=C; under other locales this message is translated.
         if let GitError::CommandFailed { stderr, .. } = &e
             && stderr.contains("couldn't find remote ref")
         {
@@ -103,24 +118,32 @@ pub fn prepare_descendant(
         e
     })?;
 
+    // Pin the exact predecessor commit: merging the moving ref would race with
+    // force-pushes between fetch and merge, and reconciliation later requires
+    // exactly this SHA to be an ancestor of the descendant.
+    let predecessor_head = rev_parse(worktree, &local_ref)?;
+
     // Checkout the descendant branch in detached HEAD mode
     let remote_branch = format!("origin/{}", descendant_branch);
     checkout_detached(worktree, &remote_branch)?;
 
-    // Merge the predecessor's head via the local PR ref
-    let merge_ref = format!("origin/pr/{}", predecessor_pr);
     let message = format!(
         "Merge predecessor into {} (merge train preparation)",
         descendant_branch
     );
 
-    merge_with_message(
+    let merge = merge_with_message(
         worktree,
-        &merge_ref,
+        predecessor_head.as_str(),
         &message,
         MergeStrategy::Default,
         identity,
-    )
+    )?;
+
+    Ok(PrepareResult {
+        merge,
+        predecessor_head,
+    })
 }
 
 /// Reconcile a descendant after the predecessor has been squash-merged.
@@ -138,6 +161,10 @@ pub fn prepare_descendant(
 /// * `worktree` - Path to the stack's worktree
 /// * `descendant_branch` - The descendant's branch name
 /// * `squash_sha` - The SHA of the squash commit on main
+/// * `expected_squash_parent` - The main HEAD captured just before the squash
+/// * `predecessor_pre_squash_head` - The predecessor head that was merged during
+///   preparation ([`PrepareResult::predecessor_head`]); must be an ancestor of the
+///   descendant's current head
 /// * `default_branch` - The default branch name (e.g., "main")
 /// * `identity` - Identity for the merge commits (author/committer, optional signing key)
 ///
@@ -148,6 +175,8 @@ pub fn prepare_descendant(
 /// # Errors
 ///
 /// Returns an error if:
+/// - The descendant does not contain `predecessor_pre_squash_head` (preparation
+///   missing or stale, e.g. the predecessor was force-pushed after preparation)
 /// - The squash commit has no parent (shouldn't happen for a valid squash)
 /// - Either merge results in a conflict
 /// - The squash commit has multiple parents (not a squash merge)
@@ -158,6 +187,7 @@ pub fn reconcile_descendant(
     descendant_branch: &str,
     squash_sha: &Sha,
     expected_squash_parent: &Sha,
+    predecessor_pre_squash_head: &Sha,
     default_branch: &str,
     identity: &CommitIdentity,
 ) -> GitResult<MergeResult> {
@@ -170,23 +200,50 @@ pub fn reconcile_descendant(
     // we'd check out an old commit and lose the prepared merge state.
     fetch(worktree, &[default_branch, descendant_branch])?;
 
+    let remote_branch = format!("origin/{}", descendant_branch);
+    let descendant_head = rev_parse(worktree, &remote_branch)?;
+
+    // The ours-merge below records `squash_sha` as an ancestor WITHOUT taking
+    // its tree. That is only sound if the descendant already contains the
+    // predecessor's pre-squash content (established by prepare_descendant). A
+    // force-push to the predecessor between preparation and squash breaks
+    // this; proceeding would lose the squashed content with no later phase
+    // able to restore it.
+    let predecessor_known = git_command(worktree)
+        .args([
+            "cat-file",
+            "-e",
+            &format!("{}^{{commit}}", predecessor_pre_squash_head),
+        ])
+        .output()?
+        .status
+        .success();
+    if !predecessor_known
+        || !super::is_ancestor(worktree, predecessor_pre_squash_head, &descendant_head)?
+    {
+        return Err(GitError::PreparationNotCompleted {
+            descendant_branch: descendant_branch.to_string(),
+            predecessor_head: predecessor_pre_squash_head.clone(),
+            descendant_head,
+        });
+    }
+
     // Get the parent of the squash commit (main state just before squash)
     let parents = get_parents(worktree, squash_sha.as_str())?;
 
     // Validate this is a squash merge (single parent)
     if parents.is_empty() {
-        return Err(GitError::CommandFailed {
-            command: "get squash parent".to_string(),
-            stderr: format!("Squash commit {} has no parents", squash_sha),
+        return Err(GitError::InvalidSquashCommit {
+            squash_sha: squash_sha.clone(),
+            details: "commit has no parents, expected 1 for squash merge".to_string(),
         });
     }
     if parents.len() > 1 {
-        return Err(GitError::CommandFailed {
-            command: "validate squash commit".to_string(),
-            stderr: format!(
-                "Commit {} has {} parents, expected 1 for squash merge. \
-                 This may indicate a merge commit or rebase was used instead of squash.",
-                squash_sha,
+        return Err(GitError::InvalidSquashCommit {
+            squash_sha: squash_sha.clone(),
+            details: format!(
+                "commit has {} parents, expected 1 for squash merge; \
+                 a merge commit or rebase may have been used instead of squash",
                 parents.len()
             ),
         });
@@ -196,17 +253,15 @@ pub fn reconcile_descendant(
 
     // Validate: the squash commit must be on the default branch.
     // This catches cases where a wrong SHA (off-main) is passed.
+    // (`merge-base --is-ancestor X X` exits 0, so equality needs no extra arm.)
     let default_head = rev_parse(worktree, &format!("origin/{}", default_branch))?;
-    let commit_on_default =
-        super::is_ancestor(worktree, squash_sha, &default_head)? || squash_sha == &default_head;
-
-    if !commit_on_default {
-        return Err(GitError::CommandFailed {
-            command: "validate squash commit".to_string(),
-            stderr: format!(
-                "Commit {} is not on the {} branch history. \
-                 The squash SHA must be a commit on the default branch.",
-                squash_sha, default_branch
+    if !super::is_ancestor(worktree, squash_sha, &default_head)? {
+        return Err(GitError::InvalidSquashCommit {
+            squash_sha: squash_sha.clone(),
+            details: format!(
+                "commit is not on the {} branch history; \
+                 the squash SHA must be a commit on the default branch",
+                default_branch
             ),
         });
     }
@@ -215,17 +270,14 @@ pub fn reconcile_descendant(
     // For a valid squash merge: parent is the prior main HEAD, which is on main.
     // For a multi-commit rebase: parent is the previous rebased commit,
     // which is NOT on the main branch history.
-    let parent_on_default = super::is_ancestor(worktree, squash_parent, &default_head)?
-        || squash_parent == &default_head;
-
-    if !parent_on_default {
-        return Err(GitError::CommandFailed {
-            command: "validate squash parent".to_string(),
-            stderr: format!(
-                "Commit {} has parent {} which is not on the {} branch history. \
-                 This indicates a rebase or fast-forward merge was used instead of squash. \
-                 The merge train only supports squash merges.",
-                squash_sha, squash_parent, default_branch
+    if !super::is_ancestor(worktree, squash_parent, &default_head)? {
+        return Err(GitError::InvalidSquashCommit {
+            squash_sha: squash_sha.clone(),
+            details: format!(
+                "parent {} is not on the {} branch history; \
+                 this indicates a rebase or fast-forward merge was used instead of squash \
+                 (the merge train only supports squash merges)",
+                squash_parent, default_branch
             ),
         });
     }
@@ -235,19 +287,18 @@ pub fn reconcile_descendant(
     // After a multi-commit FF, both commits are on main, so the ancestor check passes.
     // But the parent is NOT the prior main HEAD - it's another FF'd commit.
     if squash_parent != expected_squash_parent {
-        return Err(GitError::CommandFailed {
-            command: "validate squash parent".to_string(),
-            stderr: format!(
-                "Commit {} has parent {} but expected {}. \
-                 This indicates a multi-commit rebase or fast-forward merge was used \
-                 instead of squash. The merge train only supports squash merges.",
-                squash_sha, squash_parent, expected_squash_parent
+        return Err(GitError::InvalidSquashCommit {
+            squash_sha: squash_sha.clone(),
+            details: format!(
+                "parent {} does not match expected parent {}; \
+                 this indicates a multi-commit rebase or fast-forward merge was used \
+                 instead of squash (the merge train only supports squash merges)",
+                squash_parent, expected_squash_parent
             ),
         });
     }
 
     // Checkout the descendant branch in detached HEAD mode
-    let remote_branch = format!("origin/{}", descendant_branch);
     checkout_detached(worktree, &remote_branch)?;
 
     // Step 1: Merge the PARENT of the squash commit ($SQUASH_SHA^)
@@ -339,6 +390,9 @@ pub fn catch_up_descendant(
 ///
 /// Uses the provided identity for the commit author/committer. If
 /// `identity.signing_key` is set, the merge commit will be GPG signed.
+///
+/// Classification is structural (locale-independent): a no-op merge is
+/// detected by HEAD not moving, a conflict by unmerged index entries.
 fn merge_with_message(
     worktree: &Path,
     target: &str,
@@ -346,6 +400,8 @@ fn merge_with_message(
     strategy: MergeStrategy,
     identity: &CommitIdentity,
 ) -> GitResult<MergeResult> {
+    let head_before = rev_parse(worktree, "HEAD")?;
+
     let mut args = vec!["merge", "--no-edit", "-m", message];
 
     if let Some(strategy_arg) = strategy.as_git_arg() {
@@ -363,32 +419,28 @@ fn merge_with_message(
         .args(&args)
         .output()?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
     if output.status.success() {
-        // Check if it was already up-to-date
-        if stdout.contains("Already up to date") {
+        let head_after = rev_parse(worktree, "HEAD")?;
+        if head_after == head_before {
             return Ok(MergeResult::AlreadyUpToDate);
         }
-
-        // Get the resulting commit SHA
-        let commit_sha = rev_parse(worktree, "HEAD")?;
-        return Ok(MergeResult::Success { commit_sha });
+        return Ok(MergeResult::Success {
+            commit_sha: head_after,
+        });
     }
 
-    // Check for merge conflict (git outputs CONFLICT to stdout, not stderr)
-    let combined = format!("{}{}", stdout, stderr);
-    if combined.contains("CONFLICT") || combined.contains("Automatic merge failed") {
-        // Get the list of conflicting files
+    // Unmerged index entries mean the merge started and hit conflicts. If
+    // `ls-files -u` itself fails, fall through to the hard error: an
+    // unclassifiable merge failure must halt the cascade.
+    let unmerged = run_git_stdout(worktree, &["ls-files", "-u"]).unwrap_or_default();
+    if !unmerged.is_empty() {
         let conflicting_files = get_conflicting_files(worktree)?;
         return Ok(MergeResult::Conflict { conflicting_files });
     }
 
-    // Other error
     Err(GitError::CommandFailed {
         command: format!("git {}", args.join(" ")),
-        stderr: stderr.to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
     })
 }
 
@@ -501,9 +553,8 @@ pub fn is_valid_squash_merge(
 
     // The COMMIT must be on the default branch.
     // This catches cases where a wrong SHA (off-main) is passed.
-    let commit_on_default =
-        super::is_ancestor(worktree, commit, &default_head)? || commit == &default_head;
-    if !commit_on_default {
+    // (`merge-base --is-ancestor X X` exits 0, so equality needs no extra arm.)
+    if !super::is_ancestor(worktree, commit, &default_head)? {
         return Ok(false);
     }
 
@@ -511,12 +562,7 @@ pub fn is_valid_squash_merge(
     // For a valid squash: the parent is the prior main HEAD, which is on main.
     // For a multi-commit rebase: the parent is the previous rebased commit,
     // which is NOT on the main branch history.
-    // Check if the parent is an ancestor of (or equal to) the default branch HEAD
-    // This catches rebase merges where the parent is not on main's history
-    let parent_on_default =
-        super::is_ancestor(worktree, parent, &default_head)? || parent == &default_head;
-
-    Ok(parent_on_default)
+    super::is_ancestor(worktree, parent, &default_head)
 }
 
 #[cfg(test)]
@@ -689,10 +735,13 @@ mod tests {
 
         // Should complete without conflict (either Success or AlreadyUpToDate)
         assert!(
-            result.is_ok(),
+            result.merge.is_ok(),
             "Expected merge to succeed, got {:?}",
-            result
+            result.merge
         );
+
+        // The pinned predecessor head must be the SHA the PR ref pointed at
+        assert_eq!(result.predecessor_head, pred_sha);
 
         // The descendant should now have both files
         assert!(worktree.join("pred.txt").exists());
@@ -725,9 +774,9 @@ mod tests {
         let result1 = prepare_descendant(&worktree, "pr-124", 123, &identity).unwrap();
         // Since pr-124 was created from pr-123, it might be AlreadyUpToDate
         assert!(
-            result1.is_ok(),
+            result1.merge.is_ok(),
             "Expected merge to succeed, got {:?}",
-            result1
+            result1.merge
         );
 
         // Push the prepared state
@@ -741,7 +790,7 @@ mod tests {
         let worktree2 = worktree_for_stack(&config, PrNumber(124)).unwrap();
         let result2 = prepare_descendant(&worktree2, "pr-124", 123, &identity).unwrap();
 
-        assert!(matches!(result2, MergeResult::AlreadyUpToDate));
+        assert!(matches!(result2.merge, MergeResult::AlreadyUpToDate));
     }
 
     #[test]
@@ -806,9 +855,9 @@ mod tests {
         let identity = test_identity();
         let prep_result = prepare_descendant(&worktree, "pr-124", 123, &identity).unwrap();
         assert!(
-            prep_result.is_ok(),
+            prep_result.merge.is_ok(),
             "Expected prepare to succeed, got {:?}",
-            prep_result
+            prep_result.merge
         );
         run_git_sync(
             &worktree,
@@ -822,6 +871,7 @@ mod tests {
             "pr-124",
             &squash_sha,
             &main_before_squash,
+            &prep_result.predecessor_head,
             "main",
             &identity,
         )
@@ -921,6 +971,7 @@ mod tests {
             "pr-124",
             &merge_sha,
             &main_before_merge,
+            &pred_sha,
             "main",
             &identity,
         );
@@ -928,12 +979,12 @@ mod tests {
         // Should fail because it's not a squash merge
         assert!(result.is_err());
         let err = result.unwrap_err();
-        match err {
-            GitError::CommandFailed { stderr, .. } => {
-                assert!(stderr.contains("2 parents"));
-            }
-            _ => panic!("Expected CommandFailed error"),
-        }
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("2 parents"),
+            "Error should mention parent count, got: {}",
+            err_str
+        );
     }
 
     #[test]
@@ -1000,7 +1051,7 @@ mod tests {
         let worktree1 = worktree_for_stack(&config, PrNumber(123)).unwrap();
         let identity = test_identity();
         let prep_result = prepare_descendant(&worktree1, "pr-124", 123, &identity).unwrap();
-        assert!(prep_result.is_ok(), "Prepare should succeed");
+        assert!(prep_result.merge.is_ok(), "Prepare should succeed");
 
         // Push the prepared state
         run_git_sync(
@@ -1058,6 +1109,7 @@ mod tests {
             "pr-124",
             &squash_sha,
             &main_before_squash,
+            &prep_result.predecessor_head,
             "main",
             &identity,
         )
@@ -1781,6 +1833,7 @@ mod tests {
             "pr-124",
             &second_sha,
             &main_head,
+            &pred_sha,
             "main",
             &identity,
         );
@@ -1900,6 +1953,7 @@ mod tests {
             "pr-124",
             &second_sha,
             &main_before_ff, // Expected parent: what main was BEFORE the FF
+            &pred_sha,
             "main",
             &identity,
         );
@@ -1924,5 +1978,267 @@ mod tests {
 
         // Verify initial_sha is not used (silence warning)
         let _ = initial_sha;
+    }
+
+    /// `git merge-base --is-ancestor X X` exits 0: every commit is its own
+    /// ancestor. The `is_ancestor(x, y)? || x == y` pattern is therefore
+    /// redundant; this test pins the git semantics that justify omitting it.
+    #[test]
+    fn is_ancestor_is_reflexive() {
+        let (_temp_dir, config, initial_sha) = create_test_repo();
+        let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
+        assert!(super::super::is_ancestor(&worktree, &initial_sha, &initial_sha).unwrap());
+    }
+
+    /// Simulates the force-push race: the predecessor is force-pushed to new
+    /// content AFTER the descendant was prepared, then squash-merged. The
+    /// descendant does not contain the squashed content, so the ours-merge in
+    /// reconciliation would record the squash as an ancestor while the tree
+    /// lacks its content — permanent, silent content loss. Reconcile must
+    /// refuse.
+    #[test]
+    fn reconcile_refuses_when_predecessor_force_pushed_after_prepare() {
+        let (_temp_dir, config, _initial_sha) = create_test_repo();
+        let clone_dir = config.clone_dir();
+        let identity = test_identity();
+
+        // Predecessor at state X
+        let pred_x =
+            create_branch_with_file(&config, "pr-123", "pred.txt", "original content", "main");
+        create_pr_ref(&config, 123, &pred_x);
+
+        // Descendant from X
+        let _desc_sha = create_branch_with_file(
+            &config,
+            "pr-124",
+            "desc.txt",
+            "descendant content",
+            "pr-123",
+        );
+
+        // Prepare the descendant (pins X)
+        let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
+        let prep = prepare_descendant(&worktree, "pr-124", 123, &identity).unwrap();
+        assert_eq!(prep.predecessor_head, pred_x);
+        run_git_sync(
+            &worktree,
+            &["push", "origin", "HEAD:refs/heads/pr-124", "--force"],
+        )
+        .unwrap();
+
+        // Force-push the predecessor to state Y: rewritten from main, X is NOT
+        // an ancestor of Y and Y's content is absent from the descendant.
+        let pred_y = create_branch_with_file(
+            &config,
+            "pr-123-rewrite",
+            "pred.txt",
+            "rewritten content",
+            "main",
+        );
+        run_git_sync(
+            &clone_dir,
+            &["update-ref", "refs/heads/pr-123", pred_y.as_str()],
+        )
+        .unwrap();
+        run_git_sync(
+            &clone_dir,
+            &["update-ref", "refs/pull/123/head", pred_y.as_str()],
+        )
+        .unwrap();
+
+        // GitHub squash-merges Y to main
+        let main_before_squash =
+            run_git_stdout(&clone_dir, &["rev-parse", "refs/heads/main"]).unwrap();
+        let main_before_squash = Sha::parse(&main_before_squash).unwrap();
+
+        let temp_work = clone_dir.parent().unwrap().join("temp_squash_race");
+        std::fs::create_dir_all(&temp_work).unwrap();
+        run_git_sync(
+            &clone_dir,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                temp_work.to_str().unwrap(),
+                "refs/heads/main",
+            ],
+        )
+        .unwrap();
+        run_git_sync(&temp_work, &["config", "user.email", "test@test.com"]).unwrap();
+        run_git_sync(&temp_work, &["config", "user.name", "Test"]).unwrap();
+        run_git_sync(&temp_work, &["merge", "--squash", pred_y.as_str()]).unwrap();
+        run_git_sync(&temp_work, &["commit", "-m", "Squash: rewritten pred"]).unwrap();
+        let squash_sha = run_git_stdout(&temp_work, &["rev-parse", "HEAD"]).unwrap();
+        let squash_sha = Sha::parse(&squash_sha).unwrap();
+        run_git_sync(&temp_work, &["push", "origin", "HEAD:refs/heads/main"]).unwrap();
+        run_git_sync(
+            &clone_dir,
+            &["worktree", "remove", "--force", temp_work.to_str().unwrap()],
+        )
+        .unwrap();
+
+        // The cascade believes the pre-squash predecessor head is Y. Y is not
+        // an ancestor of the descendant (only X was merged), so reconciliation
+        // must refuse rather than perform the ours-merge.
+        let result = reconcile_descendant(
+            &worktree,
+            "pr-124",
+            &squash_sha,
+            &main_before_squash,
+            &pred_y,
+            "main",
+            &identity,
+        );
+
+        assert!(
+            result.is_err(),
+            "reconcile must refuse when the descendant does not contain the \
+             predecessor's pre-squash head (force-push race), got {:?}",
+            result
+        );
+    }
+
+    /// Strips the crate-name prefix from `module_path!()` and appends the test
+    /// name, producing the name libtest expects for `--exact` filtering.
+    fn child_test_name(test_name: &str) -> String {
+        let module = module_path!();
+        let module = module
+            .split_once("::")
+            .map(|(_, rest)| rest)
+            .unwrap_or(module);
+        format!("{}::{}", module, test_name)
+    }
+
+    /// Re-runs the named test in a child process with extra environment
+    /// variables, leaving the parent test process's environment untouched
+    /// (mutating the process environment would race with parallel tests).
+    fn rerun_self_with_env(test_name: &str, envs: &[(&str, &str)]) {
+        let exe = std::env::current_exe().unwrap();
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.args([test_name, "--exact", "--test-threads=1", "--nocapture"]);
+        for (key, value) in envs {
+            cmd.env(key, value);
+        }
+        let output = cmd.output().unwrap();
+        assert!(
+            output.status.success(),
+            "child test run failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    const CHILD_MARKER: &str = "MERGE_TRAIN_GIT_ENV_TEST_CHILD";
+
+    /// Merge classification must not depend on the process locale: under a
+    /// German locale git prints "Bereits aktuell." and "KONFLIKT", which prose
+    /// parsing of the English strings misclassifies (a no-op merge as Success,
+    /// a conflict as an unexpected error).
+    #[test]
+    fn merge_classification_is_locale_independent() {
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            rerun_self_with_env(
+                &child_test_name("merge_classification_is_locale_independent"),
+                &[
+                    (CHILD_MARKER, "1"),
+                    ("LC_ALL", "de_DE.UTF-8"),
+                    ("LC_MESSAGES", "de_DE.UTF-8"),
+                    ("LANG", "de_DE.UTF-8"),
+                    ("LANGUAGE", "de_DE.UTF-8"),
+                ],
+            );
+            return;
+        }
+
+        let (_temp_dir, config, _initial_sha) = create_test_repo();
+        let identity = test_identity();
+
+        // No-op merge: branch already contains main.
+        create_branch_with_file(&config, "pr-123", "feature.txt", "feature", "main");
+        let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
+        let result = catch_up_descendant(&worktree, "pr-123", "main", &identity).unwrap();
+        assert!(
+            matches!(result, MergeResult::AlreadyUpToDate),
+            "no-op merge must classify as AlreadyUpToDate regardless of locale, got {:?}",
+            result
+        );
+
+        // Conflicting merge: branch and main both add conflict.txt.
+        create_branch_with_file(&config, "pr-200", "conflict.txt", "branch version", "main");
+        create_branch_with_file(&config, "main", "conflict.txt", "main version", "main");
+        let worktree2 = worktree_for_stack(&config, PrNumber(200)).unwrap();
+        let result = catch_up_descendant(&worktree2, "pr-200", "main", &identity)
+            .expect("conflicting merge must classify as Conflict regardless of locale");
+        assert!(
+            result.is_conflict(),
+            "conflicting merge must classify as Conflict regardless of locale, got {:?}",
+            result
+        );
+    }
+
+    /// GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE in the parent environment must
+    /// not redirect git operations away from the directory each command is run
+    /// in.
+    #[test]
+    fn parent_env_does_not_redirect_git_operations() {
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            rerun_self_with_env(
+                &child_test_name("parent_env_does_not_redirect_git_operations"),
+                &[
+                    (CHILD_MARKER, "1"),
+                    ("GIT_DIR", "/nonexistent/never-a-git-dir"),
+                    ("GIT_WORK_TREE", "/nonexistent/never-a-work-tree"),
+                    ("GIT_INDEX_FILE", "/nonexistent/never-an-index"),
+                ],
+            );
+            return;
+        }
+
+        let (_temp_dir, config, initial_sha) = create_test_repo();
+        let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
+        let head = rev_parse(&worktree, "HEAD").unwrap();
+        assert_eq!(head, initial_sha);
+    }
+
+    /// GIT_AUTHOR_* / GIT_COMMITTER_* in the parent environment must not
+    /// override the commit identity passed via `-c user.name` / `-c user.email`.
+    #[test]
+    fn commit_identity_not_overridden_by_parent_env() {
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            rerun_self_with_env(
+                &child_test_name("commit_identity_not_overridden_by_parent_env"),
+                &[
+                    (CHILD_MARKER, "1"),
+                    ("GIT_AUTHOR_NAME", "Mallory"),
+                    ("GIT_AUTHOR_EMAIL", "mallory@evil.example"),
+                    ("GIT_COMMITTER_NAME", "Mallory"),
+                    ("GIT_COMMITTER_EMAIL", "mallory@evil.example"),
+                ],
+            );
+            return;
+        }
+
+        let (_temp_dir, config, _initial_sha) = create_test_repo();
+        let identity = test_identity();
+
+        // Predecessor and descendant diverge, so preparation creates a real
+        // merge commit (not a no-op).
+        let pred_sha =
+            create_branch_with_file(&config, "pr-123", "pred.txt", "predecessor", "main");
+        create_pr_ref(&config, 123, &pred_sha);
+        let _desc_sha =
+            create_branch_with_file(&config, "pr-124", "desc.txt", "descendant", "main");
+
+        let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
+        let prep = prepare_descendant(&worktree, "pr-124", 123, &identity).unwrap();
+        assert!(prep.merge.is_success(), "expected a real merge commit");
+
+        let identities =
+            run_git_stdout(&worktree, &["log", "-1", "--format=%an <%ae>%n%cn <%ce>"]).unwrap();
+        assert_eq!(
+            identities, "Test <test@test.com>\nTest <test@test.com>",
+            "merge commit identity must come from the configured CommitIdentity, \
+             not the parent environment"
+        );
     }
 }

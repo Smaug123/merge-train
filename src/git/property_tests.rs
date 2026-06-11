@@ -244,14 +244,14 @@ proptest! {
         // Get worktree and prepare descendant using PR number
         let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
         let prep_result = prepare_descendant(&worktree, "pr-124", 123, &test_identity()).unwrap();
-        prop_assert!(prep_result.is_ok());
+        prop_assert!(prep_result.merge.is_ok());
         run_git_sync(&worktree, &["push", "origin", "HEAD:refs/heads/pr-124", "--force"]).unwrap();
 
         // Squash merge predecessor to main
         let squash = squash_merge_to_main(&config, &pred_sha);
 
         // Reconcile descendant
-        let reconcile_result = reconcile_descendant(&worktree, "pr-124", &squash.squash_sha, &squash.prior_main_head, "main", &test_identity()).unwrap();
+        let reconcile_result = reconcile_descendant(&worktree, "pr-124", &squash.squash_sha, &squash.prior_main_head, &pred_sha, "main", &test_identity()).unwrap();
         prop_assert!(reconcile_result.is_ok());
 
         // Catch up with main (if needed)
@@ -296,7 +296,7 @@ proptest! {
         let _intervening_sha = add_commit_to_main(&config, "intervening.txt", &intervening_content);
 
         // Reconcile and catch up
-        reconcile_descendant(&worktree, "pr-124", &squash.squash_sha, &squash.prior_main_head, "main", &test_identity()).unwrap();
+        reconcile_descendant(&worktree, "pr-124", &squash.squash_sha, &squash.prior_main_head, &pred_sha, "main", &test_identity()).unwrap();
         catch_up_descendant(&worktree, "pr-124", "main", &test_identity()).unwrap();
 
         // The intervening commit should be incorporated
@@ -375,7 +375,7 @@ proptest! {
         run_git_sync(&worktree, &["push", "origin", "HEAD:refs/heads/pr-124", "--force"]).unwrap();
 
         let squash = squash_merge_to_main(&config, &pred_sha);
-        reconcile_descendant(&worktree, "pr-124", &squash.squash_sha, &squash.prior_main_head, "main", &test_identity()).unwrap();
+        reconcile_descendant(&worktree, "pr-124", &squash.squash_sha, &squash.prior_main_head, &pred_sha, "main", &test_identity()).unwrap();
         catch_up_descendant(&worktree, "pr-124", "main", &test_identity()).unwrap();
 
         // Verify ALL predecessor files preserved
@@ -432,7 +432,7 @@ proptest! {
         let _after = add_commit_to_main(&config, "after.txt", &after_squash_content);
 
         // Reconcile and catch up
-        reconcile_descendant(&worktree, "pr-124", &squash.squash_sha, &squash.prior_main_head, "main", &test_identity()).unwrap();
+        reconcile_descendant(&worktree, "pr-124", &squash.squash_sha, &squash.prior_main_head, &pred_sha, "main", &test_identity()).unwrap();
         catch_up_descendant(&worktree, "pr-124", "main", &test_identity()).unwrap();
 
         // Verify BEFORE-squash commits are preserved (via $SQUASH_SHA^)
@@ -645,6 +645,7 @@ fn squash_parent_ordering_incorporates_late_commits() {
         "pr-124",
         &squash.squash_sha,
         &squash.prior_main_head,
+        &pred_sha,
         "main",
         &test_identity(),
     )
@@ -750,6 +751,7 @@ fn catch_up_detects_conflicts_with_main() {
         "pr-124",
         &squash.squash_sha,
         &squash.prior_main_head,
+        &pred_sha,
         "main",
         &test_identity(),
     )
@@ -892,6 +894,7 @@ fn recovery_uses_frozen_descendants() {
             &branch,
             &squash.squash_sha,
             &squash.prior_main_head,
+            &pred_sha,
             "main",
             &test_identity(),
         )
@@ -971,6 +974,7 @@ fn fanout_worktree_ordering() {
             &branch,
             &squash.squash_sha,
             &squash.prior_main_head,
+            &root_sha,
             "main",
             &test_identity(),
         )
@@ -1246,6 +1250,7 @@ fn naive_ordering_loses_late_commits() {
         "pr-124",
         &squash.squash_sha,
         &squash.prior_main_head,
+        &pred_sha,
         "main",
         &test_identity(),
     )

@@ -15,7 +15,9 @@
 
 use std::path::Path;
 
-use super::{GitConfig, GitError, GitResult, run_git_sync, worktree};
+use super::{
+    GitConfig, GitError, GitResult, run_git_stdout, run_git_sync, worktree, worktree_path_str,
+};
 use crate::types::PrNumber;
 
 /// Result of worktree cleanup.
@@ -144,7 +146,7 @@ fn delete_worktree_force(clone_dir: &Path, worktree_path: &Path) -> GitResult<()
             "worktree",
             "remove",
             "--force",
-            worktree_path.to_str().unwrap(),
+            worktree_path_str(worktree_path)?,
         ],
     );
 
@@ -186,25 +188,25 @@ pub fn is_worktree_dirty(worktree_path: &Path) -> GitResult<bool> {
         }
     }
 
-    // Check for in-progress merge
-    let merge_head = worktree_path.join(".git/MERGE_HEAD");
-    if merge_head.exists() {
-        return Ok(true);
-    }
-
-    // Also check the worktree-specific gitdir (for worktrees, .git is a file pointing to the real gitdir)
-    let git_path = worktree_path.join(".git");
-    if git_path.is_file()
-        && let Ok(content) = std::fs::read_to_string(&git_path)
-        && let Some(gitdir) = content.trim().strip_prefix("gitdir: ")
-    {
-        let merge_head = Path::new(gitdir).join("MERGE_HEAD");
-        if merge_head.exists() {
-            return Ok(true);
+    // Check for an in-progress merge. MERGE_HEAD lives in the worktree's
+    // gitdir, which for a linked worktree is behind a `gitdir:` redirect in
+    // the `.git` file — possibly with a path relative to the worktree, never
+    // to the process CWD. Let git resolve it; the returned path is relative
+    // to the git process's CWD (the worktree).
+    match run_git_stdout(worktree_path, &["rev-parse", "--git-path", "MERGE_HEAD"]) {
+        Ok(merge_head_str) => {
+            let merge_head = Path::new(&merge_head_str);
+            let merge_head = if merge_head.is_absolute() {
+                merge_head.to_path_buf()
+            } else {
+                worktree_path.join(merge_head)
+            };
+            Ok(merge_head.exists())
         }
+        // Cannot determine merge state: report dirty so the caller cleans up
+        // rather than proceeding on ambiguous state.
+        Err(_) => Ok(true),
     }
-
-    Ok(false)
 }
 
 /// Check if a worktree is in a merge conflict state.
@@ -213,8 +215,6 @@ pub fn has_merge_conflict(worktree_path: &Path) -> GitResult<bool> {
         return Ok(false);
     }
 
-    // Use git_command for consistent, non-interactive, config-isolated environment.
-    // This prevents hangs on auth prompts and ensures reproducible behavior.
     let output = super::git_command(worktree_path)
         .args(["diff", "--name-only", "--diff-filter=U"])
         .output()?;
@@ -229,30 +229,6 @@ pub fn has_merge_conflict(worktree_path: &Path) -> GitResult<bool> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     Ok(!stdout.trim().is_empty())
-}
-
-/// Verify preparation was completed for a descendant.
-///
-/// Before reconciliation, we must verify that the descendant was prepared
-/// (predecessor head merged into it) before the squash. This is checked by
-/// verifying that the predecessor's pre-squash head is an ancestor of the
-/// descendant's head.
-///
-/// # Arguments
-///
-/// * `worktree` - Path to the worktree
-/// * `predecessor_head` - The predecessor's head SHA (before squash)
-/// * `descendant_head` - The descendant's current head SHA
-///
-/// # Returns
-///
-/// `true` if preparation was completed (predecessor head is an ancestor).
-pub fn verify_preparation_completed(
-    worktree: &Path,
-    predecessor_head: &crate::types::Sha,
-    descendant_head: &crate::types::Sha,
-) -> GitResult<bool> {
-    super::is_ancestor(worktree, predecessor_head, descendant_head)
 }
 
 /// Get the status of all worktrees in a repo.
@@ -278,7 +254,6 @@ mod tests {
     use super::*;
     use crate::git::worktree::worktree_for_stack;
     use crate::git::{GitConfig, run_git_stdout};
-    use crate::types::Sha;
     use std::time::Duration;
     use tempfile::TempDir;
 
@@ -445,31 +420,47 @@ mod tests {
         assert!(!is_worktree_dirty(&worktree).unwrap());
     }
 
+    /// An in-progress merge with a clean tree (e.g. `merge -s ours --no-commit`
+    /// interrupted before commit) is only visible via MERGE_HEAD. For a linked
+    /// worktree, `.git` is a `gitdir:` redirect file — possibly with a path
+    /// relative to the worktree, never to the process CWD — so MERGE_HEAD must
+    /// be located through the redirect.
     #[test]
-    fn verify_preparation_completed_works() {
+    fn is_worktree_dirty_detects_merge_head_behind_relative_gitdir() {
         let (_temp_dir, config) = create_test_repo();
-
         let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
-        run_git_sync(&worktree, &["config", "user.email", "test@test.com"]).unwrap();
-        run_git_sync(&worktree, &["config", "user.name", "Test"]).unwrap();
 
-        // Get initial commit
-        let initial = run_git_stdout(&worktree, &["rev-parse", "HEAD"]).unwrap();
-        let initial = Sha::parse(&initial).unwrap();
+        // The linked worktree's gitdir lives under <clone>/worktrees/<name>.
+        let gitdir = config.clone_dir().join("worktrees").join("stack-123");
+        assert!(
+            gitdir.is_dir(),
+            "expected linked worktree gitdir at {}",
+            gitdir.display()
+        );
 
-        // Create a new commit
-        std::fs::write(worktree.join("new.txt"), "new").unwrap();
-        run_git_sync(&worktree, &["add", "."]).unwrap();
-        run_git_sync(&worktree, &["commit", "-m", "New commit"]).unwrap();
+        // Rewrite the redirect to a relative path; git resolves it against the
+        // worktree directory, not the process CWD.
+        std::fs::write(
+            worktree.join(".git"),
+            "gitdir: ../../clone/worktrees/stack-123\n",
+        )
+        .unwrap();
 
-        let new_head = run_git_stdout(&worktree, &["rev-parse", "HEAD"]).unwrap();
-        let new_head = Sha::parse(&new_head).unwrap();
+        // The relative redirect must be valid as far as git is concerned.
+        let head = run_git_stdout(&worktree, &["rev-parse", "HEAD"]).unwrap();
+        assert_eq!(head.len(), 40);
+        assert!(!is_worktree_dirty(&worktree).unwrap());
 
-        // Initial should be ancestor of new
-        assert!(verify_preparation_completed(&worktree, &initial, &new_head).unwrap());
+        // Simulate a merge interrupted before commit: MERGE_HEAD exists but the
+        // tree and index are clean.
+        std::fs::write(gitdir.join("MERGE_HEAD"), format!("{}\n", head)).unwrap();
+        assert!(
+            is_worktree_dirty(&worktree).unwrap(),
+            "MERGE_HEAD behind a relative gitdir redirect must mark the worktree dirty"
+        );
 
-        // New should not be ancestor of initial
-        assert!(!verify_preparation_completed(&worktree, &new_head, &initial).unwrap());
+        std::fs::remove_file(gitdir.join("MERGE_HEAD")).unwrap();
+        assert!(!is_worktree_dirty(&worktree).unwrap());
     }
 
     #[test]
