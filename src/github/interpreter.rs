@@ -18,9 +18,11 @@ use crate::effects::{
 };
 use crate::types::{CommentId, MergeStateStatus, PrNumber, PrState, Sha};
 
+use std::future::Future;
+
 use super::client::OctocrabClient;
 use super::error::{GitHubApiError, is_rate_limit_error, is_transient_message};
-use super::retry::{RetryConfig, RetryPolicy, retry_with_backoff};
+use super::retry::{RetryConfig, RetryPolicy, RetryResult, retry_with_backoff};
 
 // ─── GraphQL Types ────────────────────────────────────────────────────────────
 
@@ -52,8 +54,8 @@ struct MergeStateData {
 #[derive(Debug, Deserialize)]
 struct GraphQLError {
     message: String,
+    /// GitHub's machine-readable error type, e.g. `RATE_LIMITED`.
     #[serde(default)]
-    #[allow(dead_code)]
     r#type: Option<String>,
 }
 
@@ -96,17 +98,39 @@ impl GitHubInterpreter for OctocrabClient {
 /// * `client` - The octocrab client scoped to a repository
 /// * `effect` - The effect to execute
 /// * `retry_config` - Configuration for retry behavior
-/// * `retry_policy` - Whether to retry transient errors
+/// * `retry_policy` - Whether to retry transient errors (idempotent effects only)
 pub async fn interpret_github_effect(
     client: &OctocrabClient,
     effect: GitHubEffect,
     retry_config: RetryConfig,
     retry_policy: RetryPolicy,
 ) -> Result<GitHubResponse, GitHubApiError> {
-    let result = retry_with_backoff(retry_config, retry_policy, || {
+    // A non-idempotent effect must not be retried: the server may have
+    // processed a request whose response was lost, so a retry would duplicate
+    // the side effect (PostComment) or misreport an applied one as a failure
+    // (SquashMerge against an already-merged PR).
+    let policy = if effect.is_idempotent() {
+        retry_policy
+    } else {
+        RetryPolicy::NoRetry
+    };
+
+    let result = retry_with_backoff(retry_config, policy, || {
         execute_effect(client, effect.clone())
     })
     .await;
+
+    if let RetryResult::ExhaustedRetries {
+        attempts,
+        last_error,
+    } = &result
+    {
+        tracing::warn!(
+            attempts,
+            error = %last_error,
+            "GitHub effect failed with a transient error after all attempts"
+        );
+    }
 
     result.into_result()
 }
@@ -142,6 +166,35 @@ async fn execute_effect(
         GitHubEffect::GetBranchProtection { branch } => get_branch_protection(client, branch).await,
         GitHubEffect::GetRulesets => get_rulesets(client).await,
         GitHubEffect::GetRepoSettings => get_repo_settings(client).await,
+    }
+}
+
+// ─── Pagination ───────────────────────────────────────────────────────────────
+
+/// Fetches all pages of a listing endpoint, collecting every item.
+///
+/// `fetch_page` is called with successive 1-based page numbers. The `Link`
+/// header (surfaced as `Page::next`) decides whether another page exists; the
+/// number of items on a page does not.
+async fn collect_all_pages<T, F, Fut>(mut fetch_page: F) -> Result<Vec<T>, GitHubApiError>
+where
+    F: FnMut(u32) -> Fut,
+    Fut: Future<Output = Result<octocrab::Page<T>, octocrab::Error>>,
+{
+    let mut page_number = 1u32;
+    let mut items = Vec::new();
+
+    loop {
+        let mut page = fetch_page(page_number)
+            .await
+            .map_err(GitHubApiError::from_octocrab)?;
+        let has_next = page.next.is_some();
+        items.append(&mut page.items);
+
+        if !has_next {
+            return Ok(items);
+        }
+        page_number += 1;
     }
 }
 
@@ -205,51 +258,37 @@ async fn get_pr(client: &OctocrabClient, pr: PrNumber) -> Result<GitHubResponse,
 }
 
 async fn list_open_prs(client: &OctocrabClient) -> Result<GitHubResponse, GitHubApiError> {
-    let mut page = 1u32;
-    let mut all_prs = Vec::new();
-
-    loop {
-        let result = client
+    let pulls = collect_all_pages(|page_number| async move {
+        client
             .inner()
             .pulls(client.owner(), client.repo_name())
             .list()
             .state(octocrab::params::State::Open)
             .per_page(100)
-            .page(page)
+            .page(page_number)
             .send()
-            .await;
+            .await
+    })
+    .await?;
 
-        match result {
-            Ok(page_result) => {
-                let items = page_result.items;
-                let is_last_page = items.len() < 100;
-
-                for pull in items {
-                    let head_sha = match Sha::parse(&pull.head.sha) {
-                        Ok(sha) => sha,
-                        Err(e) => {
-                            tracing::warn!(pr = pull.number, error = %e, "Skipping PR with invalid SHA");
-                            continue;
-                        }
-                    };
-
-                    all_prs.push(PrData {
-                        number: PrNumber(pull.number),
-                        head_sha,
-                        head_ref: pull.head.ref_field,
-                        base_ref: pull.base.ref_field,
-                        state: PrState::Open,
-                        is_draft: pull.draft.unwrap_or(false),
-                    });
-                }
-
-                if is_last_page {
-                    break;
-                }
-                page += 1;
+    let mut all_prs = Vec::new();
+    for pull in pulls {
+        let head_sha = match Sha::parse(&pull.head.sha) {
+            Ok(sha) => sha,
+            Err(e) => {
+                tracing::warn!(pr = pull.number, error = %e, "Skipping PR with invalid SHA");
+                continue;
             }
-            Err(e) => return Err(GitHubApiError::from_octocrab(e)),
-        }
+        };
+
+        all_prs.push(PrData {
+            number: PrNumber(pull.number),
+            head_sha,
+            head_ref: pull.head.ref_field,
+            base_ref: pull.base.ref_field,
+            state: PrState::Open,
+            is_draft: pull.draft.unwrap_or(false),
+        });
     }
 
     Ok(GitHubResponse::PrList(all_prs))
@@ -263,14 +302,14 @@ async fn list_recently_merged_prs(
     // list closed PRs and filter client-side. This is inefficient for repos with
     // many closed PRs, but works for the expected use case (recent merges).
     let since = Utc::now() - ChronoDuration::days(i64::from(since_days));
-    let mut page = 1u32;
+    let mut page_number = 1u32;
     let mut all_prs = Vec::new();
 
     // Safety limit to prevent runaway pagination on repos with many closed PRs
     const MAX_PAGES: u32 = 10;
 
     loop {
-        let result = client
+        let page = client
             .inner()
             .pulls(client.owner(), client.repo_name())
             .list()
@@ -278,91 +317,87 @@ async fn list_recently_merged_prs(
             .sort(octocrab::params::pulls::Sort::Updated)
             .direction(octocrab::params::Direction::Descending)
             .per_page(100)
-            .page(page)
+            .page(page_number)
             .send()
-            .await;
+            .await
+            .map_err(GitHubApiError::from_octocrab)?;
 
-        match result {
-            Ok(page_result) => {
-                let items = page_result.items;
-                let is_last_page = items.len() < 100;
+        let has_next = page.next.is_some();
+        let items = page.items;
 
-                for pull in items {
-                    // Only include merged PRs with merged_at within our window
-                    match pull.merged_at {
-                        Some(t) if t >= since => {} // Within window, continue processing
-                        Some(_) => continue,        // Merged but too old
-                        None => continue,           // Closed but not merged
-                    };
+        // Results are sorted by `updated` descending and a merge updates the
+        // PR, so updated_at >= merged_at. If every item on this page was
+        // updated before the window opened, no later item can have been
+        // merged within it: the scan is provably complete.
+        let page_proves_completion = !items.is_empty()
+            && items
+                .iter()
+                .all(|pull| pull.updated_at.is_some_and(|t| t < since));
 
-                    // IMPORTANT: GitHub's API has eventual consistency. After a PR is merged,
-                    // merge_commit_sha may not be populated immediately. Per DESIGN.md, we
-                    // treat this as a transient error to allow retry with backoff.
-                    let merge_commit_sha = match &pull.merge_commit_sha {
-                        Some(sha) => match Sha::parse(sha) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                tracing::warn!(pr = pull.number, error = %e, "Skipping merged PR with invalid SHA");
-                                continue;
-                            }
-                        },
-                        None => {
-                            return Err(GitHubApiError::transient_without_source(format!(
-                                "PR {} is merged but merge_commit_sha not yet available (eventual consistency)",
-                                pull.number
-                            )));
-                        }
-                    };
+        for pull in items {
+            // Only include merged PRs with merged_at within our window
+            match pull.merged_at {
+                Some(t) if t >= since => {} // Within window, continue processing
+                Some(_) => continue,        // Merged but too old
+                None => continue,           // Closed but not merged
+            };
 
-                    let head_sha = match Sha::parse(&pull.head.sha) {
-                        Ok(sha) => sha,
-                        Err(e) => {
-                            tracing::warn!(pr = pull.number, error = %e, "Skipping PR with invalid head SHA");
-                            continue;
-                        }
-                    };
-
-                    all_prs.push(PrData {
-                        number: PrNumber(pull.number),
-                        head_sha,
-                        head_ref: pull.head.ref_field,
-                        base_ref: pull.base.ref_field,
-                        state: PrState::Merged { merge_commit_sha },
-                        is_draft: pull.draft.unwrap_or(false),
-                    });
+            // IMPORTANT: GitHub's API has eventual consistency. After a PR is merged,
+            // merge_commit_sha may not be populated immediately. Per DESIGN.md, we
+            // treat this as a transient error to allow retry with backoff.
+            let merge_commit_sha = match &pull.merge_commit_sha {
+                Some(sha) => match Sha::parse(sha) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(pr = pull.number, error = %e, "Skipping merged PR with invalid SHA");
+                        continue;
+                    }
+                },
+                None => {
+                    return Err(GitHubApiError::transient_without_source(format!(
+                        "PR {} is merged but merge_commit_sha not yet available (eventual consistency)",
+                        pull.number
+                    )));
                 }
+            };
 
-                // Stop if:
-                // 1. This is the last page (< 100 items)
-                // 2. We've hit the safety limit
-                //
-                // IMPORTANT: We do NOT stop based on whether this page had recent merges.
-                // Results are sorted by `updated` (not `merged_at`), so a page could contain
-                // only old PRs with recent comments while recent merges appear on later pages.
-                // We must paginate through all pages (up to MAX_PAGES) to find all recent merges.
-                if is_last_page {
-                    // Naturally exhausted all pages - results are complete
-                    return Ok(GitHubResponse::RecentlyMergedPrList {
-                        prs: all_prs,
-                        may_be_incomplete: false,
-                    });
+            let head_sha = match Sha::parse(&pull.head.sha) {
+                Ok(sha) => sha,
+                Err(e) => {
+                    tracing::warn!(pr = pull.number, error = %e, "Skipping PR with invalid head SHA");
+                    continue;
                 }
-                if page >= MAX_PAGES {
-                    // Hit the safety limit before exhausting pages - results may be incomplete
-                    tracing::warn!(
-                        pages = page,
-                        prs_found = all_prs.len(),
-                        "Hit pagination limit for recently merged PRs; results may be incomplete"
-                    );
-                    return Ok(GitHubResponse::RecentlyMergedPrList {
-                        prs: all_prs,
-                        may_be_incomplete: true,
-                    });
-                }
-                page += 1;
-            }
-            Err(e) => return Err(GitHubApiError::from_octocrab(e)),
+            };
+
+            all_prs.push(PrData {
+                number: PrNumber(pull.number),
+                head_sha,
+                head_ref: pull.head.ref_field,
+                base_ref: pull.base.ref_field,
+                state: PrState::Merged { merge_commit_sha },
+                is_draft: pull.draft.unwrap_or(false),
+            });
         }
+
+        if !has_next || page_proves_completion {
+            return Ok(GitHubResponse::RecentlyMergedPrList {
+                prs: all_prs,
+                may_be_incomplete: false,
+            });
+        }
+        if page_number >= MAX_PAGES {
+            // Hit the safety limit before exhausting pages - results may be incomplete
+            tracing::warn!(
+                pages = page_number,
+                prs_found = all_prs.len(),
+                "Hit pagination limit for recently merged PRs; results may be incomplete"
+            );
+            return Ok(GitHubResponse::RecentlyMergedPrList {
+                prs: all_prs,
+                may_be_incomplete: true,
+            });
+        }
+        page_number += 1;
     }
 }
 
@@ -416,15 +451,24 @@ async fn get_merge_state(
 
             // If we have no data at all, report the GraphQL errors
             if response.data.is_none() {
+                // GitHub marks GraphQL rate limiting with `"type": "RATE_LIMITED"`;
+                // the accompanying message is not guaranteed to mention rate limits.
+                let rate_limited = response.errors.as_ref().is_some_and(|errors| {
+                    errors
+                        .iter()
+                        .any(|e| e.r#type.as_deref() == Some("RATE_LIMITED"))
+                });
+
                 let error_msg = error_hint.unwrap_or_else(|| "no data returned".to_string());
                 let full_msg = format!(
                     "GraphQL error querying PR {} merge state: {}",
                     pr, error_msg
                 );
 
-                // Check if the GraphQL error indicates a transient condition
-                // (rate limits, internal errors, "try again" messages)
-                if is_rate_limit_error(&error_msg) || is_transient_message(&error_msg) {
+                if rate_limited
+                    || is_rate_limit_error(&error_msg)
+                    || is_transient_message(&error_msg)
+                {
                     return Err(GitHubApiError::transient_without_source(full_msg));
                 }
 
@@ -675,49 +719,35 @@ async fn list_comments(
     client: &OctocrabClient,
     pr: PrNumber,
 ) -> Result<GitHubResponse, GitHubApiError> {
-    let mut page = 1u32;
-    let mut all_comments = Vec::new();
-
-    loop {
-        let result = client
+    let comments = collect_all_pages(|page_number| async move {
+        client
             .inner()
             .issues(client.owner(), client.repo_name())
             .list_comments(pr.0)
             .per_page(100)
-            .page(page)
+            .page(page_number)
             .send()
-            .await;
+            .await
+    })
+    .await?;
 
-        match result {
-            Ok(page_result) => {
-                let items = page_result.items;
-                let is_last_page = items.len() < 100;
-
-                for comment in items {
-                    all_comments.push(CommentData {
-                        id: CommentId(comment.id.into_inner()),
-                        author_id: comment.user.id.into_inner(),
-                        body: comment.body.unwrap_or_default(),
-                    });
-                }
-
-                if is_last_page {
-                    break;
-                }
-                page += 1;
-            }
-            Err(e) => return Err(GitHubApiError::from_octocrab(e)),
-        }
-    }
+    let all_comments = comments
+        .into_iter()
+        .map(|comment| CommentData {
+            id: CommentId(comment.id.into_inner()),
+            author_id: comment.user.id.into_inner(),
+            body: comment.body.unwrap_or_default(),
+        })
+        .collect();
 
     Ok(GitHubResponse::Comments(all_comments))
 }
 
 // ─── Repository Settings ──────────────────────────────────────────────────────
 
-/// Checks if an error message indicates we should fall back to "unknown" status.
+/// Checks if an error indicates we should fall back to "unknown" status.
 ///
-/// For branch protection and ruleset queries, 404/403 errors can mean:
+/// For branch protection and ruleset queries, 404/403 responses can mean:
 /// - No protection/rulesets configured
 /// - Insufficient permissions to view settings
 /// - Branch/resource doesn't exist
@@ -727,12 +757,13 @@ async fn list_comments(
 /// than silently treating these as "no protection" or failing hard.
 ///
 /// This is a pure function extracted for testability.
-pub fn should_fallback_to_unknown(err_str: &str) -> bool {
-    let err_lower = err_str.to_lowercase();
-    let is_not_found = err_str.contains("404") || err_lower.contains("not found");
-    let is_forbidden = err_str.contains("403") || err_lower.contains("forbidden");
-    let is_not_protected = err_lower.contains("not protected");
-    is_not_found || is_forbidden || is_not_protected
+pub fn should_fallback_to_unknown(err: &octocrab::Error) -> bool {
+    match err {
+        octocrab::Error::GitHub { source, .. } => {
+            matches!(source.status_code.as_u16(), 403 | 404)
+        }
+        _ => false,
+    }
 }
 
 async fn get_branch_protection(
@@ -781,11 +812,10 @@ async fn get_branch_protection(
             }))
         }
         Err(e) => {
-            let err_str = GitHubApiError::extract_message(&e);
-            if should_fallback_to_unknown(&err_str) {
+            if should_fallback_to_unknown(&e) {
                 tracing::warn!(
                     branch = %branch,
-                    error = %err_str,
+                    error = %GitHubApiError::extract_message(&e),
                     "Branch protection query failed - could be no protection, \
                      insufficient permissions, or missing branch"
                 );
@@ -872,10 +902,9 @@ async fn get_rulesets(client: &OctocrabClient) -> Result<GitHubResponse, GitHubA
             Ok(GitHubResponse::Rulesets(data))
         }
         Err(e) => {
-            let err_str = GitHubApiError::extract_message(&e);
-            if should_fallback_to_unknown(&err_str) {
+            if should_fallback_to_unknown(&e) {
                 tracing::warn!(
-                    error = %err_str,
+                    error = %GitHubApiError::extract_message(&e),
                     "Rulesets query failed - could be no rulesets, \
                      insufficient permissions, or unsupported API"
                 );
@@ -957,8 +986,17 @@ async fn get_repo_settings(client: &OctocrabClient) -> Result<GitHubResponse, Gi
                 )
             })?;
 
+            // A guessed default branch would silently misdirect retargeting
+            // and recovery scans; fail like the merge-method fields above.
+            let default_branch = repo.default_branch.ok_or_else(|| {
+                GitHubApiError::permanent_without_source(
+                    "Repository settings missing 'default_branch' field - \
+                     cannot determine the cascade target branch",
+                )
+            })?;
+
             Ok(GitHubResponse::RepoSettings(RepoSettingsData {
-                default_branch: repo.default_branch.unwrap_or_else(|| "main".to_string()),
+                default_branch,
                 allow_squash_merge,
                 allow_merge_commit,
                 allow_rebase_merge,
@@ -971,6 +1009,7 @@ async fn get_repo_settings(client: &OctocrabClient) -> Result<GitHubResponse, Gi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::github::error::test_support::github_error;
     use proptest::prelude::*;
 
     // ─── Unit Tests ───────────────────────────────────────────────────────────
@@ -1060,26 +1099,44 @@ mod tests {
 
     // ─── should_fallback_to_unknown tests ─────────────────────────────────────
 
-    #[test]
-    fn should_fallback_to_unknown_detects_not_found() {
-        assert!(should_fallback_to_unknown("404 Not Found"));
-        assert!(should_fallback_to_unknown("Resource not found"));
-        assert!(should_fallback_to_unknown("Branch not found"));
+    #[tokio::test]
+    async fn should_fallback_to_unknown_on_403_and_404_status() {
+        // Real GitHub bodies for these statuses need not mention the status
+        // or words like "forbidden"; only the structural status matters.
+        for (status, message) in [
+            (403, "Resource not accessible by integration"),
+            (404, "Not Found"),
+            (404, "Branch not protected"),
+        ] {
+            let err = github_error(status, message).await;
+            assert!(
+                should_fallback_to_unknown(&err),
+                "HTTP {} ({}) must fall back to unknown",
+                status,
+                message
+            );
+        }
     }
 
-    #[test]
-    fn should_fallback_to_unknown_detects_forbidden() {
-        assert!(should_fallback_to_unknown("403 Forbidden"));
-        assert!(should_fallback_to_unknown("Access forbidden"));
-        assert!(should_fallback_to_unknown("Permission denied 403"));
-    }
-
-    #[test]
-    fn should_fallback_to_unknown_rejects_other_errors() {
-        assert!(!should_fallback_to_unknown("500 Internal Server Error"));
-        assert!(!should_fallback_to_unknown("Rate limit exceeded"));
-        assert!(!should_fallback_to_unknown("Timeout"));
-        assert!(!should_fallback_to_unknown("Network error"));
+    #[tokio::test]
+    async fn should_fallback_to_unknown_rejects_other_statuses() {
+        // The 500 case mentions 404/forbidden in the body; a message-sniffing
+        // implementation would wrongly swallow it.
+        for (status, message) in [
+            (401, "Bad credentials"),
+            (422, "Validation Failed"),
+            (429, "Rate limit exceeded"),
+            (500, "upstream returned: 404 forbidden not found"),
+            (502, "Bad Gateway"),
+        ] {
+            let err = github_error(status, message).await;
+            assert!(
+                !should_fallback_to_unknown(&err),
+                "HTTP {} ({}) must not fall back to unknown",
+                status,
+                message
+            );
+        }
     }
 
     // ─── Property Tests ───────────────────────────────────────────────────────
@@ -1162,62 +1219,517 @@ mod tests {
             );
         }
 
-        /// Property: "404" or "not found" implies fallback to unknown
-        #[test]
-        fn prop_404_triggers_fallback(prefix in ".*", suffix in ".*") {
-            let err_str = format!("{}404{}", prefix, suffix);
-            prop_assert!(
-                should_fallback_to_unknown(&err_str),
-                "Error containing '404' should trigger fallback"
+    }
+
+    /// Property: fallback depends only on the structural status code, never
+    /// on the message body.
+    #[tokio::test]
+    async fn prop_fallback_depends_only_on_status() {
+        use proptest::strategy::ValueTree;
+        use proptest::test_runner::TestRunner;
+
+        let mut runner = TestRunner::default();
+        for _ in 0..64 {
+            let status = (400u16..600)
+                .new_tree(&mut runner)
+                .expect("status strategy")
+                .current();
+            let message = "[ -~]{0,80}"
+                .new_tree(&mut runner)
+                .expect("message strategy")
+                .current();
+            let err = github_error(status, &message).await;
+            assert_eq!(
+                should_fallback_to_unknown(&err),
+                matches!(status, 403 | 404),
+                "HTTP {} ({:?})",
+                status,
+                message
             );
         }
+    }
 
-        /// Property: "403" or "forbidden" implies fallback to unknown
-        #[test]
-        fn prop_403_triggers_fallback(prefix in ".*", suffix in ".*") {
-            let err_str = format!("{}403{}", prefix, suffix);
-            prop_assert!(
-                should_fallback_to_unknown(&err_str),
-                "Error containing '403' should trigger fallback"
-            );
+    // ─── Mock-API Tests ───────────────────────────────────────────────────────
+    //
+    // These run the interpreter against a local HTTP server speaking canned
+    // responses, exercising the real octocrab request/response path.
+
+    mod mock_api {
+        use std::collections::VecDeque;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        use super::super::*;
+        use crate::github::GitHubErrorKind;
+        use crate::types::RepoId;
+
+        struct CannedResponse {
+            status: u16,
+            headers: Vec<(String, String)>,
+            body: String,
         }
 
-        /// Property: "not found" (case insensitive) implies fallback to unknown
-        #[test]
-        fn prop_not_found_triggers_fallback(prefix in ".*", suffix in ".*") {
-            let err_str = format!("{}not found{}", prefix, suffix);
-            prop_assert!(
-                should_fallback_to_unknown(&err_str),
-                "Error containing 'not found' should trigger fallback"
-            );
+        fn ok_page(body: serde_json::Value, next_link: bool) -> CannedResponse {
+            let headers = if next_link {
+                vec![(
+                    "link".to_string(),
+                    r#"<https://api.github.com/x?page=2>; rel="next""#.to_string(),
+                )]
+            } else {
+                Vec::new()
+            };
+            CannedResponse {
+                status: 200,
+                headers,
+                body: body.to_string(),
+            }
         }
 
-        /// Property: "forbidden" (case insensitive) implies fallback to unknown
-        #[test]
-        fn prop_forbidden_triggers_fallback(prefix in ".*", suffix in ".*") {
-            let err_str = format!("{}forbidden{}", prefix, suffix);
-            prop_assert!(
-                should_fallback_to_unknown(&err_str),
-                "Error containing 'forbidden' should trigger fallback"
-            );
+        fn error_response(status: u16, message: &str) -> CannedResponse {
+            CannedResponse {
+                status,
+                headers: Vec::new(),
+                body: serde_json::json!({ "message": message }).to_string(),
+            }
         }
 
-        /// Property: strings without 404/403/not found/forbidden don't trigger fallback
-        #[test]
-        fn prop_no_fallback_without_markers(
-            err_str in "[a-z0-9 ]{1,100}"
-                .prop_filter("must not contain markers", |s| {
-                    let lower = s.to_lowercase();
-                    !s.contains("404")
-                        && !s.contains("403")
-                        && !lower.contains("not found")
-                        && !lower.contains("forbidden")
+        fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+            haystack.windows(needle.len()).position(|w| w == needle)
+        }
+
+        /// Serves the canned responses in order, one per request, counting
+        /// requests. Requests beyond the queue get a 400 with a marker message
+        /// so tests fail loudly rather than hang.
+        async fn spawn_mock_server(responses: Vec<CannedResponse>) -> (String, Arc<AtomicU32>) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let base_uri = format!("http://{}", listener.local_addr().expect("local addr"));
+            let hits = Arc::new(AtomicU32::new(0));
+            let queue = Arc::new(Mutex::new(VecDeque::from(responses)));
+            let hits_for_task = hits.clone();
+
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    let header_end = loop {
+                        let Ok(n) = stream.read(&mut tmp).await else {
+                            break None;
+                        };
+                        if n == 0 {
+                            break None;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if let Some(pos) = find_subsequence(&buf, b"\r\n\r\n") {
+                            break Some(pos + 4);
+                        }
+                    };
+                    let Some(header_end) = header_end else {
+                        continue;
+                    };
+                    let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
+                    let content_length: usize = head
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            if name.eq_ignore_ascii_case("content-length") {
+                                value.trim().parse().ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(0);
+                    while buf.len() < header_end + content_length {
+                        let Ok(n) = stream.read(&mut tmp).await else {
+                            break;
+                        };
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                    }
+
+                    hits_for_task.fetch_add(1, Ordering::SeqCst);
+                    let response =
+                        queue
+                            .lock()
+                            .expect("queue lock")
+                            .pop_front()
+                            .unwrap_or(CannedResponse {
+                                status: 400,
+                                headers: Vec::new(),
+                                body: r#"{"message":"mock server: unexpected extra request"}"#
+                                    .to_string(),
+                            });
+
+                    let mut out = format!(
+                        "HTTP/1.1 {} Status\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n",
+                        response.status,
+                        response.body.len()
+                    );
+                    for (name, value) in &response.headers {
+                        out.push_str(&format!("{}: {}\r\n", name, value));
+                    }
+                    out.push_str("\r\n");
+                    out.push_str(&response.body);
+                    let _ = stream.write_all(out.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                }
+            });
+
+            (base_uri, hits)
+        }
+
+        fn mock_client(base_uri: &str) -> OctocrabClient {
+            // octocrab's HTTP-layer retry must be off so that one effect
+            // attempt is exactly one request; see `OctocrabClient::new`.
+            let octocrab = octocrab::Octocrab::builder()
+                .personal_token("test-token")
+                .base_uri(base_uri)
+                .expect("valid base uri")
+                .add_retry_config(octocrab::service::middleware::retry::RetryConfig::None)
+                .build()
+                .expect("build octocrab");
+            OctocrabClient::new(octocrab, RepoId::new("owner", "repo"))
+        }
+
+        fn tiny_retry_config() -> RetryConfig {
+            RetryConfig::new(2, Duration::from_millis(1), Duration::from_millis(4), 2.0)
+        }
+
+        /// Minimal PR object accepted by octocrab's `PullRequest` model.
+        fn pr_json(
+            number: u64,
+            state: &str,
+            updated_at: &str,
+            merged_at: Option<String>,
+        ) -> serde_json::Value {
+            serde_json::json!({
+                "url": format!("https://example.test/pulls/{number}"),
+                "id": number,
+                "number": number,
+                "state": state,
+                "updated_at": updated_at,
+                "merged_at": merged_at,
+                "merge_commit_sha": merged_at.as_ref().map(|_| format!("{:040x}", number + 1_000_000)),
+                "draft": false,
+                "head": { "ref": format!("feature-{number}"), "sha": format!("{:040x}", number) },
+                "base": { "ref": "main", "sha": format!("{:040x}", number + 2_000_000) },
+            })
+        }
+
+        fn open_pr_json(number: u64) -> serde_json::Value {
+            pr_json(number, "open", "2026-06-01T00:00:00Z", None)
+        }
+
+        // ─── Error classification (Task A) ────────────────────────────────────
+
+        #[tokio::test]
+        async fn idempotent_effect_retries_transient_500() {
+            let (base, hits) = spawn_mock_server(vec![
+                error_response(500, "Server Error"),
+                error_response(500, "Server Error"),
+                error_response(500, "Server Error"),
+            ])
+            .await;
+            let client = mock_client(&base);
+
+            let err = interpret_github_effect(
+                &client,
+                GitHubEffect::GetPr { pr: PrNumber(1) },
+                tiny_retry_config(),
+                RetryPolicy::RetryTransient,
+            )
+            .await
+            .expect_err("500 must be an error");
+
+            assert_eq!(err.kind, GitHubErrorKind::Transient);
+            assert_eq!(err.status_code, Some(500));
+            // Initial attempt + 2 retries.
+            assert_eq!(hits.load(Ordering::SeqCst), 3);
+        }
+
+        #[tokio::test]
+        async fn graphql_rate_limited_type_is_transient() {
+            // The RATE_LIMITED type is the robust signal; the message
+            // deliberately contains no rate-limit wording.
+            let (base, _hits) = spawn_mock_server(vec![CannedResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: serde_json::json!({
+                    "data": null,
+                    "errors": [{ "message": "throttled", "type": "RATE_LIMITED" }],
                 })
-        ) {
-            prop_assert!(
-                !should_fallback_to_unknown(&err_str),
-                "Error without markers should not trigger fallback"
+                .to_string(),
+            }])
+            .await;
+            let client = mock_client(&base);
+
+            let err = get_merge_state(&client, PrNumber(7))
+                .await
+                .expect_err("rate-limited query must fail");
+            assert_eq!(err.kind, GitHubErrorKind::Transient);
+        }
+
+        #[tokio::test]
+        async fn branch_protection_403_falls_back_to_unknown() {
+            // Real GitHub 403 bodies do not contain "403" or "forbidden".
+            let (base, _hits) = spawn_mock_server(vec![error_response(
+                403,
+                "Resource not accessible by integration",
+            )])
+            .await;
+            let client = mock_client(&base);
+
+            let response = get_branch_protection(&client, "main".to_string())
+                .await
+                .expect("403 must fall back to unknown");
+            assert!(matches!(response, GitHubResponse::BranchProtectionUnknown));
+        }
+
+        #[tokio::test]
+        async fn rulesets_404_falls_back_to_unknown() {
+            let (base, _hits) = spawn_mock_server(vec![error_response(404, "Not Found")]).await;
+            let client = mock_client(&base);
+
+            let response = get_rulesets(&client)
+                .await
+                .expect("404 must fall back to unknown");
+            assert!(matches!(response, GitHubResponse::RulesetsUnknown));
+        }
+
+        #[tokio::test]
+        async fn branch_protection_500_is_not_swallowed() {
+            let (base, _hits) = spawn_mock_server(vec![error_response(500, "Server Error")]).await;
+            let client = mock_client(&base);
+
+            let err = get_branch_protection(&client, "main".to_string())
+                .await
+                .expect_err("500 must not fall back to unknown");
+            assert_eq!(err.kind, GitHubErrorKind::Transient);
+        }
+
+        // ─── Per-effect retry policy (Task B) ─────────────────────────────────
+
+        #[tokio::test]
+        async fn post_comment_is_not_retried_on_transient_error() {
+            // A lost response after the server processed the request would
+            // mean a duplicate comment; one attempt only.
+            let (base, hits) = spawn_mock_server(vec![
+                error_response(500, "Server Error"),
+                error_response(500, "Server Error"),
+                error_response(500, "Server Error"),
+            ])
+            .await;
+            let client = mock_client(&base);
+
+            let err = interpret_github_effect(
+                &client,
+                GitHubEffect::PostComment {
+                    pr: PrNumber(1),
+                    body: "hello".to_string(),
+                },
+                tiny_retry_config(),
+                RetryPolicy::RetryTransient,
+            )
+            .await
+            .expect_err("500 must be an error");
+
+            assert_eq!(err.kind, GitHubErrorKind::Transient);
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn squash_merge_is_not_retried_on_transient_error() {
+            let (base, hits) = spawn_mock_server(vec![
+                error_response(502, "Bad Gateway"),
+                error_response(502, "Bad Gateway"),
+                error_response(502, "Bad Gateway"),
+            ])
+            .await;
+            let client = mock_client(&base);
+
+            let err = interpret_github_effect(
+                &client,
+                GitHubEffect::SquashMerge {
+                    pr: PrNumber(1),
+                    expected_sha: Sha::parse(format!("{:040x}", 1u64)).expect("valid sha"),
+                },
+                tiny_retry_config(),
+                RetryPolicy::RetryTransient,
+            )
+            .await
+            .expect_err("502 must be an error");
+
+            assert_eq!(err.kind, GitHubErrorKind::Transient);
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+        }
+
+        // ─── Pagination (Task C) ──────────────────────────────────────────────
+
+        #[tokio::test]
+        async fn list_open_prs_follows_link_header() {
+            // Page 1 is short but advertises a next page; the Link header,
+            // not the page size, decides whether to continue.
+            let page1: Vec<_> = (1..=3).map(open_pr_json).collect();
+            let page2: Vec<_> = (4..=5).map(open_pr_json).collect();
+            let (base, hits) = spawn_mock_server(vec![
+                ok_page(serde_json::Value::Array(page1), true),
+                ok_page(serde_json::Value::Array(page2), false),
+            ])
+            .await;
+            let client = mock_client(&base);
+
+            let response = list_open_prs(&client).await.expect("must succeed");
+            let GitHubResponse::PrList(prs) = response else {
+                panic!("expected PrList");
+            };
+            assert_eq!(prs.len(), 5);
+            assert_eq!(hits.load(Ordering::SeqCst), 2);
+        }
+
+        #[tokio::test]
+        async fn list_open_prs_stops_on_absent_link_header() {
+            // A full page with no Link header is the last page.
+            let page1: Vec<_> = (1..=100).map(open_pr_json).collect();
+            let (base, hits) =
+                spawn_mock_server(vec![ok_page(serde_json::Value::Array(page1), false)]).await;
+            let client = mock_client(&base);
+
+            let response = list_open_prs(&client).await.expect("must succeed");
+            let GitHubResponse::PrList(prs) = response else {
+                panic!("expected PrList");
+            };
+            assert_eq!(prs.len(), 100);
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn recently_merged_stops_when_page_predates_window() {
+            // Results are sorted by `updated` descending and
+            // updated_at >= merged_at, so a page whose newest-to-oldest items
+            // all predate the window proves later pages cannot contain an
+            // in-window merge: stop, and the result is provably complete.
+            let page1: Vec<_> = (1..=100)
+                .map(|n| pr_json(n, "closed", "2020-01-01T00:00:00Z", None))
+                .collect();
+            let (base, hits) =
+                spawn_mock_server(vec![ok_page(serde_json::Value::Array(page1), true)]).await;
+            let client = mock_client(&base);
+
+            let response = list_recently_merged_prs(&client, 7)
+                .await
+                .expect("must succeed");
+            let GitHubResponse::RecentlyMergedPrList {
+                prs,
+                may_be_incomplete,
+            } = response
+            else {
+                panic!("expected RecentlyMergedPrList");
+            };
+            assert!(prs.is_empty());
+            assert!(!may_be_incomplete);
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn recently_merged_reports_incomplete_only_at_page_limit() {
+            // Ten short pages of in-window merges, each advertising a next
+            // page: MAX_PAGES is genuinely exhausted, so the result must be
+            // flagged as possibly incomplete.
+            let recent = (Utc::now() - ChronoDuration::hours(1)).to_rfc3339();
+            let responses: Vec<_> = (1..=10u64)
+                .map(|n| {
+                    ok_page(
+                        serde_json::Value::Array(vec![pr_json(
+                            n,
+                            "closed",
+                            &recent,
+                            Some(recent.clone()),
+                        )]),
+                        true,
+                    )
+                })
+                .collect();
+            let (base, hits) = spawn_mock_server(responses).await;
+            let client = mock_client(&base);
+
+            let response = list_recently_merged_prs(&client, 7)
+                .await
+                .expect("must succeed");
+            let GitHubResponse::RecentlyMergedPrList {
+                prs,
+                may_be_incomplete,
+            } = response
+            else {
+                panic!("expected RecentlyMergedPrList");
+            };
+            assert_eq!(prs.len(), 10);
+            assert!(may_be_incomplete);
+            assert_eq!(hits.load(Ordering::SeqCst), 10);
+        }
+
+        // ─── Repo settings (Task C) ───────────────────────────────────────────
+
+        #[tokio::test]
+        async fn repo_settings_missing_default_branch_is_an_error() {
+            let (base, _hits) = spawn_mock_server(vec![CannedResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: serde_json::json!({
+                    "id": 1,
+                    "name": "repo",
+                    "url": "https://example.test/repos/owner/repo",
+                    "allow_squash_merge": true,
+                    "allow_merge_commit": false,
+                    "allow_rebase_merge": false,
+                })
+                .to_string(),
+            }])
+            .await;
+            let client = mock_client(&base);
+
+            let err = get_repo_settings(&client)
+                .await
+                .expect_err("missing default_branch must not be defaulted");
+            assert_eq!(err.kind, GitHubErrorKind::Permanent);
+            assert!(
+                err.message.contains("default_branch"),
+                "message was: {}",
+                err.message
             );
+        }
+
+        #[tokio::test]
+        async fn repo_settings_complete_succeeds() {
+            let (base, _hits) = spawn_mock_server(vec![CannedResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: serde_json::json!({
+                    "id": 1,
+                    "name": "repo",
+                    "url": "https://example.test/repos/owner/repo",
+                    "default_branch": "trunk",
+                    "allow_squash_merge": true,
+                    "allow_merge_commit": false,
+                    "allow_rebase_merge": false,
+                })
+                .to_string(),
+            }])
+            .await;
+            let client = mock_client(&base);
+
+            let response = get_repo_settings(&client).await.expect("must succeed");
+            let GitHubResponse::RepoSettings(data) = response else {
+                panic!("expected RepoSettings");
+            };
+            assert_eq!(data.default_branch, "trunk");
         }
     }
 }

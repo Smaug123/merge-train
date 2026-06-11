@@ -23,6 +23,11 @@ pub struct OctocrabClient {
 
 impl OctocrabClient {
     /// Creates a new client scoped to the given repository.
+    ///
+    /// The `client` must have octocrab's HTTP-layer retry disabled
+    /// (`add_retry_config(RetryConfig::None)`): it re-sends requests on 5xx
+    /// and transport errors, which duplicates non-idempotent operations and
+    /// bypasses the per-effect retry policy in the interpreter.
     pub fn new(client: Octocrab, repo: RepoId) -> Self {
         Self { client, repo }
     }
@@ -31,27 +36,16 @@ impl OctocrabClient {
     ///
     /// This is a convenience method for creating a client with token authentication.
     pub fn from_token(token: impl Into<String>, repo: RepoId) -> Result<Self, octocrab::Error> {
-        let client = Octocrab::builder().personal_token(token.into()).build()?;
+        let client = Octocrab::builder()
+            .personal_token(token.into())
+            .add_retry_config(octocrab::service::middleware::retry::RetryConfig::None)
+            .build()?;
         Ok(Self::new(client, repo))
-    }
-
-    /// Creates a client from a pre-configured Octocrab instance.
-    ///
-    /// Use this when you need custom authentication (e.g., GitHub App installation tokens).
-    /// You can obtain an installation-authenticated client using octocrab's
-    /// `installation_and_token` method.
-    pub fn from_octocrab(client: Octocrab, repo: RepoId) -> Self {
-        Self::new(client, repo)
     }
 
     /// Returns a reference to the underlying octocrab client.
     pub fn inner(&self) -> &Octocrab {
         &self.client
-    }
-
-    /// Returns a mutable reference to the underlying octocrab client.
-    pub fn inner_mut(&mut self) -> &mut Octocrab {
-        &mut self.client
     }
 
     /// Returns the repository this client is scoped to.

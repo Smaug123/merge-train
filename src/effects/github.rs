@@ -109,6 +109,37 @@ pub enum GitHubEffect {
     GetRepoSettings,
 }
 
+impl GitHubEffect {
+    /// Returns true if executing this effect twice observably equals executing
+    /// it once, so a retry after a lost response is safe.
+    ///
+    /// Non-idempotent effects must not be retried on transient errors: a lost
+    /// response to `PostComment` duplicates the comment, and a lost response to
+    /// `SquashMerge` makes the retry fail ("already merged") even though the
+    /// merge landed.
+    pub fn is_idempotent(&self) -> bool {
+        match self {
+            // Queries.
+            GitHubEffect::GetPr { .. }
+            | GitHubEffect::ListOpenPrs
+            | GitHubEffect::ListRecentlyMergedPrs { .. }
+            | GitHubEffect::GetMergeState { .. }
+            | GitHubEffect::ListComments { .. }
+            | GitHubEffect::GetBranchProtection { .. }
+            | GitHubEffect::GetRulesets
+            | GitHubEffect::GetRepoSettings => true,
+
+            // Idempotent writes: re-setting the same base branch or comment
+            // body is a no-op, and GitHub deduplicates reactions per user.
+            GitHubEffect::RetargetPr { .. }
+            | GitHubEffect::UpdateComment { .. }
+            | GitHubEffect::AddReaction { .. } => true,
+
+            GitHubEffect::PostComment { .. } | GitHubEffect::SquashMerge { .. } => false,
+        }
+    }
+}
+
 // ─── Response Types ───────────────────────────────────────────────────────────
 
 /// PR data returned from the GitHub API.
@@ -547,6 +578,16 @@ mod tests {
                 if e1 == e2 {
                     prop_assert_eq!(hash(&e1), hash(&e2));
                 }
+            }
+
+            /// Property: exactly PostComment and SquashMerge are non-idempotent.
+            #[test]
+            fn non_idempotent_iff_post_comment_or_squash_merge(effect in arb_github_effect()) {
+                let expected = !matches!(
+                    effect,
+                    GitHubEffect::PostComment { .. } | GitHubEffect::SquashMerge { .. }
+                );
+                prop_assert_eq!(effect.is_idempotent(), expected);
             }
         }
     }
