@@ -1,20 +1,25 @@
 //! Webhook endpoint handler.
 //!
-//! Accepts GitHub webhook deliveries, validates signatures, and spools them
-//! durably before returning 202 Accepted. The actual processing happens
-//! asynchronously in per-repo workers.
+//! Accepts GitHub webhook deliveries, verifies signatures, and spools them
+//! durably before returning 202 Accepted. The envelope stores the raw signed
+//! body; intake parses only the routing fields (repository owner/name) needed
+//! to pick the per-repo spool directory. Full payload parsing happens at
+//! drain time (`crate::webhooks::parse_webhook`).
 
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use std::collections::HashMap;
+use serde::Deserialize;
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use super::{AppState, InvalidPathComponent, validate_path_component};
-use crate::spool::delivery::{SpoolError, WebhookEnvelope, spool_webhook};
+use crate::spool::delivery::{
+    ArrivalMarker, EmptyEventType, SpoolError, WebhookEnvelope, spool_webhook,
+};
 use crate::types::DeliveryId;
+use crate::types::ids::InvalidDeliveryId;
 use crate::webhooks::verify_signature;
 
 /// Header name for GitHub event type.
@@ -24,6 +29,12 @@ const HEADER_DELIVERY: &str = "x-github-delivery";
 /// Header name for GitHub signature.
 const HEADER_SIGNATURE: &str = "x-hub-signature-256";
 
+/// Maximum accepted webhook body size: GitHub caps payloads at 25MB.
+///
+/// Axum's 2MB default would 413 legitimate large payloads, and GitHub does
+/// not retry 413s, so those deliveries would be lost.
+pub const WEBHOOK_BODY_LIMIT_BYTES: usize = 25 * 1024 * 1024;
+
 /// Errors that can occur when processing a webhook.
 #[derive(Debug, Error)]
 pub enum WebhookError {
@@ -31,21 +42,35 @@ pub enum WebhookError {
     #[error("missing required header: {0}")]
     MissingHeader(&'static str),
 
+    /// The signature header is absent: an authentication failure, the same
+    /// class as [`WebhookError::InvalidSignature`], not a malformed request.
+    #[error("missing {HEADER_SIGNATURE} header")]
+    MissingSignature,
+
     /// Invalid signature.
     #[error("invalid signature")]
     InvalidSignature,
 
-    /// Invalid JSON body.
-    #[error("invalid JSON body: {0}")]
-    InvalidJson(#[from] serde_json::Error),
+    /// The delivery ID is not usable as a spool filename.
+    #[error(transparent)]
+    InvalidDeliveryId(#[from] InvalidDeliveryId),
 
-    /// Missing repository information in payload.
-    #[error("missing repository information in payload")]
-    MissingRepository,
+    /// The body is not valid UTF-8 (the envelope stores it as a string, and
+    /// GitHub webhook bodies are JSON and therefore UTF-8).
+    #[error("body is not valid UTF-8")]
+    BodyNotUtf8,
 
-    /// Invalid path component (e.g., path traversal attempt).
+    /// The body is not JSON carrying the repository routing fields.
+    #[error("unparseable webhook payload: {0}")]
+    InvalidPayload(#[from] serde_json::Error),
+
+    /// Repository owner/name is unusable as a filesystem path component.
     #[error("{0}")]
     InvalidPath(#[from] InvalidPathComponent),
+
+    /// Empty `X-GitHub-Event` header.
+    #[error(transparent)]
+    EmptyEventType(#[from] EmptyEventType),
 
     /// Spool error.
     #[error("spool error: {0}")]
@@ -54,142 +79,115 @@ pub enum WebhookError {
 
 impl IntoResponse for WebhookError {
     fn into_response(self) -> Response {
-        let (status, message) = match &self {
-            WebhookError::MissingHeader(_) => (StatusCode::BAD_REQUEST, self.to_string()),
-            WebhookError::InvalidSignature => (StatusCode::UNAUTHORIZED, self.to_string()),
-            WebhookError::InvalidJson(_) => (StatusCode::BAD_REQUEST, self.to_string()),
-            WebhookError::MissingRepository => (StatusCode::BAD_REQUEST, self.to_string()),
-            WebhookError::InvalidPath(_) => (StatusCode::BAD_REQUEST, self.to_string()),
-            WebhookError::Spool(SpoolError::DuplicateDelivery(_)) => {
-                // Duplicates are handled idempotently - return 202
-                return (StatusCode::ACCEPTED, "Accepted (duplicate)").into_response();
+        let status = match &self {
+            WebhookError::MissingHeader(_)
+            | WebhookError::InvalidDeliveryId(_)
+            | WebhookError::BodyNotUtf8
+            | WebhookError::InvalidPayload(_)
+            | WebhookError::InvalidPath(_)
+            | WebhookError::EmptyEventType(_) => StatusCode::BAD_REQUEST,
+            WebhookError::MissingSignature | WebhookError::InvalidSignature => {
+                StatusCode::UNAUTHORIZED
             }
-            WebhookError::Spool(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
+            WebhookError::Spool(e) => {
+                debug_assert!(
+                    !matches!(e, SpoolError::DuplicateDelivery(_)),
+                    "the handler acknowledges duplicates with 202 before constructing an error"
+                );
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
         };
 
-        (status, message).into_response()
+        (status, self.to_string()).into_response()
     }
 }
 
+/// The routing fields intake needs from the payload. Everything else is
+/// parsed at drain time from the raw stored body.
+#[derive(Debug, Deserialize)]
+struct RoutingPayload {
+    repository: RoutingRepository,
+}
+
+#[derive(Debug, Deserialize)]
+struct RoutingRepository {
+    name: String,
+    owner: RoutingOwner,
+}
+
+#[derive(Debug, Deserialize)]
+struct RoutingOwner {
+    login: String,
+}
+
 /// Webhook handler.
-///
-/// Accepts GitHub webhook deliveries and spools them for asynchronous processing.
 ///
 /// # Request
 ///
 /// - Method: POST
 /// - Required headers:
-///   - `X-GitHub-Event`: Event type (e.g., "pull_request", "issue_comment")
-///   - `X-GitHub-Delivery`: Unique delivery ID (validated for path safety, not UUID format)
-///   - `X-Hub-Signature-256`: HMAC-SHA256 signature of the payload
-/// - Body: JSON webhook payload
+///   - `X-GitHub-Event`: event type (non-empty)
+///   - `X-GitHub-Delivery`: delivery ID (must be a valid [`DeliveryId`])
+///   - `X-Hub-Signature-256`: HMAC-SHA256 signature of the raw body
+/// - Body: JSON webhook payload, at most [`WEBHOOK_BODY_LIMIT_BYTES`]
 ///
 /// # Response
 ///
-/// - 202 Accepted: Webhook spooled successfully
-/// - 400 Bad Request: Missing header or invalid JSON
-/// - 401 Unauthorized: Invalid signature
-/// - 500 Internal Server Error: Spool failure
-///
-/// # Example
-///
-/// ```ignore
-/// POST /webhook HTTP/1.1
-/// X-GitHub-Event: pull_request
-/// X-GitHub-Delivery: 550e8400-e29b-41d4-a716-446655440000
-/// X-Hub-Signature-256: sha256=...
-/// Content-Type: application/json
-///
-/// {"action": "opened", "pull_request": {...}, "repository": {...}}
-///
-/// HTTP/1.1 202 Accepted
-/// ```
+/// - 202 Accepted: spooled durably (including duplicate redeliveries, whose
+///   surviving copy is fsynced before the 202)
+/// - 400 Bad Request: missing/empty event header, invalid delivery ID, or
+///   unusable payload
+/// - 401 Unauthorized: missing or invalid signature
+/// - 413 Payload Too Large: body over [`WEBHOOK_BODY_LIMIT_BYTES`]
+/// - 500 Internal Server Error: spool failure (the delivery is NOT durable;
+///   GitHub will retry)
 pub async fn webhook_handler(
     State(app_state): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, &'static str), WebhookError> {
-    // Extract required headers
     let event_type = get_header(&headers, HEADER_EVENT)?;
-    let delivery_id_str = get_header(&headers, HEADER_DELIVERY)?;
-    let signature_header = get_header(&headers, HEADER_SIGNATURE)?;
+    let delivery_id = DeliveryId::parse(get_header(&headers, HEADER_DELIVERY)?)?;
+    let signature_header = headers
+        .get(HEADER_SIGNATURE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+        .ok_or(WebhookError::MissingSignature)?;
 
-    let delivery_id = DeliveryId::new(delivery_id_str);
-
-    debug!(
-        delivery_id = %delivery_id,
-        event_type = %event_type,
-        "Received webhook"
-    );
-
-    // Verify signature BEFORE any parsing or I/O.
-    // This is critical for security: we don't want to waste resources
-    // on malicious requests.
+    // Verify against the raw bytes before any parsing or I/O.
     if !verify_signature(&body, &signature_header, app_state.webhook_secret()) {
         warn!(delivery_id = %delivery_id, "Invalid webhook signature");
         return Err(WebhookError::InvalidSignature);
     }
 
-    // Parse the JSON body
-    let body_json: serde_json::Value = serde_json::from_slice(&body)?;
+    let body = String::from_utf8(body.to_vec()).map_err(|_| WebhookError::BodyNotUtf8)?;
 
-    // Extract repository owner and name from the payload.
-    // Most GitHub webhook events include a "repository" object.
-    let (owner, repo) = extract_repository(&body_json)?;
-
-    // Validate path components to prevent path traversal attacks.
-    // All three values (owner, repo, delivery_id) are used in filesystem paths.
+    let routing: RoutingPayload = serde_json::from_str(&body)?;
+    let owner = routing.repository.owner.login;
+    let repo = routing.repository.name;
     validate_path_component(&owner)?;
     validate_path_component(&repo)?;
-    validate_path_component(delivery_id.as_str())?;
 
-    debug!(
-        delivery_id = %delivery_id,
-        owner = %owner,
-        repo = %repo,
-        "Webhook for repository"
-    );
+    let envelope = WebhookEnvelope::new(event_type, signature_header, body, ArrivalMarker::now())?;
 
-    // Build headers map for the envelope
-    let headers_map = extract_headers(&headers);
-
-    // Create the webhook envelope
-    let envelope = WebhookEnvelope {
-        event_type: event_type.to_string(),
-        headers: headers_map,
-        body: body_json,
-    };
-
-    // Construct the spool directory for this repository.
-    // Structure: <spool_dir>/<owner>/<repo>/
     let repo_spool_dir = app_state.spool_dir().join(&owner).join(&repo);
 
-    // Spool the webhook atomically
     match spool_webhook(&repo_spool_dir, &delivery_id, &envelope) {
         Ok(_) => {
             info!(
                 delivery_id = %delivery_id,
                 owner = %owner,
                 repo = %repo,
-                event_type = %event_type,
-                "Webhook spooled successfully"
+                event_type = %envelope.event_type(),
+                "Webhook spooled"
             );
             Ok((StatusCode::ACCEPTED, "Accepted"))
         }
-        Err(SpoolError::DuplicateDelivery(_)) => {
-            // Duplicate deliveries are idempotent - return success
-            debug!(
-                delivery_id = %delivery_id,
-                "Duplicate webhook delivery (idempotent)"
-            );
-            Ok((StatusCode::ACCEPTED, "Accepted (duplicate)"))
-        }
+        // The surviving copy is durable before spool_webhook reports a
+        // duplicate, so acknowledging is safe.
+        Err(SpoolError::DuplicateDelivery(_)) => Ok((StatusCode::ACCEPTED, "Accepted (duplicate)")),
         Err(e) => {
-            warn!(
-                delivery_id = %delivery_id,
-                error = %e,
-                "Failed to spool webhook"
-            );
+            warn!(delivery_id = %delivery_id, error = %e, "Failed to spool webhook");
             Err(WebhookError::Spool(e))
         }
     }
@@ -200,104 +198,47 @@ fn get_header(headers: &HeaderMap, name: &'static str) -> Result<String, Webhook
     headers
         .get(name)
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
+        .map(str::to_owned)
         .ok_or(WebhookError::MissingHeader(name))
-}
-
-/// Extracts repository owner and name from a webhook payload.
-///
-/// Most GitHub webhook events include a "repository" object with
-/// "owner" and "name" fields.
-fn extract_repository(body: &serde_json::Value) -> Result<(String, String), WebhookError> {
-    let repository = body
-        .get("repository")
-        .ok_or(WebhookError::MissingRepository)?;
-
-    let owner = repository
-        .get("owner")
-        .and_then(|o| o.get("login"))
-        .and_then(|l| l.as_str())
-        .ok_or(WebhookError::MissingRepository)?;
-
-    let name = repository
-        .get("name")
-        .and_then(|n| n.as_str())
-        .ok_or(WebhookError::MissingRepository)?;
-
-    Ok((owner.to_string(), name.to_string()))
-}
-
-/// Extracts HTTP headers into a HashMap for storage in the envelope.
-///
-/// Only includes headers that can be converted to valid UTF-8 strings.
-fn extract_headers(headers: &HeaderMap) -> HashMap<String, String> {
-    headers
-        .iter()
-        .filter_map(|(name, value)| {
-            value
-                .to_str()
-                .ok()
-                .map(|v| (name.to_string(), v.to_string()))
-        })
-        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
-    fn extract_repository_valid() {
-        let body = json!({
+    fn routing_payload_parses_owner_and_repo() {
+        let body = r#"{
             "action": "opened",
             "repository": {
                 "name": "hello-world",
-                "owner": {
-                    "login": "octocat"
-                }
+                "owner": { "login": "octocat" }
             }
-        });
+        }"#;
 
-        let (owner, repo) = extract_repository(&body).unwrap();
-        assert_eq!(owner, "octocat");
-        assert_eq!(repo, "hello-world");
+        let routing: RoutingPayload = serde_json::from_str(body).unwrap();
+        assert_eq!(routing.repository.owner.login, "octocat");
+        assert_eq!(routing.repository.name, "hello-world");
     }
 
     #[test]
-    fn extract_repository_missing_repository() {
-        let body = json!({
-            "action": "opened"
-        });
-
-        let result = extract_repository(&body);
-        assert!(matches!(result, Err(WebhookError::MissingRepository)));
+    fn routing_payload_rejects_missing_repository() {
+        let result: Result<RoutingPayload, _> = serde_json::from_str(r#"{"action": "opened"}"#);
+        assert!(result.is_err());
     }
 
     #[test]
-    fn extract_repository_missing_owner() {
-        let body = json!({
-            "repository": {
-                "name": "hello-world"
-            }
-        });
-
-        let result = extract_repository(&body);
-        assert!(matches!(result, Err(WebhookError::MissingRepository)));
+    fn routing_payload_rejects_missing_owner() {
+        let result: Result<RoutingPayload, _> =
+            serde_json::from_str(r#"{"repository": {"name": "hello-world"}}"#);
+        assert!(result.is_err());
     }
 
     #[test]
-    fn extract_repository_missing_name() {
-        let body = json!({
-            "repository": {
-                "owner": {
-                    "login": "octocat"
-                }
-            }
-        });
-
-        let result = extract_repository(&body);
-        assert!(matches!(result, Err(WebhookError::MissingRepository)));
+    fn routing_payload_rejects_missing_name() {
+        let result: Result<RoutingPayload, _> =
+            serde_json::from_str(r#"{"repository": {"owner": {"login": "octocat"}}}"#);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -315,26 +256,5 @@ mod tests {
 
         let result = get_header(&headers, "x-github-event");
         assert!(matches!(result, Err(WebhookError::MissingHeader(_))));
-    }
-
-    #[test]
-    fn extract_headers_filters_invalid_utf8() {
-        use axum::http::HeaderValue;
-
-        let mut headers = HeaderMap::new();
-        headers.insert("valid-header", "valid-value".parse().unwrap());
-
-        // Create a header value with invalid UTF-8 using from_bytes.
-        // Bytes 0x80-0xFF are invalid as standalone UTF-8 bytes.
-        let invalid_utf8_value = HeaderValue::from_bytes(&[0x80, 0x81, 0x82]).unwrap();
-        headers.insert("invalid-header", invalid_utf8_value);
-
-        let result = extract_headers(&headers);
-
-        // Valid header should be present
-        assert_eq!(result.get("valid-header"), Some(&"valid-value".to_string()));
-
-        // Invalid UTF-8 header should be filtered out
-        assert!(!result.contains_key("invalid-header"));
     }
 }

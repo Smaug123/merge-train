@@ -6,6 +6,7 @@ use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -15,6 +16,9 @@ use crate::types::DeliveryId;
 
 /// Counter for generating unique temp file names within a process.
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Counter for ordering arrivals within a process (ties in wall-clock time).
+static ARRIVAL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Generates a unique temp file path for atomic writes.
 ///
@@ -36,66 +40,153 @@ fn unique_temp_path(base_path: &Path) -> PathBuf {
     base_path.with_extension(new_extension)
 }
 
-/// A structured webhook envelope for crash-safe spooling.
+/// A monotonic arrival marker recorded when a webhook is accepted at intake.
 ///
-/// This stores the complete webhook delivery: headers + body, as specified
-/// in DESIGN.md. The headers are required for:
-/// 1. **Replay**: The `X-GitHub-Event` header determines how to parse the body
-/// 2. **Debugging**: Headers like `X-Hub-Signature-256` aid in troubleshooting
-/// 3. **Audit**: The full request context is preserved for analysis
+/// Drains replay deliveries in `(arrival, delivery_id)` order, so this marker
+/// determines replay order. GitHub delivery IDs are UUIDs and carry no ordering
+/// information; without an arrival marker, replay order would be effectively
+/// random.
 ///
-/// # Why Not Just Store Raw Bytes?
+/// The marker is a wall-clock timestamp (milliseconds since the Unix epoch)
+/// plus a process-local atomic counter that breaks ties within a process.
+/// Within a single process the ordering is strictly monotonic; across process
+/// restarts it is as accurate as the system clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ArrivalMarker {
+    /// Milliseconds since the Unix epoch at arrival time.
+    unix_ms: u64,
+    /// Process-local sequence number breaking ties within a process.
+    seq: u64,
+}
+
+impl ArrivalMarker {
+    /// Captures the current arrival marker.
+    pub fn now() -> Self {
+        let unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        ArrivalMarker {
+            unix_ms,
+            seq: ARRIVAL_COUNTER.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+
+    /// Constructs a marker from raw parts. Test-only: production code must
+    /// capture markers with [`ArrivalMarker::now`].
+    #[cfg(test)]
+    pub(crate) fn from_parts(unix_ms: u64, seq: u64) -> Self {
+        ArrivalMarker { unix_ms, seq }
+    }
+}
+
+/// Error returned when constructing an envelope with an empty event type.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("invalid webhook envelope: event_type is empty")]
+pub struct EmptyEventType;
+
+/// A webhook envelope for crash-safe spooling.
 ///
-/// Storing raw bytes is dangerous because:
-/// 1. On replay, we don't know what type to deserialize the body as
-/// 2. The event type is in the HTTP headers, which would be lost
-/// 3. We can't validate that the payload is correctly structured
+/// Stores the *raw signed body bytes* plus the minimal request metadata needed
+/// to replay the delivery:
 ///
-/// By using a structured envelope, we "parse, don't validate" at the
-/// boundary: the API enforces that event_type is always present.
+/// - `event_type`: the `X-GitHub-Event` header, needed to parse the body at
+///   drain time (via `crate::webhooks::parse_webhook`)
+/// - `signature`: the `X-Hub-Signature-256` header, so the stored body can be
+///   re-verified against the webhook secret at any time
+/// - `body`: the exact bytes GitHub signed
+/// - `arrival`: a monotonic arrival marker; drains replay in arrival order
 ///
-/// # Example
+/// (The delivery ID is the spool filename, not an envelope field. The `http`
+/// crate lowercases header names, so the original header casing is not
+/// available to store.)
 ///
-/// ```ignore
-/// use std::collections::HashMap;
+/// # Body Representation Constraint
 ///
-/// let mut headers = HashMap::new();
-/// headers.insert("X-GitHub-Event".to_string(), "pull_request".to_string());
-/// headers.insert("X-Hub-Signature-256".to_string(), "sha256=...".to_string());
+/// The body is stored as a JSON string, which requires it to be valid UTF-8.
+/// GitHub webhook bodies are JSON and therefore UTF-8; intake rejects
+/// non-UTF-8 bodies before spooling. For valid UTF-8, the
+/// `String -> JSON string -> String` roundtrip through serde_json is
+/// byte-exact, so `verify_signature(envelope.body().as_bytes(), ...)` against
+/// the stored signature always reproduces the original verification.
 ///
-/// let envelope = WebhookEnvelope {
-///     event_type: "pull_request".to_string(),
-///     headers,
-///     body: serde_json::from_slice(&request_body)?,
-/// };
-/// spool_webhook(&spool_dir, &delivery_id, &envelope)?;
+/// # Invariants
 ///
-/// // On replay:
-/// let envelope = delivery.read_webhook()?;
-/// match envelope.event_type.as_str() {
-///     "pull_request" => {
-///         let event: PullRequestEvent = serde_json::from_value(envelope.body)?;
-///     }
-///     "check_suite" => { /* ... */ }
-/// }
-/// ```
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// `event_type` is non-empty. This is enforced by construction: the only ways
+/// to obtain a `WebhookEnvelope` are [`WebhookEnvelope::new`] and
+/// deserialization, both of which reject empty event types.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct WebhookEnvelope {
-    /// The GitHub event type from the `X-GitHub-Event` header.
-    /// This is required for determining how to parse the body on replay.
-    /// Stored separately for efficient access without parsing all headers.
-    pub event_type: String,
+    event_type: String,
+    signature: String,
+    body: String,
+    arrival: ArrivalMarker,
+}
 
-    /// All HTTP headers from the webhook request.
-    /// Stored for replay/debug purposes. Keys are header names (case-preserved),
-    /// values are the header values as strings.
-    #[serde(default)]
-    pub headers: std::collections::HashMap<String, String>,
+impl WebhookEnvelope {
+    /// Creates an envelope, rejecting empty event types.
+    ///
+    /// An empty event type would make the spooled delivery unreplayable: the
+    /// event type selects the parser at drain time.
+    pub fn new(
+        event_type: impl Into<String>,
+        signature: impl Into<String>,
+        body: impl Into<String>,
+        arrival: ArrivalMarker,
+    ) -> std::result::Result<Self, EmptyEventType> {
+        let event_type = event_type.into();
+        if event_type.is_empty() {
+            return Err(EmptyEventType);
+        }
+        Ok(WebhookEnvelope {
+            event_type,
+            signature: signature.into(),
+            body: body.into(),
+            arrival,
+        })
+    }
 
-    /// The webhook body as a JSON value.
-    /// This is the parsed JSON payload from GitHub. Using `serde_json::Value`
-    /// validates the body is valid JSON while preserving the exact structure.
-    pub body: serde_json::Value,
+    /// The GitHub event type from the `X-GitHub-Event` header. Non-empty.
+    pub fn event_type(&self) -> &str {
+        &self.event_type
+    }
+
+    /// The `X-Hub-Signature-256` header value, re-verifiable against [`Self::body`].
+    pub fn signature(&self) -> &str {
+        &self.signature
+    }
+
+    /// The raw signed body bytes (valid UTF-8; see the type-level docs).
+    pub fn body(&self) -> &str {
+        &self.body
+    }
+
+    /// The arrival marker recorded at intake.
+    pub fn arrival(&self) -> ArrivalMarker {
+        self.arrival
+    }
+}
+
+/// Wire format for [`WebhookEnvelope`]; deserialization funnels through
+/// [`WebhookEnvelope::new`] so the non-empty `event_type` invariant also holds
+/// for envelopes read back from disk.
+#[derive(Deserialize)]
+struct WebhookEnvelopeWire {
+    event_type: String,
+    signature: String,
+    body: String,
+    arrival: ArrivalMarker,
+}
+
+impl<'de> Deserialize<'de> for WebhookEnvelope {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = WebhookEnvelopeWire::deserialize(deserializer)?;
+        WebhookEnvelope::new(wire.event_type, wire.signature, wire.body, wire.arrival)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 /// Errors that can occur during spool operations.
@@ -113,44 +204,28 @@ pub enum SpoolError {
     #[error("duplicate delivery ID: {0}")]
     DuplicateDelivery(DeliveryId),
 
-    /// Invalid delivery ID (contains path separators or other unsafe characters).
-    #[error("invalid delivery ID: contains unsafe characters: {0}")]
-    InvalidDeliveryId(DeliveryId),
-
-    /// Invalid webhook envelope (empty event_type).
-    #[error("invalid webhook envelope: event_type is empty")]
-    EmptyEventType,
+    /// A spooled payload exists but is not a valid [`WebhookEnvelope`].
+    ///
+    /// This is an uncharacterizable state (the spool only ever writes
+    /// envelopes), so it is surfaced loudly rather than skipped.
+    #[error("corrupt spool envelope for delivery {delivery_id}: {source}")]
+    CorruptEnvelope {
+        delivery_id: DeliveryId,
+        #[source]
+        source: serde_json::Error,
+    },
 }
 
 /// Result type for spool operations.
 pub type Result<T> = std::result::Result<T, SpoolError>;
 
-/// Validates that a delivery ID is safe to use in filenames.
-///
-/// A delivery ID is unsafe if it:
-/// - Contains path separators (`/` or `\`)
-/// - Contains null bytes
-/// - Is empty
-/// - Starts with a dot (hidden file, could conflict with markers)
-/// - Is `.` or `..` (directory traversal)
-fn validate_delivery_id(delivery_id: &DeliveryId) -> Result<()> {
-    let id = delivery_id.as_str();
-
-    if id.is_empty() {
-        return Err(SpoolError::InvalidDeliveryId(delivery_id.clone()));
-    }
-
-    // Check for path separators, null bytes, and other unsafe characters
-    if id.contains('/') || id.contains('\\') || id.contains('\0') {
-        return Err(SpoolError::InvalidDeliveryId(delivery_id.clone()));
-    }
-
-    // Reject hidden files and directory traversal
-    if id.starts_with('.') {
-        return Err(SpoolError::InvalidDeliveryId(delivery_id.clone()));
-    }
-
-    Ok(())
+/// Outcome of attempting to claim a delivery for processing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimOutcome {
+    /// This caller created the `.proc` marker and owns the delivery.
+    Claimed,
+    /// Another worker already owns the delivery.
+    AlreadyClaimed,
 }
 
 /// A webhook delivery in the spool.
@@ -190,11 +265,6 @@ impl SpooledDelivery {
         self.payload_path.with_extension("json.done")
     }
 
-    /// Returns the path to the temp file used during atomic writes.
-    pub fn temp_path(&self) -> PathBuf {
-        self.payload_path.with_extension("json.tmp")
-    }
-
     /// Checks if the delivery is pending (payload exists, not processing, not done).
     ///
     /// A delivery is pending if:
@@ -222,13 +292,6 @@ impl SpooledDelivery {
         self.done_marker_path().exists()
     }
 
-    /// Reads and deserializes the payload.
-    pub fn read_payload<T: for<'de> Deserialize<'de>>(&self) -> Result<T> {
-        let bytes = std::fs::read(&self.payload_path)?;
-        let payload = serde_json::from_slice(&bytes)?;
-        Ok(payload)
-    }
-
     /// Reads the raw payload bytes.
     pub fn read_payload_bytes(&self) -> Result<Vec<u8>> {
         Ok(std::fs::read(&self.payload_path)?)
@@ -236,24 +299,24 @@ impl SpooledDelivery {
 
     /// Reads and deserializes the webhook envelope.
     ///
-    /// This is the preferred method for reading spooled webhooks, as it
-    /// returns a structured envelope with the event type needed for parsing.
-    ///
     /// # Errors
     ///
     /// Returns `SpoolError::Io` if the file cannot be read.
-    /// Returns `SpoolError::Json` if the file is not a valid `WebhookEnvelope`.
+    /// Returns `SpoolError::CorruptEnvelope` if the payload is not a valid
+    /// `WebhookEnvelope`.
     pub fn read_webhook(&self) -> Result<WebhookEnvelope> {
         let bytes = std::fs::read(&self.payload_path)?;
-        let envelope = serde_json::from_slice(&bytes)?;
-        Ok(envelope)
+        serde_json::from_slice(&bytes).map_err(|source| SpoolError::CorruptEnvelope {
+            delivery_id: self.delivery_id.clone(),
+            source,
+        })
     }
 }
 
 /// Spools a webhook delivery to disk atomically.
 ///
 /// The delivery is written using the write-to-temp-then-link pattern:
-/// 1. Write to `<delivery-id>.json.tmp`
+/// 1. Write to `<delivery-id>.json.tmp.<pid>.<counter>`
 /// 2. fsync the temp file
 /// 3. hard_link to `<delivery-id>.json` (fails atomically if exists)
 /// 4. Remove the temp file
@@ -266,7 +329,12 @@ impl SpooledDelivery {
 ///
 /// # Errors
 ///
-/// Returns `SpoolError::DuplicateDelivery` if a delivery with the same ID already exists.
+/// Returns `SpoolError::DuplicateDelivery` if a delivery with the same ID already
+/// exists. The spool directory is fsynced before this error is returned: callers
+/// acknowledge duplicates (HTTP 202), so the surviving copy must be durable
+/// before the acknowledgement. (The original spool attempt may have crashed
+/// after its hard_link but before its directory fsync.)
+///
 /// Returns `SpoolError::Io` for filesystem errors.
 ///
 /// # Note
@@ -278,9 +346,6 @@ pub(crate) fn spool_delivery(
     delivery_id: &DeliveryId,
     payload: &[u8],
 ) -> Result<SpooledDelivery> {
-    // Validate delivery ID to prevent path traversal attacks
-    validate_delivery_id(delivery_id)?;
-
     // Ensure spool directory exists, with durable creation.
     //
     // When create_dir_all creates intermediate directories, each parent must be
@@ -359,8 +424,14 @@ pub(crate) fn spool_delivery(
             let _ = std::fs::remove_file(&temp_path);
         }
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-            // Target already exists - this is a duplicate
             let _ = std::fs::remove_file(&temp_path);
+            // The existing payload entry may not yet be durable: the original
+            // spool attempt could have crashed between its hard_link and its
+            // directory fsync. The caller will acknowledge this duplicate
+            // (HTTP 202), so make the surviving entry durable first -
+            // otherwise a power loss could erase a delivery GitHub believes
+            // we accepted.
+            fsync_dir(spool_dir)?;
             return Err(SpoolError::DuplicateDelivery(delivery_id.clone()));
         }
         Err(e) => {
@@ -376,31 +447,16 @@ pub(crate) fn spool_delivery(
     Ok(delivery)
 }
 
-/// Spools a webhook with structured envelope to disk atomically.
+/// Spools a webhook envelope to disk atomically.
 ///
-/// This is the preferred API for spooling webhooks, as it ensures the event
-/// type is always stored alongside the body. This is required for crash
-/// recovery: on replay, we need to know the event type to correctly parse
-/// the body.
-///
-/// The envelope is serialized to JSON before being written to disk.
-///
-/// # Example
-///
-/// ```ignore
-/// use std::collections::HashMap;
-///
-/// let envelope = WebhookEnvelope {
-///     event_type: "pull_request".to_string(),
-///     headers: HashMap::new(), // or populate with actual headers
-///     body: request_body,
-/// };
-/// let delivery = spool_webhook(&spool_dir, &delivery_id, &envelope)?;
-/// ```
+/// This is the public API for spooling webhooks. The [`WebhookEnvelope`] is
+/// correct by construction (non-empty event type, raw signed body), so any
+/// successfully spooled delivery can be replayed on recovery.
 ///
 /// # Errors
 ///
-/// Returns `SpoolError::DuplicateDelivery` if a delivery with the same ID already exists.
+/// Returns `SpoolError::DuplicateDelivery` if a delivery with the same ID already
+/// exists (durably, see [`spool_delivery`]).
 /// Returns `SpoolError::Io` for filesystem errors.
 /// Returns `SpoolError::Json` if serialization fails.
 pub fn spool_webhook(
@@ -408,25 +464,43 @@ pub fn spool_webhook(
     delivery_id: &DeliveryId,
     envelope: &WebhookEnvelope,
 ) -> Result<SpooledDelivery> {
-    // Validate event_type is non-empty (required for crash-replay).
-    // This is enforced at the boundary to ensure the invariant holds.
-    if envelope.event_type.is_empty() {
-        return Err(SpoolError::EmptyEventType);
-    }
-
     let payload = serde_json::to_vec(envelope)?;
     spool_delivery(spool_dir, delivery_id, &payload)
 }
 
-/// Marks a delivery as being processed by creating the `.proc` marker.
+/// Attempts to claim a delivery for processing by creating the `.proc` marker.
 ///
-/// This is idempotent - calling it multiple times has no additional effect.
+/// The claim is atomic: the marker is created with `O_CREAT | O_EXCL`
+/// (`create_new`), so exactly one of any number of concurrent callers receives
+/// [`ClaimOutcome::Claimed`]; the rest receive [`ClaimOutcome::AlreadyClaimed`]
+/// and must not process the delivery.
+///
+/// # Durability
+///
+/// The marker and directory are fsynced after a successful claim. If power is
+/// lost before the fsync completes, the marker may vanish - which is safe:
+/// a payload without `.proc`/`.done` markers is simply pending again, and
+/// `.proc` markers without `.done` are cleared at startup anyway (interrupted
+/// processing is reprocessed).
 ///
 /// # Errors
 ///
-/// Returns `SpoolError::Io` for filesystem errors.
-pub fn mark_processing(delivery: &SpooledDelivery) -> Result<()> {
-    create_marker_file(&delivery.proc_marker_path(), &delivery.spool_dir)
+/// Returns `SpoolError::Io` for filesystem errors other than the marker
+/// already existing.
+pub fn mark_processing(delivery: &SpooledDelivery) -> Result<ClaimOutcome> {
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(delivery.proc_marker_path())
+    {
+        Ok(file) => {
+            fsync_file(&file)?;
+            fsync_dir(&delivery.spool_dir)?;
+            Ok(ClaimOutcome::Claimed)
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(ClaimOutcome::AlreadyClaimed),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Marks a delivery as done by creating the `.done` marker.
@@ -496,19 +570,22 @@ fn create_marker_file(path: &Path, spool_dir: &Path) -> Result<()> {
 ///
 /// # Deletion Order (Crash Safety)
 ///
-/// Files are deleted in this order to ensure crash safety:
-/// 1. **Payload first**: The payload is deleted before any markers. This ensures
-///    that if we crash mid-cleanup, the delivery cannot become "pending" again.
-///    (`is_pending()` requires `payload_path.exists()`, so deleting the payload
-///    first prevents reprocessing.)
-/// 2. **Markers second**: After the payload is gone, marker deletion order doesn't
-///    matter. Orphaned markers are harmless (they just consume disk space).
-/// 3. **Directory fsync last**: Ensures all deletions are durable. Without this,
-///    a power loss could "resurrect" deleted files.
+/// The dangerous state is *payload present with markers gone*: `is_pending()`
+/// would return true and an already-processed delivery would be reprocessed.
+/// POSIX gives no ordering guarantees for un-fsynced unlinks across power
+/// loss, so simply unlinking payload-then-markers with one fsync at the end is
+/// not enough: the marker unlinks could become durable while the payload
+/// unlink does not.
 ///
-/// The WRONG order (markers before payload) would be dangerous: a crash after
-/// deleting `.done` but before deleting the payload would leave a payload without
-/// a done marker, which `drain_pending()` would treat as pending → reprocessing!
+/// Therefore the order is:
+/// 1. **Unlink the payload.** Errors (other than NotFound) abort immediately,
+///    leaving all markers in place.
+/// 2. **fsync the directory.** The payload's disappearance is now durable; from
+///    this point no power loss can resurrect it.
+/// 3. **Unlink the markers** (and any orphaned temp files). Orphaned markers
+///    are harmless if we crash here: a marker without a payload is never
+///    pending.
+/// 4. **fsync the directory** so the marker deletions are durable.
 ///
 /// # Error Handling
 ///
@@ -517,9 +594,7 @@ fn create_marker_file(path: &Path, spool_dir: &Path) -> Result<()> {
 /// a dangerous state where the payload exists but markers are deleted, which
 /// would cause `is_pending()` to return true for an already-processed delivery.
 pub fn remove_delivery(delivery: &SpooledDelivery) -> Result<()> {
-    // Delete payload FIRST to prevent reprocessing on crash. If we crash after
-    // this, the delivery cannot become pending again because is_pending() requires
-    // the payload file to exist.
+    // Step 1: delete payload FIRST to prevent reprocessing on crash.
     //
     // We must NOT ignore errors here. If payload deletion fails but we proceed to
     // delete markers, is_pending() returns true for an already-processed delivery.
@@ -536,17 +611,18 @@ pub fn remove_delivery(delivery: &SpooledDelivery) -> Result<()> {
         }
     }
 
-    // Now safe to delete markers (orphaned markers are harmless).
+    // Step 2: make the payload's disappearance durable BEFORE touching markers.
+    fsync_dir(&delivery.spool_dir)?;
+
+    // Step 3: now safe to delete markers (orphaned markers are harmless).
     // We can ignore errors here because:
-    // 1. Payload is confirmed deleted, so is_pending() will return false
+    // 1. Payload is durably deleted, so is_pending() will return false
     // 2. Orphaned markers just consume disk space, they don't affect correctness
     let _ = std::fs::remove_file(delivery.done_marker_path());
     let _ = std::fs::remove_file(delivery.proc_marker_path());
 
-    // Clean up any orphaned temp files from interrupted spool operations.
-    // These have the pattern <id>.json.tmp.<pid>.<counter> or the legacy <id>.json.tmp
-    let _ = std::fs::remove_file(delivery.temp_path());
-    // Also try to clean any unique temp files by pattern matching
+    // Clean up any orphaned temp files from interrupted spool operations
+    // (pattern: <id>.json.tmp.<pid>.<counter>).
     if let Some(parent) = delivery.payload_path.parent()
         && let Some(stem) = delivery.payload_path.file_name().and_then(|n| n.to_str())
         && let Ok(entries) = std::fs::read_dir(parent)
@@ -567,9 +643,7 @@ pub fn remove_delivery(delivery: &SpooledDelivery) -> Result<()> {
     let _ = std::fs::remove_file(done_temp);
     let _ = std::fs::remove_file(proc_temp);
 
-    // fsync the directory to ensure all deletions are durable.
-    // Without this, a power loss could "resurrect" deleted files.
-    // See DESIGN.md: "All directory fsyncs are mandatory, not best-effort."
+    // Step 4: fsync the directory so the marker deletions are durable.
     fsync_dir(&delivery.spool_dir)?;
 
     Ok(())
@@ -583,7 +657,8 @@ mod tests {
 
     /// Generate valid delivery IDs (UUID-like format).
     fn arb_delivery_id() -> impl Strategy<Value = DeliveryId> {
-        "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}".prop_map(DeliveryId::new)
+        "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+            .prop_map(|s| DeliveryId::parse(s).unwrap())
     }
 
     /// Generate arbitrary payload bytes.
@@ -606,50 +681,40 @@ mod tests {
         .prop_map(|s| s.to_string())
     }
 
-    /// Generate arbitrary JSON values for webhook bodies.
-    fn arb_json_value() -> impl Strategy<Value = serde_json::Value> {
-        // Generate simple JSON objects that look like webhook payloads
+    /// Generate arbitrary signature header values.
+    fn arb_signature() -> impl Strategy<Value = String> {
+        "[0-9a-f]{64}".prop_map(|hex| format!("sha256={}", hex))
+    }
+
+    /// Generate arbitrary raw JSON body text, including formatting that a
+    /// re-serialization would not preserve.
+    fn arb_raw_body() -> impl Strategy<Value = String> {
         (
             "[a-z_]{3,10}",        // action
             0u64..100000,          // id
             "[a-zA-Z0-9_-]{3,20}", // sender login
         )
             .prop_map(|(action, id, sender)| {
-                serde_json::json!({
-                    "action": action,
-                    "sender": {
-                        "id": id,
-                        "login": sender
-                    }
-                })
+                // Deliberately odd whitespace and a duplicate key: the raw
+                // bytes must survive spooling exactly.
+                format!(
+                    "{{ \"action\": \"{action}\",  \"action\": \"{action}\",\n  \"sender\": {{ \"id\": {id}, \"login\": \"{sender}\" }} }}"
+                )
             })
-    }
-
-    /// Generate arbitrary HTTP headers for webhook envelopes.
-    fn arb_headers() -> impl Strategy<Value = std::collections::HashMap<String, String>> {
-        prop::collection::hash_map(
-            "[A-Za-z][A-Za-z0-9-]{2,20}", // Header names like X-GitHub-Event
-            "[a-zA-Z0-9/_=.-]{1,50}",     // Header values
-            0..5,
-        )
     }
 
     /// Generate arbitrary webhook envelopes.
     fn arb_webhook_envelope() -> impl Strategy<Value = WebhookEnvelope> {
-        (arb_event_type(), arb_headers(), arb_json_value()).prop_map(
-            |(event_type, headers, body)| WebhookEnvelope {
-                event_type,
-                headers,
-                body,
+        (arb_event_type(), arb_signature(), arb_raw_body()).prop_map(
+            |(event_type, signature, body)| {
+                WebhookEnvelope::new(event_type, signature, body, ArrivalMarker::now()).unwrap()
             },
         )
     }
 
     proptest! {
-        /// Webhook envelope roundtrip: spool_webhook + read_webhook preserves data.
-        ///
-        /// This test verifies the structured envelope API correctly preserves
-        /// event type, headers, and body through serialization/deserialization.
+        /// Webhook envelope roundtrip: spool_webhook + read_webhook preserves
+        /// the event type, signature, raw body bytes, and arrival marker.
         #[test]
         fn webhook_envelope_roundtrip(
             delivery_id in arb_delivery_id(),
@@ -658,67 +723,83 @@ mod tests {
             let dir = tempdir().unwrap();
             let spool_dir = dir.path();
 
-            // Spool using structured envelope API
             let delivery = spool_webhook(spool_dir, &delivery_id, &envelope).unwrap();
-
-            // Read back using structured envelope API
             let read_envelope = delivery.read_webhook().unwrap();
 
-            // Event type, headers, and body must be preserved exactly
-            prop_assert_eq!(envelope.event_type, read_envelope.event_type,
+            prop_assert_eq!(envelope.event_type(), read_envelope.event_type(),
                 "Event type must survive roundtrip");
-            prop_assert_eq!(envelope.headers, read_envelope.headers,
-                "Headers must survive roundtrip");
-            prop_assert_eq!(envelope.body, read_envelope.body,
-                "Body must survive roundtrip");
+            prop_assert_eq!(envelope.signature(), read_envelope.signature(),
+                "Signature must survive roundtrip");
+            prop_assert_eq!(envelope.body().as_bytes(), read_envelope.body().as_bytes(),
+                "Body must survive roundtrip byte-exactly");
+            prop_assert_eq!(envelope.arrival(), read_envelope.arrival(),
+                "Arrival marker must survive roundtrip");
         }
 
-        /// Event type is required for crash-replay: spool_webhook rejects empty event types.
+        /// The stored signature can be re-verified against the stored body.
         ///
-        /// This test verifies that spool_webhook enforces the invariant at the boundary:
-        /// empty event_type is rejected with EmptyEventType error. This ensures that
-        /// any successfully spooled webhook can be correctly replayed on recovery.
+        /// This is the property that motivates storing raw bytes: signing the
+        /// body, spooling it, reading it back, and re-verifying must succeed.
         #[test]
-        fn webhook_envelope_rejects_empty_event_type(
+        fn stored_signature_reverifies_against_stored_body(
             delivery_id in arb_delivery_id(),
-            body in arb_json_value(),
+            event_type in arb_event_type(),
+            body in arb_raw_body(),
+            secret in prop::collection::vec(any::<u8>(), 1..64),
         ) {
+            use crate::webhooks::{compute_signature, format_signature_header, verify_signature};
+
             let dir = tempdir().unwrap();
             let spool_dir = dir.path();
 
-            // Empty event_type must be rejected
-            let envelope = WebhookEnvelope {
-                event_type: String::new(),
-                headers: std::collections::HashMap::new(),
-                body: body.clone(),
-            };
-            let result = spool_webhook(spool_dir, &delivery_id, &envelope);
-            prop_assert!(matches!(result, Err(SpoolError::EmptyEventType)),
-                "Empty event_type must be rejected at boundary");
+            let signature = format_signature_header(&compute_signature(body.as_bytes(), &secret));
+            let envelope =
+                WebhookEnvelope::new(event_type, signature, body, ArrivalMarker::now()).unwrap();
 
-            // Whitespace-only would NOT be caught by is_empty() - document this.
-            // If stricter validation is needed, use .trim().is_empty() instead.
-        }
-
-        /// Non-empty event types are preserved through roundtrip.
-        ///
-        /// This complements webhook_envelope_rejects_empty_event_type by verifying
-        /// that valid event types survive the roundtrip.
-        #[test]
-        fn webhook_envelope_preserves_event_type(
-            delivery_id in arb_delivery_id(),
-            envelope in arb_webhook_envelope(),
-        ) {
-            let dir = tempdir().unwrap();
-            let spool_dir = dir.path();
-
-            // The generator produces non-empty event types, so this should succeed
             let delivery = spool_webhook(spool_dir, &delivery_id, &envelope).unwrap();
             let read_envelope = delivery.read_webhook().unwrap();
 
-            // Event type must be preserved exactly
-            prop_assert_eq!(envelope.event_type, read_envelope.event_type,
-                "Event type must be preserved through roundtrip");
+            prop_assert!(
+                verify_signature(read_envelope.body().as_bytes(), read_envelope.signature(), &secret),
+                "stored signature must verify against stored body"
+            );
+        }
+
+        /// Event type is required for crash-replay: the envelope constructor
+        /// rejects empty event types, so unreplayable envelopes are
+        /// unrepresentable.
+        #[test]
+        fn envelope_rejects_empty_event_type(
+            signature in arb_signature(),
+            body in arb_raw_body(),
+        ) {
+            let result = WebhookEnvelope::new("", signature, body, ArrivalMarker::now());
+            prop_assert_eq!(result, Err(EmptyEventType));
+        }
+
+        /// Deserialization enforces the same invariant as the constructor:
+        /// an on-disk envelope with an empty event type is rejected.
+        #[test]
+        fn envelope_deserialize_rejects_empty_event_type(
+            signature in arb_signature(),
+        ) {
+            let json = serde_json::json!({
+                "event_type": "",
+                "signature": signature,
+                "body": "{}",
+                "arrival": { "unix_ms": 0, "seq": 0 },
+            });
+            let result: std::result::Result<WebhookEnvelope, _> =
+                serde_json::from_value(json);
+            prop_assert!(result.is_err());
+        }
+
+        /// Arrival markers captured later compare strictly greater within a process.
+        #[test]
+        fn arrival_markers_monotonic_within_process(_n in 0u8..10) {
+            let a = ArrivalMarker::now();
+            let b = ArrivalMarker::now();
+            prop_assert!(a < b, "arrival markers must be strictly monotonic in-process");
         }
     }
 
@@ -787,9 +868,10 @@ mod tests {
             prop_assert!(temp_files.is_empty(), "temp files should be cleaned up");
         }
 
-        /// Processing marker is idempotent.
+        /// The `.proc` claim is exclusive: of two claim attempts, exactly the
+        /// first wins; the second observes AlreadyClaimed.
         #[test]
-        fn mark_processing_idempotent(
+        fn mark_processing_claim_is_exclusive(
             delivery_id in arb_delivery_id(),
             payload in arb_payload(),
         ) {
@@ -798,15 +880,41 @@ mod tests {
 
             let delivery = spool_delivery(spool_dir, &delivery_id, &payload).unwrap();
 
-            // Mark processing multiple times
-            mark_processing(&delivery).unwrap();
+            prop_assert_eq!(mark_processing(&delivery).unwrap(), ClaimOutcome::Claimed);
             prop_assert!(delivery.is_processing());
 
-            mark_processing(&delivery).unwrap();
+            // A second claim (e.g. a racing drainer) must NOT succeed.
+            prop_assert_eq!(mark_processing(&delivery).unwrap(), ClaimOutcome::AlreadyClaimed);
             prop_assert!(delivery.is_processing());
-
-            // Should still be processable, not done
             prop_assert!(!delivery.is_done());
+        }
+
+        /// Concurrent claims from multiple threads: exactly one wins.
+        #[test]
+        fn mark_processing_concurrent_single_winner(
+            delivery_id in arb_delivery_id(),
+            payload in arb_payload(),
+        ) {
+            let dir = tempdir().unwrap();
+            let spool_dir = dir.path();
+
+            let delivery = spool_delivery(spool_dir, &delivery_id, &payload).unwrap();
+
+            let claims: Vec<ClaimOutcome> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..4)
+                    .map(|_| {
+                        let delivery = &delivery;
+                        scope.spawn(move || mark_processing(delivery).unwrap())
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+
+            let winners = claims
+                .iter()
+                .filter(|c| **c == ClaimOutcome::Claimed)
+                .count();
+            prop_assert_eq!(winners, 1, "exactly one concurrent claim must win: {:?}", claims);
         }
 
         /// Done marker is idempotent.
@@ -844,8 +952,8 @@ mod tests {
             prop_assert!(!delivery.is_processing());
             prop_assert!(!delivery.is_done());
 
-            // Mark processing
-            mark_processing(&delivery).unwrap();
+            // Claim for processing
+            prop_assert_eq!(mark_processing(&delivery).unwrap(), ClaimOutcome::Claimed);
             prop_assert!(!delivery.is_pending()); // NOT pending while processing (prevents double-processing)
             prop_assert!(delivery.is_processing());
             prop_assert!(!delivery.is_done());
@@ -1016,10 +1124,10 @@ mod tests {
             prop_assert!(delivery.is_done());
         }
 
-        /// Crash during marker creation: temp marker file exists.
+        /// Crash during done-marker creation: temp marker file exists.
         ///
-        /// If a crash occurs during marker creation (after writing temp file but
-        /// before the atomic rename), only the .done.tmp or .proc.tmp file exists.
+        /// If a crash occurs during mark_done (after writing temp file but
+        /// before the atomic rename), only the .done.tmp file exists.
         /// On recovery, the temp marker file is NOT treated as a valid marker.
         #[test]
         fn crash_during_marker_creation_temp_only(
@@ -1146,9 +1254,10 @@ mod tests {
         // These tests verify that a crash during remove_delivery does not
         // cause already-processed deliveries to be reprocessed on recovery.
         //
-        // The FIX (payload deleted before markers) ensures that any crash during
-        // remove_delivery leaves the system in a safe state:
-        // - Crash before payload deletion: .done marker still exists → is_done() = true
+        // remove_delivery deletes the payload first and makes that deletion
+        // durable (fsync) before touching markers, so any crash leaves a safe
+        // state:
+        // - Crash before payload deletion: .done marker still exists → is_done()
         // - Crash after payload deletion: no payload → is_pending() = false
         //   (is_pending requires payload_path.exists())
 
@@ -1182,87 +1291,58 @@ mod tests {
             prop_assert!(!delivery.is_pending(), "Delivery should not be pending");
         }
 
-        /// Crash during remove_delivery AFTER payload deletion: delivery not pending.
+        /// The corrected removal ordering never yields a pending state.
         ///
-        /// The FIX ensures payload is deleted FIRST. If we crash after payload
-        /// deletion but before marker deletion, the delivery cannot be pending
-        /// because is_pending() requires payload_path.exists() to be true.
+        /// remove_delivery performs, in order: unlink payload, fsync dir,
+        /// unlink done marker, unlink proc marker, fsync dir. We cannot
+        /// simulate power loss in a unit test, but we CAN verify that every
+        /// crash point in that unlink sequence leaves a state in which the
+        /// delivery is not pending - i.e. the dangerous state (payload
+        /// present, markers gone) never occurs at any step. The interleaved
+        /// fsyncs only narrow the set of post-power-loss states towards these
+        /// crash-point states; they cannot introduce new ones, because the
+        /// payload unlink is made durable before any marker unlink begins.
         #[test]
-        fn crash_after_payload_deletion_not_pending(
+        fn corrected_removal_ordering_never_yields_pending(
             delivery_id in arb_delivery_id(),
             payload in arb_payload(),
         ) {
             use crate::spool::drain::cleanup_interrupted_processing;
 
-            let dir = tempdir().unwrap();
-            let spool_dir = dir.path();
+            // Replay the exact unlink sequence remove_delivery performs,
+            // checking the invariant after each step.
+            let unlink_sequence: [fn(&SpooledDelivery) -> PathBuf; 3] = [
+                |d| d.payload_path.clone(),
+                |d| d.done_marker_path(),
+                |d| d.proc_marker_path(),
+            ];
 
-            // Set up a completed delivery
-            let delivery = spool_delivery(spool_dir, &delivery_id, &payload).unwrap();
-            mark_processing(&delivery).unwrap();
-            mark_done(&delivery).unwrap();
+            for crash_after in 0..=unlink_sequence.len() {
+                let dir = tempdir().unwrap();
+                let spool_dir = dir.path();
 
-            // Simulate crash AFTER payload deletion but BEFORE marker deletion.
-            // This is the state after step 1 of the FIXED remove_delivery:
-            // - Payload: DELETED
-            // - .done marker: still exists
-            // - .proc marker: still exists
-            std::fs::remove_file(&delivery.payload_path).ok();
+                let delivery = spool_delivery(spool_dir, &delivery_id, &payload).unwrap();
+                mark_processing(&delivery).unwrap();
+                mark_done(&delivery).unwrap();
 
-            // Run recovery
-            cleanup_interrupted_processing(spool_dir).unwrap();
+                // Perform the first `crash_after` unlinks, then "crash".
+                for step in &unlink_sequence[..crash_after] {
+                    std::fs::remove_file(step(&delivery)).unwrap();
+                }
 
-            // Not pending because payload doesn't exist
-            prop_assert!(
-                !delivery.is_pending(),
-                "Delivery must not be pending after payload deletion. \
-                 payload exists: {}, proc exists: {}, done exists: {}",
-                delivery.payload_path.exists(),
-                delivery.proc_marker_path().exists(),
-                delivery.done_marker_path().exists()
-            );
+                // Run startup recovery as the restarted process would.
+                cleanup_interrupted_processing(spool_dir).unwrap();
 
-            // The .done marker still exists, so is_done() is true
-            prop_assert!(delivery.is_done(), ".done marker should still exist");
-        }
-
-        /// Crash after payload and .done marker deletion: still not pending.
-        ///
-        /// Tests the state after both payload and .done are deleted but .proc remains.
-        #[test]
-        fn crash_after_payload_and_done_deletion_not_pending(
-            delivery_id in arb_delivery_id(),
-            payload in arb_payload(),
-        ) {
-            use crate::spool::drain::cleanup_interrupted_processing;
-
-            let dir = tempdir().unwrap();
-            let spool_dir = dir.path();
-
-            // Set up a completed delivery
-            let delivery = spool_delivery(spool_dir, &delivery_id, &payload).unwrap();
-            mark_processing(&delivery).unwrap();
-            mark_done(&delivery).unwrap();
-
-            // Simulate crash after payload and .done deletion:
-            // - Payload: DELETED
-            // - .done marker: DELETED
-            // - .proc marker: still exists
-            std::fs::remove_file(&delivery.payload_path).ok();
-            std::fs::remove_file(delivery.done_marker_path()).ok();
-
-            // Run recovery
-            cleanup_interrupted_processing(spool_dir).unwrap();
-
-            // Not pending because payload doesn't exist
-            prop_assert!(
-                !delivery.is_pending(),
-                "Delivery must not be pending - no payload. \
-                 payload exists: {}, proc exists: {}, done exists: {}",
-                delivery.payload_path.exists(),
-                delivery.proc_marker_path().exists(),
-                delivery.done_marker_path().exists()
-            );
+                prop_assert!(
+                    !delivery.is_pending(),
+                    "crash after {} unlinks must not yield a pending delivery \
+                     (payload exists: {}, proc exists: {}, done exists: {})",
+                    crash_after,
+                    delivery.payload_path.exists(),
+                    delivery.proc_marker_path().exists(),
+                    delivery.done_marker_path().exists(),
+                );
+            }
         }
 
         /// If payload deletion fails (not crashes), markers must NOT be deleted.
@@ -1340,61 +1420,6 @@ mod tests {
             // If payload was somehow deleted (shouldn't happen with readonly dir),
             // then marker deletion is fine.
         }
-
-        /// Regression test: OLD buggy deletion order would cause reprocessing.
-        ///
-        /// This test documents the bug that existed before the fix: if markers
-        /// were deleted before the payload, a crash could leave the system in
-        /// a state where is_pending() returns true for an already-processed delivery.
-        ///
-        /// This scenario (markers gone, payload exists) should be impossible with
-        /// the FIXED code, but could occur with:
-        /// 1. Legacy data from before the fix
-        /// 2. External tampering (manual deletion of markers)
-        ///
-        /// We document this as a known limitation - the system cannot distinguish
-        /// between a legitimately pending delivery and one whose markers were
-        /// externally deleted.
-        #[test]
-        fn legacy_buggy_state_documented(
-            delivery_id in arb_delivery_id(),
-            payload in arb_payload(),
-        ) {
-            use crate::spool::drain::cleanup_interrupted_processing;
-
-            let dir = tempdir().unwrap();
-            let spool_dir = dir.path();
-
-            // Set up a completed delivery
-            let delivery = spool_delivery(spool_dir, &delivery_id, &payload).unwrap();
-            mark_processing(&delivery).unwrap();
-            mark_done(&delivery).unwrap();
-
-            // Simulate the LEGACY BUGGY state: markers deleted, payload remains.
-            // This can ONLY happen with:
-            // 1. Old code that deleted markers before payload
-            // 2. External tampering
-            std::fs::remove_file(delivery.done_marker_path()).ok();
-            std::fs::remove_file(delivery.proc_marker_path()).ok();
-            // payload still exists - this is the dangerous state
-
-            // Run recovery
-            cleanup_interrupted_processing(spool_dir).unwrap();
-
-            // KNOWN LIMITATION: In this corrupted state, is_pending() returns true.
-            // The system has no way to know this delivery was previously processed.
-            // This test documents the limitation rather than asserting it's fixed.
-            prop_assert!(
-                delivery.is_pending(),
-                "Expected: legacy corrupted state appears pending (known limitation). \
-                 The FIX prevents this state from occurring with new code."
-            );
-
-            // The FIX prevents this state from occurring during normal operation.
-            // For legacy data migration, operators should either:
-            // 1. Re-run with old state cleared
-            // 2. Accept potential reprocessing of in-flight deliveries during upgrade
-        }
     }
 
     // ─── Unit tests ───
@@ -1404,7 +1429,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let spool_dir = dir.path().join("nested").join("spool");
 
-        let delivery_id = DeliveryId::new("test-delivery-1");
+        let delivery_id = DeliveryId::parse("test-delivery-1").unwrap();
         let payload = b"test payload";
 
         let delivery = spool_delivery(&spool_dir, &delivery_id, payload).unwrap();
@@ -1416,7 +1441,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let spool_dir = dir.path();
 
-        let delivery_id = DeliveryId::new("test-delivery-2");
+        let delivery_id = DeliveryId::parse("test-delivery-2").unwrap();
         let payload = b"test payload";
 
         // Spool and mark done
@@ -1436,7 +1461,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let spool_dir = dir.path();
 
-        let delivery_id = DeliveryId::new("test-delivery-3");
+        let delivery_id = DeliveryId::parse("test-delivery-3").unwrap();
         let payload = b"test payload";
 
         let delivery = spool_delivery(spool_dir, &delivery_id, payload).unwrap();
@@ -1453,154 +1478,22 @@ mod tests {
         assert!(delivery.payload_path.exists());
     }
 
-    // ─── Path traversal prevention tests ───
-
+    /// read_webhook on a payload that is not a valid envelope fails loudly
+    /// with the delivery ID in the error.
     #[test]
-    fn rejects_delivery_id_with_forward_slash() {
+    fn read_webhook_reports_corrupt_envelope() {
         let dir = tempdir().unwrap();
         let spool_dir = dir.path();
 
-        let delivery_id = DeliveryId::new("../../../etc/passwd");
-        let result = spool_delivery(spool_dir, &delivery_id, b"payload");
-        assert!(matches!(result, Err(SpoolError::InvalidDeliveryId(_))));
-    }
+        let delivery_id = DeliveryId::parse("corrupt-delivery").unwrap();
+        let delivery = spool_delivery(spool_dir, &delivery_id, b"not an envelope").unwrap();
 
-    #[test]
-    fn rejects_delivery_id_with_backslash() {
-        let dir = tempdir().unwrap();
-        let spool_dir = dir.path();
-
-        let delivery_id = DeliveryId::new("..\\..\\..\\windows\\system32");
-        let result = spool_delivery(spool_dir, &delivery_id, b"payload");
-        assert!(matches!(result, Err(SpoolError::InvalidDeliveryId(_))));
-    }
-
-    #[test]
-    fn rejects_delivery_id_with_null_byte() {
-        let dir = tempdir().unwrap();
-        let spool_dir = dir.path();
-
-        let delivery_id = DeliveryId::new("delivery\0id");
-        let result = spool_delivery(spool_dir, &delivery_id, b"payload");
-        assert!(matches!(result, Err(SpoolError::InvalidDeliveryId(_))));
-    }
-
-    #[test]
-    fn rejects_empty_delivery_id() {
-        let dir = tempdir().unwrap();
-        let spool_dir = dir.path();
-
-        let delivery_id = DeliveryId::new("");
-        let result = spool_delivery(spool_dir, &delivery_id, b"payload");
-        assert!(matches!(result, Err(SpoolError::InvalidDeliveryId(_))));
-    }
-
-    #[test]
-    fn rejects_delivery_id_starting_with_dot() {
-        let dir = tempdir().unwrap();
-        let spool_dir = dir.path();
-
-        // Hidden files could conflict with marker files or be invisible
-        let delivery_id = DeliveryId::new(".hidden-delivery");
-        let result = spool_delivery(spool_dir, &delivery_id, b"payload");
-        assert!(matches!(result, Err(SpoolError::InvalidDeliveryId(_))));
-
-        // Directory traversal attempts
-        let delivery_id = DeliveryId::new(".");
-        let result = spool_delivery(spool_dir, &delivery_id, b"payload");
-        assert!(matches!(result, Err(SpoolError::InvalidDeliveryId(_))));
-
-        let delivery_id = DeliveryId::new("..");
-        let result = spool_delivery(spool_dir, &delivery_id, b"payload");
-        assert!(matches!(result, Err(SpoolError::InvalidDeliveryId(_))));
-    }
-
-    #[test]
-    fn rejects_absolute_path_delivery_id() {
-        let dir = tempdir().unwrap();
-        let spool_dir = dir.path();
-
-        let delivery_id = DeliveryId::new("/etc/passwd");
-        let result = spool_delivery(spool_dir, &delivery_id, b"payload");
-        assert!(matches!(result, Err(SpoolError::InvalidDeliveryId(_))));
-    }
-
-    #[test]
-    fn accepts_valid_uuid_delivery_id() {
-        let dir = tempdir().unwrap();
-        let spool_dir = dir.path();
-
-        // GitHub delivery IDs are UUIDs
-        let delivery_id = DeliveryId::new("550e8400-e29b-41d4-a716-446655440000");
-        let result = spool_delivery(spool_dir, &delivery_id, b"payload");
-        assert!(result.is_ok());
-    }
-
-    // ─── Path traversal property tests ───
-
-    proptest! {
-        /// Any delivery ID containing path separators is rejected.
-        #[test]
-        fn rejects_any_id_with_path_separators(
-            prefix in "[a-zA-Z0-9-]{0,10}",
-            suffix in "[a-zA-Z0-9-]{0,10}",
-            separator in prop::sample::select(vec!['/', '\\']),
-        ) {
-            let dir = tempdir().unwrap();
-            let spool_dir = dir.path();
-
-            let malicious_id = format!("{}{}{}", prefix, separator, suffix);
-            let delivery_id = DeliveryId::new(&malicious_id);
-            let result = spool_delivery(spool_dir, &delivery_id, b"payload");
-            prop_assert!(matches!(result, Err(SpoolError::InvalidDeliveryId(_))));
-        }
-
-        /// Any delivery ID starting with a dot is rejected.
-        #[test]
-        fn rejects_any_id_starting_with_dot(
-            suffix in "[a-zA-Z0-9-]{0,20}",
-        ) {
-            let dir = tempdir().unwrap();
-            let spool_dir = dir.path();
-
-            let malicious_id = format!(".{}", suffix);
-            let delivery_id = DeliveryId::new(&malicious_id);
-            let result = spool_delivery(spool_dir, &delivery_id, b"payload");
-            prop_assert!(matches!(result, Err(SpoolError::InvalidDeliveryId(_))));
-        }
-
-        /// Valid UUID-format delivery IDs are always accepted.
-        #[test]
-        fn accepts_all_valid_uuids(
-            delivery_id in arb_delivery_id(),
-            payload in arb_payload(),
-        ) {
-            let dir = tempdir().unwrap();
-            let spool_dir = dir.path();
-
-            let result = spool_delivery(spool_dir, &delivery_id, &payload);
-            // Should succeed (not an InvalidDeliveryId error)
-            prop_assert!(!matches!(result, Err(SpoolError::InvalidDeliveryId(_))));
-        }
-
-        /// Resulting file is always within spool_dir (path canonicalization check).
-        #[test]
-        fn payload_path_stays_within_spool_dir(
-            delivery_id in arb_delivery_id(),
-            payload in arb_payload(),
-        ) {
-            let dir = tempdir().unwrap();
-            let spool_dir = dir.path();
-
-            let delivery = spool_delivery(spool_dir, &delivery_id, &payload).unwrap();
-
-            // The payload path must be a child of spool_dir
-            prop_assert!(delivery.payload_path.starts_with(spool_dir));
-
-            // And must not contain any .. components after canonicalization
-            let canonical = delivery.payload_path.canonicalize().unwrap();
-            let spool_canonical = spool_dir.canonicalize().unwrap();
-            prop_assert!(canonical.starts_with(&spool_canonical));
+        let result = delivery.read_webhook();
+        match result {
+            Err(SpoolError::CorruptEnvelope {
+                delivery_id: id, ..
+            }) => assert_eq!(id.as_str(), "corrupt-delivery"),
+            other => panic!("expected CorruptEnvelope, got {:?}", other.map(|_| ())),
         }
     }
 }

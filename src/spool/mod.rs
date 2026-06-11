@@ -17,6 +17,12 @@
 //! - Marker files use temp file + rename + fsync + dir fsync (empty files, creation atomic).
 //! - On recovery, deliveries with `.proc` but no `.done` are reprocessed.
 //!
+//! # Ordering
+//!
+//! Each envelope records a monotonic arrival marker at intake; drains replay
+//! in `(arrival, delivery_id)` order. Event-priority ordering is applied by
+//! the engine after parsing, not by the spool.
+//!
 //! # Deduplication
 //!
 //! GitHub may redeliver webhooks with new delivery IDs for the same logical event.
@@ -31,6 +37,7 @@ pub use dedupe::{
     prune_expired_keys, prune_expired_keys_default,
 };
 pub use delivery::{
-    SpoolError, SpooledDelivery, WebhookEnvelope, mark_done, mark_processing, spool_webhook,
+    ArrivalMarker, ClaimOutcome, EmptyEventType, SpoolError, SpooledDelivery, WebhookEnvelope,
+    mark_done, mark_processing, spool_webhook,
 };
 pub use drain::{cleanup_interrupted_processing, drain_pending};
