@@ -12,4 +12,7 @@ pub mod train;
 pub use ids::{CommentId, DeliveryId, InvalidSha, PrNumber, RepoId, Sha};
 pub use pr::{CachedPr, MergeStateStatus, PrState};
 pub use stack::{AbortReason, BlockReason, CascadeStepOutcome};
-pub use train::{CascadePhase, DescendantProgress, TrainError, TrainRecord, TrainState};
+pub use train::{
+    CascadePhase, DescendantProgress, PhaseKind, ProgressError, TrainError, TrainErrorKind,
+    TrainRecord, TrainState,
+};

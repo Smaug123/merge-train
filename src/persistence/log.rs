@@ -367,7 +367,6 @@ impl EventLog {
             let bytes_read = reader.read_until(b'\n', &mut line_bytes)?;
 
             if bytes_read == 0 {
-                // EOF reached
                 break;
             }
 

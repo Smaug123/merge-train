@@ -1,7 +1,11 @@
 //! Shared test utilities and arbitrary generators for property-based testing.
 
 use crate::persistence::event::{StateEvent, StateEventPayload};
-use crate::types::{CascadePhase, CommentId, DescendantProgress, PrNumber, Sha, TrainError};
+use crate::types::{
+    CascadePhase, CommentId, DescendantProgress, PrNumber, Sha, TrainError, TrainErrorKind,
+    TrainRecord, TrainState,
+};
+use chrono::{DateTime, Utc};
 use proptest::prelude::*;
 
 pub fn arb_pr_number() -> impl Strategy<Value = PrNumber> {
@@ -16,19 +20,127 @@ pub fn arb_sha() -> impl Strategy<Value = Sha> {
     "[0-9a-f]{40}".prop_map(|s| Sha::parse(s).unwrap())
 }
 
-pub fn arb_train_error() -> impl Strategy<Value = TrainError> {
+/// Timestamps in a sane range (years 2000-2100), second precision (chrono's
+/// RFC 3339 serde roundtrips exactly at this precision).
+pub fn arb_datetime() -> impl Strategy<Value = DateTime<Utc>> {
+    (946_684_800i64..4_102_444_800i64).prop_map(|secs| DateTime::from_timestamp(secs, 0).unwrap())
+}
+
+/// A fixed timestamp for tests that need *a* time but don't care which.
+pub fn test_timestamp() -> DateTime<Utc> {
+    DateTime::from_timestamp(1_700_000_000, 0).unwrap()
+}
+
+pub fn arb_train_error_kind() -> impl Strategy<Value = TrainErrorKind> {
+    proptest::sample::select(&[
+        TrainErrorKind::MergeConflict,
+        TrainErrorKind::PushRejected,
+        TrainErrorKind::PrClosed,
+        TrainErrorKind::CiFailed,
+        TrainErrorKind::CycleDetected,
+        TrainErrorKind::ReviewDismissed,
+        TrainErrorKind::ApprovalWithdrawn,
+        TrainErrorKind::ApiError,
+        TrainErrorKind::BranchDeleted,
+        TrainErrorKind::NonSquashMerge,
+        TrainErrorKind::StatusCommentTooLarge,
+        TrainErrorKind::TrainTooLarge,
+        TrainErrorKind::PreparationMissing,
+        TrainErrorKind::MergeHooksEnabled,
+        TrainErrorKind::PreparationIncomplete,
+        TrainErrorKind::BaseBranchMismatch,
+        TrainErrorKind::HeadShaChanged,
+        TrainErrorKind::InternalInvariantViolation,
+    ])
+}
+
+pub fn arb_train_state() -> impl Strategy<Value = TrainState> {
+    prop_oneof![
+        Just(TrainState::Running),
+        Just(TrainState::WaitingCi),
+        Just(TrainState::NeedsManualReview),
+        arb_datetime().prop_map(|ended_at| TrainState::Stopped { ended_at }),
+        (arb_datetime(), arb_train_error())
+            .prop_map(|(ended_at, error)| TrainState::Aborted { ended_at, error }),
+    ]
+}
+
+pub fn arb_train_record() -> impl Strategy<Value = TrainRecord> {
     (
-        "[a-z_]{1,20}",
-        "[a-zA-Z0-9 ]{1,100}",
-        prop::option::of("[a-zA-Z0-9 ]{1,50}".prop_map(String::from)),
+        arb_pr_number(),
+        arb_pr_number(),
+        arb_train_state(),
+        arb_cascade_phase(),
+        prop::option::of(arb_pr_number()),
+        prop::option::of(arb_sha()),
+        any::<u64>(),
+        arb_datetime(),
+        prop::option::of(any::<u64>().prop_map(CommentId)),
     )
-        .prop_map(|(t, m, stderr)| {
-            let mut err = TrainError::new(t, m);
-            if let Some(s) = stderr {
-                err = err.with_stderr(s);
-            }
-            err
-        })
+        .prop_map(
+            |(
+                original_root_pr,
+                current_pr,
+                state,
+                cascade_phase,
+                predecessor_pr,
+                predecessor_head_sha,
+                recovery_seq,
+                started_at,
+                status_comment_id,
+            )| {
+                TrainRecord {
+                    version: 1,
+                    recovery_seq,
+                    state,
+                    original_root_pr,
+                    current_pr,
+                    cascade_phase,
+                    predecessor_pr,
+                    predecessor_head_sha,
+                    started_at,
+                    status_comment_id,
+                }
+            },
+        )
+}
+
+/// Text that exercises the status-comment escaping and truncation paths:
+/// HTML comment terminators, JSON metacharacters, newlines, and multi-byte
+/// UTF-8. The status comment is the backup state store, so its roundtrip
+/// property must hold for arbitrary error text, not just `[a-zA-Z0-9 ]`.
+pub fn arb_hostile_text(max_fragments: usize) -> impl Strategy<Value = String> {
+    let fragment = prop_oneof![
+        4 => "[a-zA-Z0-9 ]{1,40}".prop_map(String::from),
+        1 => Just("-->".to_string()),
+        1 => Just("--!>".to_string()),
+        1 => Just("--->".to_string()),
+        1 => Just("<!-- merge-train-state\n".to_string()),
+        1 => Just("\n\t".to_string()),
+        1 => Just("\"\\\u{8}".to_string()),
+        1 => Just("🚂🚃🚄".to_string()),
+    ];
+    prop::collection::vec(fragment, 0..=max_fragments).prop_map(|v| v.concat())
+}
+
+pub fn arb_train_error() -> impl Strategy<Value = TrainError> {
+    // The long arms exceed MAX_ERROR_MESSAGE_LEN (4096) / MAX_ERROR_STDERR_LEN
+    // (2048) so the truncation paths are actually exercised.
+    let message = prop_oneof![
+        3 => arb_hostile_text(8),
+        1 => arb_hostile_text(8).prop_map(|s| format!("{}{}", "m".repeat(4200), s)),
+    ];
+    let stderr = prop_oneof![
+        3 => arb_hostile_text(6),
+        1 => arb_hostile_text(6).prop_map(|s| format!("{}{}", "e".repeat(2200), s)),
+    ];
+    (arb_train_error_kind(), message, prop::option::of(stderr)).prop_map(|(kind, m, stderr)| {
+        let mut err = TrainError::new(kind, m);
+        if let Some(s) = stderr {
+            err = err.with_stderr(s);
+        }
+        err
+    })
 }
 
 pub fn arb_descendant_progress() -> impl Strategy<Value = DescendantProgress> {

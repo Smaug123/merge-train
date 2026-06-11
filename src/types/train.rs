@@ -10,20 +10,32 @@ use std::collections::HashSet;
 use super::ids::{CommentId, PrNumber, Sha};
 
 /// The high-level state of a train.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// Terminal states carry their own data: a train cannot be `Aborted` without
+/// an error, nor `Stopped`/`Aborted` without an end timestamp, and an active
+/// train cannot carry either.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TrainState {
     /// Train is actively running.
     Running,
 
-    /// Train was explicitly stopped via `@merge-train stop`.
-    Stopped,
-
     /// Train is waiting for CI/checks to pass. Auto-resumes when ready.
     WaitingCi,
 
+    /// Train was explicitly stopped via `@merge-train stop`.
+    Stopped {
+        /// When the train was stopped.
+        ended_at: DateTime<Utc>,
+    },
+
     /// Train was aborted due to an error. Requires `@merge-train start` to resume.
-    Aborted,
+    Aborted {
+        /// When the train was aborted.
+        ended_at: DateTime<Utc>,
+        /// What went wrong.
+        error: TrainError,
+    },
 
     /// Local state was lost and couldn't be recovered. Manual intervention required.
     NeedsManualReview,
@@ -39,38 +51,163 @@ impl TrainState {
     pub fn requires_restart(&self) -> bool {
         matches!(
             self,
-            TrainState::Stopped | TrainState::Aborted | TrainState::NeedsManualReview
+            TrainState::Stopped { .. } | TrainState::Aborted { .. } | TrainState::NeedsManualReview
         )
     }
+
+    /// The abort error, if the train is aborted.
+    pub fn error(&self) -> Option<&TrainError> {
+        match self {
+            TrainState::Aborted { error, .. } => Some(error),
+            _ => None,
+        }
+    }
+
+    /// When the train ended (stopped or aborted), if it has.
+    pub fn ended_at(&self) -> Option<DateTime<Utc>> {
+        match self {
+            TrainState::Stopped { ended_at } | TrainState::Aborted { ended_at, .. } => {
+                Some(*ended_at)
+            }
+            _ => None,
+        }
+    }
 }
+
+/// An invalid marking of a descendant, or invalid persisted progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgressError {
+    /// The PR is not in the frozen descendant set.
+    NotInFrozenSet { pr: PrNumber },
+
+    /// The PR was already skipped; a skipped descendant is never revisited.
+    AlreadySkipped { pr: PrNumber },
+
+    /// The PR already completed this phase; completed work cannot be skipped.
+    AlreadyCompleted { pr: PrNumber },
+
+    /// The frozen descendant set contains a duplicate (persisted input only;
+    /// `DescendantProgress::new` deduplicates).
+    DuplicateFrozen { pr: PrNumber },
+}
+
+impl std::fmt::Display for ProgressError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProgressError::NotInFrozenSet { pr } => {
+                write!(f, "PR {} is not in the frozen descendant set", pr)
+            }
+            ProgressError::AlreadySkipped { pr } => {
+                write!(f, "PR {} was already skipped", pr)
+            }
+            ProgressError::AlreadyCompleted { pr } => {
+                write!(f, "PR {} already completed this phase", pr)
+            }
+            ProgressError::DuplicateFrozen { pr } => {
+                write!(
+                    f,
+                    "PR {} appears more than once in the frozen descendant set",
+                    pr
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProgressError {}
 
 /// Data common to all cascade phases that process descendants.
 ///
 /// This is carried through from Preparing all the way to Retargeting,
 /// ensuring the frozen descendant set is never re-queried.
+///
+/// Invariants (enforced by construction, including on deserialization):
+/// - `completed ⊆ frozen_descendants` and `skipped ⊆ frozen_descendants`
+/// - `completed ∩ skipped = ∅`
+/// - `frozen_descendants` contains no duplicates
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawDescendantProgress")]
 pub struct DescendantProgress {
     /// Descendants that have completed this phase successfully.
-    pub completed: HashSet<PrNumber>,
+    completed: HashSet<PrNumber>,
 
     /// Descendants that were skipped due to errors (PR closed, branch deleted, etc.).
     /// These are not retried.
-    pub skipped: HashSet<PrNumber>,
+    skipped: HashSet<PrNumber>,
 
     /// The descendant set captured when entering `Preparing`.
     /// Frozen and carried through all subsequent phases.
     /// Recovery must use this, not re-query the descendants index.
-    pub frozen_descendants: Vec<PrNumber>,
+    frozen_descendants: Vec<PrNumber>,
+}
+
+/// Serde mirror of [`DescendantProgress`]. Deserialization goes through
+/// `TryFrom` because persisted progress (status-comment JSON, snapshots) is
+/// untrusted recovery input: progress violating the invariants is corrupt
+/// and must be rejected, not repaired.
+#[derive(Deserialize)]
+struct RawDescendantProgress {
+    completed: HashSet<PrNumber>,
+    skipped: HashSet<PrNumber>,
+    frozen_descendants: Vec<PrNumber>,
+}
+
+impl TryFrom<RawDescendantProgress> for DescendantProgress {
+    type Error = ProgressError;
+
+    fn try_from(raw: RawDescendantProgress) -> Result<Self, ProgressError> {
+        let mut seen = HashSet::new();
+        for pr in &raw.frozen_descendants {
+            if !seen.insert(*pr) {
+                return Err(ProgressError::DuplicateFrozen { pr: *pr });
+            }
+        }
+        let mut progress = DescendantProgress {
+            completed: HashSet::new(),
+            skipped: HashSet::new(),
+            frozen_descendants: raw.frozen_descendants,
+        };
+        for pr in raw.completed {
+            progress.mark_completed(pr)?;
+        }
+        for pr in raw.skipped {
+            progress.mark_skipped(pr)?;
+        }
+        Ok(progress)
+    }
 }
 
 impl DescendantProgress {
     /// Creates a new DescendantProgress with the given frozen descendants.
+    ///
+    /// Duplicates are removed, preserving first-occurrence order: progress is
+    /// tracked per PR, so a PR listed twice is still one unit of work.
     pub fn new(frozen_descendants: Vec<PrNumber>) -> Self {
+        let mut seen = HashSet::new();
+        let frozen_descendants = frozen_descendants
+            .into_iter()
+            .filter(|pr| seen.insert(*pr))
+            .collect();
         DescendantProgress {
             completed: HashSet::new(),
             skipped: HashSet::new(),
             frozen_descendants,
         }
+    }
+
+    /// Descendants that have completed the current phase.
+    pub fn completed(&self) -> &HashSet<PrNumber> {
+        &self.completed
+    }
+
+    /// Descendants that were skipped; never revisited in any later phase.
+    pub fn skipped(&self) -> &HashSet<PrNumber> {
+        &self.skipped
+    }
+
+    /// The descendant set captured when the cascade started.
+    pub fn frozen_descendants(&self) -> &[PrNumber] {
+        &self.frozen_descendants
     }
 
     /// Returns the descendants that still need to be processed.
@@ -85,14 +222,39 @@ impl DescendantProgress {
         self.remaining().next().is_none()
     }
 
-    /// Marks a descendant as completed.
-    pub fn mark_completed(&mut self, pr: PrNumber) {
+    /// Marks a descendant as completed. Idempotent for already-completed PRs.
+    pub fn mark_completed(&mut self, pr: PrNumber) -> Result<(), ProgressError> {
+        if !self.frozen_descendants.contains(&pr) {
+            return Err(ProgressError::NotInFrozenSet { pr });
+        }
+        if self.skipped.contains(&pr) {
+            return Err(ProgressError::AlreadySkipped { pr });
+        }
         self.completed.insert(pr);
+        Ok(())
     }
 
-    /// Marks a descendant as skipped.
-    pub fn mark_skipped(&mut self, pr: PrNumber) {
+    /// Marks a descendant as skipped. Idempotent for already-skipped PRs.
+    pub fn mark_skipped(&mut self, pr: PrNumber) -> Result<(), ProgressError> {
+        if !self.frozen_descendants.contains(&pr) {
+            return Err(ProgressError::NotInFrozenSet { pr });
+        }
+        if self.completed.contains(&pr) {
+            return Err(ProgressError::AlreadyCompleted { pr });
+        }
         self.skipped.insert(pr);
+        Ok(())
+    }
+
+    /// Progress for entering the next descendant-processing phase: the frozen
+    /// set and skips carry over (a skipped descendant is never revisited);
+    /// the per-phase completion ledger is cleared.
+    pub fn with_completed_reset(&self) -> Self {
+        DescendantProgress {
+            completed: HashSet::new(),
+            skipped: self.skipped.clone(),
+            frozen_descendants: self.frozen_descendants.clone(),
+        }
     }
 }
 
@@ -164,33 +326,104 @@ pub enum CascadePhase {
     },
 }
 
+/// The cascade phases, without their data. The constant [`PhaseKind::ORDER`]
+/// is the single definition of the cascade sequence; `successor` and
+/// `CascadePhase::can_transition_to` are derived from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PhaseKind {
+    Idle,
+    Preparing,
+    SquashPending,
+    Reconciling,
+    CatchingUp,
+    Retargeting,
+}
+
+impl PhaseKind {
+    /// The active phases in execution order. `Idle` is both entry and exit of
+    /// the cycle and is therefore not listed.
+    pub const ORDER: [PhaseKind; 5] = [
+        PhaseKind::Preparing,
+        PhaseKind::SquashPending,
+        PhaseKind::Reconciling,
+        PhaseKind::CatchingUp,
+        PhaseKind::Retargeting,
+    ];
+
+    /// Position in the cascade: `Idle` (entry) is 0, active phases are 1..=5.
+    fn position(self) -> usize {
+        match self {
+            PhaseKind::Idle => 0,
+            active => {
+                1 + Self::ORDER
+                    .iter()
+                    .position(|k| *k == active)
+                    .expect("every non-Idle kind is in ORDER")
+            }
+        }
+    }
+
+    /// The phase that follows once this phase's work is done.
+    /// `None` for `Idle`: leaving `Idle` is `start_preparing`'s job, not a
+    /// completion event.
+    pub fn successor(self) -> Option<PhaseKind> {
+        match self {
+            PhaseKind::Idle => None,
+            active => Some(
+                Self::ORDER
+                    .get(active.position())
+                    .copied()
+                    .unwrap_or(PhaseKind::Idle),
+            ),
+        }
+    }
+
+    /// Phases whose work is per-descendant bookkeeping (mark completed or
+    /// skipped until none remain). `SquashPending`'s exit is the squash
+    /// itself, not descendant progress; `Idle` has no work.
+    pub fn processes_descendants(self) -> bool {
+        matches!(
+            self,
+            PhaseKind::Preparing
+                | PhaseKind::Reconciling
+                | PhaseKind::CatchingUp
+                | PhaseKind::Retargeting
+        )
+    }
+
+    /// Returns the name of this phase for logging/display.
+    pub fn name(self) -> &'static str {
+        match self {
+            PhaseKind::Idle => "idle",
+            PhaseKind::Preparing => "preparing",
+            PhaseKind::SquashPending => "squash_pending",
+            PhaseKind::Reconciling => "reconciling",
+            PhaseKind::CatchingUp => "catching_up",
+            PhaseKind::Retargeting => "retargeting",
+        }
+    }
+}
+
 impl CascadePhase {
+    /// This phase's kind (the phase without its data).
+    pub fn kind(&self) -> PhaseKind {
+        match self {
+            CascadePhase::Idle => PhaseKind::Idle,
+            CascadePhase::Preparing { .. } => PhaseKind::Preparing,
+            CascadePhase::SquashPending { .. } => PhaseKind::SquashPending,
+            CascadePhase::Reconciling { .. } => PhaseKind::Reconciling,
+            CascadePhase::CatchingUp { .. } => PhaseKind::CatchingUp,
+            CascadePhase::Retargeting { .. } => PhaseKind::Retargeting,
+        }
+    }
+
     /// Returns the name of this phase for logging/display.
     pub fn name(&self) -> &'static str {
-        match self {
-            CascadePhase::Idle => "idle",
-            CascadePhase::Preparing { .. } => "preparing",
-            CascadePhase::SquashPending { .. } => "squash_pending",
-            CascadePhase::Reconciling { .. } => "reconciling",
-            CascadePhase::CatchingUp { .. } => "catching_up",
-            CascadePhase::Retargeting { .. } => "retargeting",
-        }
+        self.kind().name()
     }
 
     /// Returns the descendant progress if this phase has it.
     pub fn progress(&self) -> Option<&DescendantProgress> {
-        match self {
-            CascadePhase::Idle => None,
-            CascadePhase::Preparing { progress }
-            | CascadePhase::SquashPending { progress }
-            | CascadePhase::Reconciling { progress, .. }
-            | CascadePhase::CatchingUp { progress, .. }
-            | CascadePhase::Retargeting { progress, .. } => Some(progress),
-        }
-    }
-
-    /// Returns a mutable reference to the descendant progress if this phase has it.
-    pub fn progress_mut(&mut self) -> Option<&mut DescendantProgress> {
         match self {
             CascadePhase::Idle => None,
             CascadePhase::Preparing { progress }
@@ -217,45 +450,59 @@ impl CascadePhase {
     /// whether descendants exist. The cascade engine enforces those constraints
     /// when performing the actual transition.
     ///
-    /// Valid phase sequences:
-    /// - Idle -> Preparing | SquashPending
-    /// - Preparing -> SquashPending
-    /// - SquashPending -> Reconciling | Idle
-    /// - Reconciling -> CatchingUp
-    /// - CatchingUp -> Retargeting
-    /// - Retargeting -> Idle
+    /// Derived from [`PhaseKind::ORDER`]: transitions move strictly forward,
+    /// and phases with no remaining work are passed through rather than parked
+    /// in, so a single observable transition may jump several phases ahead.
+    /// The one gate that can never be jumped is `SquashPending`: every path
+    /// out of `Idle`/`Preparing` stops there until the squash itself happens.
     pub fn can_transition_to(&self, target: &CascadePhase) -> bool {
-        matches!(
-            (self, target),
-            (CascadePhase::Idle, CascadePhase::Preparing { .. })
-                | (CascadePhase::Idle, CascadePhase::SquashPending { .. })
-                | (
-                    CascadePhase::Preparing { .. },
-                    CascadePhase::SquashPending { .. }
-                )
-                | (
-                    CascadePhase::SquashPending { .. },
-                    CascadePhase::Reconciling { .. }
-                )
-                | (CascadePhase::SquashPending { .. }, CascadePhase::Idle)
-                | (
-                    CascadePhase::Reconciling { .. },
-                    CascadePhase::CatchingUp { .. }
-                )
-                | (
-                    CascadePhase::CatchingUp { .. },
-                    CascadePhase::Retargeting { .. }
-                )
-                | (CascadePhase::Retargeting { .. }, CascadePhase::Idle)
-        )
+        let from = self.kind().position();
+        // Idle is the exit as well as the entry: as a target it sits one past
+        // the last active phase.
+        let to = match target.kind() {
+            PhaseKind::Idle => PhaseKind::ORDER.len() + 1,
+            kind => kind.position(),
+        };
+        let squash_gate = PhaseKind::SquashPending.position();
+        to > from && (from >= squash_gate || to <= squash_gate)
     }
+}
+
+/// The category of error that aborted a train.
+///
+/// One variant per [`super::stack::AbortReason`] variant;
+/// `AbortReason::error_type()` is the mapping. Serialized snake_case in
+/// status comments (e.g. `"merge_conflict"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrainErrorKind {
+    MergeConflict,
+    PushRejected,
+    PrClosed,
+    CiFailed,
+    CycleDetected,
+    ReviewDismissed,
+    ApprovalWithdrawn,
+    ApiError,
+    BranchDeleted,
+    NonSquashMerge,
+    StatusCommentTooLarge,
+    TrainTooLarge,
+    PreparationMissing,
+    MergeHooksEnabled,
+    PreparationIncomplete,
+    BaseBranchMismatch,
+    HeadShaChanged,
+    InternalInvariantViolation,
 }
 
 /// Error details when a train is aborted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrainError {
-    /// The type of error.
-    pub error_type: String,
+    /// The category of error. Serialized as `error_type` (the status-comment
+    /// schema name).
+    #[serde(rename = "error_type")]
+    pub kind: TrainErrorKind,
 
     /// Human-readable error message. Truncated to 4KB in status comments.
     pub message: String,
@@ -265,9 +512,9 @@ pub struct TrainError {
 }
 
 impl TrainError {
-    pub fn new(error_type: impl Into<String>, message: impl Into<String>) -> Self {
+    pub fn new(kind: TrainErrorKind, message: impl Into<String>) -> Self {
         TrainError {
-            error_type: error_type.into(),
+            kind,
             message: message.into(),
             stderr: None,
         }
@@ -314,19 +561,8 @@ pub struct TrainRecord {
     /// Head SHA of predecessor at preparation time (for verifying preparation during recovery).
     pub predecessor_head_sha: Option<Sha>,
 
-    /// SHA of last squash commit (for reconciliation recovery).
-    pub last_squash_sha: Option<Sha>,
-
     /// ISO 8601 timestamp when started.
     pub started_at: DateTime<Utc>,
-
-    /// ISO 8601 timestamp when the train was stopped or aborted.
-    /// Note: Completed trains are removed from `active_trains` entirely rather than
-    /// being marked with a timestamp.
-    pub ended_at: Option<DateTime<Utc>>,
-
-    /// Error details if aborted.
-    pub error: Option<TrainError>,
 
     /// The ID of the status comment on the original root PR.
     /// Used to update the comment as the train progresses.
@@ -341,7 +577,10 @@ pub struct TrainRecord {
 
 impl TrainRecord {
     /// Creates a new train record for a starting train.
-    pub fn new(root_pr: PrNumber) -> Self {
+    ///
+    /// The timestamp is passed in (not read from the clock): the types layer
+    /// is pure, and the shell decides what time it is.
+    pub fn new(root_pr: PrNumber, started_at: DateTime<Utc>) -> Self {
         TrainRecord {
             version: 1,
             recovery_seq: 0,
@@ -351,10 +590,7 @@ impl TrainRecord {
             cascade_phase: CascadePhase::Idle,
             predecessor_pr: None,
             predecessor_head_sha: None,
-            last_squash_sha: None,
-            started_at: Utc::now(),
-            ended_at: None,
-            error: None,
+            started_at,
             status_comment_id: None,
         }
     }
@@ -366,17 +602,14 @@ impl TrainRecord {
     }
 
     /// Marks the train as stopped.
-    pub fn stop(&mut self) {
-        self.state = TrainState::Stopped;
-        self.ended_at = Some(Utc::now());
+    pub fn stop(&mut self, ended_at: DateTime<Utc>) {
+        self.state = TrainState::Stopped { ended_at };
         self.increment_seq();
     }
 
     /// Marks the train as aborted with an error.
-    pub fn abort(&mut self, error: TrainError) {
-        self.state = TrainState::Aborted;
-        self.ended_at = Some(Utc::now());
-        self.error = Some(error);
+    pub fn abort(&mut self, error: TrainError, ended_at: DateTime<Utc>) {
+        self.state = TrainState::Aborted { ended_at, error };
         self.increment_seq();
     }
 
@@ -418,49 +651,23 @@ mod tests {
         any::<u64>().prop_map(PrNumber)
     }
 
-    fn arb_train_state() -> impl Strategy<Value = TrainState> {
-        prop_oneof![
-            Just(TrainState::Running),
-            Just(TrainState::Stopped),
-            Just(TrainState::WaitingCi),
-            Just(TrainState::Aborted),
-            Just(TrainState::NeedsManualReview),
-        ]
-    }
+    use crate::test_utils::{arb_train_state, test_timestamp};
 
     fn arb_descendant_progress() -> impl Strategy<Value = DescendantProgress> {
         prop::collection::vec(arb_pr_number(), 0..10).prop_flat_map(|frozen| {
-            let frozen_clone = frozen.clone();
-            let frozen_len = frozen.len();
-
-            // Handle empty frozen set specially to avoid 0..0 range
-            if frozen_len == 0 {
-                return Just(DescendantProgress::new(frozen)).boxed();
-            }
-
-            // Pick random subsets for completed and skipped
-            prop::collection::vec(any::<usize>(), 0..=frozen_len)
-                .prop_flat_map(move |completed_indices| {
-                    let frozen = frozen_clone.clone();
-                    let frozen_len = frozen.len();
-                    prop::collection::vec(any::<usize>(), 0..=frozen_len).prop_map(
-                        move |skipped_indices| {
-                            let mut progress = DescendantProgress::new(frozen.clone());
-                            for i in &completed_indices {
-                                if *i < frozen.len() {
-                                    progress.mark_completed(frozen[*i]);
-                                }
-                            }
-                            for i in &skipped_indices {
-                                if *i < frozen.len() && !progress.completed.contains(&frozen[*i]) {
-                                    progress.mark_skipped(frozen[*i]);
-                                }
-                            }
-                            progress
-                        },
-                    )
-                })
-                .boxed()
+            // Per descendant: 0 = pending, 1 = completed, 2 = skipped.
+            prop::collection::vec(0u8..3, frozen.len()..=frozen.len()).prop_map(move |marks| {
+                let mut progress = DescendantProgress::new(frozen.clone());
+                let in_progress_order = progress.frozen_descendants().to_vec();
+                for (pr, mark) in in_progress_order.into_iter().zip(marks) {
+                    match mark {
+                        1 => progress.mark_completed(pr).unwrap(),
+                        2 => progress.mark_skipped(pr).unwrap(),
+                        _ => {}
+                    }
+                }
+                progress
+            })
         })
     }
 
@@ -503,20 +710,25 @@ mod tests {
         }
 
         #[test]
-        fn is_active_correct() {
+        fn activity_and_restart_are_complementary() {
+            let stopped = TrainState::Stopped {
+                ended_at: test_timestamp(),
+            };
+            let aborted = TrainState::Aborted {
+                ended_at: test_timestamp(),
+                error: TrainError::new(TrainErrorKind::ApiError, "boom"),
+            };
+
             assert!(TrainState::Running.is_active());
             assert!(TrainState::WaitingCi.is_active());
-            assert!(!TrainState::Stopped.is_active());
-            assert!(!TrainState::Aborted.is_active());
+            assert!(!stopped.is_active());
+            assert!(!aborted.is_active());
             assert!(!TrainState::NeedsManualReview.is_active());
-        }
 
-        #[test]
-        fn requires_restart_correct() {
             assert!(!TrainState::Running.requires_restart());
             assert!(!TrainState::WaitingCi.requires_restart());
-            assert!(TrainState::Stopped.requires_restart());
-            assert!(TrainState::Aborted.requires_restart());
+            assert!(stopped.requires_restart());
+            assert!(aborted.requires_restart());
             assert!(TrainState::NeedsManualReview.requires_restart());
         }
     }
@@ -536,9 +748,23 @@ mod tests {
             fn remaining_excludes_completed_and_skipped(progress in arb_descendant_progress()) {
                 let remaining: Vec<_> = progress.remaining().collect();
                 for pr in &remaining {
-                    prop_assert!(!progress.completed.contains(pr));
-                    prop_assert!(!progress.skipped.contains(pr));
+                    prop_assert!(!progress.completed().contains(pr));
+                    prop_assert!(!progress.skipped().contains(pr));
                 }
+            }
+
+            #[test]
+            fn new_dedupes_frozen_descendants(
+                // Tiny domain so duplicates actually occur.
+                frozen in prop::collection::vec((1u64..5).prop_map(PrNumber), 0..10)
+            ) {
+                let progress = DescendantProgress::new(frozen.clone());
+                let unique: std::collections::HashSet<_> = frozen.iter().copied().collect();
+                prop_assert_eq!(progress.frozen_descendants().len(), unique.len());
+                // First-occurrence order is preserved
+                let mut seen = std::collections::HashSet::new();
+                let expected: Vec<_> = frozen.iter().copied().filter(|pr| seen.insert(*pr)).collect();
+                prop_assert_eq!(progress.frozen_descendants().to_vec(), expected);
             }
 
             #[test]
@@ -548,14 +774,39 @@ mod tests {
                 // Mark all as completed or skipped
                 for (i, pr) in frozen.iter().enumerate() {
                     if i % 2 == 0 {
-                        progress.mark_completed(*pr);
+                        progress.mark_completed(*pr).unwrap();
                     } else {
-                        progress.mark_skipped(*pr);
+                        progress.mark_skipped(*pr).unwrap();
                     }
                 }
 
                 prop_assert!(progress.is_complete());
             }
+        }
+
+        #[test]
+        fn deserialize_rejects_completed_outside_frozen() {
+            let json = r#"{"completed":[5],"skipped":[],"frozen_descendants":[1,2]}"#;
+            let result: Result<DescendantProgress, _> = serde_json::from_str(json);
+            assert!(
+                result.is_err(),
+                "completed must be a subset of frozen_descendants; status-comment \
+                 JSON violating that is corrupt and recovery must not trust it"
+            );
+        }
+
+        #[test]
+        fn deserialize_rejects_completed_skipped_overlap() {
+            let json = r#"{"completed":[1],"skipped":[1],"frozen_descendants":[1,2]}"#;
+            let result: Result<DescendantProgress, _> = serde_json::from_str(json);
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn deserialize_rejects_duplicate_frozen() {
+            let json = r#"{"completed":[],"skipped":[],"frozen_descendants":[1,1,2]}"#;
+            let result: Result<DescendantProgress, _> = serde_json::from_str(json);
+            assert!(result.is_err());
         }
     }
 
@@ -595,7 +846,7 @@ mod tests {
                 // All phases that carry progress should have the same frozen_descendants
                 for phase in [preparing, squash_pending, reconciling, catching_up, retargeting] {
                     let phase_progress = phase.progress().unwrap();
-                    prop_assert_eq!(&phase_progress.frozen_descendants, &frozen);
+                    prop_assert_eq!(phase_progress.frozen_descendants(), &frozen[..]);
                 }
             }
         }
@@ -634,6 +885,15 @@ mod tests {
             assert!(reconciling.can_transition_to(&catching_up));
             assert!(catching_up.can_transition_to(&retargeting));
             assert!(retargeting.can_transition_to(&idle));
+
+            // Forward jumps: phases with no remaining work are settled
+            // through, so observable transitions can skip them entirely
+            // (e.g. all descendants skipped during reconciliation).
+            assert!(squash_pending.can_transition_to(&catching_up));
+            assert!(squash_pending.can_transition_to(&retargeting));
+            assert!(reconciling.can_transition_to(&retargeting));
+            assert!(reconciling.can_transition_to(&idle));
+            assert!(catching_up.can_transition_to(&idle));
         }
 
         #[test]
@@ -667,81 +927,7 @@ mod tests {
 
     mod train_record {
         use super::*;
-        use crate::types::ids::CommentId;
-
-        fn arb_train_error() -> impl Strategy<Value = TrainError> {
-            (
-                "[a-zA-Z_]{1,20}",
-                "[a-zA-Z0-9 ]{1,100}",
-                prop::option::of("[a-zA-Z0-9 ]{1,50}".prop_map(|s| s.to_string())),
-            )
-                .prop_map(|(error_type, message, stderr)| {
-                    let mut err = TrainError::new(error_type, message);
-                    if let Some(s) = stderr {
-                        err = err.with_stderr(s);
-                    }
-                    err
-                })
-        }
-
-        fn arb_datetime() -> impl Strategy<Value = DateTime<Utc>> {
-            // Generate timestamps in a reasonable range (year 2000-2100)
-            (946684800i64..4102444800i64)
-                .prop_map(|secs| DateTime::from_timestamp(secs, 0).unwrap())
-        }
-
-        fn arb_comment_id() -> impl Strategy<Value = CommentId> {
-            any::<u64>().prop_map(CommentId)
-        }
-
-        fn arb_train_record() -> impl Strategy<Value = TrainRecord> {
-            (
-                arb_pr_number(),
-                arb_pr_number(),
-                arb_train_state(),
-                arb_cascade_phase(),
-                prop::option::of(arb_pr_number()),
-                prop::option::of(arb_sha()),
-                prop::option::of(arb_sha()),
-                prop::option::of(arb_train_error()),
-                any::<u64>(),
-                arb_datetime(),
-                prop::option::of(arb_datetime()),
-                prop::option::of(arb_comment_id()),
-            )
-                .prop_map(
-                    |(
-                        original_root_pr,
-                        current_pr,
-                        state,
-                        cascade_phase,
-                        predecessor_pr,
-                        predecessor_head_sha,
-                        last_squash_sha,
-                        error,
-                        recovery_seq,
-                        started_at,
-                        ended_at,
-                        status_comment_id,
-                    )| {
-                        TrainRecord {
-                            version: 1,
-                            recovery_seq,
-                            state,
-                            original_root_pr,
-                            current_pr,
-                            cascade_phase,
-                            predecessor_pr,
-                            predecessor_head_sha,
-                            last_squash_sha,
-                            started_at,
-                            ended_at,
-                            error,
-                            status_comment_id,
-                        }
-                    },
-                )
-        }
+        use crate::test_utils::arb_train_record;
 
         proptest! {
             #[test]
@@ -756,7 +942,7 @@ mod tests {
             fn increment_seq_increases(initial_seq: u64) {
                 // Avoid overflow
                 if initial_seq < u64::MAX {
-                    let mut record = TrainRecord::new(PrNumber(1));
+                    let mut record = TrainRecord::new(PrNumber(1), test_timestamp());
                     record.recovery_seq = initial_seq;
                     record.increment_seq();
                     prop_assert_eq!(record.recovery_seq, initial_seq + 1);
@@ -766,7 +952,7 @@ mod tests {
 
         #[test]
         fn new_creates_valid_record() {
-            let record = TrainRecord::new(PrNumber(123));
+            let record = TrainRecord::new(PrNumber(123), test_timestamp());
 
             assert_eq!(record.version, 1);
             assert_eq!(record.recovery_seq, 0);
@@ -776,35 +962,42 @@ mod tests {
             assert_eq!(record.cascade_phase, CascadePhase::Idle);
             assert!(record.predecessor_pr.is_none());
             assert!(record.predecessor_head_sha.is_none());
-            assert!(record.last_squash_sha.is_none());
-            assert!(record.ended_at.is_none());
-            assert!(record.error.is_none());
             assert!(record.status_comment_id.is_none());
         }
 
         #[test]
         fn stop_sets_state_and_timestamp() {
-            let mut record = TrainRecord::new(PrNumber(123));
+            let mut record = TrainRecord::new(PrNumber(123), test_timestamp());
             let initial_seq = record.recovery_seq;
 
-            record.stop();
+            record.stop(test_timestamp());
 
-            assert_eq!(record.state, TrainState::Stopped);
-            assert!(record.ended_at.is_some());
+            assert_eq!(
+                record.state,
+                TrainState::Stopped {
+                    ended_at: test_timestamp()
+                }
+            );
             assert_eq!(record.recovery_seq, initial_seq + 1);
         }
 
         #[test]
         fn abort_sets_state_and_error() {
-            let mut record = TrainRecord::new(PrNumber(123));
+            let mut record = TrainRecord::new(PrNumber(123), test_timestamp());
             let initial_seq = record.recovery_seq;
 
-            record.abort(TrainError::new("merge_conflict", "Cannot merge"));
+            record.abort(
+                TrainError::new(TrainErrorKind::MergeConflict, "Cannot merge"),
+                test_timestamp(),
+            );
 
-            assert_eq!(record.state, TrainState::Aborted);
-            assert!(record.ended_at.is_some());
-            assert!(record.error.is_some());
-            assert_eq!(record.error.as_ref().unwrap().error_type, "merge_conflict");
+            match &record.state {
+                TrainState::Aborted { ended_at, error } => {
+                    assert_eq!(*ended_at, test_timestamp());
+                    assert_eq!(error.kind, TrainErrorKind::MergeConflict);
+                }
+                other => panic!("expected Aborted, got {:?}", other),
+            }
             assert_eq!(record.recovery_seq, initial_seq + 1);
         }
     }

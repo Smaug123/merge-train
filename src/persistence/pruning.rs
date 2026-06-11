@@ -97,7 +97,7 @@ fn prune_prs(snapshot: &mut PersistedRepoSnapshot, config: &PruneConfig) {
         // Keep all frozen descendants - they're part of the active cascade
         // and needed for the operation to complete correctly
         if let Some(progress) = train.cascade_phase.progress() {
-            for pr in &progress.frozen_descendants {
+            for pr in progress.frozen_descendants() {
                 keep.insert(*pr);
             }
         }
@@ -184,6 +184,7 @@ fn prune_dedupe_keys(snapshot: &mut PersistedRepoSnapshot, config: &PruneConfig)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::test_timestamp;
     use crate::types::{
         CachedPr, CascadePhase, DescendantProgress, MergeStateStatus, PrState, Sha, TrainRecord,
     };
@@ -284,7 +285,7 @@ mod tests {
             .insert(PrNumber(1), create_merged_pr(1, old_date));
 
         // Add train referencing that PR
-        let train = TrainRecord::new(PrNumber(1));
+        let train = TrainRecord::new(PrNumber(1), test_timestamp());
         snapshot.active_trains.insert(PrNumber(1), train);
 
         prune_snapshot(&mut snapshot, &default_config());
@@ -435,7 +436,7 @@ mod tests {
         }
 
         // Add active train referencing PR 1
-        let train = TrainRecord::new(PrNumber(1));
+        let train = TrainRecord::new(PrNumber(1), test_timestamp());
         snapshot.active_trains.insert(PrNumber(1), train);
 
         // Set limit that requires pruning
@@ -476,12 +477,10 @@ mod tests {
 
     // ─── Property tests ───
 
+    use crate::test_utils::arb_sha;
+
     fn arb_pr_number() -> impl Strategy<Value = PrNumber> {
         (1u64..10000).prop_map(PrNumber)
-    }
-
-    fn arb_sha() -> impl Strategy<Value = Sha> {
-        "[0-9a-f]{40}".prop_map(|s| Sha::parse(s).unwrap())
     }
 
     proptest! {
@@ -514,7 +513,7 @@ mod tests {
             snapshot.prs.insert(train_pr, create_merged_pr(train_pr.0, old_date));
 
             // Add train
-            let train = TrainRecord::new(train_pr);
+            let train = TrainRecord::new(train_pr, test_timestamp());
             snapshot.active_trains.insert(train_pr, train);
 
             prune_snapshot(&mut snapshot, &default_config());
@@ -644,7 +643,7 @@ mod tests {
 
             // Create train with non-Idle phase containing frozen_descendants
             let progress = DescendantProgress::new(frozen_descendants.clone());
-            let mut train = TrainRecord::new(PrNumber(train_pr));
+            let mut train = TrainRecord::new(PrNumber(train_pr), test_timestamp());
             train.cascade_phase = CascadePhase::Reconciling {
                 progress,
                 squash_sha: sha,

@@ -786,6 +786,7 @@ pub fn should_compact(state_dir: &Path, threshold_bytes: u64) -> io::Result<bool
 mod tests {
     use super::*;
     use crate::persistence::snapshot::PersistedRepoSnapshot;
+    use crate::test_utils::test_timestamp;
     use crate::types::{CachedPr, MergeStateStatus, PrNumber, PrState, Sha, TrainRecord};
     use proptest::prelude::*;
     use std::fs::File;
@@ -817,7 +818,7 @@ mod tests {
 
     fn create_snapshot_with_train(pr_num: u64) -> PersistedRepoSnapshot {
         let mut snapshot = create_test_snapshot();
-        let train = TrainRecord::new(PrNumber(pr_num));
+        let train = TrainRecord::new(PrNumber(pr_num), test_timestamp());
         snapshot.active_trains.insert(PrNumber(pr_num), train);
         snapshot
     }
@@ -1069,12 +1070,10 @@ mod tests {
 
     // ─── Property tests ───
 
+    use crate::test_utils::arb_sha;
+
     fn arb_pr_number() -> impl Strategy<Value = PrNumber> {
         (1u64..10000).prop_map(PrNumber)
-    }
-
-    fn arb_sha() -> impl Strategy<Value = Sha> {
-        "[0-9a-f]{40}".prop_map(|s| Sha::parse(s).unwrap())
     }
 
     fn arb_cached_pr() -> impl Strategy<Value = CachedPr> {
@@ -1102,7 +1101,7 @@ mod tests {
             let mut snapshot = create_test_snapshot();
 
             for pr in &train_prs {
-                snapshot.active_trains.insert(*pr, TrainRecord::new(*pr));
+                snapshot.active_trains.insert(*pr, TrainRecord::new(*pr, test_timestamp()));
             }
 
             compact_clean(dir.path(), &mut snapshot);
@@ -1151,7 +1150,7 @@ mod tests {
         ) {
             let dir = tempdir().unwrap();
             let mut snapshot = create_test_snapshot();
-            snapshot.active_trains.insert(train_pr, TrainRecord::new(train_pr));
+            snapshot.active_trains.insert(train_pr, TrainRecord::new(train_pr, test_timestamp()));
 
             for _ in 0..num_compactions {
                 compact_clean(dir.path(), &mut snapshot);
@@ -1167,19 +1166,19 @@ mod tests {
             prop_assert!(loaded.active_trains.contains_key(&train_pr));
         }
 
-        /// Crash at any point during compaction leaves recoverable state.
+        /// Recovery from every legal mid-compaction on-disk state.
         ///
-        /// Simulates crashes at different points in the compaction sequence:
+        /// The states are CONSTRUCTED directly from the documented on-disk
+        /// protocol (not by interrupting `compact()` — its write ordering is
+        /// covered by the `compact_rejects_*` and rollback tests):
         /// 0 = crash before anything (no-op)
-        /// 1 = crash after writing new snapshot, before updating generation
-        /// 2 = crash after updating generation, before deleting old files
+        /// 1 = staged snapshot.N+1 exists, generation file still points at N
+        /// 2 = generation file points at N+1, old generation files remain
         /// 3 = complete (no crash)
         ///
-        /// Validates:
-        /// - Snapshot data is preserved
-        /// - `log_position` is correct for the recovered generation
-        /// - Event log replay works and returns correct `next_seq`
-        /// - File cleanup removes stale generations
+        /// Validates that `cleanup_stale_generations` + snapshot load + log
+        /// replay recover the train data from each state, with correct
+        /// `log_position` and `next_seq`.
         #[test]
         fn crash_during_compaction_is_recoverable(
             train_pr in arb_pr_number(),
@@ -1194,7 +1193,7 @@ mod tests {
 
             // Set up initial state at generation N
             let mut snapshot = create_test_snapshot();
-            snapshot.active_trains.insert(train_pr, TrainRecord::new(train_pr));
+            snapshot.active_trains.insert(train_pr, TrainRecord::new(train_pr, test_timestamp()));
             snapshot.log_generation = initial_gen;
             snapshot.log_position = 0;
             snapshot.next_seq = 0;
@@ -1223,7 +1222,7 @@ mod tests {
                 for i in 0..num_events {
                     snapshot.active_trains.insert(
                         PrNumber(1000 + i as u64),
-                        TrainRecord::new(PrNumber(1000 + i as u64))
+                        TrainRecord::new(PrNumber(1000 + i as u64), test_timestamp())
                     );
                 }
             }
@@ -1762,7 +1761,7 @@ mod tests {
             let dir = tempdir().unwrap();
 
             let mut snapshot = create_test_snapshot();
-            snapshot.active_trains.insert(train_pr, TrainRecord::new(train_pr));
+            snapshot.active_trains.insert(train_pr, TrainRecord::new(train_pr, test_timestamp()));
             snapshot.log_generation = initial_gen;
             snapshot.log_position = 42; // Non-zero to detect mutation
 
@@ -1807,7 +1806,7 @@ mod tests {
             // Set up: snapshot exists at high generation but NO generation file
             let mut existing_snapshot = create_test_snapshot();
             existing_snapshot.log_generation = existing_gen;
-            existing_snapshot.active_trains.insert(PrNumber(999), TrainRecord::new(PrNumber(999)));
+            existing_snapshot.active_trains.insert(PrNumber(999), TrainRecord::new(PrNumber(999), test_timestamp()));
             save_snapshot_atomic(&snapshot_path(dir.path(), existing_gen), &existing_snapshot).unwrap();
             File::create(events_path(dir.path(), existing_gen)).unwrap();
             // Note: generation file intentionally NOT written
@@ -1854,9 +1853,10 @@ mod tests {
         // This snapshot has MORE data (train 200 in addition to train 100).
         // compact() stages log_generation = new_gen into the new snapshot, so
         // the crash state has a matching embedded generation.
-        snapshot
-            .active_trains
-            .insert(PrNumber(200), TrainRecord::new(PrNumber(200)));
+        snapshot.active_trains.insert(
+            PrNumber(200),
+            TrainRecord::new(PrNumber(200), test_timestamp()),
+        );
         snapshot.log_generation = 1;
         save_snapshot_atomic(&snapshot_path(dir.path(), 1), &snapshot).unwrap();
         // Generation file still says 0!
@@ -2810,7 +2810,7 @@ mod tests {
 
             // Set up initial state
             let mut snapshot = create_test_snapshot();
-            snapshot.active_trains.insert(train_pr, TrainRecord::new(train_pr));
+            snapshot.active_trains.insert(train_pr, TrainRecord::new(train_pr, test_timestamp()));
             snapshot.log_generation = initial_gen;
             snapshot.log_position = 0;
             snapshot.next_seq = 0;

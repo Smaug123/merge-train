@@ -9,9 +9,17 @@ use thiserror::Error;
 /// Errors that can occur when parsing a status comment.
 #[derive(Debug, Error)]
 pub enum ParseError {
-    /// The comment does not contain a status comment marker.
-    #[error("status comment marker not found")]
-    MarkerNotFound,
+    /// The comment does not contain the start marker: it is not a status
+    /// comment at all (or the bot never wrote one).
+    #[error("status comment start marker not found")]
+    StartMarkerNotFound,
+
+    /// The start marker is present but the end marker is missing. The bot
+    /// always writes both, so this means the comment was truncated or
+    /// corrupted after writing — a recovery-relevant diagnosis, distinct
+    /// from "not a status comment".
+    #[error("status comment end marker not found; comment is truncated or corrupted")]
+    EndMarkerNotFound,
 
     /// The JSON portion of the comment is malformed.
     #[error("invalid JSON in status comment: {0}")]
@@ -31,11 +39,10 @@ pub enum ParseError {
 ///
 /// # Errors
 ///
-/// Returns `ParseError::MarkerNotFound` if the comment doesn't contain the
-/// expected markers.
-///
-/// Returns `ParseError::InvalidJson` if the JSON is malformed or doesn't
-/// match the `TrainRecord` schema.
+/// Returns `ParseError::StartMarkerNotFound` if the comment is not a status
+/// comment, `ParseError::EndMarkerNotFound` if it is one but was truncated
+/// or corrupted, and `ParseError::InvalidJson` if the JSON is malformed or
+/// doesn't match the `TrainRecord` schema.
 pub fn parse_status_comment(body: &str) -> Result<TrainRecord, ParseError> {
     let json = extract_json(body)?;
     let record: TrainRecord = serde_json::from_str(json)?;
@@ -46,12 +53,12 @@ pub fn parse_status_comment(body: &str) -> Result<TrainRecord, ParseError> {
 fn extract_json(body: &str) -> Result<&str, ParseError> {
     let start = body
         .find(STATUS_COMMENT_START)
-        .ok_or(ParseError::MarkerNotFound)?;
+        .ok_or(ParseError::StartMarkerNotFound)?;
     let json_start = start + STATUS_COMMENT_START.len();
 
     let end = body[json_start..]
         .find(STATUS_COMMENT_END)
-        .ok_or(ParseError::MarkerNotFound)?;
+        .ok_or(ParseError::EndMarkerNotFound)?;
 
     Ok(&body[json_start..json_start + end])
 }
@@ -60,73 +67,11 @@ fn extract_json(body: &str) -> Result<&str, ParseError> {
 mod tests {
     use super::*;
     use crate::status::format::format_status_comment;
-    use crate::test_utils::{arb_cascade_phase, arb_pr_number, arb_sha, arb_train_error};
-    use crate::types::train::{CascadePhase, DescendantProgress, TrainRecord, TrainState};
+    use crate::test_utils::arb_train_record;
+    use crate::test_utils::test_timestamp;
+    use crate::types::train::{CascadePhase, DescendantProgress, TrainState};
     use crate::types::{PrNumber, Sha};
-    use chrono::{DateTime, Utc};
     use proptest::prelude::*;
-
-    fn arb_train_state() -> impl Strategy<Value = TrainState> {
-        prop_oneof![
-            Just(TrainState::Running),
-            Just(TrainState::Stopped),
-            Just(TrainState::WaitingCi),
-            Just(TrainState::Aborted),
-            Just(TrainState::NeedsManualReview),
-        ]
-    }
-
-    fn arb_datetime() -> impl Strategy<Value = DateTime<Utc>> {
-        (946684800i64..4102444800i64).prop_map(|secs| DateTime::from_timestamp(secs, 0).unwrap())
-    }
-
-    fn arb_train_record() -> impl Strategy<Value = TrainRecord> {
-        (
-            arb_pr_number(),
-            arb_pr_number(),
-            arb_train_state(),
-            arb_cascade_phase(),
-            prop::option::of(arb_pr_number()),
-            prop::option::of(arb_sha()),
-            prop::option::of(arb_sha()),
-            prop::option::of(arb_train_error()),
-            any::<u64>(),
-            arb_datetime(),
-            prop::option::of(arb_datetime()),
-        )
-            .prop_map(
-                |(
-                    original_root_pr,
-                    current_pr,
-                    state,
-                    cascade_phase,
-                    predecessor_pr,
-                    predecessor_head_sha,
-                    last_squash_sha,
-                    error,
-                    recovery_seq,
-                    started_at,
-                    ended_at,
-                )| {
-                    TrainRecord {
-                        version: 1,
-                        recovery_seq,
-                        state,
-                        original_root_pr,
-                        current_pr,
-                        cascade_phase,
-                        predecessor_pr,
-                        predecessor_head_sha,
-                        last_squash_sha,
-                        started_at,
-                        ended_at,
-                        error,
-                        // Exclude status_comment_id since it's not serialized
-                        status_comment_id: None,
-                    }
-                },
-            )
-    }
 
     mod parse {
         use super::*;
@@ -135,7 +80,7 @@ mod tests {
         fn parse_missing_marker_returns_error() {
             let body = "Just a regular comment without any markers";
             let result = parse_status_comment(body);
-            assert!(matches!(result, Err(ParseError::MarkerNotFound)));
+            assert!(matches!(result, Err(ParseError::StartMarkerNotFound)));
         }
 
         #[test]
@@ -146,11 +91,13 @@ mod tests {
         }
 
         #[test]
-        fn parse_incomplete_marker_returns_error() {
-            // Missing end marker
+        fn truncated_comment_is_distinguished_from_non_status_comment() {
+            // A missing end marker means a bot-authored comment was truncated
+            // or corrupted after writing; recovery must be able to tell this
+            // apart from "this comment is not a status comment".
             let body = "<!-- merge-train-state\n{\"version\": 1}";
             let result = parse_status_comment(body);
-            assert!(matches!(result, Err(ParseError::MarkerNotFound)));
+            assert!(matches!(result, Err(ParseError::EndMarkerNotFound)));
         }
 
         #[test]
@@ -172,7 +119,6 @@ mod tests {
     }
   },
   "predecessor_pr": 123,
-  "last_squash_sha": "abc123def456789012345678901234567890abcd",
   "started_at": "2024-01-15T09:00:00Z"
 }
 -->
@@ -199,11 +145,11 @@ Train is currently reconciling descendants after squash-merge.
                     squash_sha,
                 } => {
                     assert_eq!(
-                        progress.frozen_descendants,
+                        progress.frozen_descendants(),
                         vec![PrNumber(125), PrNumber(126)]
                     );
-                    assert!(progress.completed.contains(&PrNumber(125)));
-                    assert!(progress.skipped.is_empty());
+                    assert!(progress.completed().contains(&PrNumber(125)));
+                    assert!(progress.skipped().is_empty());
                     assert_eq!(
                         squash_sha,
                         &Sha::parse("abc123def456789012345678901234567890abcd").unwrap()
@@ -242,16 +188,20 @@ Train is currently reconciling descendants after squash-merge.
 {
   "version": 1,
   "recovery_seq": 10,
-  "state": "aborted",
+  "state": {
+    "aborted": {
+      "ended_at": "2024-01-01T01:00:00Z",
+      "error": {
+        "error_type": "merge_conflict",
+        "message": "Merge conflict in src/main.rs",
+        "stderr": null
+      }
+    }
+  },
   "original_root_pr": 1,
   "current_pr": 1,
   "cascade_phase": "Idle",
-  "started_at": "2024-01-01T00:00:00Z",
-  "ended_at": "2024-01-01T01:00:00Z",
-  "error": {
-    "error_type": "merge_conflict",
-    "message": "Merge conflict in src/main.rs"
-  }
+  "started_at": "2024-01-01T00:00:00Z"
 }
 -->
 **Merge Train Status**
@@ -263,11 +213,13 @@ Train aborted due to merge conflict.
             assert!(result.is_ok(), "Failed to parse: {:?}", result);
 
             let train = result.unwrap();
-            assert_eq!(train.state, TrainState::Aborted);
-            assert!(train.error.is_some());
-            let error = train.error.unwrap();
-            assert_eq!(error.error_type, "merge_conflict");
+            let error = train.state.error().expect("aborted train carries error");
+            assert_eq!(error.kind, crate::types::TrainErrorKind::MergeConflict);
             assert_eq!(error.message, "Merge conflict in src/main.rs");
+            assert_eq!(
+                train.state.ended_at().map(|t| t.to_rfc3339()),
+                Some("2024-01-01T01:00:00+00:00".to_string())
+            );
         }
     }
 
@@ -309,7 +261,7 @@ Train aborted due to merge conflict.
             /// The core correctness property: parse(format(train)) == train
             #[test]
             fn roundtrip_preserves_train_record(train in arb_train_record()) {
-                let comment = format_status_comment(&train, "Test message");
+                let comment = format_status_comment(&train, "Test message").unwrap();
                 let parsed = parse_status_comment(&comment);
 
                 prop_assert!(parsed.is_ok(), "Failed to parse formatted comment: {:?}", parsed.err());
@@ -318,24 +270,23 @@ Train aborted due to merge conflict.
                 // Compare all fields
                 prop_assert_eq!(parsed_train.version, train.version);
                 prop_assert_eq!(parsed_train.recovery_seq, train.recovery_seq);
-                prop_assert_eq!(parsed_train.state, train.state);
                 prop_assert_eq!(parsed_train.original_root_pr, train.original_root_pr);
                 prop_assert_eq!(parsed_train.current_pr, train.current_pr);
                 prop_assert_eq!(parsed_train.cascade_phase, train.cascade_phase);
                 prop_assert_eq!(parsed_train.predecessor_pr, train.predecessor_pr);
                 prop_assert_eq!(parsed_train.predecessor_head_sha, train.predecessor_head_sha);
-                prop_assert_eq!(parsed_train.last_squash_sha, train.last_squash_sha);
                 prop_assert_eq!(parsed_train.started_at, train.started_at);
-                prop_assert_eq!(parsed_train.ended_at, train.ended_at);
 
-                // Error comparison (message/stderr may be truncated but error_type preserved)
-                match (&parsed_train.error, &train.error) {
-                    (None, None) => {}
-                    (Some(p), Some(t)) => {
-                        prop_assert_eq!(&p.error_type, &t.error_type);
-                        // Verify message: either exact match or valid truncation
+                // State comparison: exact, except that an aborted train's error
+                // message/stderr may have been truncated for the size limit.
+                match (&parsed_train.state, &train.state) {
+                    (
+                        TrainState::Aborted { ended_at: parsed_ended, error: p },
+                        TrainState::Aborted { ended_at: orig_ended, error: t },
+                    ) => {
+                        prop_assert_eq!(parsed_ended, orig_ended);
+                        prop_assert_eq!(p.kind, t.kind);
                         verify_truncation_roundtrip(&p.message, &t.message, "message")?;
-                        // Verify stderr: either both None, or valid truncation
                         match (&p.stderr, &t.stderr) {
                             (None, None) => {}
                             (Some(ps), Some(ts)) => {
@@ -344,7 +295,7 @@ Train aborted due to merge conflict.
                             _ => prop_assert!(false, "stderr presence mismatch: parsed={:?}, original={:?}", p.stderr, t.stderr),
                         }
                     }
-                    _ => prop_assert!(false, "Error presence mismatch"),
+                    (p, t) => prop_assert_eq!(p, t),
                 }
 
                 // status_comment_id is intentionally excluded
@@ -377,10 +328,10 @@ Train aborted due to merge conflict.
             ];
 
             for phase in phases {
-                let mut train = TrainRecord::new(PrNumber(1));
+                let mut train = TrainRecord::new(PrNumber(1), test_timestamp());
                 train.cascade_phase = phase.clone();
 
-                let comment = format_status_comment(&train, "Test");
+                let comment = format_status_comment(&train, "Test").unwrap();
                 let parsed = parse_status_comment(&comment).expect("Failed to parse");
 
                 assert_eq!(
@@ -399,27 +350,27 @@ Train aborted due to merge conflict.
                 PrNumber(30),
                 PrNumber(40),
             ]);
-            progress.mark_completed(PrNumber(10));
-            progress.mark_completed(PrNumber(20));
-            progress.mark_skipped(PrNumber(30));
+            progress.mark_completed(PrNumber(10)).unwrap();
+            progress.mark_completed(PrNumber(20)).unwrap();
+            progress.mark_skipped(PrNumber(30)).unwrap();
 
-            let mut train = TrainRecord::new(PrNumber(1));
+            let mut train = TrainRecord::new(PrNumber(1), test_timestamp());
             train.cascade_phase = CascadePhase::Preparing { progress };
 
-            let comment = format_status_comment(&train, "Test");
+            let comment = format_status_comment(&train, "Test").unwrap();
             let parsed = parse_status_comment(&comment).expect("Failed to parse");
 
             match &parsed.cascade_phase {
                 CascadePhase::Preparing { progress } => {
                     assert_eq!(
-                        progress.frozen_descendants,
+                        progress.frozen_descendants(),
                         vec![PrNumber(10), PrNumber(20), PrNumber(30), PrNumber(40)]
                     );
-                    assert!(progress.completed.contains(&PrNumber(10)));
-                    assert!(progress.completed.contains(&PrNumber(20)));
-                    assert!(progress.skipped.contains(&PrNumber(30)));
-                    assert!(!progress.completed.contains(&PrNumber(40)));
-                    assert!(!progress.skipped.contains(&PrNumber(40)));
+                    assert!(progress.completed().contains(&PrNumber(10)));
+                    assert!(progress.completed().contains(&PrNumber(20)));
+                    assert!(progress.skipped().contains(&PrNumber(30)));
+                    assert!(!progress.completed().contains(&PrNumber(40)));
+                    assert!(!progress.skipped().contains(&PrNumber(40)));
                 }
                 _ => panic!("Wrong phase"),
             }
@@ -427,18 +378,25 @@ Train aborted due to merge conflict.
 
         #[test]
         fn roundtrip_with_html_comment_terminator_in_error() {
-            use crate::types::train::TrainError;
+            use crate::types::train::{TrainError, TrainErrorKind};
 
-            let mut train = TrainRecord::new(PrNumber(1));
+            let mut train = TrainRecord::new(PrNumber(1), test_timestamp());
             // Error message containing the HTML comment terminator sequence
             let dangerous_message = "error --> happened\nwith --> multiple --> arrows";
-            train.error = Some(TrainError::new("test_error", dangerous_message));
+            train.abort(
+                TrainError::new(TrainErrorKind::ApiError, dangerous_message),
+                test_timestamp(),
+            );
 
-            let comment = format_status_comment(&train, "Test");
+            let comment = format_status_comment(&train, "Test").unwrap();
             let parsed = parse_status_comment(&comment).expect("Failed to parse comment with -->");
 
-            let parsed_error = parsed.error.expect("Error should be preserved");
-            assert_eq!(parsed_error.error_type, "test_error");
+            let parsed_error = parsed
+                .state
+                .error()
+                .expect("Error should be preserved")
+                .clone();
+            assert_eq!(parsed_error.kind, TrainErrorKind::ApiError);
             // The message should be unescaped back to original
             assert_eq!(parsed_error.message, dangerous_message);
         }
