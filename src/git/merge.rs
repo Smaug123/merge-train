@@ -36,8 +36,11 @@ pub struct PrepareResult {
 
     /// The exact predecessor commit that was merged (resolved from the PR ref
     /// at fetch time, then pinned). [`reconcile_descendant`] requires this SHA
-    /// to be an ancestor of the descendant before it will perform the
-    /// irreversible ours-merge.
+    /// to (a) equal the head the PR ref says was actually squash-merged, and
+    /// (b) be an ancestor of the descendant, before it will perform the
+    /// irreversible ours-merge. (a) is what detects a force-push between
+    /// preparation and squash; an ancestry check alone cannot, because this
+    /// pre-force-push head IS an ancestor of the prepared descendant.
     pub predecessor_head: Sha,
 }
 
@@ -146,6 +149,30 @@ pub fn prepare_descendant(
     })
 }
 
+/// Inputs to [`reconcile_descendant`].
+///
+/// Named fields rather than positional arguments: three of these are `Sha`s
+/// guarding an irreversible ours-merge, and a transposition at a positional
+/// call site would compile silently.
+#[derive(Debug, Clone, Copy)]
+pub struct ReconcileRequest<'a> {
+    /// The descendant's branch name (e.g. "feature-2").
+    pub descendant_branch: &'a str,
+    /// The predecessor's PR number; its PR ref names the head that was
+    /// actually squash-merged.
+    pub predecessor_pr: u64,
+    /// The squash commit on the default branch.
+    pub squash_sha: &'a Sha,
+    /// The expected parent of the squash commit (default branch head at
+    /// squash time).
+    pub expected_squash_parent: &'a Sha,
+    /// The predecessor head that preparation merged into the descendant
+    /// ([`PrepareResult::predecessor_head`]).
+    pub predecessor_pre_squash_head: &'a Sha,
+    /// The repository default branch (e.g. "main").
+    pub default_branch: &'a str,
+}
+
 /// Reconcile a descendant after the predecessor has been squash-merged.
 ///
 /// This performs two merges:
@@ -182,26 +209,51 @@ pub fn prepare_descendant(
 /// - The squash commit has multiple parents (not a squash merge)
 /// - The squash parent is not on the default branch (rebase/fast-forward merge detected)
 /// - The squash parent does not match the expected parent (multi-commit rebase/FF detected)
+/// - The head named by the predecessor's PR ref (the head that was actually
+///   squash-merged) differs from `predecessor_pre_squash_head`, or the latter
+///   is not an ancestor of the descendant (force-push race; the ours-merge
+///   would record content as merged that the descendant does not contain)
 pub fn reconcile_descendant(
     worktree: &Path,
-    descendant_branch: &str,
-    squash_sha: &Sha,
-    expected_squash_parent: &Sha,
-    predecessor_pre_squash_head: &Sha,
-    default_branch: &str,
+    req: &ReconcileRequest<'_>,
     identity: &CommitIdentity,
 ) -> GitResult<MergeResult> {
-    // Fetch the default branch AND the descendant branch.
-    // We fetch the default branch (not the squash SHA) because:
+    let &ReconcileRequest {
+        descendant_branch,
+        predecessor_pr,
+        squash_sha,
+        expected_squash_parent,
+        predecessor_pre_squash_head,
+        default_branch,
+    } = req;
+    // Fetch the default branch, the descendant branch, AND the predecessor's
+    // PR ref. We fetch the default branch (not the squash SHA) because:
     // 1. The squash commit is on the default branch, so fetching main gets it
     // 2. Some servers disallow fetching by raw SHA (uploadpack.allowReachableSHA1InWant)
     // The descendant branch must be fetched because after a push, our local
     // remote-tracking ref (origin/<branch>) may be stale. Without fetching,
     // we'd check out an old commit and lose the prepared merge state.
-    fetch(worktree, &[default_branch, descendant_branch])?;
+    let pr_ref = format!("refs/pull/{}/head", predecessor_pr);
+    let pr_local_ref = format!("refs/remotes/origin/pr/{}", predecessor_pr);
+    let pr_refspec = format!("+{}:{}", pr_ref, pr_local_ref);
+    fetch(worktree, &[default_branch, descendant_branch, &pr_refspec])?;
 
     let remote_branch = format!("origin/{}", descendant_branch);
     let descendant_head = rev_parse(worktree, &remote_branch)?;
+
+    // The PR ref is frozen once the PR is merged, so it names the head GitHub
+    // actually squash-merged. An ancestry check on the caller-supplied
+    // prepared head alone cannot detect a force-push between preparation and
+    // squash: the prepared head IS an ancestor of the descendant, but the
+    // squashed content is not.
+    let squashed_head = rev_parse(worktree, &pr_local_ref)?;
+    if squashed_head != *predecessor_pre_squash_head {
+        return Err(GitError::PredecessorHeadChanged {
+            predecessor_pr,
+            prepared: predecessor_pre_squash_head.clone(),
+            squashed: squashed_head,
+        });
+    }
 
     // The ours-merge below records `squash_sha` as an ancestor WITHOUT taking
     // its tree. That is only sound if the descendant already contains the
@@ -868,11 +920,14 @@ mod tests {
         // Now reconcile the descendant
         let result = reconcile_descendant(
             &worktree,
-            "pr-124",
-            &squash_sha,
-            &main_before_squash,
-            &prep_result.predecessor_head,
-            "main",
+            &ReconcileRequest {
+                descendant_branch: "pr-124",
+                predecessor_pr: 123,
+                squash_sha: &squash_sha,
+                expected_squash_parent: &main_before_squash,
+                predecessor_pre_squash_head: &prep_result.predecessor_head,
+                default_branch: "main",
+            },
             &identity,
         )
         .unwrap();
@@ -968,11 +1023,14 @@ mod tests {
 
         let result = reconcile_descendant(
             &worktree,
-            "pr-124",
-            &merge_sha,
-            &main_before_merge,
-            &pred_sha,
-            "main",
+            &ReconcileRequest {
+                descendant_branch: "pr-124",
+                predecessor_pr: 123,
+                squash_sha: &merge_sha,
+                expected_squash_parent: &main_before_merge,
+                predecessor_pre_squash_head: &pred_sha,
+                default_branch: "main",
+            },
             &identity,
         );
 
@@ -1106,11 +1164,14 @@ mod tests {
         // Reconcile should fetch pr-124 and use the PREPARED state, not the old state
         let result = reconcile_descendant(
             &worktree2,
-            "pr-124",
-            &squash_sha,
-            &main_before_squash,
-            &prep_result.predecessor_head,
-            "main",
+            &ReconcileRequest {
+                descendant_branch: "pr-124",
+                predecessor_pr: 123,
+                squash_sha: &squash_sha,
+                expected_squash_parent: &main_before_squash,
+                predecessor_pre_squash_head: &prep_result.predecessor_head,
+                default_branch: "main",
+            },
             &identity,
         )
         .unwrap();
@@ -1830,11 +1891,14 @@ mod tests {
         // This simulates trying to use a rebased commit as if it were a squash
         let result = reconcile_descendant(
             &worktree,
-            "pr-124",
-            &second_sha,
-            &main_head,
-            &pred_sha,
-            "main",
+            &ReconcileRequest {
+                descendant_branch: "pr-124",
+                predecessor_pr: 123,
+                squash_sha: &second_sha,
+                expected_squash_parent: &main_head,
+                predecessor_pre_squash_head: &pred_sha,
+                default_branch: "main",
+            },
             &identity,
         );
 
@@ -1950,11 +2014,15 @@ mod tests {
         // first_sha != main_before_ff
         let result = reconcile_descendant(
             &worktree,
-            "pr-124",
-            &second_sha,
-            &main_before_ff, // Expected parent: what main was BEFORE the FF
+            &ReconcileRequest {
+                descendant_branch: "pr-124",
+                predecessor_pr: 123,
+                squash_sha: &second_sha,
+                expected_squash_parent: &main_before_ff,
+                predecessor_pre_squash_head: // Expected parent: what main was BEFORE the FF
             &pred_sha,
-            "main",
+                default_branch: "main",
+            },
             &identity,
         );
 
@@ -2082,11 +2150,14 @@ mod tests {
         // must refuse rather than perform the ours-merge.
         let result = reconcile_descendant(
             &worktree,
-            "pr-124",
-            &squash_sha,
-            &main_before_squash,
-            &pred_y,
-            "main",
+            &ReconcileRequest {
+                descendant_branch: "pr-124",
+                predecessor_pr: 123,
+                squash_sha: &squash_sha,
+                expected_squash_parent: &main_before_squash,
+                predecessor_pre_squash_head: &pred_y,
+                default_branch: "main",
+            },
             &identity,
         );
 
@@ -2094,6 +2165,111 @@ mod tests {
             result.is_err(),
             "reconcile must refuse when the descendant does not contain the \
              predecessor's pre-squash head (force-push race), got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn reconcile_refuses_when_caller_passes_the_prepared_head_after_force_push() {
+        // The companion test above passes the NEW head Y. A caller following
+        // the documentation passes what prepare_descendant RETURNED — the old
+        // head X. X is an ancestor of the descendant, so an ancestry check on
+        // the passed value alone cannot detect the force-push: reconcile must
+        // verify the head that was ACTUALLY squash-merged.
+        let (_temp_dir, config, _initial_sha) = create_test_repo();
+        let clone_dir = config.clone_dir();
+        let identity = test_identity();
+
+        let pred_x =
+            create_branch_with_file(&config, "pr-123", "pred.txt", "original content", "main");
+        create_pr_ref(&config, 123, &pred_x);
+
+        let _desc_sha = create_branch_with_file(
+            &config,
+            "pr-124",
+            "desc.txt",
+            "descendant content",
+            "pr-123",
+        );
+
+        let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
+        let prep = prepare_descendant(&worktree, "pr-124", 123, &identity).unwrap();
+        assert_eq!(prep.predecessor_head, pred_x);
+        run_git_sync(
+            &worktree,
+            &["push", "origin", "HEAD:refs/heads/pr-124", "--force"],
+        )
+        .unwrap();
+
+        // Force-push the predecessor to Y after preparation.
+        let pred_y = create_branch_with_file(
+            &config,
+            "pr-123-rewrite",
+            "pred.txt",
+            "rewritten content",
+            "main",
+        );
+        run_git_sync(
+            &clone_dir,
+            &["update-ref", "refs/heads/pr-123", pred_y.as_str()],
+        )
+        .unwrap();
+        run_git_sync(
+            &clone_dir,
+            &["update-ref", "refs/pull/123/head", pred_y.as_str()],
+        )
+        .unwrap();
+
+        // GitHub squash-merges Y to main.
+        let main_before_squash =
+            run_git_stdout(&clone_dir, &["rev-parse", "refs/heads/main"]).unwrap();
+        let main_before_squash = Sha::parse(&main_before_squash).unwrap();
+
+        let temp_work = clone_dir.parent().unwrap().join("temp_squash_race2");
+        std::fs::create_dir_all(&temp_work).unwrap();
+        run_git_sync(
+            &clone_dir,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                temp_work.to_str().unwrap(),
+                "refs/heads/main",
+            ],
+        )
+        .unwrap();
+        run_git_sync(&temp_work, &["config", "user.email", "test@test.com"]).unwrap();
+        run_git_sync(&temp_work, &["config", "user.name", "Test"]).unwrap();
+        run_git_sync(&temp_work, &["merge", "--squash", pred_y.as_str()]).unwrap();
+        run_git_sync(&temp_work, &["commit", "-m", "Squash: rewritten pred"]).unwrap();
+        let squash_sha = run_git_stdout(&temp_work, &["rev-parse", "HEAD"]).unwrap();
+        let squash_sha = Sha::parse(&squash_sha).unwrap();
+        run_git_sync(&temp_work, &["push", "origin", "HEAD:refs/heads/main"]).unwrap();
+        run_git_sync(
+            &clone_dir,
+            &["worktree", "remove", "--force", temp_work.to_str().unwrap()],
+        )
+        .unwrap();
+
+        // The caller passes exactly what prepare returned: X.
+        let result = reconcile_descendant(
+            &worktree,
+            &ReconcileRequest {
+                descendant_branch: "pr-124",
+                predecessor_pr: 123,
+                squash_sha: &squash_sha,
+                expected_squash_parent: &main_before_squash,
+                predecessor_pre_squash_head: &prep.predecessor_head,
+                default_branch: "main",
+            },
+            &identity,
+        );
+
+        assert!(
+            result.is_err(),
+            "reconcile must refuse when the squashed head differs from the \
+             prepared head, even though the prepared head IS an ancestor of \
+             the descendant; got {:?}",
             result
         );
     }
@@ -2198,6 +2374,50 @@ mod tests {
         let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
         let head = rev_parse(&worktree, "HEAD").unwrap();
         assert_eq!(head, initial_sha);
+    }
+
+    /// HOME and SSH_AUTH_SOCK must survive the environment scrub: ssh
+    /// resolves ~/.ssh/config, keys, and known_hosts via HOME, and
+    /// agent-based auth needs the socket. Without them, every fetch/push to
+    /// an SSH remote breaks. (Config injection stays blocked regardless:
+    /// GIT_CONFIG_GLOBAL/GIT_CONFIG_NOSYSTEM are pinned.)
+    #[test]
+    fn transport_auth_env_is_preserved() {
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            rerun_self_with_env(
+                &child_test_name("transport_auth_env_is_preserved"),
+                &[
+                    (CHILD_MARKER, "1"),
+                    ("HOME", "/tmp/test-home"),
+                    ("SSH_AUTH_SOCK", "/tmp/test-agent.sock"),
+                    ("GIT_DIR", "/nonexistent/still-scrubbed"),
+                ],
+            );
+            return;
+        }
+
+        let cmd = git_command(Path::new("."));
+        let envs: std::collections::HashMap<_, _> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| v.map(|v| (k.to_os_string(), v.to_os_string())))
+            .collect();
+
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("HOME"))
+                .map(|v| v.as_os_str()),
+            Some(std::ffi::OsStr::new("/tmp/test-home")),
+            "HOME must be preserved for ssh config/keys/known_hosts"
+        );
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("SSH_AUTH_SOCK"))
+                .map(|v| v.as_os_str()),
+            Some(std::ffi::OsStr::new("/tmp/test-agent.sock")),
+            "SSH_AUTH_SOCK must be preserved for agent auth"
+        );
+        assert!(
+            !envs.contains_key(std::ffi::OsStr::new("GIT_DIR")),
+            "GIT_DIR must still be scrubbed"
+        );
     }
 
     /// GIT_AUTHOR_* / GIT_COMMITTER_* in the parent environment must not

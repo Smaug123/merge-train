@@ -69,6 +69,21 @@ pub enum GitError {
         predecessor_head: Sha,
         descendant_head: Sha,
     },
+
+    /// Reconciliation refused: the head that was actually squash-merged (per
+    /// the predecessor's PR ref, which is frozen at merge time) differs from
+    /// the head preparation merged into the descendant. The predecessor was
+    /// force-pushed between preparation and squash; the ours-merge would
+    /// record the squash as merged while the descendant lacks its content.
+    #[error(
+        "predecessor PR #{predecessor_pr} head changed after preparation: \
+         prepared {prepared}, but {squashed} was squash-merged"
+    )]
+    PredecessorHeadChanged {
+        predecessor_pr: u64,
+        prepared: Sha,
+        squashed: Sha,
+    },
 }
 
 /// Result type for git operations.
@@ -213,8 +228,19 @@ pub(crate) fn git_command(workdir: &Path) -> std::process::Command {
     cmd.current_dir(workdir);
 
     cmd.env_clear();
-    if let Some(path) = std::env::var_os("PATH") {
-        cmd.env("PATH", path);
+    // Allowlist, not denylist: anything not named here is scrubbed.
+    // - PATH: to find git (and its transport helpers).
+    // - HOME: ssh needs it for ~/.ssh/config, keys, and known_hosts. Git
+    //   config injection via ~/.gitconfig is still blocked: GIT_CONFIG_GLOBAL
+    //   and GIT_CONFIG_NOSYSTEM below are pinned regardless of HOME.
+    // - SSH_AUTH_SOCK: agent-based SSH auth for fetch/push/ls-remote.
+    // Deliberately NOT preserved: GIT_SSH/GIT_SSH_COMMAND (arbitrary command
+    // execution; deployments needing a custom SSH wrapper must configure it
+    // explicitly when such a knob exists) and credential-helper overrides.
+    for var in ["PATH", "HOME", "SSH_AUTH_SOCK"] {
+        if let Some(value) = std::env::var_os(var) {
+            cmd.env(var, value);
+        }
     }
 
     cmd.env("LC_ALL", "C");
