@@ -100,16 +100,6 @@ pub fn write_generation(state_dir: &Path, generation: u64) -> Result<()> {
     Ok(())
 }
 
-/// Increments the generation number and returns the new value.
-///
-/// This is an atomic read-modify-write operation.
-pub fn increment_generation(state_dir: &Path) -> Result<u64> {
-    let current = read_generation(state_dir)?;
-    let next = current + 1;
-    write_generation(state_dir, next)?;
-    Ok(next)
-}
-
 /// Returns the path to the snapshot file for a given generation.
 pub fn snapshot_path(state_dir: &Path, generation: u64) -> std::path::PathBuf {
     state_dir.join(format!("snapshot.{}.json", generation))
@@ -150,11 +140,19 @@ pub fn delete_old_generation(state_dir: &Path, generation: u64) -> Result<()> {
     }
 }
 
+/// The kind of a per-generation file in the state directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GenerationFileKind {
+    /// `events.<gen>.log`
+    Events,
+    /// `snapshot.<gen>.json`
+    Snapshot,
+}
+
 /// Lists all generation files in the state directory.
 ///
-/// Returns a sorted list of (generation, file_type) pairs where file_type
-/// is either "snapshot" or "events".
-pub fn list_generation_files(state_dir: &Path) -> io::Result<Vec<(u64, &'static str)>> {
+/// Returns a sorted list of (generation, kind) pairs.
+pub fn list_generation_files(state_dir: &Path) -> io::Result<Vec<(u64, GenerationFileKind)>> {
     let mut files = Vec::new();
 
     if !state_dir.exists() {
@@ -171,19 +169,38 @@ pub fn list_generation_files(state_dir: &Path) -> io::Result<Vec<(u64, &'static 
             .and_then(|s| s.strip_suffix(".json"))
             && let Ok(generation) = gen_str.parse()
         {
-            files.push((generation, "snapshot"));
+            files.push((generation, GenerationFileKind::Snapshot));
         } else if let Some(gen_str) = name
             .strip_prefix("events.")
             .and_then(|s| s.strip_suffix(".log"))
             && let Ok(generation) = gen_str.parse()
         {
-            files.push((generation, "events"));
+            files.push((generation, GenerationFileKind::Events));
         }
     }
 
-    // Sort by generation, then by file type for deterministic ordering
-    files.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+    // Sort by generation, then by file kind for deterministic ordering
+    files.sort_unstable();
     Ok(files)
+}
+
+/// Resolves the current snapshot: the `snapshot.<gen>.json` file with the
+/// highest generation number in the state directory.
+///
+/// This is *the* definition of "current snapshot" shared by recovery
+/// (`cleanup_stale_generations` repairs the generation file to agree with
+/// it) and by read-only consumers such as the state inspection endpoint.
+///
+/// Returns `Ok(None)` if the directory doesn't exist or contains no
+/// snapshot files.
+pub fn find_current_snapshot(state_dir: &Path) -> io::Result<Option<(u64, std::path::PathBuf)>> {
+    let files = list_generation_files(state_dir)?;
+    Ok(files
+        .into_iter()
+        .filter(|(_, kind)| *kind == GenerationFileKind::Snapshot)
+        .map(|(generation, _)| generation)
+        .max()
+        .map(|generation| (generation, snapshot_path(state_dir, generation))))
 }
 
 #[cfg(test)]
@@ -202,19 +219,6 @@ mod tests {
             write_generation(dir.path(), generation).unwrap();
             let read_gen = read_generation(dir.path()).unwrap();
             prop_assert_eq!(generation, read_gen);
-        }
-
-        /// Increment increases generation by 1.
-        #[test]
-        fn increment_adds_one(initial in 0u64..1000000) {
-            let dir = tempdir().unwrap();
-            write_generation(dir.path(), initial).unwrap();
-            let next = increment_generation(dir.path()).unwrap();
-            prop_assert_eq!(next, initial + 1);
-
-            // Verify persistence
-            let read = read_generation(dir.path()).unwrap();
-            prop_assert_eq!(read, next);
         }
 
         /// Generation file is atomic - temp file shouldn't remain.
@@ -331,11 +335,64 @@ mod tests {
         let files = list_generation_files(dir.path()).unwrap();
 
         assert_eq!(files.len(), 5);
-        assert!(files.contains(&(0, "snapshot")));
-        assert!(files.contains(&(0, "events")));
-        assert!(files.contains(&(1, "snapshot")));
-        assert!(files.contains(&(1, "events")));
-        assert!(files.contains(&(5, "snapshot")));
+        assert!(files.contains(&(0, GenerationFileKind::Snapshot)));
+        assert!(files.contains(&(0, GenerationFileKind::Events)));
+        assert!(files.contains(&(1, GenerationFileKind::Snapshot)));
+        assert!(files.contains(&(1, GenerationFileKind::Events)));
+        assert!(files.contains(&(5, GenerationFileKind::Snapshot)));
+    }
+
+    // ─── find_current_snapshot ───
+
+    #[test]
+    fn find_current_snapshot_empty_dir() {
+        let dir = tempdir().unwrap();
+        let result = find_current_snapshot(dir.path()).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn find_current_snapshot_nonexistent_dir() {
+        let dir = tempdir().unwrap();
+        let nonexistent = dir.path().join("does-not-exist");
+        let result = find_current_snapshot(&nonexistent).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn find_current_snapshot_single_file() {
+        let dir = tempdir().unwrap();
+        File::create(snapshot_path(dir.path(), 0)).unwrap();
+
+        let result = find_current_snapshot(dir.path()).unwrap();
+        assert_eq!(result, Some((0, snapshot_path(dir.path(), 0))));
+    }
+
+    #[test]
+    fn find_current_snapshot_multiple_generations() {
+        let dir = tempdir().unwrap();
+
+        for generation in 0..=2 {
+            File::create(snapshot_path(dir.path(), generation)).unwrap();
+        }
+
+        let result = find_current_snapshot(dir.path()).unwrap();
+        assert_eq!(result, Some((2, snapshot_path(dir.path(), 2))));
+    }
+
+    #[test]
+    fn find_current_snapshot_ignores_temp_and_event_files() {
+        let dir = tempdir().unwrap();
+
+        File::create(snapshot_path(dir.path(), 0)).unwrap();
+        // Files that must not be picked up as snapshots.
+        std::fs::write(dir.path().join("snapshot.1.json.tmp"), "{}").unwrap();
+        std::fs::write(dir.path().join("snapshot.abc.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("other.0.json"), "{}").unwrap();
+        File::create(events_path(dir.path(), 7)).unwrap();
+
+        let result = find_current_snapshot(dir.path()).unwrap();
+        assert_eq!(result, Some((0, snapshot_path(dir.path(), 0))));
     }
 
     #[test]

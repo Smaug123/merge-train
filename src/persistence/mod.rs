@@ -21,16 +21,15 @@
 //!
 //! # Recovery
 //!
-//! On startup (via `cleanup_stale_generations`):
-//! 1. Scan for the highest existing snapshot generation (handles crash during compaction)
-//! 2. If the generation file is stale, missing, or corrupt, restore it to match the highest snapshot
-//! 3. Load the snapshot for the current generation
-//! 4. Replay events for the current generation from the snapshot's `log_position`
-//! 5. Clean up files from other generations
+//! On startup, call [`recovery::recover`]: the single entry point that locks
+//! the state directory, settles generations (validating the surviving
+//! snapshot before deleting anything), loads the snapshot, replays events,
+//! and returns an [`EventLog`] with the replay-derived next sequence number.
 //!
 //! # Crash Safety
 //!
-//! - Event log: Partial writes detected and truncated on replay
+//! - Event log: Torn tail writes detected and truncated on replay; any other
+//!   inconsistency is uncharacterizable and fails loudly
 //! - Snapshots: Written atomically using write-to-temp-then-rename
 //! - Compaction: Generation-based scheme ensures either old or new generation is complete
 //! - All critical operations use fsync on both files and directories
@@ -41,17 +40,19 @@ pub mod fsync;
 pub mod generation;
 pub mod log;
 pub mod pruning;
+pub mod recovery;
 pub mod snapshot;
 
-pub use compaction::{cleanup_stale_generations, compact, should_compact};
+pub use compaction::{CompactionOutcome, cleanup_stale_generations, compact, should_compact};
 pub use event::{StateEvent, StateEventPayload};
 pub use fsync::{fsync_dir, fsync_file};
 pub use generation::{
-    delete_old_generation, events_path, increment_generation, read_generation, snapshot_path,
-    write_generation,
+    GenerationFileKind, delete_old_generation, events_path, find_current_snapshot, read_generation,
+    snapshot_path, write_generation,
 };
 pub use log::EventLog;
 pub use pruning::{PruneConfig, prune_snapshot};
+pub use recovery::{RecoverError, RecoveredState, StateDirLock, recover};
 pub use snapshot::{
     PersistedRepoSnapshot, SCHEMA_VERSION, load_snapshot, save_snapshot_atomic, try_load_snapshot,
 };

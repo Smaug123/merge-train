@@ -175,6 +175,9 @@ pub fn arb_state_event_payload() -> impl Strategy<Value = StateEventPayload> {
 }
 
 pub fn arb_state_event() -> impl Strategy<Value = StateEvent> {
-    (any::<u64>(), arb_state_event_payload())
-        .prop_map(|(seq, payload)| StateEvent::new(seq, payload))
+    (any::<u64>(), arb_state_event_payload()).prop_map(|(seq, payload)| StateEvent {
+        seq,
+        ts: chrono::Utc::now(),
+        payload,
+    })
 }
