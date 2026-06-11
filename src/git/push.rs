@@ -32,18 +32,6 @@ pub enum PushResult {
     AlreadyUpToDate,
 }
 
-impl PushResult {
-    /// Returns true if the push succeeded.
-    pub fn is_success(&self) -> bool {
-        matches!(self, PushResult::Success { .. })
-    }
-
-    /// Returns true if the push was rejected.
-    pub fn is_rejected(&self) -> bool {
-        matches!(self, PushResult::Rejected { .. })
-    }
-}
-
 /// Push the current HEAD to a remote branch.
 ///
 /// Uses detached HEAD mode: pushes with `HEAD:refs/heads/<branch>`.
@@ -270,71 +258,14 @@ pub fn capture_pre_push_state(worktree: &Path, branch: &str) -> GitResult<(Sha, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::run_git_sync;
+    use crate::git::test_support::create_test_repo_with_origin;
     use crate::git::worktree::worktree_for_stack;
-    use crate::git::{GitConfig, run_git_sync};
     use crate::types::PrNumber;
-    use std::time::Duration;
-    use tempfile::TempDir;
-
-    /// Create a minimal git repo with a main branch and initial commit.
-    fn create_test_repo() -> (TempDir, GitConfig) {
-        let temp_dir = TempDir::new().unwrap();
-        let base_dir = temp_dir.path().to_path_buf();
-
-        let config = GitConfig {
-            base_dir: base_dir.clone(),
-            owner: "test".to_string(),
-            repo: "repo".to_string(),
-            default_branch: "main".to_string(),
-            worktree_max_age: Duration::from_secs(24 * 3600),
-            commit_identity: crate::git::CommitIdentity {
-                name: "Test".to_string(),
-                email: "test@test.com".to_string(),
-                signing_key: None,
-            },
-        };
-
-        // Create the clone directory and initialize a bare repo
-        let clone_dir = config.clone_dir();
-        std::fs::create_dir_all(&clone_dir).unwrap();
-        run_git_sync(&clone_dir, &["init", "--bare"]).unwrap();
-
-        // Add origin pointing to itself so worktrees can push/fetch
-        run_git_sync(
-            &clone_dir,
-            &["remote", "add", "origin", clone_dir.to_str().unwrap()],
-        )
-        .unwrap();
-
-        // Create a temporary working repo to make an initial commit
-        let work_dir = temp_dir.path().join("work");
-        std::fs::create_dir_all(&work_dir).unwrap();
-        run_git_sync(&work_dir, &["init"]).unwrap();
-        run_git_sync(&work_dir, &["config", "user.email", "test@test.com"]).unwrap();
-        run_git_sync(&work_dir, &["config", "user.name", "Test"]).unwrap();
-
-        // Create initial commit
-        std::fs::write(work_dir.join("README.md"), "# Test").unwrap();
-        run_git_sync(&work_dir, &["add", "."]).unwrap();
-        run_git_sync(&work_dir, &["commit", "-m", "Initial commit"]).unwrap();
-
-        // Push to the bare repo
-        run_git_sync(
-            &work_dir,
-            &["remote", "add", "origin", clone_dir.to_str().unwrap()],
-        )
-        .unwrap();
-        run_git_sync(&work_dir, &["push", "-u", "origin", "HEAD:main"]).unwrap();
-
-        // Update HEAD in the bare repo
-        run_git_sync(&clone_dir, &["symbolic-ref", "HEAD", "refs/heads/main"]).unwrap();
-
-        (temp_dir, config)
-    }
 
     #[test]
     fn push_head_to_branch_creates_branch() {
-        let (_temp_dir, config) = create_test_repo();
+        let (_temp_dir, config, _) = create_test_repo_with_origin();
 
         // Get a worktree and make a commit
         let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
@@ -348,7 +279,7 @@ mod tests {
         // Push to a new branch
         let result = push_head_to_branch(&worktree, "feature-123").unwrap();
 
-        assert!(result.is_success());
+        assert!(matches!(result, PushResult::Success { .. }));
 
         // Verify the branch exists on the remote
         let remote_ref = get_remote_ref(&worktree, "feature-123").unwrap();
@@ -357,7 +288,7 @@ mod tests {
 
     #[test]
     fn push_head_to_branch_updates_branch() {
-        let (_temp_dir, config) = create_test_repo();
+        let (_temp_dir, config, _) = create_test_repo_with_origin();
 
         let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
         run_git_sync(&worktree, &["config", "user.email", "test@test.com"]).unwrap();
@@ -375,7 +306,7 @@ mod tests {
         run_git_sync(&worktree, &["commit", "-m", "Second commit"]).unwrap();
 
         let result = push_head_to_branch(&worktree, "feature").unwrap();
-        assert!(result.is_success());
+        assert!(matches!(result, PushResult::Success { .. }));
 
         // Verify HEAD matches remote
         let head_sha = rev_parse(&worktree, "HEAD").unwrap();
@@ -385,7 +316,7 @@ mod tests {
 
     #[test]
     fn push_head_rejected_on_force_needed() {
-        let (_temp_dir, config) = create_test_repo();
+        let (_temp_dir, config, _) = create_test_repo_with_origin();
 
         let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
         run_git_sync(&worktree, &["config", "user.email", "test@test.com"]).unwrap();
@@ -405,12 +336,12 @@ mod tests {
 
         // Try to push - should be rejected
         let result = push_head_to_branch(&worktree, "feature").unwrap();
-        assert!(result.is_rejected());
+        assert!(matches!(result, PushResult::Rejected { .. }));
     }
 
     #[test]
     fn get_remote_ref_returns_none_for_nonexistent() {
-        let (_temp_dir, config) = create_test_repo();
+        let (_temp_dir, config, _) = create_test_repo_with_origin();
         let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
 
         let result = get_remote_ref(&worktree, "nonexistent-branch").unwrap();
@@ -419,7 +350,7 @@ mod tests {
 
     #[test]
     fn get_remote_ref_returns_sha_for_existing() {
-        let (_temp_dir, config) = create_test_repo();
+        let (_temp_dir, config, _) = create_test_repo_with_origin();
         let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
 
         // main branch should exist
@@ -433,7 +364,7 @@ mod tests {
 
     #[test]
     fn capture_pre_push_state_captures_tree_and_remote() {
-        let (_temp_dir, config) = create_test_repo();
+        let (_temp_dir, config, _) = create_test_repo_with_origin();
         let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
         run_git_sync(&worktree, &["config", "user.email", "test@test.com"]).unwrap();
         run_git_sync(&worktree, &["config", "user.name", "Test"]).unwrap();
@@ -459,7 +390,7 @@ mod tests {
 
     #[test]
     fn is_push_completed_detects_completed_push() {
-        let (_temp_dir, config) = create_test_repo();
+        let (_temp_dir, config, _) = create_test_repo_with_origin();
         let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
         run_git_sync(&worktree, &["config", "user.email", "test@test.com"]).unwrap();
         run_git_sync(&worktree, &["config", "user.name", "Test"]).unwrap();
@@ -489,7 +420,7 @@ mod tests {
 
     #[test]
     fn push_intent_is_completed() {
-        let (_temp_dir, config) = create_test_repo();
+        let (_temp_dir, config, _) = create_test_repo_with_origin();
         let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
         run_git_sync(&worktree, &["config", "user.email", "test@test.com"]).unwrap();
         run_git_sync(&worktree, &["config", "user.name", "Test"]).unwrap();
@@ -521,7 +452,7 @@ mod tests {
         // Test that is_push_completed correctly detects a completed ours-merge push.
         // In an ours-merge, the tree doesn't change (expected_tree == pre_push_tree).
         // The fix checks if remote's first parent is pre_push_sha to confirm our merge made it.
-        let (_temp_dir, config) = create_test_repo();
+        let (_temp_dir, config, _) = create_test_repo_with_origin();
         let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
         run_git_sync(&worktree, &["config", "user.email", "test@test.com"]).unwrap();
         run_git_sync(&worktree, &["config", "user.name", "Test"]).unwrap();
@@ -593,7 +524,7 @@ mod tests {
     fn is_push_completed_rejects_wrong_second_parent() {
         // Test that is_push_completed rejects an ours-merge with wrong second parent.
         // This prevents misclassifying a different merge commit as our push.
-        let (_temp_dir, config) = create_test_repo();
+        let (_temp_dir, config, _) = create_test_repo_with_origin();
         let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
         run_git_sync(&worktree, &["config", "user.email", "test@test.com"]).unwrap();
         run_git_sync(&worktree, &["config", "user.name", "Test"]).unwrap();

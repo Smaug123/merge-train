@@ -44,13 +44,8 @@ impl OctocrabClient {
     }
 
     /// Returns a reference to the underlying octocrab client.
-    pub fn inner(&self) -> &Octocrab {
+    pub(crate) fn inner(&self) -> &Octocrab {
         &self.client
-    }
-
-    /// Returns the repository this client is scoped to.
-    pub fn repo(&self) -> &RepoId {
-        &self.repo
     }
 
     /// Returns the repository owner.

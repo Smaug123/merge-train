@@ -216,11 +216,6 @@ pub fn cleanup_stale_worktrees(
     Ok(removed)
 }
 
-/// Check if a worktree exists for the given stack.
-pub fn worktree_exists(config: &GitConfig, root_pr: PrNumber) -> bool {
-    config.worktree_path(root_pr).exists()
-}
-
 /// List all existing worktrees and their associated PR numbers.
 pub fn list_worktrees(config: &GitConfig) -> GitResult<Vec<(PrNumber, PathBuf)>> {
     let worktrees_dir = config.worktrees_dir();
@@ -245,89 +240,14 @@ pub fn list_worktrees(config: &GitConfig) -> GitResult<Vec<(PrNumber, PathBuf)>>
     Ok(worktrees)
 }
 
-/// Get the age of a worktree (time since last modification).
-pub fn worktree_age(config: &GitConfig, root_pr: PrNumber) -> GitResult<Option<Duration>> {
-    let worktree_path = config.worktree_path(root_pr);
-
-    if !worktree_path.exists() {
-        return Ok(None);
-    }
-
-    let metadata = std::fs::metadata(&worktree_path)?;
-    let modified = metadata.modified()?;
-    let age = SystemTime::now()
-        .duration_since(modified)
-        .unwrap_or(Duration::MAX);
-
-    Ok(Some(age))
-}
-
-/// Initialize the worktrees directory structure if needed.
-///
-/// This creates the necessary directories but does not create any worktrees.
-/// Worktrees are created lazily by `worktree_for_stack`.
-pub fn init_worktree_dir(config: &GitConfig) -> GitResult<()> {
-    std::fs::create_dir_all(config.worktrees_dir())?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
-
-    /// Create a minimal git repo for testing.
-    fn create_test_repo() -> (TempDir, GitConfig) {
-        let temp_dir = TempDir::new().unwrap();
-        let base_dir = temp_dir.path().to_path_buf();
-
-        let config = GitConfig {
-            base_dir: base_dir.clone(),
-            owner: "test".to_string(),
-            repo: "repo".to_string(),
-            default_branch: "main".to_string(),
-            worktree_max_age: Duration::from_secs(24 * 3600),
-            commit_identity: crate::git::CommitIdentity {
-                name: "Test".to_string(),
-                email: "test@test.com".to_string(),
-                signing_key: None,
-            },
-        };
-
-        // Create the clone directory and initialize a bare repo
-        let clone_dir = config.clone_dir();
-        std::fs::create_dir_all(&clone_dir).unwrap();
-        run_git_sync(&clone_dir, &["init", "--bare"]).unwrap();
-
-        // Create a temporary working repo to make an initial commit
-        let work_dir = temp_dir.path().join("work");
-        std::fs::create_dir_all(&work_dir).unwrap();
-        run_git_sync(&work_dir, &["init"]).unwrap();
-        run_git_sync(&work_dir, &["config", "user.email", "test@test.com"]).unwrap();
-        run_git_sync(&work_dir, &["config", "user.name", "Test"]).unwrap();
-
-        // Create initial commit
-        std::fs::write(work_dir.join("README.md"), "# Test").unwrap();
-        run_git_sync(&work_dir, &["add", "."]).unwrap();
-        run_git_sync(&work_dir, &["commit", "-m", "Initial commit"]).unwrap();
-
-        // Push to the bare repo
-        run_git_sync(
-            &work_dir,
-            &["remote", "add", "origin", clone_dir.to_str().unwrap()],
-        )
-        .unwrap();
-        run_git_sync(&work_dir, &["push", "-u", "origin", "HEAD:main"]).unwrap();
-
-        // Update HEAD in the bare repo
-        run_git_sync(&clone_dir, &["symbolic-ref", "HEAD", "refs/heads/main"]).unwrap();
-
-        (temp_dir, config)
-    }
+    use crate::git::test_support::create_test_repo;
 
     #[test]
     fn worktree_for_stack_creates_worktree() {
-        let (_temp_dir, config) = create_test_repo();
+        let (_temp_dir, config, _) = create_test_repo();
 
         let worktree_path = worktree_for_stack(&config, PrNumber(123)).unwrap();
 
@@ -343,7 +263,7 @@ mod tests {
 
     #[test]
     fn worktree_for_stack_is_idempotent() {
-        let (_temp_dir, config) = create_test_repo();
+        let (_temp_dir, config, _) = create_test_repo();
 
         let path1 = worktree_for_stack(&config, PrNumber(123)).unwrap();
         let path2 = worktree_for_stack(&config, PrNumber(123)).unwrap();
@@ -353,7 +273,7 @@ mod tests {
 
     #[test]
     fn remove_worktree_removes_existing() {
-        let (_temp_dir, config) = create_test_repo();
+        let (_temp_dir, config, _) = create_test_repo();
 
         // Create a worktree
         let worktree_path = worktree_for_stack(&config, PrNumber(123)).unwrap();
@@ -366,7 +286,7 @@ mod tests {
 
     #[test]
     fn remove_worktree_is_idempotent() {
-        let (_temp_dir, config) = create_test_repo();
+        let (_temp_dir, config, _) = create_test_repo();
 
         // Create and remove a worktree
         worktree_for_stack(&config, PrNumber(123)).unwrap();
@@ -378,7 +298,7 @@ mod tests {
 
     #[test]
     fn list_worktrees_returns_all() {
-        let (_temp_dir, config) = create_test_repo();
+        let (_temp_dir, config, _) = create_test_repo();
 
         // Create some worktrees
         worktree_for_stack(&config, PrNumber(100)).unwrap();
@@ -393,7 +313,7 @@ mod tests {
 
     #[test]
     fn cleanup_stale_worktrees_preserves_active() {
-        let (_temp_dir, config) = create_test_repo();
+        let (_temp_dir, config, _) = create_test_repo();
 
         // Create worktrees
         worktree_for_stack(&config, PrNumber(100)).unwrap();
@@ -414,33 +334,13 @@ mod tests {
         assert_eq!(removed[0], PrNumber(200));
 
         // Verify 100 still exists, 200 is gone
-        assert!(worktree_exists(&config, PrNumber(100)));
-        assert!(!worktree_exists(&config, PrNumber(200)));
-    }
-
-    #[test]
-    fn worktree_age_returns_none_for_missing() {
-        let (_temp_dir, config) = create_test_repo();
-
-        let age = worktree_age(&config, PrNumber(999)).unwrap();
-        assert!(age.is_none());
-    }
-
-    #[test]
-    fn worktree_age_returns_some_for_existing() {
-        let (_temp_dir, config) = create_test_repo();
-
-        worktree_for_stack(&config, PrNumber(123)).unwrap();
-
-        let age = worktree_age(&config, PrNumber(123)).unwrap();
-        assert!(age.is_some());
-        // Should be very recent
-        assert!(age.unwrap() < Duration::from_secs(60));
+        assert!(config.worktree_path(PrNumber(100)).exists());
+        assert!(!config.worktree_path(PrNumber(200)).exists());
     }
 
     #[test]
     fn multiple_worktrees_are_isolated() {
-        let (_temp_dir, config) = create_test_repo();
+        let (_temp_dir, config, _) = create_test_repo();
 
         // Create two worktrees
         let wt1 = worktree_for_stack(&config, PrNumber(100)).unwrap();

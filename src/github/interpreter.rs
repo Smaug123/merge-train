@@ -1,7 +1,6 @@
 //! GitHub effect interpreter using octocrab.
 //!
-//! This module implements the `GitHubInterpreter` trait, executing GitHub effects
-//! against the real GitHub API via octocrab.
+//! This module executes GitHub effects against the real GitHub API via octocrab.
 //!
 //! Key implementation details:
 //! - Uses GraphQL for `mergeStateStatus` queries (REST doesn't expose this)
@@ -13,8 +12,8 @@ use chrono::{Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::effects::{
-    BranchProtectionData, CommentData, GitHubEffect, GitHubInterpreter, GitHubResponse, PrData,
-    Reaction, RepoSettingsData, RulesetData,
+    BranchProtectionData, CommentData, GitHubEffect, GitHubResponse, PrData, Reaction,
+    RepoSettingsData, RulesetData,
 };
 use crate::types::{CommentId, MergeStateStatus, PrNumber, PrState, Sha};
 
@@ -74,10 +73,9 @@ struct MergeStatePr {
 
 // ─── Interpreter Implementation ───────────────────────────────────────────────
 
-impl GitHubInterpreter for OctocrabClient {
-    type Error = GitHubApiError;
-
-    async fn interpret(&self, effect: GitHubEffect) -> Result<GitHubResponse, Self::Error> {
+impl OctocrabClient {
+    /// Execute a GitHub effect with default retry configuration.
+    pub async fn interpret(&self, effect: GitHubEffect) -> Result<GitHubResponse, GitHubApiError> {
         interpret_github_effect(
             self,
             effect,
@@ -441,7 +439,6 @@ async fn get_merge_state(
                     msgs.join("; ")
                 });
 
-            // Log GraphQL errors if present
             if let Some(ref errors_str) = error_hint {
                 tracing::warn!(
                     pr = %pr,

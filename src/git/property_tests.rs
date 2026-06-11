@@ -15,148 +15,17 @@ use proptest::test_runner::Config as ProptestConfig;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tempfile::TempDir;
 
 use crate::git::merge::{
     ReconcileRequest, catch_up_descendant, prepare_descendant, reconcile_descendant,
 };
 use crate::git::recovery::{cleanup_worktree_on_abort, is_worktree_dirty};
+use crate::git::test_support::{
+    create_branch_with_file, create_pr_ref, create_test_repo_with_origin, test_identity,
+};
 use crate::git::worktree::{cleanup_stale_worktrees, list_worktrees, worktree_for_stack};
-use crate::git::{CommitIdentity, GitConfig, is_ancestor, run_git_stdout, run_git_sync};
+use crate::git::{GitConfig, MergeResult, is_ancestor, run_git_stdout, run_git_sync};
 use crate::types::{PrNumber, Sha};
-
-/// Test identity for merge commits (no signing).
-fn test_identity() -> CommitIdentity {
-    CommitIdentity {
-        name: "Test".to_string(),
-        email: "test@test.com".to_string(),
-        signing_key: None,
-    }
-}
-
-/// Create a test repository with the given configuration.
-fn create_test_repo() -> (TempDir, GitConfig) {
-    let temp_dir = TempDir::new().unwrap();
-    let base_dir = temp_dir.path().to_path_buf();
-
-    let config = GitConfig {
-        base_dir: base_dir.clone(),
-        owner: "test".to_string(),
-        repo: "repo".to_string(),
-        default_branch: "main".to_string(),
-        worktree_max_age: Duration::from_secs(24 * 3600),
-        commit_identity: CommitIdentity {
-            name: "Test".to_string(),
-            email: "test@test.com".to_string(),
-            signing_key: None,
-        },
-    };
-
-    // Create the clone directory and initialize a bare repo
-    let clone_dir = config.clone_dir();
-    std::fs::create_dir_all(&clone_dir).unwrap();
-    run_git_sync(&clone_dir, &["init", "--bare"]).unwrap();
-
-    // Add origin pointing to itself so worktrees can push/fetch
-    run_git_sync(
-        &clone_dir,
-        &["remote", "add", "origin", clone_dir.to_str().unwrap()],
-    )
-    .unwrap();
-
-    // Create a temporary working repo to make an initial commit
-    let work_dir = temp_dir.path().join("work");
-    std::fs::create_dir_all(&work_dir).unwrap();
-    run_git_sync(&work_dir, &["init"]).unwrap();
-    run_git_sync(&work_dir, &["config", "user.email", "test@test.com"]).unwrap();
-    run_git_sync(&work_dir, &["config", "user.name", "Test"]).unwrap();
-
-    // Create initial commit
-    std::fs::write(work_dir.join("README.md"), "# Test").unwrap();
-    run_git_sync(&work_dir, &["add", "."]).unwrap();
-    run_git_sync(&work_dir, &["commit", "-m", "Initial commit"]).unwrap();
-
-    // Push to the bare repo
-    run_git_sync(
-        &work_dir,
-        &["remote", "add", "origin", clone_dir.to_str().unwrap()],
-    )
-    .unwrap();
-    run_git_sync(&work_dir, &["push", "-u", "origin", "HEAD:main"]).unwrap();
-
-    // Update HEAD in the bare repo
-    run_git_sync(&clone_dir, &["symbolic-ref", "HEAD", "refs/heads/main"]).unwrap();
-
-    (temp_dir, config)
-}
-
-/// Create a branch with a file.
-fn create_branch_with_file(
-    config: &GitConfig,
-    branch: &str,
-    filename: &str,
-    content: &str,
-    base_branch: &str,
-) -> Sha {
-    let clone_dir = config.clone_dir();
-
-    // Create a temporary worktree for making the branch
-    let temp_work = clone_dir.parent().unwrap().join(format!("temp_{}", branch));
-    std::fs::create_dir_all(&temp_work).unwrap();
-    run_git_sync(
-        &clone_dir,
-        &[
-            "worktree",
-            "add",
-            "--detach",
-            temp_work.to_str().unwrap(),
-            &format!("refs/heads/{}", base_branch),
-        ],
-    )
-    .unwrap();
-
-    run_git_sync(&temp_work, &["config", "user.email", "test@test.com"]).unwrap();
-    run_git_sync(&temp_work, &["config", "user.name", "Test"]).unwrap();
-
-    // Create the file and commit
-    std::fs::write(temp_work.join(filename), content).unwrap();
-    run_git_sync(&temp_work, &["add", filename]).unwrap();
-    run_git_sync(&temp_work, &["commit", "-m", &format!("Add {}", filename)]).unwrap();
-
-    let sha = run_git_stdout(&temp_work, &["rev-parse", "HEAD"]).unwrap();
-
-    // Push the new branch
-    run_git_sync(
-        &temp_work,
-        &["push", "origin", &format!("HEAD:refs/heads/{}", branch)],
-    )
-    .unwrap();
-
-    // Cleanup
-    run_git_sync(
-        &clone_dir,
-        &["worktree", "remove", "--force", temp_work.to_str().unwrap()],
-    )
-    .unwrap();
-
-    Sha::parse(&sha).unwrap()
-}
-
-/// Create a PR ref in the bare repo (simulates GitHub's refs/pull/<n>/head).
-///
-/// This is needed because prepare_descendant now fetches via PR refs.
-fn create_pr_ref(config: &GitConfig, pr_number: u64, sha: &Sha) {
-    let clone_dir = config.clone_dir();
-    run_git_sync(
-        &clone_dir,
-        &[
-            "update-ref",
-            &format!("refs/pull/{}/head", pr_number),
-            sha.as_str(),
-        ],
-    )
-    .unwrap();
-}
 
 /// Result of a squash merge: the squash commit SHA and the prior main HEAD.
 struct SquashResult {
@@ -234,7 +103,7 @@ proptest! {
         pred_content in "[a-z]{10,50}",
         desc_content in "[a-z]{10,50}",
     ) {
-        let (_temp_dir, config) = create_test_repo();
+        let (_temp_dir, config, _) = create_test_repo_with_origin();
 
         // Create predecessor branch with a file
         let pred_sha = create_branch_with_file(&config, "pr-123", "pred.txt", &pred_content, "main");
@@ -246,7 +115,14 @@ proptest! {
         // Get worktree and prepare descendant using PR number
         let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
         let prep_result = prepare_descendant(&worktree, "pr-124", 123, &test_identity()).unwrap();
-        prop_assert!(prep_result.merge.is_ok());
+        prop_assert!(
+            matches!(
+                prep_result.merge,
+                MergeResult::Success { .. } | MergeResult::AlreadyUpToDate
+            ),
+            "Expected prepare to succeed, got {:?}",
+            prep_result.merge
+        );
         run_git_sync(&worktree, &["push", "origin", "HEAD:refs/heads/pr-124", "--force"]).unwrap();
 
         // Squash merge predecessor to main
@@ -265,7 +141,14 @@ proptest! {
             },
             &test_identity(),
         ).unwrap();
-        prop_assert!(reconcile_result.is_ok());
+        prop_assert!(
+            matches!(
+                reconcile_result,
+                MergeResult::Success { .. } | MergeResult::AlreadyUpToDate
+            ),
+            "Expected reconcile to succeed, got {:?}",
+            reconcile_result
+        );
 
         // Catch up with main (if needed)
         let _ = catch_up_descendant(&worktree, "pr-124", "main", &test_identity()).unwrap();
@@ -290,7 +173,7 @@ proptest! {
         desc_content in "[a-z]{10,50}",
         intervening_content in "[a-z]{10,50}",
     ) {
-        let (_temp_dir, config) = create_test_repo();
+        let (_temp_dir, config, _) = create_test_repo_with_origin();
 
         // Create predecessor and descendant
         let pred_sha = create_branch_with_file(&config, "pr-123", "pred.txt", &pred_content, "main");
@@ -344,7 +227,7 @@ proptest! {
         desc_content2 in "[a-z]{10,30}",
         desc_content3 in "[a-z]{10,30}",
     ) {
-        let (_temp_dir, config) = create_test_repo();
+        let (_temp_dir, config, _) = create_test_repo_with_origin();
         let clone_dir = config.clone_dir();
 
         // Create predecessor with MULTIPLE files (simulates multi-commit)
@@ -442,7 +325,7 @@ proptest! {
         before_squash_content2 in "[a-z]{10,30}",
         after_squash_content in "[a-z]{10,30}",
     ) {
-        let (_temp_dir, config) = create_test_repo();
+        let (_temp_dir, config, _) = create_test_repo_with_origin();
 
         // Create predecessor and descendant
         let pred_sha = create_branch_with_file(&config, "pr-123", "pred.txt", &pred_content, "main");
@@ -509,7 +392,7 @@ proptest! {
     fn squash_has_single_parent(
         content in "[a-z]{10,50}",
     ) {
-        let (_temp_dir, config) = create_test_repo();
+        let (_temp_dir, config, _) = create_test_repo_with_origin();
 
         // Create and squash a branch
         let branch_sha = create_branch_with_file(&config, "pr-123", "file.txt", &content, "main");
@@ -545,7 +428,7 @@ proptest! {
     fn worktree_cleanup_leaves_clean_state(
         file_content in "[a-z]{10,50}",
     ) {
-        let (_temp_dir, config) = create_test_repo();
+        let (_temp_dir, config, _) = create_test_repo_with_origin();
 
         // Create a worktree and make it dirty
         let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
@@ -577,7 +460,7 @@ proptest! {
         pr_numbers in prop::collection::vec(1u64..1000, 1..5),
         active_pr in 1u64..1000,
     ) {
-        let (_temp_dir, config) = create_test_repo();
+        let (_temp_dir, config, _) = create_test_repo_with_origin();
 
         // Create worktrees for the generated PR numbers
         for pr in &pr_numbers {
@@ -634,7 +517,7 @@ proptest! {
 /// complexity by not pre-merging main.
 #[test]
 fn squash_parent_ordering_incorporates_late_commits() {
-    let (_temp_dir, config) = create_test_repo();
+    let (_temp_dir, config, _) = create_test_repo_with_origin();
 
     // Create predecessor PR
     let pred_sha = create_branch_with_file(&config, "pr-123", "pred.txt", "predecessor", "main");
@@ -740,7 +623,7 @@ fn squash_parent_ordering_incorporates_late_commits() {
 /// detect the conflict.
 #[test]
 fn catch_up_detects_conflicts_with_main() {
-    let (_temp_dir, config) = create_test_repo();
+    let (_temp_dir, config, _) = create_test_repo_with_origin();
 
     // Create predecessor
     let pred_sha = create_branch_with_file(&config, "pr-123", "pred.txt", "predecessor", "main");
@@ -812,15 +695,11 @@ fn catch_up_detects_conflicts_with_main() {
     // Catch-up should detect the conflict
     let result = catch_up_descendant(&worktree, "pr-124", "main", &test_identity()).unwrap();
     assert!(
-        result.is_conflict(),
+        matches!(result, MergeResult::Conflict { .. }),
         "Expected conflict during catch-up, got {:?}",
         result
     );
 }
-
-// =============================================================================
-// Stage-8 Required Tests
-// =============================================================================
 
 /// Property 9: Recovery uses frozen descendants, not current state.
 ///
@@ -899,7 +778,7 @@ fn recovery_uses_frozen_descendants() {
     );
 
     // Also test with real git operations to show the late descendant is not processed
-    let (_temp_dir, config) = create_test_repo();
+    let (_temp_dir, config, _) = create_test_repo_with_origin();
 
     // Create predecessor and initial descendants
     let pred_sha = create_branch_with_file(&config, "pr-100", "pred.txt", "predecessor", "main");
@@ -981,7 +860,7 @@ fn recovery_uses_frozen_descendants() {
 /// 3. The cleanup/creation ordering is correct (remove before create to avoid conflicts)
 #[test]
 fn fanout_worktree_ordering() {
-    let (_temp_dir, config) = create_test_repo();
+    let (_temp_dir, config, _) = create_test_repo_with_origin();
 
     // Create a root PR that will fan out to multiple descendants
     let root_sha = create_branch_with_file(&config, "pr-100", "root.txt", "root", "main");
@@ -1147,7 +1026,7 @@ fn fanout_worktree_ordering() {
 /// those that should be removed.
 #[test]
 fn worktree_cleanup_leaves_no_orphans() {
-    let (_temp_dir, config) = create_test_repo();
+    let (_temp_dir, config, _) = create_test_repo_with_origin();
 
     // Create several worktrees
     let worktrees_to_create: Vec<u64> = vec![100, 101, 102, 103, 104];
@@ -1218,7 +1097,7 @@ fn worktree_cleanup_leaves_no_orphans() {
 /// because `$SQUASH_SHA^` IS main at the time of the squash, which includes the late commit.
 #[test]
 fn naive_ordering_loses_late_commits() {
-    let (_temp_dir, config) = create_test_repo();
+    let (_temp_dir, config, _) = create_test_repo_with_origin();
 
     // Create predecessor and descendant
     let pred_sha = create_branch_with_file(&config, "pr-123", "pred.txt", "predecessor", "main");

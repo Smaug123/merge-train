@@ -620,148 +620,16 @@ pub fn is_valid_squash_merge(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::test_support::{
+        create_branch_with_file, create_pr_ref, create_test_repo_with_origin, test_identity,
+    };
     use crate::git::worktree::worktree_for_stack;
-    use crate::git::{CommitIdentity, GitConfig, run_git_stdout, run_git_sync};
+    use crate::git::{GitConfig, run_git_stdout, run_git_sync};
     use crate::types::PrNumber;
-    use std::time::Duration;
-    use tempfile::TempDir;
-
-    /// Test identity for merge commits (no signing).
-    fn test_identity() -> CommitIdentity {
-        CommitIdentity {
-            name: "Test".to_string(),
-            email: "test@test.com".to_string(),
-            signing_key: None,
-        }
-    }
-
-    /// Create a minimal git repo with a main branch and initial commit.
-    fn create_test_repo() -> (TempDir, GitConfig, Sha) {
-        let temp_dir = TempDir::new().unwrap();
-        let base_dir = temp_dir.path().to_path_buf();
-
-        let config = GitConfig {
-            base_dir: base_dir.clone(),
-            owner: "test".to_string(),
-            repo: "repo".to_string(),
-            default_branch: "main".to_string(),
-            worktree_max_age: Duration::from_secs(24 * 3600),
-            commit_identity: test_identity(),
-        };
-
-        // Create the clone directory and initialize a bare repo
-        let clone_dir = config.clone_dir();
-        std::fs::create_dir_all(&clone_dir).unwrap();
-        run_git_sync(&clone_dir, &["init", "--bare"]).unwrap();
-
-        // Add origin pointing to itself so worktrees can push/fetch
-        run_git_sync(
-            &clone_dir,
-            &["remote", "add", "origin", clone_dir.to_str().unwrap()],
-        )
-        .unwrap();
-
-        // Create a temporary working repo to make an initial commit
-        let work_dir = temp_dir.path().join("work");
-        std::fs::create_dir_all(&work_dir).unwrap();
-        run_git_sync(&work_dir, &["init"]).unwrap();
-        run_git_sync(&work_dir, &["config", "user.email", "test@test.com"]).unwrap();
-        run_git_sync(&work_dir, &["config", "user.name", "Test"]).unwrap();
-
-        // Create initial commit
-        std::fs::write(work_dir.join("README.md"), "# Test").unwrap();
-        run_git_sync(&work_dir, &["add", "."]).unwrap();
-        run_git_sync(&work_dir, &["commit", "-m", "Initial commit"]).unwrap();
-
-        // Get the initial commit SHA
-        let initial_sha = run_git_stdout(&work_dir, &["rev-parse", "HEAD"]).unwrap();
-        let initial_sha = Sha::parse(&initial_sha).unwrap();
-
-        // Push to the bare repo
-        run_git_sync(
-            &work_dir,
-            &["remote", "add", "origin", clone_dir.to_str().unwrap()],
-        )
-        .unwrap();
-        run_git_sync(&work_dir, &["push", "-u", "origin", "HEAD:main"]).unwrap();
-
-        // Update HEAD in the bare repo
-        run_git_sync(&clone_dir, &["symbolic-ref", "HEAD", "refs/heads/main"]).unwrap();
-
-        (temp_dir, config, initial_sha)
-    }
-
-    /// Create a branch with a file in the test repo.
-    fn create_branch_with_file(
-        config: &GitConfig,
-        branch: &str,
-        filename: &str,
-        content: &str,
-        base_branch: &str,
-    ) -> Sha {
-        let clone_dir = config.clone_dir();
-
-        // Create a temporary worktree for making the branch
-        let temp_work = clone_dir.parent().unwrap().join("temp_work");
-        std::fs::create_dir_all(&temp_work).unwrap();
-        run_git_sync(
-            &clone_dir,
-            &[
-                "worktree",
-                "add",
-                "--detach",
-                temp_work.to_str().unwrap(),
-                &format!("refs/heads/{}", base_branch),
-            ],
-        )
-        .unwrap();
-
-        run_git_sync(&temp_work, &["config", "user.email", "test@test.com"]).unwrap();
-        run_git_sync(&temp_work, &["config", "user.name", "Test"]).unwrap();
-
-        // Create the file and commit
-        std::fs::write(temp_work.join(filename), content).unwrap();
-        run_git_sync(&temp_work, &["add", filename]).unwrap();
-        run_git_sync(&temp_work, &["commit", "-m", &format!("Add {}", filename)]).unwrap();
-
-        let sha = run_git_stdout(&temp_work, &["rev-parse", "HEAD"]).unwrap();
-
-        // Push the new branch
-        run_git_sync(
-            &temp_work,
-            &["push", "origin", &format!("HEAD:refs/heads/{}", branch)],
-        )
-        .unwrap();
-
-        // Cleanup
-        run_git_sync(
-            &clone_dir,
-            &["worktree", "remove", "--force", temp_work.to_str().unwrap()],
-        )
-        .unwrap();
-
-        Sha::parse(&sha).unwrap()
-    }
-
-    /// Create a PR ref in the bare repo (simulates GitHub's refs/pull/<n>/head).
-    ///
-    /// This is needed because prepare_descendant now fetches via PR refs.
-    fn create_pr_ref(config: &GitConfig, pr_number: u64, sha: &Sha) {
-        let clone_dir = config.clone_dir();
-        run_git_sync(
-            &clone_dir,
-            &[
-                "update-ref",
-                &format!("refs/pull/{}/head", pr_number),
-                sha.as_str(),
-            ],
-        )
-        .unwrap();
-    }
 
     #[test]
     fn prepare_descendant_merges_predecessor() {
-        let (_temp_dir, config, _initial_sha) = create_test_repo();
+        let (_temp_dir, config, _initial_sha) = create_test_repo_with_origin();
 
         // Create predecessor branch (PR #123)
         let pred_sha =
@@ -787,7 +655,10 @@ mod tests {
 
         // Should complete without conflict (either Success or AlreadyUpToDate)
         assert!(
-            result.merge.is_ok(),
+            matches!(
+                result.merge,
+                MergeResult::Success { .. } | MergeResult::AlreadyUpToDate
+            ),
             "Expected merge to succeed, got {:?}",
             result.merge
         );
@@ -802,7 +673,7 @@ mod tests {
 
     #[test]
     fn prepare_descendant_already_up_to_date() {
-        let (_temp_dir, config, _initial_sha) = create_test_repo();
+        let (_temp_dir, config, _initial_sha) = create_test_repo_with_origin();
 
         // Create predecessor branch
         let pred_sha =
@@ -826,7 +697,10 @@ mod tests {
         let result1 = prepare_descendant(&worktree, "pr-124", 123, &identity).unwrap();
         // Since pr-124 was created from pr-123, it might be AlreadyUpToDate
         assert!(
-            result1.merge.is_ok(),
+            matches!(
+                result1.merge,
+                MergeResult::Success { .. } | MergeResult::AlreadyUpToDate
+            ),
             "Expected merge to succeed, got {:?}",
             result1.merge
         );
@@ -847,7 +721,7 @@ mod tests {
 
     #[test]
     fn reconcile_descendant_incorporates_squash() {
-        let (_temp_dir, config, initial_sha) = create_test_repo();
+        let (_temp_dir, config, initial_sha) = create_test_repo_with_origin();
 
         // Create predecessor branch
         let pred_sha =
@@ -907,7 +781,10 @@ mod tests {
         let identity = test_identity();
         let prep_result = prepare_descendant(&worktree, "pr-124", 123, &identity).unwrap();
         assert!(
-            prep_result.merge.is_ok(),
+            matches!(
+                prep_result.merge,
+                MergeResult::Success { .. } | MergeResult::AlreadyUpToDate
+            ),
             "Expected prepare to succeed, got {:?}",
             prep_result.merge
         );
@@ -933,7 +810,10 @@ mod tests {
         .unwrap();
 
         assert!(
-            result.is_ok(),
+            matches!(
+                result,
+                MergeResult::Success { .. } | MergeResult::AlreadyUpToDate
+            ),
             "Expected reconcile to succeed, got {:?}",
             result
         );
@@ -948,7 +828,7 @@ mod tests {
 
     #[test]
     fn reconcile_rejects_non_squash() {
-        let (_temp_dir, config, _initial_sha) = create_test_repo();
+        let (_temp_dir, config, _initial_sha) = create_test_repo_with_origin();
 
         // Create predecessor branch
         let pred_sha =
@@ -1047,7 +927,7 @@ mod tests {
 
     #[test]
     fn catch_up_descendant_merges_new_main_commits() {
-        let (_temp_dir, config, _initial_sha) = create_test_repo();
+        let (_temp_dir, config, _initial_sha) = create_test_repo_with_origin();
 
         // Create a branch
         let _branch_sha =
@@ -1062,7 +942,7 @@ mod tests {
         let identity = test_identity();
         let result = catch_up_descendant(&worktree, "pr-123", "main", &identity).unwrap();
 
-        assert!(result.is_success());
+        assert!(matches!(result, MergeResult::Success { .. }));
 
         // Both files should exist
         assert!(worktree.join("feature.txt").exists());
@@ -1071,7 +951,7 @@ mod tests {
 
     #[test]
     fn catch_up_already_up_to_date() {
-        let (_temp_dir, config, _initial_sha) = create_test_repo();
+        let (_temp_dir, config, _initial_sha) = create_test_repo_with_origin();
 
         // Create a branch from main (no new commits on main since)
         let _branch_sha =
@@ -1091,7 +971,7 @@ mod tests {
     /// otherwise it checks out the old (unprepared) commit and drops the merge.
     #[test]
     fn reconcile_descendant_fetches_descendant_before_checkout() {
-        let (_temp_dir, config, _initial_sha) = create_test_repo();
+        let (_temp_dir, config, _initial_sha) = create_test_repo_with_origin();
 
         // Create predecessor and descendant branches
         let pred_sha =
@@ -1109,7 +989,13 @@ mod tests {
         let worktree1 = worktree_for_stack(&config, PrNumber(123)).unwrap();
         let identity = test_identity();
         let prep_result = prepare_descendant(&worktree1, "pr-124", 123, &identity).unwrap();
-        assert!(prep_result.merge.is_ok(), "Prepare should succeed");
+        assert!(
+            matches!(
+                prep_result.merge,
+                MergeResult::Success { .. } | MergeResult::AlreadyUpToDate
+            ),
+            "Prepare should succeed"
+        );
 
         // Push the prepared state
         run_git_sync(
@@ -1175,7 +1061,14 @@ mod tests {
             &identity,
         )
         .unwrap();
-        assert!(result.is_ok(), "Reconcile should succeed, got {:?}", result);
+        assert!(
+            matches!(
+                result,
+                MergeResult::Success { .. } | MergeResult::AlreadyUpToDate
+            ),
+            "Reconcile should succeed, got {:?}",
+            result
+        );
 
         // Verify we reconciled from the prepared state (prepared SHA should be an ancestor)
         let head_sha = run_git_stdout(&worktree2, &["rev-parse", "HEAD"]).unwrap();
@@ -1194,7 +1087,7 @@ mod tests {
     /// After reconcile pushes, the local refs are stale. catch_up must fetch first.
     #[test]
     fn catch_up_descendant_fetches_descendant_before_checkout() {
-        let (_temp_dir, config, _initial_sha) = create_test_repo();
+        let (_temp_dir, config, _initial_sha) = create_test_repo_with_origin();
 
         // Create a branch
         let _branch_sha =
@@ -1230,7 +1123,10 @@ mod tests {
         let identity = test_identity();
         let result = catch_up_descendant(&worktree2, "pr-123", "main", &identity).unwrap();
         assert!(
-            result.is_ok() || result.is_success(),
+            matches!(
+                result,
+                MergeResult::Success { .. } | MergeResult::AlreadyUpToDate
+            ),
             "Catch up should succeed"
         );
 
@@ -1244,7 +1140,7 @@ mod tests {
     /// Test that is_valid_squash_merge accepts a legitimate squash merge.
     #[test]
     fn is_valid_squash_merge_accepts_squash() {
-        let (_temp_dir, config, _initial_sha) = create_test_repo();
+        let (_temp_dir, config, _initial_sha) = create_test_repo_with_origin();
 
         // Create a feature branch
         let branch_sha =
@@ -1290,7 +1186,7 @@ mod tests {
     /// Test that is_valid_squash_merge rejects a merge commit (two parents).
     #[test]
     fn is_valid_squash_merge_rejects_merge_commit() {
-        let (_temp_dir, config, _initial_sha) = create_test_repo();
+        let (_temp_dir, config, _initial_sha) = create_test_repo_with_origin();
 
         // Create a feature branch
         let branch_sha =
@@ -1351,7 +1247,7 @@ mod tests {
     /// the previous rebased commit, NOT the prior main HEAD.
     #[test]
     fn is_valid_squash_merge_rejects_multi_commit_rebase() {
-        let (_temp_dir, config, _initial_sha) = create_test_repo();
+        let (_temp_dir, config, _initial_sha) = create_test_repo_with_origin();
         let clone_dir = config.clone_dir();
 
         // Create a feature branch with TWO commits
@@ -1433,7 +1329,7 @@ mod tests {
     /// This is expected behavior per DESIGN.md.
     #[test]
     fn is_valid_squash_merge_accepts_single_commit_rebase() {
-        let (_temp_dir, config, _initial_sha) = create_test_repo();
+        let (_temp_dir, config, _initial_sha) = create_test_repo_with_origin();
         let clone_dir = config.clone_dir();
 
         // Create a feature branch with ONE commit
@@ -1508,7 +1404,7 @@ mod tests {
     /// prior main HEAD. This is expected behavior per DESIGN.md.
     #[test]
     fn is_valid_squash_merge_accepts_single_commit_fast_forward() {
-        let (_temp_dir, config, _initial_sha) = create_test_repo();
+        let (_temp_dir, config, _initial_sha) = create_test_repo_with_origin();
         let clone_dir = config.clone_dir();
 
         // Record main HEAD before creating feature
@@ -1589,7 +1485,7 @@ mod tests {
     /// the same underlying property with a different branch structure.
     #[test]
     fn is_valid_squash_merge_rejects_multi_commit_branch() {
-        let (_temp_dir, config, _initial_sha) = create_test_repo();
+        let (_temp_dir, config, _initial_sha) = create_test_repo_with_origin();
         let clone_dir = config.clone_dir();
 
         // Record main HEAD before creating feature
@@ -1724,7 +1620,7 @@ mod tests {
     /// dropping newer commits when we later push.
     #[test]
     fn update_root_for_behind_fetches_branch() {
-        let (_temp_dir, config, _initial_sha) = create_test_repo();
+        let (_temp_dir, config, _initial_sha) = create_test_repo_with_origin();
 
         // Create a branch
         let _branch_sha = create_branch_with_file(
@@ -1774,7 +1670,10 @@ mod tests {
         let identity = test_identity();
         let result = update_root_for_behind(&worktree, "pr-123", "main", &identity).unwrap();
         assert!(
-            result.is_ok(),
+            matches!(
+                result,
+                MergeResult::Success { .. } | MergeResult::AlreadyUpToDate
+            ),
             "update_root_for_behind should succeed, got {:?}",
             result
         );
@@ -1807,7 +1706,7 @@ mod tests {
     /// reconcile_descendant.
     #[test]
     fn reconcile_descendant_rejects_commit_with_parent_not_on_main() {
-        let (_temp_dir, config, _initial_sha) = create_test_repo();
+        let (_temp_dir, config, _initial_sha) = create_test_repo_with_origin();
         let clone_dir = config.clone_dir();
 
         // Create predecessor
@@ -1928,7 +1827,7 @@ mod tests {
     /// is exactly what we expect (the prior main HEAD), not just any ancestor.
     #[test]
     fn reconcile_descendant_rejects_multi_commit_ff_on_main() {
-        let (_temp_dir, config, initial_sha) = create_test_repo();
+        let (_temp_dir, config, initial_sha) = create_test_repo_with_origin();
         let clone_dir = config.clone_dir();
 
         // Create predecessor
@@ -2053,7 +1952,7 @@ mod tests {
     /// redundant; this test pins the git semantics that justify omitting it.
     #[test]
     fn is_ancestor_is_reflexive() {
-        let (_temp_dir, config, initial_sha) = create_test_repo();
+        let (_temp_dir, config, initial_sha) = create_test_repo_with_origin();
         let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
         assert!(super::super::is_ancestor(&worktree, &initial_sha, &initial_sha).unwrap());
     }
@@ -2066,7 +1965,7 @@ mod tests {
     /// refuse.
     #[test]
     fn reconcile_refuses_when_predecessor_force_pushed_after_prepare() {
-        let (_temp_dir, config, _initial_sha) = create_test_repo();
+        let (_temp_dir, config, _initial_sha) = create_test_repo_with_origin();
         let clone_dir = config.clone_dir();
         let identity = test_identity();
 
@@ -2176,7 +2075,7 @@ mod tests {
         // head X. X is an ancestor of the descendant, so an ancestry check on
         // the passed value alone cannot detect the force-push: reconcile must
         // verify the head that was ACTUALLY squash-merged.
-        let (_temp_dir, config, _initial_sha) = create_test_repo();
+        let (_temp_dir, config, _initial_sha) = create_test_repo_with_origin();
         let clone_dir = config.clone_dir();
         let identity = test_identity();
 
@@ -2326,7 +2225,7 @@ mod tests {
             return;
         }
 
-        let (_temp_dir, config, _initial_sha) = create_test_repo();
+        let (_temp_dir, config, _initial_sha) = create_test_repo_with_origin();
         let identity = test_identity();
 
         // No-op merge: branch already contains main.
@@ -2346,7 +2245,7 @@ mod tests {
         let result = catch_up_descendant(&worktree2, "pr-200", "main", &identity)
             .expect("conflicting merge must classify as Conflict regardless of locale");
         assert!(
-            result.is_conflict(),
+            matches!(result, MergeResult::Conflict { .. }),
             "conflicting merge must classify as Conflict regardless of locale, got {:?}",
             result
         );
@@ -2370,7 +2269,7 @@ mod tests {
             return;
         }
 
-        let (_temp_dir, config, initial_sha) = create_test_repo();
+        let (_temp_dir, config, initial_sha) = create_test_repo_with_origin();
         let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
         let head = rev_parse(&worktree, "HEAD").unwrap();
         assert_eq!(head, initial_sha);
@@ -2438,7 +2337,7 @@ mod tests {
             return;
         }
 
-        let (_temp_dir, config, _initial_sha) = create_test_repo();
+        let (_temp_dir, config, _initial_sha) = create_test_repo_with_origin();
         let identity = test_identity();
 
         // Predecessor and descendant diverge, so preparation creates a real
@@ -2451,7 +2350,10 @@ mod tests {
 
         let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
         let prep = prepare_descendant(&worktree, "pr-124", 123, &identity).unwrap();
-        assert!(prep.merge.is_success(), "expected a real merge commit");
+        assert!(
+            matches!(prep.merge, MergeResult::Success { .. }),
+            "expected a real merge commit"
+        );
 
         let identities =
             run_git_stdout(&worktree, &["log", "-1", "--format=%an <%ae>%n%cn <%ce>"]).unwrap();

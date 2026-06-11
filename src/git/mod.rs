@@ -17,6 +17,8 @@ pub mod worktree;
 
 #[cfg(test)]
 mod property_tests;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 // Re-export commonly used types from submodules
 pub use push::{PushIntent, PushResult, is_push_completed};
@@ -109,27 +111,6 @@ pub enum MergeResult {
 
     /// Merge was a no-op (already up-to-date).
     AlreadyUpToDate,
-}
-
-impl MergeResult {
-    /// Returns true if the merge was successful (created a merge commit).
-    pub fn is_success(&self) -> bool {
-        matches!(self, MergeResult::Success { .. })
-    }
-
-    /// Returns true if the merge completed without conflict.
-    /// This includes both `Success` (created a merge commit) and `AlreadyUpToDate` (no-op).
-    pub fn is_ok(&self) -> bool {
-        matches!(
-            self,
-            MergeResult::Success { .. } | MergeResult::AlreadyUpToDate
-        )
-    }
-
-    /// Returns true if the merge resulted in a conflict.
-    pub fn is_conflict(&self) -> bool {
-        matches!(self, MergeResult::Conflict { .. })
-    }
 }
 
 /// Identity used for creating commits.
@@ -485,27 +466,5 @@ mod tests {
                 err
             );
         }
-    }
-
-    #[test]
-    fn merge_result_predicates() {
-        let success = MergeResult::Success {
-            commit_sha: Sha::parse("a".repeat(40)).unwrap(),
-        };
-        assert!(success.is_success());
-        assert!(success.is_ok());
-        assert!(!success.is_conflict());
-
-        let conflict = MergeResult::Conflict {
-            conflicting_files: vec!["foo.rs".to_string()],
-        };
-        assert!(!conflict.is_success());
-        assert!(!conflict.is_ok());
-        assert!(conflict.is_conflict());
-
-        let up_to_date = MergeResult::AlreadyUpToDate;
-        assert!(!up_to_date.is_success());
-        assert!(up_to_date.is_ok());
-        assert!(!up_to_date.is_conflict());
     }
 }

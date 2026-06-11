@@ -3,24 +3,22 @@
 //! This module defines effect types that describe operations without executing them.
 //! This enables:
 //! - Pure core logic that returns effects as data
-//! - Testability via mock interpreters
+//! - Testability without I/O
 //! - Logging/tracing of intended operations
 //! - Recovery by knowing what was attempted
 //!
-//! Interpreters that execute these effects are defined in later stages.
+//! GitHub effects are executed by `crate::github::interpret_github_effect`.
 
 use serde::{Deserialize, Serialize};
 
 pub mod git;
 pub mod github;
-pub mod interpreter;
 
 pub use git::{GitEffect, GitResponse, MergeStrategy};
 pub use github::{
     BranchProtectionData, CommentData, GitHubEffect, GitHubResponse, PrData, Reaction,
     RepoSettingsData, RulesetData,
 };
-pub use interpreter::{GitHubInterpreter, GitInterpreter};
 
 use crate::types::{PrNumber, Sha};
 
@@ -106,19 +104,19 @@ mod tests {
         }
 
         #[test]
-        fn effect_serde_roundtrip_github(_unused in 0u8..1) {
-            let effect = Effect::GitHub(GitHubEffect::GetRepoSettings);
-            let json = serde_json::to_string(&effect).unwrap();
-            let parsed: Effect = serde_json::from_str(&json).unwrap();
-            prop_assert_eq!(effect, parsed);
-        }
-
-        #[test]
         fn effect_serde_roundtrip_record_reconciliation(pr in arb_pr_number(), squash_sha in arb_sha()) {
             let effect = Effect::RecordReconciliation { pr, squash_sha };
             let json = serde_json::to_string(&effect).unwrap();
             let parsed: Effect = serde_json::from_str(&json).unwrap();
             prop_assert_eq!(effect, parsed);
         }
+    }
+
+    #[test]
+    fn effect_serde_roundtrip_github() {
+        let effect = Effect::GitHub(GitHubEffect::GetRepoSettings);
+        let json = serde_json::to_string(&effect).unwrap();
+        let parsed: Effect = serde_json::from_str(&json).unwrap();
+        assert_eq!(effect, parsed);
     }
 }

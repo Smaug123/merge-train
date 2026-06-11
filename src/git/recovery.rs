@@ -15,9 +15,7 @@
 
 use std::path::Path;
 
-use super::{
-    GitConfig, GitError, GitResult, run_git_stdout, run_git_sync, worktree, worktree_path_str,
-};
+use super::{GitConfig, GitResult, run_git_stdout, run_git_sync, worktree_path_str};
 use crate::types::PrNumber;
 
 /// Result of worktree cleanup.
@@ -209,106 +207,26 @@ pub fn is_worktree_dirty(worktree_path: &Path) -> GitResult<bool> {
     }
 }
 
-/// Check if a worktree is in a merge conflict state.
-pub fn has_merge_conflict(worktree_path: &Path) -> GitResult<bool> {
-    if !worktree_path.exists() {
-        return Ok(false);
-    }
-
-    let output = super::git_command(worktree_path)
-        .args(["diff", "--name-only", "--diff-filter=U"])
-        .output()?;
-
-    if !output.status.success() {
-        // If this command fails, we can't determine conflict state
-        return Err(GitError::CommandFailed {
-            command: "git diff --name-only --diff-filter=U".to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        });
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(!stdout.trim().is_empty())
-}
-
-/// Get the status of all worktrees in a repo.
-///
-/// Returns a list of (PrNumber, dirty, age_secs) tuples.
-pub fn get_worktree_statuses(config: &GitConfig) -> GitResult<Vec<(PrNumber, bool, u64)>> {
-    let worktrees = worktree::list_worktrees(config)?;
-    let mut statuses = Vec::new();
-
-    for (pr_number, path) in worktrees {
-        let dirty = is_worktree_dirty(&path).unwrap_or(true);
-        let age = worktree::worktree_age(config, pr_number)?
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        statuses.push((pr_number, dirty, age));
-    }
-
-    Ok(statuses)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::run_git_stdout;
+    use crate::git::test_support::create_test_repo;
     use crate::git::worktree::worktree_for_stack;
-    use crate::git::{GitConfig, run_git_stdout};
-    use std::time::Duration;
-    use tempfile::TempDir;
 
-    /// Create a minimal git repo for testing.
-    fn create_test_repo() -> (TempDir, GitConfig) {
-        let temp_dir = TempDir::new().unwrap();
-        let base_dir = temp_dir.path().to_path_buf();
-
-        let config = GitConfig {
-            base_dir: base_dir.clone(),
-            owner: "test".to_string(),
-            repo: "repo".to_string(),
-            default_branch: "main".to_string(),
-            worktree_max_age: Duration::from_secs(24 * 3600),
-            commit_identity: crate::git::CommitIdentity {
-                name: "Test".to_string(),
-                email: "test@test.com".to_string(),
-                signing_key: None,
-            },
-        };
-
-        // Create the clone directory and initialize a bare repo
-        let clone_dir = config.clone_dir();
-        std::fs::create_dir_all(&clone_dir).unwrap();
-        run_git_sync(&clone_dir, &["init", "--bare"]).unwrap();
-
-        // Create a temporary working repo to make an initial commit
-        let work_dir = temp_dir.path().join("work");
-        std::fs::create_dir_all(&work_dir).unwrap();
-        run_git_sync(&work_dir, &["init"]).unwrap();
-        run_git_sync(&work_dir, &["config", "user.email", "test@test.com"]).unwrap();
-        run_git_sync(&work_dir, &["config", "user.name", "Test"]).unwrap();
-
-        // Create initial commit
-        std::fs::write(work_dir.join("README.md"), "# Test").unwrap();
-        run_git_sync(&work_dir, &["add", "."]).unwrap();
-        run_git_sync(&work_dir, &["commit", "-m", "Initial commit"]).unwrap();
-
-        // Push to the bare repo
-        run_git_sync(
-            &work_dir,
-            &["remote", "add", "origin", clone_dir.to_str().unwrap()],
-        )
-        .unwrap();
-        run_git_sync(&work_dir, &["push", "-u", "origin", "HEAD:main"]).unwrap();
-
-        // Update HEAD in the bare repo
-        run_git_sync(&clone_dir, &["symbolic-ref", "HEAD", "refs/heads/main"]).unwrap();
-
-        (temp_dir, config)
+    /// True if the worktree's index has unmerged (conflicted) entries.
+    fn has_merge_conflict(worktree_path: &Path) -> bool {
+        let output = crate::git::git_command(worktree_path)
+            .args(["diff", "--name-only", "--diff-filter=U"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git diff --diff-filter=U failed");
+        !String::from_utf8_lossy(&output.stdout).trim().is_empty()
     }
 
     #[test]
     fn cleanup_worktree_on_abort_cleans_dirty_state() {
-        let (_temp_dir, config) = create_test_repo();
+        let (_temp_dir, config, _) = create_test_repo();
 
         // Create a worktree and make it dirty
         let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
@@ -337,7 +255,7 @@ mod tests {
 
     #[test]
     fn cleanup_worktree_on_abort_handles_merge_conflict() {
-        let (_temp_dir, config) = create_test_repo();
+        let (_temp_dir, config, _) = create_test_repo();
 
         // Create a worktree
         let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
@@ -360,14 +278,14 @@ mod tests {
         assert!(merge_result.is_err()); // Should fail due to conflict
 
         // Verify we have a conflict
-        assert!(has_merge_conflict(&worktree).unwrap());
+        assert!(has_merge_conflict(&worktree));
 
         // Clean up
         let result = cleanup_worktree_on_abort(&worktree).unwrap();
         assert_eq!(result, CleanupResult::Cleaned);
 
         // Verify clean
-        assert!(!has_merge_conflict(&worktree).unwrap());
+        assert!(!has_merge_conflict(&worktree));
         assert!(!is_worktree_dirty(&worktree).unwrap());
     }
 
@@ -379,7 +297,7 @@ mod tests {
 
     #[test]
     fn cleanup_worktree_on_restart_cleans_dirty() {
-        let (_temp_dir, config) = create_test_repo();
+        let (_temp_dir, config, _) = create_test_repo();
 
         // Create a dirty worktree
         let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
@@ -395,7 +313,7 @@ mod tests {
 
     #[test]
     fn cleanup_worktree_on_restart_handles_missing() {
-        let (_temp_dir, config) = create_test_repo();
+        let (_temp_dir, config, _) = create_test_repo();
 
         // Try to clean a non-existent worktree
         let result = cleanup_worktree_on_restart(&config, PrNumber(999)).unwrap();
@@ -404,7 +322,7 @@ mod tests {
 
     #[test]
     fn is_worktree_dirty_detects_uncommitted_changes() {
-        let (_temp_dir, config) = create_test_repo();
+        let (_temp_dir, config, _) = create_test_repo();
 
         let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
 
@@ -427,7 +345,7 @@ mod tests {
     /// be located through the redirect.
     #[test]
     fn is_worktree_dirty_detects_merge_head_behind_relative_gitdir() {
-        let (_temp_dir, config) = create_test_repo();
+        let (_temp_dir, config, _) = create_test_repo();
         let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
 
         // The linked worktree's gitdir lives under <clone>/worktrees/<name>.
@@ -464,31 +382,8 @@ mod tests {
     }
 
     #[test]
-    fn get_worktree_statuses_lists_all() {
-        let (_temp_dir, config) = create_test_repo();
-
-        // Create some worktrees
-        worktree_for_stack(&config, PrNumber(100)).unwrap();
-        let wt2 = worktree_for_stack(&config, PrNumber(200)).unwrap();
-
-        // Make one dirty
-        std::fs::write(wt2.join("dirty.txt"), "dirty").unwrap();
-
-        let statuses = get_worktree_statuses(&config).unwrap();
-
-        assert_eq!(statuses.len(), 2);
-
-        // Find statuses by PR number
-        let status_100 = statuses.iter().find(|(pr, _, _)| pr.0 == 100).unwrap();
-        let status_200 = statuses.iter().find(|(pr, _, _)| pr.0 == 200).unwrap();
-
-        assert!(!status_100.1); // PR 100 is clean
-        assert!(status_200.1); // PR 200 is dirty
-    }
-
-    #[test]
     fn cleanup_worktree_on_restart_deletes_corrupted() {
-        let (_temp_dir, config) = create_test_repo();
+        let (_temp_dir, config, _) = create_test_repo();
 
         // Create a worktree
         let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
