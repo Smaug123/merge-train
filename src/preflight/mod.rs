@@ -17,6 +17,7 @@ pub mod branch_protection;
 pub mod merge_method;
 
 pub use branch_protection::{
-    DismissStaleApprovalsCheck, DismissStaleApprovalsCheckInput, PreflightWarning,
+    BranchProtectionInput, DismissStaleApprovalsCheck, DismissStaleApprovalsCheckInput,
+    DismissStaleInputError, PreflightWarning, RulesetsInput,
 };
 pub use merge_method::{PreflightError, check_merge_method_preflight};
