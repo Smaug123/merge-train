@@ -387,6 +387,7 @@ pub fn recover(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::persistence::fsync::fault;
     use crate::persistence::generation::write_generation;
     use crate::persistence::snapshot::save_snapshot_atomic;
     use crate::test_utils::arb_state_event_payload;
@@ -692,6 +693,76 @@ mod tests {
         }
     }
 
+    /// Records the instrumented filesystem-op sequence of one successful
+    /// [`PersistenceHandle::compact`] on a fresh state directory with
+    /// `num_events` appended events.
+    ///
+    /// Fault-driven tests locate their target op index in this recording
+    /// (made on an identical setup) instead of hardcoding it, so they don't
+    /// silently drift when the compaction procedure changes shape.
+    fn record_compact_ops(num_events: u64) -> Vec<fault::RecordedOp> {
+        let dir = tempdir().unwrap();
+        let recovered = recover(dir.path(), "main").unwrap();
+        let mut snapshot = recovered.snapshot;
+        let mut handle = recovered.handle;
+        for i in 0..num_events {
+            handle.append(payload(i)).unwrap();
+        }
+        snapshot.next_seq = handle.next_seq();
+
+        // Armed strictly around the compact call: appends and recover
+        // perform instrumented ops of their own.
+        let guard = fault::arm(fault::FaultMode::Record);
+        compact_clean(&mut handle, &mut snapshot);
+        guard.take_recording()
+    }
+
+    /// Index of `write_generation`'s tmp-file fsync within a recorded
+    /// compact: the `FsyncFile` immediately preceding the rename onto
+    /// `generation`.
+    fn write_generation_tmp_fsync_index(ops: &[fault::RecordedOp]) -> usize {
+        let rename_idx = ops
+            .iter()
+            .position(|op| {
+                op.kind == fault::OpKind::Rename
+                    && op.path.file_name() == Some(std::ffi::OsStr::new("generation"))
+            })
+            .expect("a successful compact must rename onto the generation file");
+        let idx = rename_idx
+            .checked_sub(1)
+            .expect("the generation rename cannot be the first op");
+        assert_eq!(
+            ops[idx].kind,
+            fault::OpKind::FsyncFile,
+            "the op before the generation rename must be the tmp-file fsync"
+        );
+        idx
+    }
+
+    #[test]
+    fn compact_op_sequence_is_pinned() {
+        // The fault-driven tests below sweep or target indices within the
+        // op-stream of a compact. Pin the stream's shape so a change to the
+        // compaction procedure updates those tests knowingly rather than
+        // silently shifting every fault index.
+        use fault::OpKind::*;
+        let ops = record_compact_ops(3);
+        let kinds: Vec<fault::OpKind> = ops.iter().map(|op| op.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                // save_snapshot_atomic(snapshot.<N+1>): fsync tmp, rename, fsync dir
+                FsyncFile, Rename, FsyncDir,
+                // write_generation(N+1): fsync tmp, rename, fsync dir
+                FsyncFile, Rename, FsyncDir,
+                // delete_old_generation(N): unlink snapshot, unlink log, fsync dir
+                RemoveFile, RemoveFile, FsyncDir,
+                // the handle reopens (creates) the new generation's log
+                FsyncDir,
+            ]
+        );
+    }
+
     #[test]
     fn append_after_compaction_is_durable() {
         // Regression test: compacting used to leave a live log handle
@@ -853,6 +924,13 @@ mod tests {
         // file still points at N. An append through a still-usable handle
         // would land in events.<N>.log, which the next recovery deletes when
         // it promotes the orphan: the handle must poison itself instead.
+        //
+        // Induced with a dead disk (FailFrom) starting at write_generation's
+        // tmp-file fsync: the generation update fails before its rename, and
+        // the orphan's rollback unlink then fails too. The injected unlink
+        // failure suppresses the unlink itself, so the orphan survives.
+        let fail_from = write_generation_tmp_fsync_index(&record_compact_ops(3));
+
         let dir = tempdir().unwrap();
 
         let recovered = recover(dir.path(), "main").unwrap();
@@ -864,9 +942,11 @@ mod tests {
         }
         snapshot.next_seq = handle.next_seq();
 
-        crate::persistence::compaction::fault_injection::FAIL_NEXT_COMMIT_AND_ROLLBACK
-            .with(|f| f.set(true));
+        let guard = fault::arm(fault::FaultMode::FailFrom(fail_from));
         let err = handle.compact(&mut snapshot).unwrap_err();
+        // Disarm before the post-failure probes and final recovery below:
+        // the dead disk ends with the failed compact.
+        drop(guard);
         assert!(
             matches!(err, CompactionError::RollbackFailed { .. }),
             "got {:?}",

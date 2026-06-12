@@ -24,7 +24,7 @@ use std::path::Path;
 
 use thiserror::Error;
 
-use super::fsync::{fsync_dir, fsync_file};
+use super::fsync::{fsync_dir, fsync_file, remove_file, rename};
 
 /// Errors that can occur during generation file operations.
 #[derive(Debug, Error)]
@@ -92,7 +92,7 @@ pub fn write_generation(state_dir: &Path, generation: u64) -> Result<()> {
     }
 
     // Atomic rename
-    std::fs::rename(&tmp_path, &path)?;
+    rename(&tmp_path, &path)?;
 
     // fsync directory
     fsync_dir(state_dir)?;
@@ -120,12 +120,12 @@ pub fn delete_old_generation(state_dir: &Path, generation: u64) -> Result<()> {
     let events = events_path(state_dir, generation);
 
     // Only ignore NotFound errors - propagate other errors
-    match std::fs::remove_file(&snapshot) {
+    match remove_file(&snapshot) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
-    match std::fs::remove_file(&events) {
+    match remove_file(&events) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),

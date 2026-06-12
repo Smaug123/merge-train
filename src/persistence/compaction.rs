@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use super::event::StateEvent;
-use super::fsync::fsync_dir;
+use super::fsync::{fsync_dir, remove_file};
 use super::generation::{
     GenerationFileKind, delete_old_generation, events_path, find_current_snapshot,
     list_generation_files, read_generation, snapshot_path, write_generation,
@@ -351,22 +351,6 @@ pub(crate) fn compact(
         ));
     }
 
-    // Test-only fault injection: simulate the generation-file update failing
-    // with the orphan's rollback also failing. The double failure cannot be
-    // induced portably through the real filesystem, but the disk state it
-    // leaves behind can: the orphan snapshot is already durably on disk at
-    // this point and the generation file is untouched.
-    #[cfg(test)]
-    if fault_injection::FAIL_NEXT_COMMIT_AND_ROLLBACK.with(|f| f.take()) {
-        return Err(CompactionError::RollbackFailed {
-            snapshot_path: new_snapshot_path,
-            original: Box::new(CompactionError::Io(io::Error::other(
-                "injected generation update failure",
-            ))),
-            rollback_error: io::Error::other("injected rollback failure"),
-        });
-    }
-
     // 4. Update generation file (atomic)
     // This is the commit point - once this completes, the new generation is active.
     // If this fails, we must clean up the orphaned snapshot to prevent data loss:
@@ -396,20 +380,6 @@ pub(crate) fn compact(
     }
 }
 
-/// Test-only fault injection for [`compact`].
-#[cfg(test)]
-pub(super) mod fault_injection {
-    use std::cell::Cell;
-
-    thread_local! {
-        /// When set, the next [`super::compact`] call fails its generation
-        /// file update with the orphaned snapshot's rollback also failing
-        /// (the [`super::CompactionError::RollbackFailed`] state), after the
-        /// orphan snapshot really has been written to disk.
-        pub static FAIL_NEXT_COMMIT_AND_ROLLBACK: Cell<bool> = const { Cell::new(false) };
-    }
-}
-
 /// Removes the (possibly existing) orphaned `snapshot.<N+1>` after a failed
 /// snapshot write or generation-file update, returning the error `compact`
 /// should report.
@@ -425,7 +395,7 @@ fn rollback_orphaned_snapshot(
     orphaned_snapshot: &Path,
     original: CompactionError,
 ) -> CompactionError {
-    let removed = match std::fs::remove_file(orphaned_snapshot) {
+    let removed = match remove_file(orphaned_snapshot) {
         Ok(()) => Ok(()),
         // Already gone: the rollback is trivially complete.
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),

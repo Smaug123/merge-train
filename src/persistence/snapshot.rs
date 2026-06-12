@@ -28,7 +28,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::fsync::{fsync_dir, fsync_file};
+use super::fsync::{fsync_dir, fsync_file, rename};
 use crate::types::{CachedPr, PrNumber, TrainRecord};
 
 /// Current schema version. Increment when making breaking changes.
@@ -149,7 +149,7 @@ pub fn save_snapshot_atomic(path: &Path, snapshot: &PersistedRepoSnapshot) -> Re
     }
 
     // Atomic rename
-    std::fs::rename(&tmp_path, path)?;
+    rename(&tmp_path, path)?;
 
     // fsync directory to ensure rename is durable
     if let Some(parent) = path.parent() {
