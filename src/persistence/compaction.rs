@@ -36,8 +36,8 @@ use thiserror::Error;
 use super::event::StateEvent;
 use super::fsync::{fsync_dir, remove_file};
 use super::generation::{
-    GenerationFileKind, delete_old_generation, events_path, find_current_snapshot,
-    list_generation_files, read_generation, snapshot_path, write_generation,
+    GenerationFileKind, WriteGenerationError, delete_old_generation, events_path,
+    find_current_snapshot, list_generation_files, read_generation, snapshot_path, write_generation,
 };
 use super::log::{EventLog, EventLogError};
 use super::snapshot::{PersistedRepoSnapshot, load_snapshot, save_snapshot_atomic};
@@ -52,6 +52,11 @@ pub enum CompactionError {
     /// Generation file error.
     #[error("generation error: {0}")]
     Generation(#[from] super::generation::GenerationError),
+
+    /// Generation file write error, carrying its position relative to the
+    /// commit point; see [`WriteGenerationError`].
+    #[error("generation write error: {0}")]
+    WriteGeneration(#[from] WriteGenerationError),
 
     /// Snapshot error.
     #[error("snapshot error: {0}")]
@@ -2550,14 +2555,16 @@ mod tests {
         );
     }
 
-    /// Tests that compact() properly rolls back when write_generation() fails.
+    /// Tests that compact() rolls the orphaned snapshot back when
+    /// write_generation() fails before its commit point (`NotCommitted`).
     ///
-    /// Uses fault injection: creating generation.tmp as a directory causes
-    /// write_generation() to fail when opening the temp file for writing,
-    /// while save_snapshot_atomic() succeeds (writes to a different file).
-    ///
-    /// This verifies the rollback code at lines 137-141 of compact():
-    /// - On write_generation failure, the orphaned snapshot is deleted
+    /// Creating generation.tmp as a directory causes write_generation() to
+    /// fail when opening the temp file for writing — well before the rename,
+    /// so the failure is a clean abort — while save_snapshot_atomic()
+    /// succeeds (it writes to a different file), leaving an orphan to roll
+    /// back. Verifies, through the real filesystem:
+    /// - On a NotCommitted write_generation failure, the orphaned snapshot
+    ///   is deleted
     /// - The in-memory snapshot remains unchanged
     /// - The original generation's files remain intact
     #[cfg(unix)]
@@ -2587,8 +2594,14 @@ mod tests {
         // 3. Call compact() - should fail but rollback the orphaned snapshot
         let result = compact(dir.path(), &mut snapshot);
         assert!(
-            result.is_err(),
-            "compact should fail when generation.tmp is a directory"
+            matches!(
+                result,
+                Err(CompactionError::WriteGeneration(
+                    WriteGenerationError::NotCommitted(_)
+                ))
+            ),
+            "compact must report the pre-commit write_generation failure, got {:?}",
+            result
         );
 
         // 4. Verify rollback: snapshot.2.json should NOT exist

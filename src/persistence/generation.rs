@@ -41,6 +41,33 @@ pub enum GenerationError {
 /// Result type for generation file operations.
 pub type Result<T> = std::result::Result<T, GenerationError>;
 
+/// Errors from [`write_generation`], split by whether the failure happened
+/// before or after the commit point (the rename onto `generation`).
+///
+/// The split exists because callers must react differently: an uncommitted
+/// failure leaves the old generation authoritative and is safe to retry or
+/// roll back from, while an ambiguous failure means the new generation may
+/// already be in force and nothing it depends on may be destroyed.
+#[derive(Debug, Error)]
+pub enum WriteGenerationError {
+    /// The update failed at or before its rename: the `generation` file is
+    /// untouched and still holds the previous value. (POSIX guarantees a
+    /// failed rename changes nothing; this guarantee leans on that.) A stale
+    /// `generation.tmp` may remain; it is harmless — the next write
+    /// truncates it, and startup cleanup removes it.
+    #[error("generation update failed before commit: {0}")]
+    NotCommitted(#[source] io::Error),
+
+    /// The rename succeeded but the directory fsync after it failed: the
+    /// live filesystem namespace already shows the new value, and whether it
+    /// survives a crash is unknown (after a failed fsync the state of the
+    /// page cache is undefined). The caller must treat the new generation as
+    /// possibly committed: neither assume the old value is still in force,
+    /// nor destroy state the new value depends on.
+    #[error("generation update ambiguous: renamed but directory fsync failed: {0}")]
+    Ambiguous(#[source] io::Error),
+}
+
 /// Reads the current generation number from the generation file.
 ///
 /// Returns `Ok(0)` if the file doesn't exist (fresh state directory).
@@ -71,14 +98,30 @@ pub fn read_generation(state_dir: &Path) -> Result<u64> {
 /// Uses the write-to-temp-then-rename pattern:
 /// 1. Write to `generation.tmp`
 /// 2. fsync the file
-/// 3. Rename to `generation`
+/// 3. Rename to `generation` — **the commit point**
 /// 4. fsync the directory
-pub fn write_generation(state_dir: &Path, generation: u64) -> Result<()> {
+///
+/// # Failure position
+///
+/// The error reports which side of the commit point the failure fell on,
+/// because the two states demand different reactions (see
+/// [`WriteGenerationError`]): on [`NotCommitted`] the `generation` file
+/// still holds the old value and the caller may retry or cleanly undo
+/// work that depended on the new one; on [`Ambiguous`] the new value is
+/// already live in the filesystem namespace and may or may not survive a
+/// crash, so the caller must act as if it committed.
+///
+/// [`NotCommitted`]: WriteGenerationError::NotCommitted
+/// [`Ambiguous`]: WriteGenerationError::Ambiguous
+pub fn write_generation(
+    state_dir: &Path,
+    generation: u64,
+) -> std::result::Result<(), WriteGenerationError> {
     let path = state_dir.join("generation");
     let tmp_path = state_dir.join("generation.tmp");
 
     // Ensure directory exists
-    std::fs::create_dir_all(state_dir)?;
+    std::fs::create_dir_all(state_dir).map_err(WriteGenerationError::NotCommitted)?;
 
     // Write to temp file
     {
@@ -86,16 +129,18 @@ pub fn write_generation(state_dir: &Path, generation: u64) -> Result<()> {
             .write(true)
             .create(true)
             .truncate(true)
-            .open(&tmp_path)?;
-        writeln!(file, "{}", generation)?;
-        fsync_file(&file)?;
+            .open(&tmp_path)
+            .map_err(WriteGenerationError::NotCommitted)?;
+        writeln!(file, "{}", generation).map_err(WriteGenerationError::NotCommitted)?;
+        fsync_file(&file).map_err(WriteGenerationError::NotCommitted)?;
     }
 
-    // Atomic rename
-    rename(&tmp_path, &path)?;
+    // Atomic rename: the commit point.
+    rename(&tmp_path, &path).map_err(WriteGenerationError::NotCommitted)?;
 
-    // fsync directory
-    fsync_dir(state_dir)?;
+    // fsync directory. A failure here is not a clean abort: the rename has
+    // already changed the live namespace.
+    fsync_dir(state_dir).map_err(WriteGenerationError::Ambiguous)?;
 
     Ok(())
 }

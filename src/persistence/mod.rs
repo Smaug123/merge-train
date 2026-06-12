@@ -51,8 +51,8 @@ pub use compaction::{CompactionError, CompactionOutcome, should_compact};
 pub use event::{StateEvent, StateEventPayload};
 pub use fsync::{fsync_dir, fsync_file};
 pub use generation::{
-    GenerationFileKind, delete_old_generation, events_path, find_current_snapshot, read_generation,
-    snapshot_path, write_generation,
+    GenerationFileKind, WriteGenerationError, delete_old_generation, events_path,
+    find_current_snapshot, read_generation, snapshot_path, write_generation,
 };
 pub use log::EventLog;
 pub use pruning::{PruneConfig, prune_snapshot};
