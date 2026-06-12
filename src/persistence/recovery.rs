@@ -22,10 +22,12 @@ use std::path::{Path, PathBuf};
 use fs2::FileExt;
 use thiserror::Error;
 
-use super::compaction::{CompactionError, cleanup_stale_generations};
+use super::compaction::{
+    CompactionError, cleanup_stale_generations, validate_snapshot_against_log,
+};
 use super::event::StateEvent;
 use super::generation::{GenerationError, events_path, read_generation, snapshot_path};
-use super::log::{EventLog, EventLogError};
+use super::log::EventLog;
 use super::snapshot::{PersistedRepoSnapshot, SnapshotError, try_load_snapshot};
 
 /// Name of the lock file inside the state directory.
@@ -61,10 +63,6 @@ pub enum RecoverError {
     #[error("snapshot error: {0}")]
     Snapshot(#[from] SnapshotError),
 
-    /// Event log error.
-    #[error("event log error: {0}")]
-    EventLog(#[from] EventLogError),
-
     /// The generation file points at a generation with no snapshot file.
     /// Compaction writes the snapshot before advancing the generation file,
     /// so a missing snapshot at a non-zero generation means it was deleted.
@@ -86,34 +84,6 @@ pub enum RecoverError {
         path: PathBuf,
         snapshot_generation: u64,
         disk_generation: u64,
-    },
-
-    /// The event log is shorter than the snapshot's recorded `log_position`:
-    /// bytes the snapshot has seen as durable are gone.
-    #[error(
-        "event log {} is {file_len} bytes but the snapshot's log_position is {log_position}; \
-         the log has lost data; manual intervention required",
-        path.display()
-    )]
-    LogTruncated {
-        path: PathBuf,
-        log_position: u64,
-        file_len: u64,
-    },
-
-    /// The snapshot's `next_seq` does not line up with the events found in
-    /// the log: events are missing or duplicated across snapshot and log.
-    #[error(
-        "sequence mismatch in {}: snapshot next_seq is {snapshot_next_seq} and {replayed} \
-         events were replayed after it, but the log implies next_seq {log_next_seq}; \
-         manual intervention required",
-        path.display()
-    )]
-    SequenceMismatch {
-        path: PathBuf,
-        snapshot_next_seq: u64,
-        replayed: usize,
-        log_next_seq: u64,
     },
 }
 
@@ -210,10 +180,11 @@ pub fn recover(
     let lock = StateDirLock::acquire(state_dir)?;
 
     // Step 2: settle generations. This semantically validates the surviving
-    // snapshot (it loads and describes the generation it is stored as) and
-    // refuses states showing a committed generation's snapshot was lost,
-    // all before deleting anything; then repairs the generation file and
-    // removes stale generations and temp files.
+    // snapshot (it loads, describes the generation it is stored as, and is
+    // consistent with its event log) and refuses states showing a committed
+    // generation's snapshot was lost, all before deleting anything; then
+    // repairs the generation file and removes stale generations and temp
+    // files.
     cleanup_stale_generations(state_dir)?;
 
     // Step 3: load the snapshot for the settled generation.
@@ -240,57 +211,15 @@ pub fn recover(
         }
     };
 
-    // Step 4: replay events from the snapshot's position.
-    let log_path = events_path(state_dir, generation);
-    let file_len = match std::fs::metadata(&log_path) {
-        Ok(m) => m.len(),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
-        Err(e) => return Err(e.into()),
-    };
-    if snapshot.log_position > file_len {
-        return Err(RecoverError::LogTruncated {
-            path: log_path,
-            log_position: snapshot.log_position,
-            file_len,
-        });
-    }
-    let (events, log_next_seq) = EventLog::replay_from(&log_path, snapshot.log_position)?;
-
-    // Replay may truncate a torn tail write, but it must never cut below the
-    // snapshot's position: those bytes were durable, complete events when the
-    // snapshot recorded them.
-    let file_len_after = match std::fs::metadata(&log_path) {
-        Ok(m) => m.len(),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
-        Err(e) => return Err(e.into()),
-    };
-    if snapshot.log_position > file_len_after {
-        return Err(RecoverError::LogTruncated {
-            path: log_path,
-            log_position: snapshot.log_position,
-            file_len: file_len_after,
-        });
-    }
-
-    // Cross-check: events in the log after the snapshot's position must carry
-    // exactly the sequence numbers the snapshot expects next. A log with no
-    // events at all carries no evidence either way (a fresh generation's log
-    // starts empty with next_seq carried over from the previous generation),
-    // so only a non-empty log is checked.
-    let next_seq = if log_next_seq == 0 {
-        snapshot.next_seq
-    } else if log_next_seq == snapshot.next_seq + events.len() as u64 {
-        log_next_seq
-    } else {
-        return Err(RecoverError::SequenceMismatch {
-            path: log_path,
-            snapshot_next_seq: snapshot.next_seq,
-            replayed: events.len(),
-            log_next_seq,
-        });
-    };
+    // Step 4: replay events from the snapshot's position, with the shared
+    // log-consistency checks (log at least `log_position` bytes long,
+    // sequence numbers lining up with `next_seq`). Generation settling
+    // already applied these checks to the candidate before deleting
+    // anything; this run is the backstop, and produces the replayed events.
+    let (events, next_seq) = validate_snapshot_against_log(state_dir, &snapshot)?;
 
     // Step 5: open the log for appending with the replay-derived next_seq.
+    let log_path = events_path(state_dir, generation);
     let log = EventLog::open_with_seq(&log_path, next_seq)?;
 
     Ok(RecoveredState {
@@ -486,9 +415,18 @@ mod tests {
         std::fs::write(events_path(dir.path(), 0), b"").unwrap();
 
         let result = recover(dir.path(), "main");
+        // Generation settling already refuses this candidate (before it
+        // would delete anything); recover applies the same shared check to
+        // the settled generation as a backstop.
         assert!(
-            matches!(result, Err(RecoverError::LogTruncated { .. })),
-            "log shorter than snapshot.log_position must be a hard error"
+            matches!(
+                result,
+                Err(RecoverError::Compaction(
+                    CompactionError::LogTruncated { .. }
+                ))
+            ),
+            "log shorter than snapshot.log_position must be a hard error, got {:?}",
+            result.as_ref().map(|_| "Ok").map_err(|e| e.to_string())
         );
     }
 
@@ -515,8 +453,16 @@ mod tests {
         drop(file);
 
         let result = recover(dir.path(), "main");
+        // Generation settling already refuses this candidate (before it
+        // would delete anything); recover applies the same shared check to
+        // the settled generation as a backstop.
         assert!(
-            matches!(result, Err(RecoverError::SequenceMismatch { .. })),
+            matches!(
+                result,
+                Err(RecoverError::Compaction(
+                    CompactionError::SequenceMismatch { .. }
+                ))
+            ),
             "snapshot/log next_seq disagreement must be a hard error, got {:?}",
             result.as_ref().map(|_| "Ok").map_err(|e| e.to_string())
         );

@@ -19,8 +19,9 @@
 //!
 //! On startup (via `cleanup_stale_generations`):
 //! 1. Scan for the highest existing snapshot generation (handles crash during compaction)
-//! 2. Semantically validate that snapshot, and refuse (deleting nothing) any state
-//!    showing a committed generation's snapshot was lost
+//! 2. Semantically validate that snapshot — including against its event log,
+//!    with the same checks recovery applies — and refuse (deleting nothing)
+//!    any state showing a committed generation's snapshot was lost
 //! 3. If the generation file is stale, missing, or corrupt, restore it to match the
 //!    highest snapshot
 //! 4. Load the snapshot for the current generation
@@ -32,6 +33,7 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+use super::event::StateEvent;
 use super::fsync::fsync_dir;
 use super::generation::{
     GenerationFileKind, delete_old_generation, events_path, find_current_snapshot,
@@ -147,6 +149,34 @@ pub enum CompactionError {
         path: PathBuf,
         snapshot_generation: u64,
         file_generation: u64,
+    },
+
+    /// The event log is shorter than the snapshot's recorded `log_position`:
+    /// bytes the snapshot has seen as durable are gone.
+    #[error(
+        "event log {} is {file_len} bytes but the snapshot's log_position is {log_position}; \
+         the log has lost data; manual intervention required",
+        path.display()
+    )]
+    LogTruncated {
+        path: PathBuf,
+        log_position: u64,
+        file_len: u64,
+    },
+
+    /// The snapshot's `next_seq` does not line up with the events found in
+    /// the log: events are missing or duplicated across snapshot and log.
+    #[error(
+        "sequence mismatch in {}: snapshot next_seq is {snapshot_next_seq} and {replayed} \
+         events were replayed after it, but the log implies next_seq {log_next_seq}; \
+         manual intervention required",
+        path.display()
+    )]
+    SequenceMismatch {
+        path: PathBuf,
+        snapshot_next_seq: u64,
+        replayed: usize,
+        log_next_seq: u64,
     },
 
     /// FATAL: the generation file update failed AND removing the orphaned
@@ -355,6 +385,76 @@ fn rollback_orphaned_snapshot(
     }
 }
 
+/// Validates a snapshot against its generation's on-disk event log, returning
+/// the events recorded after the snapshot's `log_position` and the next
+/// sequence number to append with.
+///
+/// These are the log-consistency checks recovery applies before trusting a
+/// generation: the log must be at least `log_position` bytes long (before and
+/// after replay's torn-tail repair), replay must not report uncharacterizable
+/// corruption, and the replayed events must carry exactly the sequence
+/// numbers the snapshot expects next. `cleanup_stale_generations` applies
+/// them to the candidate snapshot before committing to it, so a candidate
+/// that recovery would reject can never cause the older generations to be
+/// deleted; `recover` then applies them to the settled generation as the
+/// backstop (and to consume the replayed events).
+///
+/// The only file mutation this can perform is `EventLog::replay_from`'s
+/// torn-tail truncation of the log.
+pub(super) fn validate_snapshot_against_log(
+    state_dir: &Path,
+    snapshot: &PersistedRepoSnapshot,
+) -> Result<(Vec<StateEvent>, u64)> {
+    let log_path = events_path(state_dir, snapshot.log_generation);
+    let file_len = match std::fs::metadata(&log_path) {
+        Ok(m) => m.len(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
+        Err(e) => return Err(e.into()),
+    };
+    if snapshot.log_position > file_len {
+        return Err(CompactionError::LogTruncated {
+            path: log_path,
+            log_position: snapshot.log_position,
+            file_len,
+        });
+    }
+    let (events, log_next_seq) = EventLog::replay_from(&log_path, snapshot.log_position)?;
+
+    // Replay may truncate a torn tail write, but it must never cut below the
+    // snapshot's position: those bytes were durable, complete events when the
+    // snapshot recorded them.
+    let file_len_after = match std::fs::metadata(&log_path) {
+        Ok(m) => m.len(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
+        Err(e) => return Err(e.into()),
+    };
+    if snapshot.log_position > file_len_after {
+        return Err(CompactionError::LogTruncated {
+            path: log_path,
+            log_position: snapshot.log_position,
+            file_len: file_len_after,
+        });
+    }
+
+    // Cross-check: events in the log after the snapshot's position must carry
+    // exactly the sequence numbers the snapshot expects next. A log with no
+    // events at all carries no evidence either way (a fresh generation's log
+    // starts empty with next_seq carried over from the previous generation),
+    // so only a non-empty log is checked.
+    if log_next_seq == 0 {
+        Ok((events, snapshot.next_seq))
+    } else if log_next_seq == snapshot.next_seq + events.len() as u64 {
+        Ok((events, log_next_seq))
+    } else {
+        Err(CompactionError::SequenceMismatch {
+            path: log_path,
+            snapshot_next_seq: snapshot.next_seq,
+            replayed: events.len(),
+            log_next_seq,
+        })
+    }
+}
+
 /// Cleans up stale generation files that may remain from interrupted compaction.
 ///
 /// This should be called during startup to ensure a clean state.
@@ -379,10 +479,14 @@ fn rollback_orphaned_snapshot(
 ///
 /// The highest-generation snapshot is semantically validated **before** the
 /// generation file is touched or anything is deleted: it must deserialize,
-/// and its embedded `log_generation` must agree with the generation it is
-/// stored as (the same hard check `recover` applies afterwards). A candidate
-/// that fails validation means the state is uncharacterizable: this function
-/// fails loudly and deletes nothing, preserving the last good generation.
+/// its embedded `log_generation` must agree with the generation it is stored
+/// as, and it must be consistent with its own event log (`log_position`
+/// within the log, `next_seq` matching replay) — the same hard checks
+/// `recover` applies afterwards. A candidate that fails validation means the
+/// state is uncharacterizable: this function fails loudly and deletes
+/// nothing, preserving the last good generation. (The one file mutation a
+/// failed cleanup may perform is replay's torn-tail truncation of the
+/// candidate's log, the same repair recovery itself performs.)
 ///
 /// # Lost committed generations
 ///
@@ -466,6 +570,12 @@ pub fn cleanup_stale_generations(state_dir: &Path) -> Result<()> {
                     file_generation: max_gen,
                 });
             }
+            // The candidate must also be consistent with its own event log:
+            // recovery failing LogTruncated/SequenceMismatch after the
+            // deletion loop below has run would leave nothing to fall back
+            // to. The replayed events are discarded here; recovery re-derives
+            // them from the settled generation.
+            let _ = validate_snapshot_against_log(state_dir, &candidate)?;
             // If there's a mismatch or corruption, update the generation file to be consistent
             if max_gen != file_gen || gen_file_corrupt {
                 write_generation(state_dir, max_gen)?;
@@ -623,6 +733,32 @@ mod tests {
             Just(SnapshotState::Valid),
             (0u64..8).prop_map(SnapshotState::ClaimsGeneration),
             Just(SnapshotState::Corrupt),
+        ]
+    }
+
+    /// Ways the candidate generation's snapshot/log pair can be damaged (or
+    /// not) after being built through the real `EventLog` API.
+    #[derive(Debug, Clone, Copy)]
+    enum LogTamper {
+        /// Leave the pair exactly as written: consistent.
+        Intact,
+        /// Delete the log file outright.
+        DeleteLog,
+        /// Truncate the log to half the snapshot's `log_position`.
+        TruncateBelowPosition,
+        /// Overstate the snapshot's `next_seq` by one.
+        OverstateNextSeq,
+        /// Append a torn tail write (partial JSON, no trailing newline).
+        TornTail,
+    }
+
+    fn arb_log_tamper() -> impl Strategy<Value = LogTamper> {
+        prop_oneof![
+            Just(LogTamper::Intact),
+            Just(LogTamper::DeleteLog),
+            Just(LogTamper::TruncateBelowPosition),
+            Just(LogTamper::OverstateNextSeq),
+            Just(LogTamper::TornTail),
         ]
     }
 
@@ -1360,6 +1496,117 @@ mod tests {
             }
         }
 
+        /// Cleanup commits to the candidate generation (rewriting the
+        /// generation file and deleting every other generation) only when the
+        /// candidate will pass recovery's log-consistency checks: a successful
+        /// cleanup implies a successful recovery, and a failed cleanup leaves
+        /// the older generation and the generation file untouched.
+        ///
+        /// This is the regression property for the bug where a candidate with
+        /// valid JSON but unsatisfiable log metadata (log_position past the
+        /// log, next_seq disagreeing with replay) was promoted, the fallback
+        /// generation deleted, and recovery then failed with nothing left.
+        #[test]
+        fn cleanup_commits_only_to_recoverable_state(
+            applied in 0u64..4,
+            extra in 0u64..4,
+            tamper in arb_log_tamper(),
+        ) {
+            use crate::persistence::event::StateEventPayload;
+            use crate::persistence::log::EventLog;
+
+            let dir = tempdir().unwrap();
+
+            // Older valid generation 1: the fallback that must survive a refusal.
+            let mut old = create_snapshot_with_train(100);
+            old.log_generation = 1;
+            save_snapshot_atomic(&snapshot_path(dir.path(), 1), &old).unwrap();
+            File::create(events_path(dir.path(), 1)).unwrap();
+            write_generation(dir.path(), 1).unwrap();
+
+            // Candidate generation 2, built through the real log API:
+            // `applied` events folded into the snapshot (its log_position is
+            // past them), `extra` events appended after the snapshot.
+            let mut candidate = create_test_snapshot();
+            candidate.log_generation = 2;
+            {
+                let mut log =
+                    EventLog::open_with_seq(events_path(dir.path(), 2), 0).unwrap();
+                for i in 0..applied {
+                    log.append(StateEventPayload::TrainStarted {
+                        root_pr: PrNumber(i),
+                        current_pr: PrNumber(i),
+                    })
+                    .unwrap();
+                }
+                candidate.log_position = log.position().unwrap();
+                candidate.next_seq = applied;
+                for i in applied..applied + extra {
+                    log.append(StateEventPayload::TrainStarted {
+                        root_pr: PrNumber(i),
+                        current_pr: PrNumber(i),
+                    })
+                    .unwrap();
+                }
+            }
+            match tamper {
+                LogTamper::Intact => {}
+                LogTamper::DeleteLog => {
+                    std::fs::remove_file(events_path(dir.path(), 2)).unwrap();
+                }
+                LogTamper::TruncateBelowPosition => {
+                    let file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(events_path(dir.path(), 2))
+                        .unwrap();
+                    file.set_len(candidate.log_position / 2).unwrap();
+                }
+                LogTamper::OverstateNextSeq => candidate.next_seq += 1,
+                LogTamper::TornTail => {
+                    let mut file = std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(events_path(dir.path(), 2))
+                        .unwrap();
+                    write!(file, "{{\"seq\":").unwrap();
+                }
+            }
+            save_snapshot_atomic(&snapshot_path(dir.path(), 2), &candidate).unwrap();
+
+            match cleanup_stale_generations(dir.path()) {
+                Ok(()) => {
+                    // Cleanup committed and deleted the fallback: the
+                    // surviving generation must actually be recoverable.
+                    let recovered =
+                        crate::persistence::recovery::recover(dir.path(), "main");
+                    prop_assert!(
+                        recovered.is_ok(),
+                        "cleanup committed to generation 2 and deleted the \
+                         fallback, but recovery then failed: {:?}",
+                        recovered.err().map(|e| e.to_string())
+                    );
+                }
+                Err(_) => {
+                    prop_assert!(
+                        snapshot_path(dir.path(), 1).exists(),
+                        "a failed cleanup must preserve the fallback snapshot"
+                    );
+                    prop_assert!(
+                        events_path(dir.path(), 1).exists(),
+                        "a failed cleanup must preserve the fallback event log"
+                    );
+                    prop_assert!(
+                        snapshot_path(dir.path(), 2).exists(),
+                        "a failed cleanup must not delete the candidate"
+                    );
+                    prop_assert_eq!(
+                        read_generation(dir.path()).unwrap(),
+                        1,
+                        "a failed cleanup must not rewrite the generation file"
+                    );
+                }
+            }
+        }
+
         // ─── Error handling properties ───
 
         /// Property: If compact returns Err, the in-memory snapshot is unchanged.
@@ -1834,6 +2081,211 @@ mod tests {
             1,
             "the generation file must be untouched"
         );
+    }
+
+    #[test]
+    fn cleanup_refuses_when_candidate_log_position_past_log() {
+        // snapshot.2.json deserializes and describes generation 2, but its
+        // log_position points past the end of events.2.log (here: the log is
+        // missing entirely, so its length is 0). Recovery would reject this
+        // generation as LogTruncated; promoting it and deleting generation 1
+        // first would destroy the only recoverable fallback.
+        let dir = tempdir().unwrap();
+
+        // Valid generation 1 state: the fallback that must survive.
+        let mut snapshot = create_snapshot_with_train(100);
+        snapshot.log_generation = 1;
+        save_snapshot_atomic(&snapshot_path(dir.path(), 1), &snapshot).unwrap();
+        File::create(events_path(dir.path(), 1)).unwrap();
+        write_generation(dir.path(), 1).unwrap();
+
+        // Candidate at generation 2 whose log metadata is unsatisfiable.
+        let mut candidate = create_test_snapshot();
+        candidate.log_generation = 2;
+        candidate.log_position = 100;
+        save_snapshot_atomic(&snapshot_path(dir.path(), 2), &candidate).unwrap();
+
+        let result = cleanup_stale_generations(dir.path());
+        assert!(
+            matches!(
+                result,
+                Err(CompactionError::LogTruncated {
+                    log_position: 100,
+                    file_len: 0,
+                    ..
+                })
+            ),
+            "cleanup must reject a candidate whose log_position points past \
+             its event log, got {:?}",
+            result
+        );
+
+        assert!(
+            snapshot_path(dir.path(), 1).exists(),
+            "the last good snapshot must survive"
+        );
+        assert!(
+            events_path(dir.path(), 1).exists(),
+            "the last good event log must survive"
+        );
+        assert!(
+            snapshot_path(dir.path(), 2).exists(),
+            "nothing may be deleted, not even the bad candidate"
+        );
+        assert_eq!(
+            read_generation(dir.path()).unwrap(),
+            1,
+            "the generation file must not be promoted to the bad candidate"
+        );
+    }
+
+    #[test]
+    fn cleanup_refuses_when_candidate_next_seq_disagrees_with_log() {
+        // events.2.log holds events with seqs 0..3, but snapshot.2.json claims
+        // next_seq 5 at log_position 0: recovery would reject this generation
+        // as SequenceMismatch. Cleanup must apply the same check before
+        // deleting the older generation.
+        use crate::persistence::event::StateEventPayload;
+
+        let dir = tempdir().unwrap();
+
+        let mut snapshot = create_snapshot_with_train(100);
+        snapshot.log_generation = 1;
+        save_snapshot_atomic(&snapshot_path(dir.path(), 1), &snapshot).unwrap();
+        File::create(events_path(dir.path(), 1)).unwrap();
+        write_generation(dir.path(), 1).unwrap();
+
+        let mut candidate = create_test_snapshot();
+        candidate.log_generation = 2;
+        candidate.next_seq = 5;
+        save_snapshot_atomic(&snapshot_path(dir.path(), 2), &candidate).unwrap();
+        {
+            let mut log = EventLog::open_with_seq(events_path(dir.path(), 2), 0).unwrap();
+            for i in 0..3 {
+                log.append(StateEventPayload::TrainStarted {
+                    root_pr: PrNumber(i),
+                    current_pr: PrNumber(i),
+                })
+                .unwrap();
+            }
+        }
+
+        let result = cleanup_stale_generations(dir.path());
+        assert!(
+            matches!(
+                result,
+                Err(CompactionError::SequenceMismatch {
+                    snapshot_next_seq: 5,
+                    replayed: 3,
+                    log_next_seq: 3,
+                    ..
+                })
+            ),
+            "cleanup must reject a candidate whose next_seq disagrees with \
+             its event log, got {:?}",
+            result
+        );
+
+        assert!(
+            snapshot_path(dir.path(), 1).exists(),
+            "the last good snapshot must survive"
+        );
+        assert!(
+            events_path(dir.path(), 1).exists(),
+            "the last good event log must survive"
+        );
+        assert_eq!(
+            read_generation(dir.path()).unwrap(),
+            1,
+            "the generation file must not be promoted to the bad candidate"
+        );
+    }
+
+    #[test]
+    fn cleanup_refuses_when_candidate_log_corrupt_mid_file() {
+        // events.2.log has a garbage line FOLLOWED by a valid event: not a
+        // torn tail write, so replay reports uncharacterizable corruption.
+        // Cleanup must surface that error before deleting anything.
+        let dir = tempdir().unwrap();
+
+        let mut snapshot = create_snapshot_with_train(100);
+        snapshot.log_generation = 1;
+        save_snapshot_atomic(&snapshot_path(dir.path(), 1), &snapshot).unwrap();
+        File::create(events_path(dir.path(), 1)).unwrap();
+        write_generation(dir.path(), 1).unwrap();
+
+        let mut candidate = create_test_snapshot();
+        candidate.log_generation = 2;
+        save_snapshot_atomic(&snapshot_path(dir.path(), 2), &candidate).unwrap();
+        std::fs::write(
+            events_path(dir.path(), 2),
+            concat!(
+                r#"{"seq":0,"ts":"2024-01-01T00:00:00Z","type":"train_completed","root_pr":1}"#,
+                "\n",
+                "not json\n",
+                r#"{"seq":1,"ts":"2024-01-01T00:00:00Z","type":"train_completed","root_pr":1}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let result = cleanup_stale_generations(dir.path());
+        assert!(
+            matches!(result, Err(CompactionError::EventLog(_))),
+            "cleanup must reject a candidate whose log is corrupt mid-file, got {:?}",
+            result
+        );
+
+        assert!(
+            snapshot_path(dir.path(), 1).exists(),
+            "the last good snapshot must survive"
+        );
+        assert!(
+            events_path(dir.path(), 1).exists(),
+            "the last good event log must survive"
+        );
+        assert_eq!(
+            read_generation(dir.path()).unwrap(),
+            1,
+            "the generation file must not be promoted to the bad candidate"
+        );
+    }
+
+    #[test]
+    fn cleanup_accepts_candidate_with_consistent_nonempty_log() {
+        // The candidate's log holds events 0..3 and the snapshot says
+        // next_seq 0 at log_position 0: replay accounts for every event, so
+        // the candidate is exactly what recovery will accept. Cleanup must
+        // promote it and delete the older generation.
+        use crate::persistence::event::StateEventPayload;
+
+        let dir = tempdir().unwrap();
+
+        write_valid_snapshot(dir.path(), 1);
+        File::create(events_path(dir.path(), 1)).unwrap();
+        write_generation(dir.path(), 1).unwrap();
+
+        let mut candidate = create_test_snapshot();
+        candidate.log_generation = 2;
+        save_snapshot_atomic(&snapshot_path(dir.path(), 2), &candidate).unwrap();
+        {
+            let mut log = EventLog::open_with_seq(events_path(dir.path(), 2), 0).unwrap();
+            for i in 0..3 {
+                log.append(StateEventPayload::TrainStarted {
+                    root_pr: PrNumber(i),
+                    current_pr: PrNumber(i),
+                })
+                .unwrap();
+            }
+        }
+
+        cleanup_stale_generations(dir.path()).unwrap();
+
+        assert!(!snapshot_path(dir.path(), 1).exists());
+        assert!(!events_path(dir.path(), 1).exists());
+        assert!(snapshot_path(dir.path(), 2).exists());
+        assert!(events_path(dir.path(), 2).exists());
+        assert_eq!(read_generation(dir.path()).unwrap(), 2);
     }
 
     #[test]
