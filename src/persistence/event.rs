@@ -31,16 +31,6 @@ pub struct StateEvent {
 }
 
 impl StateEvent {
-    /// Creates a new event with the given sequence number and payload.
-    /// Timestamp is set to the current time.
-    pub fn new(seq: u64, payload: StateEventPayload) -> Self {
-        StateEvent {
-            seq,
-            ts: Utc::now(),
-            payload,
-        }
-    }
-
     /// Returns true if this event requires immediate fsync.
     ///
     /// Critical events must be durable before the operation proceeds:

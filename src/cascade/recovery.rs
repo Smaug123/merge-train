@@ -682,13 +682,11 @@ pub fn apply_recovery_plan(
                     });
                 }
             }
-            RecoveryAction::NeedsManualReview { reason } => {
-                // Only set ApiError if we don't already have a more specific reason
-                if abort_reason.is_none() {
-                    abort_reason = Some(AbortReason::ApiError {
-                        details: reason.clone(),
-                    });
-                }
+            // Only set ApiError if we don't already have a more specific reason
+            RecoveryAction::NeedsManualReview { reason } if abort_reason.is_none() => {
+                abort_reason = Some(AbortReason::ApiError {
+                    details: reason.clone(),
+                });
             }
             _ => {
                 // Other actions don't affect the recovery state directly

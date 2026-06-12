@@ -24,11 +24,11 @@ use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::fsync::{fsync_dir, fsync_file};
+use super::fsync::{fsync_dir, fsync_file, rename};
 use crate::types::{CachedPr, PrNumber, TrainRecord};
 
 /// Current schema version. Increment when making breaking changes.
@@ -108,11 +108,6 @@ impl PersistedRepoSnapshot {
         }
     }
 
-    /// Checks if the snapshot is stale (older than the given threshold).
-    pub fn is_stale(&self, threshold: Duration) -> bool {
-        Utc::now() - self.snapshot_at > threshold
-    }
-
     /// Updates the `snapshot_at` timestamp to now.
     pub fn touch(&mut self) {
         self.snapshot_at = Utc::now();
@@ -154,7 +149,7 @@ pub fn save_snapshot_atomic(path: &Path, snapshot: &PersistedRepoSnapshot) -> Re
     }
 
     // Atomic rename
-    std::fs::rename(&tmp_path, path)?;
+    rename(&tmp_path, path)?;
 
     // fsync directory to ensure rename is durable
     if let Some(parent) = path.parent() {
@@ -400,21 +395,6 @@ mod tests {
         assert!(snapshot.prs.is_empty());
         assert!(snapshot.active_trains.is_empty());
         assert!(snapshot.seen_dedupe_keys.is_empty());
-    }
-
-    #[test]
-    fn is_stale_works() {
-        let mut snapshot = PersistedRepoSnapshot::new("main");
-
-        // Fresh snapshot is not stale
-        assert!(!snapshot.is_stale(Duration::hours(1)));
-
-        // Snapshot from 2 hours ago is stale with 1 hour threshold
-        snapshot.snapshot_at = Utc::now() - Duration::hours(2);
-        assert!(snapshot.is_stale(Duration::hours(1)));
-
-        // But not with 3 hour threshold
-        assert!(!snapshot.is_stale(Duration::hours(3)));
     }
 
     #[test]

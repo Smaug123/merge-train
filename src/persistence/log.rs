@@ -7,15 +7,25 @@
 //!
 //! # Recovery
 //!
-//! On startup:
-//! 1. Load snapshot to get `log_position`
-//! 2. Call `replay_from(path, log_position)` to replay events
-//! 3. If final line is incomplete, it's truncated automatically
+//! On startup, use [`super::recovery::recover`]: it loads the snapshot, calls
+//! [`EventLog::replay_from`] from the snapshot's `log_position`, and opens the
+//! log with the replay-derived `next_seq`. Only garbage with no valid event
+//! after it (a torn tail write) is repaired, by truncation; any other
+//! inconsistency (mid-file corruption, sequence gaps) is uncharacterizable
+//! and is a hard error.
 //!
 //! # fsync Strategy
 //!
 //! - Critical events: `sync_all()` immediately after write
 //! - Non-critical events: No fsync (caller batches)
+//!
+//! # Poisoning
+//!
+//! If a write or fsync fails during [`EventLog::append`], bytes of unknown
+//! extent may be on disk while `next_seq` was not incremented: a subsequent
+//! append would write a duplicate sequence number, which replay then rejects
+//! as corruption. The log therefore poisons itself on any write/fsync failure
+//! and refuses all further operations; the process must restart and recover.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Seek, SeekFrom, Write};
@@ -38,9 +48,48 @@ pub enum EventLogError {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
-    /// Sequence number mismatch during replay.
-    #[error("sequence mismatch: expected {expected}, got {got}")]
-    SequenceMismatch { expected: u64, got: u64 },
+    /// A sequence gap during replay: events were assigned sequence numbers
+    /// and are gone. There is no sound repair (truncation would not bring
+    /// the missing events back), so this is always a hard error.
+    #[error(
+        "sequence gap in event log {}: expected seq {expected}, got {got}; \
+         events are missing; manual intervention required",
+        path.display()
+    )]
+    SequenceGap {
+        path: PathBuf,
+        expected: u64,
+        got: u64,
+    },
+
+    /// A bad line (unparsable, invalid UTF-8, or non-monotonic sequence
+    /// number) followed by later valid events. This is not a torn tail
+    /// write, so truncating would silently destroy the later events:
+    /// uncharacterizable corruption is a hard error and nothing is repaired.
+    #[error(
+        "uncharacterizable corruption in event log {} at byte {offset}: {reason} is \
+         followed by later valid events, so this is not a torn tail write; refusing \
+         to repair; manual intervention required",
+        path.display()
+    )]
+    Corrupted {
+        path: PathBuf,
+        offset: u64,
+        reason: &'static str,
+    },
+
+    /// The log was poisoned: this handle no longer describes durable state.
+    /// Either a write/fsync failed (bytes of unknown extent may be on disk
+    /// while `next_seq` was not incremented, so any further append could
+    /// write a duplicate sequence number), or a compaction committed but the
+    /// new generation's log could not be opened (this handle's file is the
+    /// old generation's deleted log).
+    #[error(
+        "event log {} is poisoned by an earlier failure; refusing further \
+         operations; restart and recover",
+        path.display()
+    )]
+    PoisonedLog { path: PathBuf },
 }
 
 /// Result type for event log operations.
@@ -57,51 +106,32 @@ pub struct EventLog {
     path: PathBuf,
     /// Next sequence number to assign.
     next_seq: u64,
+    /// Set when a write or fsync fails. A failed write may leave bytes of
+    /// unknown extent on disk while `next_seq` was not incremented, so any
+    /// further append could write a duplicate sequence number. Once poisoned,
+    /// all operations fail with [`EventLogError::PoisonedLog`].
+    poisoned: bool,
+    /// Test-only fault injection: the next write performs a partial write
+    /// and then fails.
+    #[cfg(test)]
+    fail_next_write: bool,
 }
 
 impl EventLog {
-    /// Opens an existing log file or creates a new one.
+    /// Opens an existing log file or creates a new one, with a known next
+    /// sequence number.
     ///
-    /// If the file exists, it's opened for append. The `next_seq` is set to 0;
-    /// call `replay_from` to determine the actual next sequence number.
-    ///
-    /// If the file doesn't exist, it's created and the parent directory is
-    /// fsynced to ensure the new file survives a crash.
-    pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
-        let path = path.as_ref().to_path_buf();
-        let is_new = !path.exists();
-
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(&path)?;
-
-        // Seek to EOF so that position() returns the correct offset.
-        // Files opened with append(true) may have cursor at 0 until first write.
-        file.seek(SeekFrom::End(0))?;
-
-        // fsync the parent directory when creating a new file to ensure the
-        // directory entry is durable. Without this, a crash could lose the file
-        // even if its contents were fsynced.
-        if is_new && let Some(parent) = path.parent() {
-            fsync_dir(parent)?;
-        }
-
-        Ok(EventLog {
-            file,
-            path,
-            next_seq: 0,
-        })
-    }
-
-    /// Opens an existing log file or creates a new one, with a known next sequence number.
-    ///
-    /// Use this after calling `replay_from` to create a log ready for appending.
+    /// Crate-private on purpose: opening an existing log with the wrong
+    /// `next_seq` writes duplicate sequence numbers, which replay then
+    /// rejects as corruption. From outside this crate the log is reachable
+    /// only through [`super::recovery::PersistenceHandle`]: its constructor
+    /// [`super::recovery::recover`] derives `next_seq` from replay, and
+    /// [`super::recovery::PersistenceHandle::compact`] swaps the handle to
+    /// the new generation's log.
     ///
     /// If the file doesn't exist, it's created and the parent directory is
     /// fsynced to ensure the new file survives a crash.
-    pub fn open_with_seq(path: impl AsRef<Path>, next_seq: u64) -> io::Result<Self> {
+    pub(crate) fn open_with_seq(path: impl AsRef<Path>, next_seq: u64) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         let is_new = !path.exists();
 
@@ -126,6 +156,9 @@ impl EventLog {
             file,
             path,
             next_seq,
+            poisoned: false,
+            #[cfg(test)]
+            fail_next_write: false,
         })
     }
 
@@ -134,66 +167,95 @@ impl EventLog {
     /// The event is assigned the next sequence number and the current timestamp.
     /// If the payload is critical, fsync is called immediately after writing.
     ///
+    /// On any write or fsync failure the log is poisoned (see
+    /// [`EventLogError::PoisonedLog`]) and all subsequent operations fail.
+    ///
     /// Returns the complete event that was written.
     pub fn append(&mut self, payload: StateEventPayload) -> Result<StateEvent> {
+        if self.poisoned {
+            return Err(EventLogError::PoisonedLog {
+                path: self.path.clone(),
+            });
+        }
+
         let event = StateEvent {
             seq: self.next_seq,
             ts: Utc::now(),
             payload,
         };
 
-        // Serialize to JSON and write with newline
+        // Serialization happens before any bytes reach the file, so a failure
+        // here leaves the log clean and does not poison it.
         let json = serde_json::to_string(&event)?;
-        writeln!(self.file, "{}", json)?;
 
-        // fsync if critical
-        if event.is_critical() {
-            fsync_file(&self.file)?;
+        // From here on, a failure may have left bytes of unknown extent on
+        // disk while next_seq is un-incremented: a retry or subsequent append
+        // would write a duplicate sequence number. Poison the log.
+        if let Err(e) = self.write_line(&json) {
+            self.poisoned = true;
+            return Err(e.into());
+        }
+
+        // fsync if critical. An fsync failure means the durability of the
+        // just-written bytes (and possibly earlier ones) is unknown: poison.
+        if event.is_critical()
+            && let Err(e) = fsync_file(&self.file)
+        {
+            self.poisoned = true;
+            return Err(e.into());
         }
 
         self.next_seq += 1;
         Ok(event)
     }
 
-    /// Appends an event with explicit fsync control.
-    ///
-    /// Use this when you want to override the default fsync behavior,
-    /// such as when batching non-critical events before a manual sync.
-    pub fn append_with_sync(
-        &mut self,
-        payload: StateEventPayload,
-        sync: bool,
-    ) -> Result<StateEvent> {
-        let event = StateEvent {
-            seq: self.next_seq,
-            ts: Utc::now(),
-            payload,
-        };
-
-        // Serialize to JSON and write with newline
-        let json = serde_json::to_string(&event)?;
-        writeln!(self.file, "{}", json)?;
-
-        if sync {
-            fsync_file(&self.file)?;
+    /// Writes a single JSON line to the file (with test-only fault injection).
+    fn write_line(&mut self, json: &str) -> io::Result<()> {
+        #[cfg(test)]
+        if self.fail_next_write {
+            self.fail_next_write = false;
+            // Simulate a torn write: some bytes reach the file, then the
+            // write fails.
+            self.file.write_all(&json.as_bytes()[..json.len() / 2])?;
+            return Err(io::Error::other("injected write failure"));
         }
-
-        self.next_seq += 1;
-        Ok(event)
+        writeln!(self.file, "{}", json)
     }
 
     /// Forces fsync of the log file.
     ///
     /// Call this after batching multiple non-critical events.
-    pub fn sync(&self) -> io::Result<()> {
-        fsync_file(&self.file)
+    ///
+    /// On fsync failure the durability of previously written events is
+    /// unknown, so the log is poisoned.
+    pub fn sync(&mut self) -> Result<()> {
+        if self.poisoned {
+            return Err(EventLogError::PoisonedLog {
+                path: self.path.clone(),
+            });
+        }
+        if let Err(e) = fsync_file(&self.file) {
+            self.poisoned = true;
+            return Err(e.into());
+        }
+        Ok(())
     }
 
     /// Returns the current byte position in the log file.
     ///
-    /// This is used to record `log_position` in snapshots.
-    pub fn position(&mut self) -> io::Result<u64> {
-        self.file.stream_position()
+    /// This is used to record `log_position` in snapshots, so a poisoned
+    /// log refuses it like every other operation: after a failed write the
+    /// file may hold a torn tail beyond the last durable event, and
+    /// recording such an offset as a snapshot's `log_position` would make
+    /// the next recovery fail (its torn-tail truncation would cut the log
+    /// below the snapshot's position).
+    pub fn position(&mut self) -> Result<u64> {
+        if self.poisoned {
+            return Err(EventLogError::PoisonedLog {
+                path: self.path.clone(),
+            });
+        }
+        Ok(self.file.stream_position()?)
     }
 
     /// Returns the next sequence number that will be assigned.
@@ -204,6 +266,23 @@ impl EventLog {
     /// Returns the path to the log file.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Whether the log is poisoned (see [`EventLogError::PoisonedLog`]).
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    /// Poisons the log so all further operations fail with
+    /// [`EventLogError::PoisonedLog`].
+    ///
+    /// For when this handle is known to no longer describe durable state
+    /// even though no write failed: after a committed compaction, this
+    /// handle's file is the old generation's deleted log, so if the new
+    /// generation's log cannot be opened the handle must refuse appends
+    /// rather than silently write to an unlinked file.
+    pub(crate) fn poison(&mut self) {
+        self.poisoned = true;
     }
 
     /// Replays events from a byte offset, truncating any partial line at EOF.
@@ -231,18 +310,24 @@ impl EventLog {
     /// correct recovery when `offset` is at or past EOF (e.g., when replaying
     /// from a snapshot's `log_position`).
     ///
-    /// # Truncation
+    /// # Truncation (torn tail writes only)
     ///
-    /// If the final line doesn't parse as valid JSON (crash mid-write),
-    /// the file is truncated at the start of that line. This ensures
-    /// the log always contains a valid prefix of events.
+    /// Garbage at EOF with no valid event after it (partial JSON, invalid
+    /// UTF-8, a non-monotonic sequence number as the final record) is the
+    /// signature of a torn tail write: the file is truncated back to the end
+    /// of the last valid event. This is the *only* repair this function
+    /// performs (plus appending a missing final newline).
     ///
-    /// # Crash recovery
+    /// # Hard errors (uncharacterizable corruption)
     ///
-    /// This function handles several crash scenarios:
-    /// - Partial JSON (crash mid-write): truncated
-    /// - Valid JSON without trailing newline (crash between JSON and newline): newline appended
-    /// - Invalid UTF-8 (crash mid-multibyte character): treated as corruption, truncated
+    /// - A bad line (unparsable, invalid UTF-8, or non-monotonic sequence
+    ///   number) **followed by later valid events** is not a torn tail write;
+    ///   truncating would silently destroy the later events. Returns
+    ///   [`EventLogError::Corrupted`] without modifying the file.
+    /// - A **sequence gap** (`seq > prev + 1`) means events were assigned and
+    ///   are gone; truncation cannot bring them back. Returns
+    ///   [`EventLogError::SequenceGap`] without modifying the file, even if
+    ///   the gapped event is the final record.
     pub fn replay_from(path: impl AsRef<Path>, offset: u64) -> Result<(Vec<StateEvent>, u64)> {
         let path = path.as_ref();
 
@@ -270,6 +355,11 @@ impl EventLog {
         let mut current_pos = 0u64;
         let mut max_seq: Option<u64> = None;
         let mut last_line_had_newline = true;
+        // Offset and description of the first bad line (unparsable, invalid
+        // UTF-8, or non-monotonic seq), if any. Such a line is repairable
+        // torn-tail garbage only if NO valid event follows it; a later valid
+        // event upgrades it to uncharacterizable corruption (hard error).
+        let mut first_bad: Option<(u64, &'static str)> = None;
 
         loop {
             // Read bytes until newline to handle invalid UTF-8 gracefully
@@ -288,13 +378,9 @@ impl EventLog {
             let has_newline = line_bytes.last() == Some(&b'\n');
 
             // Try to convert to UTF-8
-            let line = match std::str::from_utf8(&line_bytes) {
-                Ok(s) => s,
-                Err(_) => {
-                    // Invalid UTF-8 - treat as corruption. Don't update last_valid_pos;
-                    // it already points to the end of the last valid event.
-                    break;
-                }
+            let Ok(line) = std::str::from_utf8(&line_bytes) else {
+                first_bad.get_or_insert((line_start, "an invalid-UTF-8 line"));
+                continue;
             };
 
             // Skip empty/whitespace-only lines without advancing last_valid_pos.
@@ -307,45 +393,51 @@ impl EventLog {
             }
 
             // Try to parse as JSON
-            match serde_json::from_str::<StateEvent>(trimmed) {
-                Ok(event) => {
-                    // Validate sequence number is monotonically increasing
-                    if max_seq.is_some_and(|prev_max| event.seq <= prev_max) {
-                        // Non-monotonic sequence - this is corruption
-                        // Truncate at this line
-                        break;
-                    }
-                    // Warn on gaps - doesn't require truncation (events are still valid),
-                    // but indicates a logic bug in the writer
-                    if let Some(prev) = max_seq
-                        && event.seq != prev + 1
-                    {
-                        tracing::warn!(
-                            prev,
-                            current = event.seq,
-                            path = %path.display(),
-                            "sequence gap detected in event log - possible logic bug"
-                        );
-                    }
-                    max_seq = Some(event.seq);
-                    // Only collect events from the requested offset onwards
-                    if line_start >= offset {
-                        events.push(event);
-                    }
-                    last_valid_pos = current_pos;
-                    last_line_had_newline = has_newline;
-                }
-                Err(_) => {
-                    // Invalid JSON - partial write from a crash.
-                    // Don't update last_valid_pos; it already points to the end
-                    // of the last valid event. Any skipped empty lines between
-                    // that event and this garbage will be truncated too.
-                    break;
-                }
+            let Ok(event) = serde_json::from_str::<StateEvent>(trimmed) else {
+                first_bad.get_or_insert((line_start, "an unparsable line"));
+                continue;
+            };
+
+            // A valid event after a bad line: the bad line is not torn-tail
+            // garbage, so there is no sound repair.
+            if let Some((bad_offset, reason)) = first_bad {
+                return Err(EventLogError::Corrupted {
+                    path: path.to_path_buf(),
+                    offset: bad_offset,
+                    reason,
+                });
             }
+
+            match max_seq {
+                Some(prev) if event.seq <= prev => {
+                    // Non-monotonic sequence: as the final record it is torn-tail
+                    // garbage (truncate); followed by a valid event it is
+                    // corruption (the check above fires on that event).
+                    first_bad = Some((line_start, "a non-monotonic sequence number"));
+                    continue;
+                }
+                Some(prev) if event.seq != prev + 1 => {
+                    // Sequence gap: events are missing. No repair is sound.
+                    return Err(EventLogError::SequenceGap {
+                        path: path.to_path_buf(),
+                        expected: prev + 1,
+                        got: event.seq,
+                    });
+                }
+                _ => {}
+            }
+
+            max_seq = Some(event.seq);
+            // Only collect events from the requested offset onwards
+            if line_start >= offset {
+                events.push(event);
+            }
+            last_valid_pos = current_pos;
+            last_line_had_newline = has_newline;
         }
 
-        // Determine if we need to modify the file
+        // Everything after last_valid_pos (bad lines and blank lines with no
+        // valid event after them) is torn-tail garbage: truncate it.
         let needs_truncation = last_valid_pos < file_len;
         let needs_newline = !needs_truncation && !last_line_had_newline && file_len > 0;
 
@@ -375,6 +467,11 @@ mod tests {
     use std::io::Write;
     use tempfile::tempdir;
 
+    /// Opens a fresh (not yet existing) log for tests.
+    fn open_log(path: &Path) -> EventLog {
+        EventLog::open_with_seq(path, 0).unwrap()
+    }
+
     // ─── Basic functionality tests ───
 
     #[test]
@@ -383,7 +480,7 @@ mod tests {
         let path = dir.path().join("events.log");
 
         assert!(!path.exists());
-        let _log = EventLog::open(&path).unwrap();
+        let _log = open_log(&path);
         assert!(path.exists());
     }
 
@@ -392,7 +489,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("events.log");
 
-        let mut log = EventLog::open(&path).unwrap();
+        let mut log = open_log(&path);
         log.append(StateEventPayload::TrainStarted {
             root_pr: PrNumber(123),
             current_pr: PrNumber(123),
@@ -417,7 +514,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("events.log");
 
-        let mut log = EventLog::open(&path).unwrap();
+        let mut log = open_log(&path);
 
         for i in 0..5 {
             let event = log
@@ -432,6 +529,146 @@ mod tests {
         assert_eq!(log.next_seq(), 5);
     }
 
+    // ─── Poisoning tests ───
+
+    #[test]
+    fn failed_append_poisons_log() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.log");
+
+        let mut log = open_log(&path);
+        log.append(StateEventPayload::TrainStarted {
+            root_pr: PrNumber(1),
+            current_pr: PrNumber(1),
+        })
+        .unwrap();
+
+        // Inject a torn write: bytes hit the disk, then the write fails.
+        log.fail_next_write = true;
+        let err = log
+            .append(StateEventPayload::TrainStopped {
+                root_pr: PrNumber(1),
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, EventLogError::Io(_)),
+            "the failing append itself reports the IO error, got {:?}",
+            err
+        );
+
+        // The log is now poisoned: the failed append left bytes on disk while
+        // next_seq was not incremented, so another append would write a
+        // duplicate sequence number. All further operations must refuse.
+        let err = log
+            .append(StateEventPayload::TrainStopped {
+                root_pr: PrNumber(1),
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, EventLogError::PoisonedLog { .. }),
+            "append after a failed write must report PoisonedLog, got {:?}",
+            err
+        );
+
+        let err = log.sync().unwrap_err();
+        assert!(
+            matches!(err, EventLogError::PoisonedLog { .. }),
+            "sync after a failed write must report PoisonedLog, got {:?}",
+            err
+        );
+
+        // The torn bytes really are on disk (the scenario poisoning guards
+        // against), and recovery repairs them as a torn tail write.
+        drop(log);
+        let (events, next_seq) = EventLog::replay_from(&path, 0).unwrap();
+        assert_eq!(events.len(), 1, "only the complete event survives");
+        assert_eq!(next_seq, 1);
+
+        // After recovery the log is usable again with no duplicate seq.
+        let mut log = EventLog::open_with_seq(&path, next_seq).unwrap();
+        let event = log
+            .append(StateEventPayload::TrainStopped {
+                root_pr: PrNumber(1),
+            })
+            .unwrap();
+        assert_eq!(event.seq, 1);
+        drop(log);
+        let (events, next_seq) = EventLog::replay_from(&path, 0).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(next_seq, 2);
+    }
+
+    #[test]
+    fn position_fails_on_poisoned_log() {
+        // The hazard: a torn append leaves bytes on disk past the last
+        // durable event. If position() still reported the (advanced) file
+        // offset and a snapshot recorded it as log_position, the next
+        // recovery would truncate the torn tail below that position and
+        // fail with LogTruncated.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.log");
+
+        let mut log = open_log(&path);
+        log.append(StateEventPayload::TrainStarted {
+            root_pr: PrNumber(1),
+            current_pr: PrNumber(1),
+        })
+        .unwrap();
+        let safe_position = log.position().unwrap();
+
+        log.fail_next_write = true;
+        let _ = log
+            .append(StateEventPayload::TrainStopped {
+                root_pr: PrNumber(1),
+            })
+            .unwrap_err();
+
+        let err = log.position().unwrap_err();
+        assert!(
+            matches!(err, EventLogError::PoisonedLog { .. }),
+            "position after a failed write must report PoisonedLog, got {:?}",
+            err
+        );
+
+        // The torn bytes really do extend past the last safe position (the
+        // offset position() would have leaked), and recovery from the safe
+        // position still works.
+        let file_len = std::fs::metadata(&path).unwrap().len();
+        assert!(file_len > safe_position);
+        drop(log);
+        let (events, next_seq) = EventLog::replay_from(&path, safe_position).unwrap();
+        assert!(events.is_empty());
+        assert_eq!(next_seq, 1);
+    }
+
+    #[test]
+    fn poisoned_log_does_not_write_duplicate_seq() {
+        // Without poisoning, the sequence "append fails -> append succeeds"
+        // writes two records with the same seq, which replay then rejects as
+        // corruption. Poisoning turns that silent corruption into a loud
+        // refusal at the second append.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.log");
+
+        let mut log = open_log(&path);
+        log.fail_next_write = true;
+        let _ = log
+            .append(StateEventPayload::TrainStarted {
+                root_pr: PrNumber(1),
+                current_pr: PrNumber(1),
+            })
+            .unwrap_err();
+        assert_eq!(log.next_seq(), 0, "failed append must not advance next_seq");
+
+        let err = log
+            .append(StateEventPayload::TrainStarted {
+                root_pr: PrNumber(2),
+                current_pr: PrNumber(2),
+            })
+            .unwrap_err();
+        assert!(matches!(err, EventLogError::PoisonedLog { .. }));
+    }
+
     // ─── Property tests ───
 
     proptest! {
@@ -442,7 +679,7 @@ mod tests {
             let path = dir.path().join("events.log");
 
             // Write events
-            let mut log = EventLog::open(&path).unwrap();
+            let mut log = open_log(&path);
             let mut written_events = Vec::new();
             for payload in &payloads {
                 let event = log.append(payload.clone()).unwrap();
@@ -469,7 +706,7 @@ mod tests {
             let path = dir.path().join("events.log");
 
             // Write events, recording position after each
-            let mut log = EventLog::open(&path).unwrap();
+            let mut log = open_log(&path);
             let mut positions = vec![0u64]; // Position before first event
 
             for payload in &payloads {
@@ -507,7 +744,7 @@ mod tests {
             let path = dir.path().join("events.log");
 
             // Write events
-            let mut log = EventLog::open(&path).unwrap();
+            let mut log = open_log(&path);
             for payload in &payloads {
                 log.append(payload.clone()).unwrap();
             }
@@ -538,7 +775,7 @@ mod tests {
             let path = dir.path().join("events.log");
 
             // Write complete events
-            let mut log = EventLog::open(&path).unwrap();
+            let mut log = open_log(&path);
             for payload in &payloads {
                 log.append(payload.clone()).unwrap();
             }
@@ -574,7 +811,7 @@ mod tests {
             let path = dir.path().join("events.log");
 
             // Write events
-            let mut log = EventLog::open(&path).unwrap();
+            let mut log = open_log(&path);
             for payload in &payloads {
                 log.append(payload.clone()).unwrap();
             }
@@ -626,7 +863,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("events.log");
 
-        let mut log = EventLog::open(&path).unwrap();
+        let mut log = open_log(&path);
 
         // Write a critical event
         log.append(StateEventPayload::TrainStarted {
@@ -645,7 +882,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("events.log");
 
-        let mut log = EventLog::open(&path).unwrap();
+        let mut log = open_log(&path);
 
         // Write non-critical events
         for i in 0..10 {
@@ -695,7 +932,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("events.log");
 
-        let mut log = EventLog::open(&path).unwrap();
+        let mut log = open_log(&path);
         log.append(StateEventPayload::TrainStarted {
             root_pr: PrNumber(1),
             current_pr: PrNumber(1),
@@ -722,7 +959,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("events.log");
 
-        let mut log = EventLog::open(&path).unwrap();
+        let mut log = open_log(&path);
         for i in 0..5 {
             log.append(StateEventPayload::TrainStarted {
                 root_pr: PrNumber(i),
@@ -745,7 +982,7 @@ mod tests {
         let path = dir.path().join("events.log");
 
         // Write event, then empty line, then another event
-        let mut log = EventLog::open(&path).unwrap();
+        let mut log = open_log(&path);
         log.append(StateEventPayload::TrainStarted {
             root_pr: PrNumber(1),
             current_pr: PrNumber(1),
@@ -773,12 +1010,12 @@ mod tests {
     }
 
     #[test]
-    fn non_monotonic_sequence_treated_as_corruption() {
+    fn non_monotonic_sequence_followed_by_valid_event_is_hard_error() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("events.log");
 
         // Write two valid events with seq 0 and 1
-        let mut log = EventLog::open(&path).unwrap();
+        let mut log = open_log(&path);
         log.append(StateEventPayload::TrainStarted {
             root_pr: PrNumber(1),
             current_pr: PrNumber(1),
@@ -797,7 +1034,8 @@ mod tests {
             r#"{{"seq":1,"ts":"2024-01-01T00:00:00Z","type":"train_completed","root_pr":1}}"#
         )
         .unwrap();
-        // Also add a valid event after to show we stop at corruption
+        // A valid event follows the corruption: this is NOT a torn tail write,
+        // so truncating would silently destroy the later event.
         writeln!(
             file,
             r#"{{"seq":2,"ts":"2024-01-01T00:00:01Z","type":"train_completed","root_pr":2}}"#
@@ -805,22 +1043,216 @@ mod tests {
         .unwrap();
         drop(file);
 
-        // Replay should stop at the non-monotonic event and truncate
-        let (events, next_seq) = EventLog::replay_from(&path, 0).unwrap();
-        assert_eq!(events.len(), 2, "Should recover only the valid prefix");
-        assert_eq!(next_seq, 2);
-        assert!(matches!(
-            events[0].payload,
-            StateEventPayload::TrainStarted { .. }
-        ));
-        assert!(matches!(
-            events[1].payload,
-            StateEventPayload::TrainStopped { .. }
-        ));
+        let len_before = std::fs::metadata(&path).unwrap().len();
 
-        // File should be truncated to remove corruption
-        let (events_after, _) = EventLog::replay_from(&path, 0).unwrap();
-        assert_eq!(events_after.len(), 2, "File should be truncated");
+        // Replay must refuse: this is uncharacterizable corruption, not a torn write.
+        let result = EventLog::replay_from(&path, 0);
+        assert!(
+            result.is_err(),
+            "non-monotonic seq followed by a valid event must be a hard error, got {:?}",
+            result.map(|(events, next)| (events.len(), next))
+        );
+
+        // No repair may have been attempted: the file must be untouched.
+        let len_after = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(
+            len_before, len_after,
+            "file must not be modified when corruption is uncharacterizable"
+        );
+    }
+
+    #[test]
+    fn non_monotonic_sequence_at_tail_is_truncated() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.log");
+
+        let mut log = open_log(&path);
+        log.append(StateEventPayload::TrainStarted {
+            root_pr: PrNumber(1),
+            current_pr: PrNumber(1),
+        })
+        .unwrap();
+        log.append(StateEventPayload::TrainStopped {
+            root_pr: PrNumber(1),
+        })
+        .unwrap();
+        let valid_len = log.position().unwrap();
+        drop(log);
+
+        // Duplicate seq as the FINAL line: tail garbage, repairable by truncation.
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(
+            file,
+            r#"{{"seq":1,"ts":"2024-01-01T00:00:00Z","type":"train_completed","root_pr":1}}"#
+        )
+        .unwrap();
+        drop(file);
+
+        let (events, next_seq) = EventLog::replay_from(&path, 0).unwrap();
+        assert_eq!(events.len(), 2, "valid prefix should be recovered");
+        assert_eq!(next_seq, 2);
+
+        let len_after = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(len_after, valid_len, "tail garbage should be truncated");
+    }
+
+    #[test]
+    fn mid_file_garbage_followed_by_valid_event_is_hard_error() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.log");
+
+        let mut log = open_log(&path);
+        log.append(StateEventPayload::TrainStarted {
+            root_pr: PrNumber(1),
+            current_pr: PrNumber(1),
+        })
+        .unwrap();
+        drop(log);
+
+        // Garbage line, then a valid event after it.
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file, "this is not json").unwrap();
+        writeln!(
+            file,
+            r#"{{"seq":1,"ts":"2024-01-01T00:00:01Z","type":"train_completed","root_pr":2}}"#
+        )
+        .unwrap();
+        drop(file);
+
+        let len_before = std::fs::metadata(&path).unwrap().len();
+
+        let result = EventLog::replay_from(&path, 0);
+        assert!(
+            result.is_err(),
+            "garbage followed by a valid event must be a hard error, got {:?}",
+            result.map(|(events, next)| (events.len(), next))
+        );
+
+        let len_after = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(len_before, len_after, "file must not be modified");
+    }
+
+    #[test]
+    fn mid_file_invalid_utf8_followed_by_valid_event_is_hard_error() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.log");
+
+        let mut log = open_log(&path);
+        log.append(StateEventPayload::TrainStarted {
+            root_pr: PrNumber(1),
+            current_pr: PrNumber(1),
+        })
+        .unwrap();
+        drop(log);
+
+        // Invalid UTF-8 line, then a valid event after it.
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&[0xF0, 0x9F, b'\n']).unwrap();
+        writeln!(
+            file,
+            r#"{{"seq":1,"ts":"2024-01-01T00:00:01Z","type":"train_completed","root_pr":2}}"#
+        )
+        .unwrap();
+        drop(file);
+
+        let result = EventLog::replay_from(&path, 0);
+        assert!(
+            result.is_err(),
+            "invalid UTF-8 followed by a valid event must be a hard error, got {:?}",
+            result.map(|(events, next)| (events.len(), next))
+        );
+    }
+
+    #[test]
+    fn multi_line_garbage_at_tail_is_truncated() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.log");
+
+        let mut log = open_log(&path);
+        log.append(StateEventPayload::TrainStarted {
+            root_pr: PrNumber(1),
+            current_pr: PrNumber(1),
+        })
+        .unwrap();
+        let valid_len = log.position().unwrap();
+        drop(log);
+
+        // Several garbage lines at the tail, none of which is a valid event:
+        // this is repairable (torn writes / junk at EOF only).
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file, "garbage one").unwrap();
+        file.write_all(&[0xF0, 0x9F, b'\n']).unwrap();
+        write!(file, r#"{{"seq":9,"partial"#).unwrap();
+        drop(file);
+
+        let (events, next_seq) = EventLog::replay_from(&path, 0).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(next_seq, 1);
+
+        let len_after = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(
+            len_after, valid_len,
+            "all tail garbage should be truncated away"
+        );
+    }
+
+    #[test]
+    fn sequence_gap_is_hard_error() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.log");
+
+        // seq 0 then seq 2: events are missing. There is no sound repair.
+        let mut file = File::create(&path).unwrap();
+        writeln!(
+            file,
+            r#"{{"seq":0,"ts":"2024-01-01T00:00:00Z","type":"train_completed","root_pr":1}}"#
+        )
+        .unwrap();
+        writeln!(
+            file,
+            r#"{{"seq":2,"ts":"2024-01-01T00:00:01Z","type":"train_completed","root_pr":2}}"#
+        )
+        .unwrap();
+        drop(file);
+
+        let result = EventLog::replay_from(&path, 0);
+        assert!(
+            result.is_err(),
+            "a sequence gap means events are missing and must be a hard error, got {:?}",
+            result.map(|(events, next)| (events.len(), next))
+        );
+    }
+
+    #[test]
+    fn sequence_gap_at_tail_is_hard_error() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.log");
+
+        // seq 0, seq 1, then seq 5 as the final line. Unlike tail garbage,
+        // truncating the gapped event would not bring back events 2-4;
+        // they were assigned and are gone. Uncharacterizable -> hard error.
+        let mut file = File::create(&path).unwrap();
+        for seq in [0u64, 1] {
+            writeln!(
+                file,
+                r#"{{"seq":{},"ts":"2024-01-01T00:00:00Z","type":"train_completed","root_pr":1}}"#,
+                seq
+            )
+            .unwrap();
+        }
+        writeln!(
+            file,
+            r#"{{"seq":5,"ts":"2024-01-01T00:00:01Z","type":"train_completed","root_pr":2}}"#
+        )
+        .unwrap();
+        drop(file);
+
+        let result = EventLog::replay_from(&path, 0);
+        assert!(
+            result.is_err(),
+            "a sequence gap at the tail must still be a hard error, got {:?}",
+            result.map(|(events, next)| (events.len(), next))
+        );
     }
 
     #[test]
@@ -828,7 +1260,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("events.log");
 
-        let mut log = EventLog::open(&path).unwrap();
+        let mut log = open_log(&path);
 
         // Write a complex PhaseTransition event
         let sha = Sha::parse("a".repeat(40)).unwrap();
@@ -872,7 +1304,7 @@ mod tests {
             let path = dir.path().join("events.log");
 
             // Write initial events
-            let mut log = EventLog::open(&path).unwrap();
+            let mut log = open_log(&path);
             for payload in &initial_payloads {
                 log.append(payload.clone()).unwrap();
             }
@@ -934,7 +1366,7 @@ mod tests {
             // Determine reopen points (indices after which we reopen)
             let reopen_set: std::collections::HashSet<_> = reopen_after.into_iter().collect();
 
-            let mut log = EventLog::open(&path).unwrap();
+            let mut log = open_log(&path);
             let mut next_seq = 0u64;
 
             for (i, payload) in payloads.iter().enumerate() {
@@ -973,6 +1405,54 @@ mod tests {
             }
         }
 
+        /// Every offset position() successfully returns is a safe snapshot
+        /// `log_position`: recovery from that offset succeeds and replays
+        /// exactly the events appended after it — even when a later append
+        /// tears (fails partway through its write) and poisons the log.
+        #[test]
+        fn returned_positions_are_safe_snapshot_positions(
+            payloads in prop::collection::vec(arb_state_event_payload(), 1..8),
+            torn_append in proptest::bool::ANY,
+        ) {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("events.log");
+
+            let mut log = open_log(&path);
+            let mut positions = vec![log.position().unwrap()];
+            for p in &payloads {
+                log.append(p.clone()).unwrap();
+                positions.push(log.position().unwrap());
+            }
+
+            if torn_append {
+                log.fail_next_write = true;
+                let _ = log.append(payloads[0].clone()).unwrap_err();
+                // Once poisoned the log must stop handing out positions:
+                // the file now holds torn bytes beyond the last durable
+                // event, so an offset reported here would record
+                // un-replayable bytes into a snapshot.
+                let position_result = log.position();
+                prop_assert!(
+                    matches!(position_result, Err(EventLogError::PoisonedLog { .. })),
+                    "position on a poisoned log must be refused, got {:?}",
+                    position_result
+                );
+            }
+            drop(log);
+
+            // The first recovery repairs the torn tail (if any); every
+            // offset handed out earlier must then be a valid replay point.
+            let (_, next_seq) = EventLog::replay_from(&path, 0).unwrap();
+            prop_assert_eq!(next_seq, payloads.len() as u64);
+            for (i, offset) in positions.iter().enumerate() {
+                let (events, _) = EventLog::replay_from(&path, *offset).unwrap();
+                prop_assert_eq!(events.len(), payloads.len() - i);
+                for (j, event) in events.iter().enumerate() {
+                    prop_assert_eq!(event.seq, (i + j) as u64);
+                }
+            }
+        }
+
         /// Arbitrary trailing bytes (including invalid UTF-8) do not prevent recovery.
         ///
         /// This property verifies that:
@@ -985,15 +1465,11 @@ mod tests {
             // Generate arbitrary bytes including invalid UTF-8 sequences
             garbage_bytes in prop::collection::vec(prop::num::u8::ANY, 1..100),
         ) {
-            use std::sync::atomic::{AtomicU32, Ordering};
-            static INVALID_UTF8_COUNT: AtomicU32 = AtomicU32::new(0);
-            static TOTAL_COUNT: AtomicU32 = AtomicU32::new(0);
-
             let dir = tempdir().unwrap();
             let path = dir.path().join("events.log");
 
             // Write valid events
-            let mut log = EventLog::open(&path).unwrap();
+            let mut log = open_log(&path);
             for payload in &payloads {
                 log.append(payload.clone()).unwrap();
             }
@@ -1004,13 +1480,6 @@ mod tests {
             {
                 let mut file = OpenOptions::new().append(true).open(&path).unwrap();
                 file.write_all(&garbage_bytes).unwrap();
-            }
-
-            // Track whether we're testing invalid UTF-8
-            let is_invalid_utf8 = std::str::from_utf8(&garbage_bytes).is_err();
-            TOTAL_COUNT.fetch_add(1, Ordering::Relaxed);
-            if is_invalid_utf8 {
-                INVALID_UTF8_COUNT.fetch_add(1, Ordering::Relaxed);
             }
 
             // Recovery must succeed
@@ -1064,23 +1533,6 @@ mod tests {
                 valid_len + 1,
                 new_len
             );
-
-            // After the test suite, verify distribution (on drop would be better but this is simpler)
-            // We check periodically rather than at the end
-            let total = TOTAL_COUNT.load(Ordering::Relaxed);
-            if total > 0 && total.is_multiple_of(100) {
-                let invalid_count = INVALID_UTF8_COUNT.load(Ordering::Relaxed);
-                let invalid_ratio = invalid_count as f64 / total as f64;
-                // Random bytes should produce invalid UTF-8 most of the time
-                // (valid UTF-8 is a small subset of all byte sequences)
-                prop_assert!(
-                    invalid_ratio > 0.5,
-                    "Expected >50% invalid UTF-8 cases, got {:.1}% ({}/{})",
-                    invalid_ratio * 100.0,
-                    invalid_count,
-                    total
-                );
-            }
         }
     }
 
@@ -1096,7 +1548,7 @@ mod tests {
         let path = dir.path().join("events.log");
 
         // Write a valid event
-        let mut log = EventLog::open(&path).unwrap();
+        let mut log = open_log(&path);
         log.append(StateEventPayload::TrainStarted {
             root_pr: PrNumber(1),
             current_pr: PrNumber(1),
@@ -1152,7 +1604,7 @@ mod tests {
         let path = dir.path().join("events.log");
 
         // Create a log with some events
-        let mut log = EventLog::open(&path).unwrap();
+        let mut log = open_log(&path);
         log.append(StateEventPayload::TrainStarted {
             root_pr: PrNumber(1),
             current_pr: PrNumber(1),
@@ -1236,7 +1688,7 @@ mod tests {
         let path = dir.path().join("events.log");
 
         // Write the specific payload from the proptest failure
-        let mut log = EventLog::open(&path).unwrap();
+        let mut log = open_log(&path);
         log.append(StateEventPayload::IntentSquash {
             train_root: PrNumber(249042210413805320),
             pr: PrNumber(773602773637626364),
