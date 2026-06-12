@@ -179,17 +179,24 @@ pub enum CompactionError {
         log_next_seq: u64,
     },
 
-    /// FATAL: the generation file update failed AND removing the orphaned
-    /// `snapshot.<N+1>` also failed. The orphan must not be left on disk:
-    /// on the next startup `cleanup_stale_generations` would promote to
-    /// generation N+1 and delete `events.<N>.log`, losing every event
-    /// appended since the snapshot. Manual intervention required: delete
-    /// the orphaned snapshot before restarting.
+    /// FATAL: a step of compaction failed in a way that may have left an
+    /// orphaned `snapshot.<N+1>` on disk (the snapshot write or the
+    /// generation file update failed) AND rolling the orphan back also
+    /// failed. On the next startup `cleanup_stale_generations` will promote
+    /// the surviving orphan to generation N+1 and delete `events.<N>.log`,
+    /// so any event appended to generation N after this error would be
+    /// silently destroyed. [`super::recovery::PersistenceHandle::compact`]
+    /// therefore poisons the handle on this error; the process must restart
+    /// and recover. Restarting is safe: the orphan folds in every event
+    /// appended before the failed compaction (guaranteed by the
+    /// folded-everything guards), so whichever generation recovery settles
+    /// on, no event is lost.
     #[error(
-        "FATAL: generation update failed ({original}) and rolling back the orphaned \
-         snapshot {} also failed ({rollback_error}); on the next startup the orphan \
-         would cause the current event log to be deleted; manual intervention required: \
-         delete the orphaned snapshot before restarting",
+        "FATAL: compaction failed ({original}) and rolling back the orphaned \
+         snapshot {} also failed ({rollback_error}); the orphan may survive on \
+         disk, and the next recovery would promote it and delete the current \
+         generation's event log; no further events may be appended; restart \
+         and recover",
         snapshot_path.display()
     )]
     RollbackFailed {
@@ -262,12 +269,17 @@ pub enum CompactionOutcome {
 /// # Error Handling
 ///
 /// If validation, the snapshot write, or the generation file update fails,
-/// the in-memory `snapshot` is left unchanged and the caller can safely retry
-/// or continue with the original generation. If the generation file update
-/// fails *and* the orphaned `snapshot.<N+1>` cannot be removed, the error is
-/// the fatal [`CompactionError::RollbackFailed`]: the process must not
-/// continue, because the orphan would cause `events.<N>.log` to be deleted on
-/// the next startup.
+/// the in-memory `snapshot` is left unchanged. Failures that may have left
+/// an orphaned `snapshot.<N+1>` on disk (the snapshot write failing after
+/// its rename, or the generation file update failing) roll the orphan back,
+/// so that on a non-[`RollbackFailed`](CompactionError::RollbackFailed)
+/// error the old generation really is authoritative and the caller can
+/// safely retry or continue with it. If the rollback itself fails, the
+/// error is the fatal [`CompactionError::RollbackFailed`]: the surviving
+/// orphan would cause `events.<N>.log` to be deleted on the next startup,
+/// so no further event may be appended to it —
+/// [`super::recovery::PersistenceHandle::compact`] poisons the handle in
+/// this state, and the process must restart and recover.
 ///
 /// If cleanup of old generation files fails (after the new generation is
 /// committed), the in-memory `snapshot` already reflects the new generation
@@ -326,8 +338,34 @@ pub(crate) fn compact(
     staged.touch(); // Update snapshot_at timestamp
 
     // 3. Write new snapshot (atomic)
+    // "Atomic" covers the rename, not the whole call: a failure of the
+    // directory fsync AFTER the rename leaves snapshot.<N+1> on disk, the
+    // same orphan hazard as a failed generation-file update below. Roll the
+    // orphan back on any failure (a no-op when the rename never happened).
     let new_snapshot_path = snapshot_path(state_dir, new_gen);
-    save_snapshot_atomic(&new_snapshot_path, &staged)?;
+    if let Err(e) = save_snapshot_atomic(&new_snapshot_path, &staged) {
+        return Err(rollback_orphaned_snapshot(
+            state_dir,
+            &new_snapshot_path,
+            e.into(),
+        ));
+    }
+
+    // Test-only fault injection: simulate the generation-file update failing
+    // with the orphan's rollback also failing. The double failure cannot be
+    // induced portably through the real filesystem, but the disk state it
+    // leaves behind can: the orphan snapshot is already durably on disk at
+    // this point and the generation file is untouched.
+    #[cfg(test)]
+    if fault_injection::FAIL_NEXT_COMMIT_AND_ROLLBACK.with(|f| f.take()) {
+        return Err(CompactionError::RollbackFailed {
+            snapshot_path: new_snapshot_path,
+            original: Box::new(CompactionError::Io(io::Error::other(
+                "injected generation update failure",
+            ))),
+            rollback_error: io::Error::other("injected rollback failure"),
+        });
+    }
 
     // 4. Update generation file (atomic)
     // This is the commit point - once this completes, the new generation is active.
@@ -358,10 +396,25 @@ pub(crate) fn compact(
     }
 }
 
-/// Removes the orphaned `snapshot.<N+1>` after a failed generation-file
-/// update, returning the error `compact` should report.
+/// Test-only fault injection for [`compact`].
+#[cfg(test)]
+pub(super) mod fault_injection {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// When set, the next [`super::compact`] call fails its generation
+        /// file update with the orphaned snapshot's rollback also failing
+        /// (the [`super::CompactionError::RollbackFailed`] state), after the
+        /// orphan snapshot really has been written to disk.
+        pub static FAIL_NEXT_COMMIT_AND_ROLLBACK: Cell<bool> = const { Cell::new(false) };
+    }
+}
+
+/// Removes the (possibly existing) orphaned `snapshot.<N+1>` after a failed
+/// snapshot write or generation-file update, returning the error `compact`
+/// should report.
 ///
-/// On rollback success (including the orphan already being gone) the
+/// On rollback success (including the orphan never having reached disk) the
 /// original error is returned: the compaction failed cleanly and the old
 /// generation remains authoritative. On rollback failure the fatal
 /// [`CompactionError::RollbackFailed`] is returned instead: the orphan left

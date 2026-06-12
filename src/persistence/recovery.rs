@@ -184,8 +184,11 @@ impl PersistenceHandle {
     }
 
     /// Returns the current byte position in the log file, for recording as
-    /// `log_position` in snapshots. See [`EventLog::position`].
-    pub fn position(&mut self) -> io::Result<u64> {
+    /// `log_position` in snapshots. Fails once the log is poisoned, like
+    /// append/sync/compact: a post-failure offset may include a torn tail
+    /// that the next recovery truncates away, so recording it would make
+    /// recovery fail. See [`EventLog::position`].
+    pub fn position(&mut self) -> Result<u64, EventLogError> {
         self.log.position()
     }
 
@@ -228,14 +231,23 @@ impl PersistenceHandle {
     ///
     /// # Failure
     ///
-    /// On any failure before the commit point the old generation remains
+    /// On a clean failure before the commit point the old generation remains
     /// authoritative and this handle still appends to it; the caller may
-    /// retry or carry on. If the commit succeeds but the new generation's
-    /// log cannot be opened, the durable state is intact (the snapshot holds
-    /// everything; the new log has no events yet) but this process can no
-    /// longer write: the handle poisons itself so appends fail loudly
-    /// instead of landing in the old generation's deleted file, and the
-    /// process must restart and recover.
+    /// retry or carry on. Two failures are fatal for the handle (it poisons
+    /// itself so appends fail loudly, and the process must restart and
+    /// recover):
+    ///
+    /// - [`CompactionError::RollbackFailed`]: the orphaned `snapshot.<N+1>`
+    ///   may survive on disk while the generation file still points at N.
+    ///   The next recovery will promote the orphan and delete this
+    ///   generation's log, so an event appended through this handle now
+    ///   would be silently destroyed then. Nothing already appended is lost:
+    ///   the orphan folds in every appended event.
+    /// - The commit succeeded but the new generation's log cannot be opened:
+    ///   the durable state is intact (the snapshot holds everything; the new
+    ///   log has no events yet) but this handle's file is the old
+    ///   generation's deleted log, so appends through it would land in an
+    ///   unlinked file.
     pub fn compact(
         &mut self,
         snapshot: &mut PersistedRepoSnapshot,
@@ -261,7 +273,20 @@ impl PersistenceHandle {
             });
         }
 
-        let outcome = super::compaction::compact(&self.state_dir, snapshot)?;
+        let outcome = match super::compaction::compact(&self.state_dir, snapshot) {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                // RollbackFailed leaves snapshot.<N+1> on disk while the
+                // generation file still points at N: the next recovery
+                // promotes the orphan and deletes events.<N>.log, so an
+                // event appended through this handle now would be silently
+                // destroyed then. Refuse post-failure appends instead.
+                if matches!(e, CompactionError::RollbackFailed { .. }) {
+                    self.log.poison();
+                }
+                return Err(e);
+            }
+        };
 
         // The commit is durable: from here appends must go to the new
         // generation's log, and this handle's file is the old generation's
@@ -794,6 +819,139 @@ mod tests {
         drop(handle);
         let recovered = recover(dir.path(), "main").unwrap();
         assert_eq!(recovered.events.len(), 2);
+    }
+
+    #[test]
+    fn position_on_poisoned_handle_is_refused() {
+        // The misuse the review flagged: after an append/sync failure the
+        // file may hold a torn tail beyond the last durable event. If
+        // position() still reported an offset and the caller recorded it as
+        // a snapshot's log_position, recovery would truncate the torn tail
+        // below the saved position and fail with LogTruncated.
+        let dir = tempdir().unwrap();
+
+        let recovered = recover(dir.path(), "main").unwrap();
+        let mut handle = recovered.handle;
+
+        handle.append(payload(0)).unwrap();
+        handle.position().unwrap();
+
+        // Simulate an earlier failed write (test-only direct field access).
+        handle.log.poison();
+
+        let err = handle.position().unwrap_err();
+        assert!(
+            matches!(err, EventLogError::PoisonedLog { .. }),
+            "position on a poisoned handle must be refused, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn rollback_failed_compact_poisons_handle() {
+        // RollbackFailed leaves snapshot.<N+1> on disk while the generation
+        // file still points at N. An append through a still-usable handle
+        // would land in events.<N>.log, which the next recovery deletes when
+        // it promotes the orphan: the handle must poison itself instead.
+        let dir = tempdir().unwrap();
+
+        let recovered = recover(dir.path(), "main").unwrap();
+        let mut snapshot = recovered.snapshot;
+        let mut handle = recovered.handle;
+
+        for i in 0..3 {
+            handle.append(payload(i)).unwrap();
+        }
+        snapshot.next_seq = handle.next_seq();
+
+        crate::persistence::compaction::fault_injection::FAIL_NEXT_COMMIT_AND_ROLLBACK
+            .with(|f| f.set(true));
+        let err = handle.compact(&mut snapshot).unwrap_err();
+        assert!(
+            matches!(err, CompactionError::RollbackFailed { .. }),
+            "got {:?}",
+            err
+        );
+
+        // The hazard state really is on disk: the orphan exists while the
+        // generation file still points at the old generation.
+        assert!(snapshot_path(dir.path(), 1).exists());
+        assert_eq!(read_generation(dir.path()).unwrap(), 0);
+        assert_eq!(snapshot.log_generation, 0, "in-memory snapshot unchanged");
+
+        // Every write-path operation must now refuse.
+        assert!(matches!(
+            handle.append(payload(9)),
+            Err(EventLogError::PoisonedLog { .. })
+        ));
+        assert!(matches!(
+            handle.sync(),
+            Err(EventLogError::PoisonedLog { .. })
+        ));
+        assert!(matches!(
+            handle.position(),
+            Err(EventLogError::PoisonedLog { .. })
+        ));
+        assert!(matches!(
+            handle.compact(&mut snapshot),
+            Err(CompactionError::EventLog(EventLogError::PoisonedLog { .. }))
+        ));
+
+        // Because nothing could be appended after the failure, a restart
+        // recovers cleanly: the orphan (which folds every appended event) is
+        // promoted and no event is lost.
+        drop(handle);
+        let recovered = recover(dir.path(), "main").unwrap();
+        assert_eq!(recovered.snapshot.log_generation, 1);
+        assert_eq!(recovered.snapshot.next_seq, 3);
+        assert!(recovered.events.is_empty());
+        assert_eq!(recovered.handle.next_seq(), 3);
+    }
+
+    #[test]
+    fn failed_snapshot_write_during_compact_leaves_handle_usable() {
+        // A snapshot write that fails before its rename leaves no orphan:
+        // the rollback is a no-op, the old generation remains authoritative,
+        // and the handle must NOT be poisoned (the failure is retriable).
+        let dir = tempdir().unwrap();
+
+        let recovered = recover(dir.path(), "main").unwrap();
+        let mut snapshot = recovered.snapshot;
+        let mut handle = recovered.handle;
+
+        handle.append(payload(0)).unwrap();
+        snapshot.next_seq = handle.next_seq();
+
+        // Obstruct the snapshot's tmp path so the write fails before rename.
+        let obstruction = dir.path().join("snapshot.1.json.tmp");
+        std::fs::create_dir(&obstruction).unwrap();
+
+        let err = handle.compact(&mut snapshot).unwrap_err();
+        assert!(
+            matches!(err, CompactionError::Snapshot(_)),
+            "a clean snapshot-write failure must surface as Snapshot, got {:?}",
+            err
+        );
+        assert!(
+            !snapshot_path(dir.path(), 1).exists(),
+            "no orphan may be left behind"
+        );
+        assert_eq!(snapshot.log_generation, 0, "in-memory snapshot unchanged");
+
+        // The failure was clean: appends still land, and compaction succeeds
+        // once the obstruction is gone.
+        handle.append(payload(1)).unwrap();
+        snapshot.next_seq = handle.next_seq();
+        std::fs::remove_dir(&obstruction).unwrap();
+        compact_clean(&mut handle, &mut snapshot);
+        handle.append(payload(2)).unwrap();
+        drop(handle);
+
+        let recovered = recover(dir.path(), "main").unwrap();
+        assert_eq!(recovered.snapshot.log_generation, 1);
+        assert_eq!(recovered.snapshot.next_seq, 2);
+        assert_eq!(recovered.events.len(), 1);
+        assert_eq!(recovered.handle.next_seq(), 3);
     }
 
     #[test]
