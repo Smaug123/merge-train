@@ -209,9 +209,11 @@ pub fn recover(
     // Step 1: lock out concurrent instances before touching anything.
     let lock = StateDirLock::acquire(state_dir)?;
 
-    // Step 2: settle generations. This validates that the surviving snapshot
-    // actually loads before deleting anything, repairs the generation file,
-    // and removes stale generations and temp files.
+    // Step 2: settle generations. This semantically validates the surviving
+    // snapshot (it loads and describes the generation it is stored as) and
+    // refuses states showing a committed generation's snapshot was lost,
+    // all before deleting anything; then repairs the generation file and
+    // removes stale generations and temp files.
     cleanup_stale_generations(state_dir)?;
 
     // Step 3: load the snapshot for the settled generation.
@@ -386,12 +388,65 @@ mod tests {
         write_generation(dir.path(), 2).unwrap();
 
         let result = recover(dir.path(), "main");
+        // Generation settling already refuses this state (before it would
+        // delete or repair anything); recover's own MissingSnapshot check
+        // remains as a backstop behind it.
         assert!(
             matches!(
                 result,
-                Err(RecoverError::MissingSnapshot { generation: 2, .. })
+                Err(RecoverError::Compaction(CompactionError::MissingSnapshot {
+                    file_gen: 2,
+                    max_snapshot_gen: None,
+                }))
             ),
-            "generation 2 with no snapshot must be a hard error"
+            "generation 2 with no snapshot must be a hard error, got {:?}",
+            result.as_ref().map(|_| "Ok").map_err(|e| e.to_string())
+        );
+    }
+
+    #[test]
+    fn generation_file_ahead_of_snapshots_fails_recovery_without_deletion() {
+        // The generation file records a committed generation (5) whose
+        // snapshot is gone, while an older snapshot (3) survives. Recovery
+        // must fail loudly without demoting the generation file or deleting
+        // the older generation's files or events.5.log.
+        let dir = tempdir().unwrap();
+
+        let mut snapshot = PersistedRepoSnapshot::new("main");
+        snapshot.log_generation = 3;
+        save_snapshot_atomic(&snapshot_path(dir.path(), 3), &snapshot).unwrap();
+        std::fs::write(events_path(dir.path(), 3), b"").unwrap();
+        std::fs::write(events_path(dir.path(), 5), b"").unwrap();
+        write_generation(dir.path(), 5).unwrap();
+
+        let result = recover(dir.path(), "main");
+        assert!(
+            matches!(
+                result,
+                Err(RecoverError::Compaction(CompactionError::MissingSnapshot {
+                    file_gen: 5,
+                    max_snapshot_gen: Some(3),
+                }))
+            ),
+            "a lost committed generation must abort recovery, got {:?}",
+            result.as_ref().map(|_| "Ok").map_err(|e| e.to_string())
+        );
+        assert!(
+            snapshot_path(dir.path(), 3).exists(),
+            "the previous generation's snapshot must survive"
+        );
+        assert!(
+            events_path(dir.path(), 3).exists(),
+            "the previous generation's event log must survive"
+        );
+        assert!(
+            events_path(dir.path(), 5).exists(),
+            "the committed generation's event log must survive"
+        );
+        assert_eq!(
+            read_generation(dir.path()).unwrap(),
+            5,
+            "the generation file must not be demoted"
         );
     }
 
@@ -405,9 +460,18 @@ mod tests {
         write_generation(dir.path(), 1).unwrap();
 
         let result = recover(dir.path(), "main");
+        // Generation settling already refuses this candidate (before it
+        // would delete anything); recover's own GenerationMismatch check
+        // remains as a backstop behind it.
         assert!(
-            matches!(result, Err(RecoverError::GenerationMismatch { .. })),
-            "snapshot claiming a different generation must be a hard error"
+            matches!(
+                result,
+                Err(RecoverError::Compaction(
+                    CompactionError::CandidateGenerationMismatch { .. }
+                ))
+            ),
+            "snapshot claiming a different generation must be a hard error, got {:?}",
+            result.as_ref().map(|_| "Ok").map_err(|e| e.to_string())
         );
     }
 

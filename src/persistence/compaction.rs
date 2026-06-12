@@ -19,10 +19,13 @@
 //!
 //! On startup (via `cleanup_stale_generations`):
 //! 1. Scan for the highest existing snapshot generation (handles crash during compaction)
-//! 2. If the generation file is stale, missing, or corrupt, restore it to match the highest snapshot
-//! 3. Load the snapshot for the current generation
-//! 4. Replay events for the current generation from the snapshot's `log_position`
-//! 5. Clean up files from other generations
+//! 2. Semantically validate that snapshot, and refuse (deleting nothing) any state
+//!    showing a committed generation's snapshot was lost
+//! 3. If the generation file is stale, missing, or corrupt, restore it to match the
+//!    highest snapshot
+//! 4. Load the snapshot for the current generation
+//! 5. Replay events for the current generation from the snapshot's `log_position`
+//! 6. Clean up files from other generations
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -31,8 +34,8 @@ use thiserror::Error;
 
 use super::fsync::fsync_dir;
 use super::generation::{
-    delete_old_generation, events_path, find_current_snapshot, list_generation_files,
-    read_generation, snapshot_path, write_generation,
+    GenerationFileKind, delete_old_generation, events_path, find_current_snapshot,
+    list_generation_files, read_generation, snapshot_path, write_generation,
 };
 use super::log::{EventLog, EventLogError};
 use super::snapshot::{PersistedRepoSnapshot, load_snapshot, save_snapshot_atomic};
@@ -91,6 +94,61 @@ pub enum CompactionError {
         log_next_seq: u64,
     },
 
+    /// The generation file records a generation with no snapshot file (and
+    /// the directory is not fresh). Compaction writes `snapshot.<N>` before
+    /// advancing the generation file to N, so the committed generation's
+    /// snapshot has been lost. "Repairing" the generation file to point at
+    /// an older snapshot would silently roll back committed state, and the
+    /// cleanup loop would then delete the committed generation's remaining
+    /// files.
+    #[error(
+        "generation file says {file_gen} but the highest snapshot on disk is {}; \
+         generation {file_gen} was committed and its snapshot has been lost; \
+         refusing to repair the generation file or delete anything; manual \
+         intervention required",
+        describe_max_snapshot_gen(max_snapshot_gen)
+    )]
+    MissingSnapshot {
+        file_gen: u64,
+        max_snapshot_gen: Option<u64>,
+    },
+
+    /// An event log exists at a generation higher than every snapshot. Event
+    /// logs are only created once their generation is committed (snapshot
+    /// written, generation file advanced), so that generation's snapshot and
+    /// generation-file record have both been lost; deleting the log would
+    /// destroy the only remaining trace of its events.
+    #[error(
+        "event log {} is from generation {log_generation} but the highest snapshot \
+         on disk is {}; generation {log_generation} was committed and its snapshot \
+         has been lost; refusing to delete anything; manual intervention required",
+        path.display(),
+        describe_max_snapshot_gen(max_snapshot_gen)
+    )]
+    EventLogAheadOfSnapshots {
+        path: PathBuf,
+        log_generation: u64,
+        max_snapshot_gen: Option<u64>,
+    },
+
+    /// The candidate (highest-generation) snapshot deserializes but its
+    /// embedded `log_generation` disagrees with the generation in its
+    /// filename: it does not describe the generation it is stored as.
+    /// Promoting it would delete the other generations and recovery would
+    /// then fail its `GenerationMismatch` hard check, after the last good
+    /// generation was already gone.
+    #[error(
+        "snapshot {} says log_generation {snapshot_generation} but its filename \
+         says generation {file_generation}; refusing to promote it or delete \
+         anything; manual intervention required",
+        path.display()
+    )]
+    CandidateGenerationMismatch {
+        path: PathBuf,
+        snapshot_generation: u64,
+        file_generation: u64,
+    },
+
     /// FATAL: the generation file update failed AND removing the orphaned
     /// `snapshot.<N+1>` also failed. The orphan must not be left on disk:
     /// on the next startup `cleanup_stale_generations` would promote to
@@ -109,6 +167,14 @@ pub enum CompactionError {
         original: Box<CompactionError>,
         rollback_error: io::Error,
     },
+}
+
+/// Renders the "highest snapshot on disk" part of cleanup error messages.
+fn describe_max_snapshot_gen(max: &Option<u64>) -> String {
+    match max {
+        Some(g) => format!("generation {g}"),
+        None => "no snapshot at all".to_string(),
+    }
 }
 
 /// Result type for compaction operations.
@@ -311,11 +377,24 @@ fn rollback_orphaned_snapshot(
 ///
 /// # Candidate snapshot validation
 ///
-/// The highest-generation snapshot is fully loaded (deserialized) **before**
-/// the generation file is touched or anything is deleted. A snapshot file
-/// whose mere existence would promote it to "current" but which cannot be
-/// loaded means the state is uncharacterizable: this function fails loudly
-/// and deletes nothing, preserving the last good generation.
+/// The highest-generation snapshot is semantically validated **before** the
+/// generation file is touched or anything is deleted: it must deserialize,
+/// and its embedded `log_generation` must agree with the generation it is
+/// stored as (the same hard check `recover` applies afterwards). A candidate
+/// that fails validation means the state is uncharacterizable: this function
+/// fails loudly and deletes nothing, preserving the last good generation.
+///
+/// # Lost committed generations
+///
+/// Evidence that a generation was committed but its snapshot is gone is also
+/// a loud failure that deletes nothing:
+/// - the generation file points above every snapshot on disk, or
+/// - an event log exists above every snapshot on disk (event logs are only
+///   created once their generation is committed).
+///
+/// Silently falling back to an older snapshot in these states would roll
+/// back committed state, and the cleanup loop would delete the committed
+/// generation's remaining files.
 pub fn cleanup_stale_generations(state_dir: &Path) -> Result<()> {
     let (file_gen, gen_file_corrupt) = match read_generation(state_dir) {
         Ok(g) => (g, false),
@@ -331,6 +410,40 @@ pub fn cleanup_stale_generations(state_dir: &Path) -> Result<()> {
     // definition of "current snapshot", see `find_current_snapshot`).
     let max_snapshot_gen = find_current_snapshot(state_dir)?;
 
+    // The best candidate for "current generation": the highest snapshot, or
+    // generation 0 (fresh directory) if there are no snapshots.
+    let candidate_gen = max_snapshot_gen.as_ref().map_or(0, |(g, _)| *g);
+
+    // Guard: a non-corrupt generation file ahead of every snapshot means a
+    // committed generation's snapshot has been lost (compaction writes the
+    // snapshot before advancing the generation file). "Repairing" the
+    // generation file downward would silently roll back committed state, and
+    // the deletion loop below would remove the committed generation's event
+    // log. Generation 0 needs no snapshot (fresh directory), so it is exempt.
+    if !gen_file_corrupt && file_gen > candidate_gen {
+        return Err(CompactionError::MissingSnapshot {
+            file_gen,
+            max_snapshot_gen: max_snapshot_gen.map(|(g, _)| g),
+        });
+    }
+
+    // Guard: an event log ahead of every snapshot is the same loss with the
+    // generation-file evidence also gone: event logs are only created once
+    // their generation is committed.
+    if let Some(max_event_gen) = files
+        .iter()
+        .filter(|(_, kind)| *kind == GenerationFileKind::Events)
+        .map(|(g, _)| *g)
+        .max()
+        && max_event_gen > candidate_gen
+    {
+        return Err(CompactionError::EventLogAheadOfSnapshots {
+            path: events_path(state_dir, max_event_gen),
+            log_generation: max_event_gen,
+            max_snapshot_gen: max_snapshot_gen.map(|(g, _)| g),
+        });
+    }
+
     // Determine the actual current generation:
     // - If snapshots exist, use the highest snapshot generation. This handles:
     //   - Stale generation file (points to older gen than exists)
@@ -339,11 +452,20 @@ pub fn cleanup_stale_generations(state_dir: &Path) -> Result<()> {
     // - If no snapshots exist, trust the generation file (fresh state)
     let current_gen = match max_snapshot_gen {
         Some((max_gen, snap_path)) => {
-            // Validate that the candidate snapshot actually loads BEFORE
-            // committing to it (generation file update) or deleting anything
-            // based on it. An unloadable candidate is a loud failure that
-            // leaves every file untouched.
-            load_snapshot(&snap_path)?;
+            // Validate the candidate snapshot BEFORE committing to it
+            // (generation file update) or deleting anything based on it,
+            // with the same semantic checks recovery applies afterwards: it
+            // must deserialize, and its embedded log_generation must agree
+            // with the generation it is stored as. An invalid candidate is a
+            // loud failure that leaves every file untouched.
+            let candidate = load_snapshot(&snap_path)?;
+            if candidate.log_generation != max_gen {
+                return Err(CompactionError::CandidateGenerationMismatch {
+                    path: snap_path,
+                    snapshot_generation: candidate.log_generation,
+                    file_generation: max_gen,
+                });
+            }
             // If there's a mismatch or corruption, update the generation file to be consistent
             if max_gen != file_gen || gen_file_corrupt {
                 write_generation(state_dir, max_gen)?;
@@ -466,6 +588,52 @@ mod tests {
         );
         snapshot.prs.insert(PrNumber(pr_num), pr);
         snapshot
+    }
+
+    /// State of the `generation` file in a generated state-directory layout.
+    #[derive(Debug, Clone, Copy)]
+    enum GenFileState {
+        Missing,
+        Corrupt,
+        Value(u64),
+    }
+
+    /// State of `snapshot.<gen>.json` in a generated state-directory layout.
+    #[derive(Debug, Clone, Copy)]
+    enum SnapshotState {
+        Absent,
+        /// Loadable; embedded `log_generation` matches the filename.
+        Valid,
+        /// Loadable; embedded `log_generation` is this (possibly wrong) value.
+        ClaimsGeneration(u64),
+        Corrupt,
+    }
+
+    fn arb_gen_file_state() -> impl Strategy<Value = GenFileState> {
+        prop_oneof![
+            Just(GenFileState::Missing),
+            Just(GenFileState::Corrupt),
+            (0u64..8).prop_map(GenFileState::Value),
+        ]
+    }
+
+    fn arb_snapshot_state() -> impl Strategy<Value = SnapshotState> {
+        prop_oneof![
+            Just(SnapshotState::Absent),
+            Just(SnapshotState::Valid),
+            (0u64..8).prop_map(SnapshotState::ClaimsGeneration),
+            Just(SnapshotState::Corrupt),
+        ]
+    }
+
+    /// Sorted file names in the state directory.
+    fn dir_listing(path: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(path)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
     }
 
     // ─── Unit tests ───
@@ -961,6 +1129,24 @@ mod tests {
             // Determine expected: highest snapshot generation
             let expected_gen = *snapshot_gens.iter().max().unwrap();
 
+            if gen_file_value > expected_gen {
+                // The generation file claims a committed generation whose
+                // snapshot does not exist: cleanup must refuse and delete
+                // nothing rather than roll back committed state.
+                let result = cleanup_stale_generations(dir.path());
+                prop_assert!(
+                    result.is_err(),
+                    "cleanup must refuse when the generation file is ahead of \
+                     every snapshot"
+                );
+                for g in &snapshot_gens {
+                    prop_assert!(snapshot_path(dir.path(), *g).exists());
+                    prop_assert!(events_path(dir.path(), *g).exists());
+                }
+                prop_assert_eq!(read_generation(dir.path()).unwrap(), gen_file_value);
+                return Ok(());
+            }
+
             // Run cleanup
             cleanup_stale_generations(dir.path()).unwrap();
 
@@ -1056,6 +1242,122 @@ mod tests {
                 after_first, after_second,
                 "Cleanup should be idempotent"
             );
+        }
+
+        /// Cleanup either settles the directory to a single semantically
+        /// valid generation, or fails having touched nothing.
+        ///
+        /// This is the no-data-loss contract of the recovery path: no file
+        /// may be deleted (and the generation file may not be rewritten)
+        /// unless the chosen generation passes the same semantic validation
+        /// recovery will apply to it, and a successful cleanup must never
+        /// discard evidence of a committed generation (the generation file
+        /// value, or an event log above every snapshot).
+        #[test]
+        fn cleanup_settles_fully_or_touches_nothing(
+            gen_file in arb_gen_file_state(),
+            snapshots in prop::collection::vec(arb_snapshot_state(), 6),
+            events in prop::collection::vec(prop::bool::ANY, 6),
+        ) {
+            let dir = tempdir().unwrap();
+
+            match gen_file {
+                GenFileState::Missing => {}
+                GenFileState::Corrupt => {
+                    std::fs::write(dir.path().join("generation"), "garbage\n").unwrap();
+                }
+                GenFileState::Value(g) => write_generation(dir.path(), g).unwrap(),
+            }
+            for (i, snap) in snapshots.iter().enumerate() {
+                let g = i as u64;
+                match snap {
+                    SnapshotState::Absent => {}
+                    SnapshotState::Valid => write_valid_snapshot(dir.path(), g),
+                    SnapshotState::ClaimsGeneration(claimed) => {
+                        let mut s = create_test_snapshot();
+                        s.log_generation = *claimed;
+                        save_snapshot_atomic(&snapshot_path(dir.path(), g), &s).unwrap();
+                    }
+                    SnapshotState::Corrupt => {
+                        std::fs::write(snapshot_path(dir.path(), g), "{ not json").unwrap();
+                    }
+                }
+            }
+            for (i, has_events) in events.iter().enumerate() {
+                if *has_events {
+                    File::create(events_path(dir.path(), i as u64)).unwrap();
+                }
+            }
+
+            let files_before = dir_listing(dir.path());
+            let gen_file_before = std::fs::read(dir.path().join("generation")).ok();
+            let max_snapshot_before = snapshots
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| !matches!(s, SnapshotState::Absent))
+                .map(|(i, _)| i as u64)
+                .max();
+
+            match cleanup_stale_generations(dir.path()) {
+                Err(_) => {
+                    prop_assert_eq!(
+                        dir_listing(dir.path()),
+                        files_before,
+                        "a failed cleanup must not create or delete any file"
+                    );
+                    prop_assert_eq!(
+                        std::fs::read(dir.path().join("generation")).ok(),
+                        gen_file_before,
+                        "a failed cleanup must not rewrite the generation file"
+                    );
+                }
+                Ok(()) => {
+                    let settled = read_generation(dir.path()).unwrap();
+                    match max_snapshot_before {
+                        Some(max) => {
+                            prop_assert_eq!(
+                                settled, max,
+                                "cleanup must settle on the highest snapshot generation"
+                            );
+                            let loaded =
+                                load_snapshot(&snapshot_path(dir.path(), settled)).unwrap();
+                            prop_assert_eq!(
+                                loaded.log_generation, settled,
+                                "the surviving snapshot must describe its own generation"
+                            );
+                        }
+                        None => prop_assert_eq!(
+                            settled, 0,
+                            "no snapshots means a fresh directory at generation 0"
+                        ),
+                    }
+                    // Evidence of committed generations must never be
+                    // discarded by a successful cleanup.
+                    if let GenFileState::Value(v) = gen_file {
+                        prop_assert!(
+                            settled >= v,
+                            "cleanup rolled the generation file back from {} to {}",
+                            v, settled
+                        );
+                    }
+                    for (i, has_events) in events.iter().enumerate() {
+                        if *has_events {
+                            prop_assert!(
+                                settled >= i as u64,
+                                "cleanup succeeded despite an event log at generation {} \
+                                 above the settled generation {}",
+                                i, settled
+                            );
+                        }
+                    }
+                    for (g, _) in list_generation_files(dir.path()).unwrap() {
+                        prop_assert_eq!(
+                            g, settled,
+                            "only the settled generation's files may remain"
+                        );
+                    }
+                }
+            }
         }
 
         // ─── Error handling properties ───
@@ -1164,10 +1466,13 @@ mod tests {
         writeln!(f, r#"{{"seq":0,"ts":"2024-01-01T00:00:00Z","type":"train_started","root_pr":101,"current_pr":101}}"#).unwrap();
 
         // Simulate crash after writing snapshot.1 but before updating generation
-        // This snapshot has MORE data (train 200 in addition to train 100)
+        // This snapshot has MORE data (train 200 in addition to train 100).
+        // compact() stages log_generation = new_gen into the new snapshot, so
+        // the crash state has a matching embedded generation.
         snapshot
             .active_trains
             .insert(PrNumber(200), TrainRecord::new(PrNumber(200)));
+        snapshot.log_generation = 1;
         save_snapshot_atomic(&snapshot_path(dir.path(), 1), &snapshot).unwrap();
         // Generation file still says 0!
 
@@ -1473,6 +1778,167 @@ mod tests {
             read_generation(dir.path()).unwrap(),
             1,
             "generation file must not be promoted to the corrupt generation"
+        );
+    }
+
+    #[test]
+    fn cleanup_refuses_when_candidate_snapshot_claims_other_generation() {
+        // snapshot.2.json deserializes but its embedded log_generation says 7:
+        // it does not describe generation 2. Promoting it would delete the
+        // last good generation, and recovery would then fail its
+        // GenerationMismatch hard check with the data already gone. Cleanup
+        // must apply the same check first and delete nothing.
+        let dir = tempdir().unwrap();
+
+        // Valid generation 1 state.
+        let mut snapshot = create_snapshot_with_train(100);
+        snapshot.log_generation = 1;
+        save_snapshot_atomic(&snapshot_path(dir.path(), 1), &snapshot).unwrap();
+        File::create(events_path(dir.path(), 1)).unwrap();
+        write_generation(dir.path(), 1).unwrap();
+
+        // Loadable snapshot at generation 2 whose embedded generation is wrong.
+        let mut liar = create_test_snapshot();
+        liar.log_generation = 7;
+        save_snapshot_atomic(&snapshot_path(dir.path(), 2), &liar).unwrap();
+
+        let result = cleanup_stale_generations(dir.path());
+        assert!(
+            matches!(
+                result,
+                Err(CompactionError::CandidateGenerationMismatch {
+                    snapshot_generation: 7,
+                    file_generation: 2,
+                    ..
+                })
+            ),
+            "cleanup must reject a candidate whose embedded generation disagrees \
+             with its filename, got {:?}",
+            result
+        );
+
+        assert!(
+            snapshot_path(dir.path(), 1).exists(),
+            "the last good snapshot must survive"
+        );
+        assert!(
+            events_path(dir.path(), 1).exists(),
+            "the last good event log must survive"
+        );
+        assert!(
+            snapshot_path(dir.path(), 2).exists(),
+            "nothing may be deleted, not even the bad candidate"
+        );
+        assert_eq!(
+            read_generation(dir.path()).unwrap(),
+            1,
+            "the generation file must be untouched"
+        );
+    }
+
+    #[test]
+    fn cleanup_refuses_when_generation_file_ahead_of_all_snapshots() {
+        // The generation file says 5 — generation 5 was committed — but
+        // snapshot.5.json is gone and only snapshot.3.json remains. Demoting
+        // the generation file to 3 would silently roll back committed state,
+        // and the cleanup loop would delete events.5.log (events that exist
+        // nowhere else). Cleanup must fail loudly and delete nothing.
+        let dir = tempdir().unwrap();
+
+        write_valid_snapshot(dir.path(), 3);
+        File::create(events_path(dir.path(), 3)).unwrap();
+        File::create(events_path(dir.path(), 5)).unwrap();
+        write_generation(dir.path(), 5).unwrap();
+
+        let result = cleanup_stale_generations(dir.path());
+        assert!(
+            matches!(
+                result,
+                Err(CompactionError::MissingSnapshot {
+                    file_gen: 5,
+                    max_snapshot_gen: Some(3),
+                })
+            ),
+            "cleanup must refuse when the generation file is ahead of every \
+             snapshot, got {:?}",
+            result
+        );
+
+        assert!(snapshot_path(dir.path(), 3).exists());
+        assert!(events_path(dir.path(), 3).exists());
+        assert!(
+            events_path(dir.path(), 5).exists(),
+            "the committed generation's event log must survive"
+        );
+        assert_eq!(
+            read_generation(dir.path()).unwrap(),
+            5,
+            "the generation file must not be demoted"
+        );
+    }
+
+    #[test]
+    fn cleanup_refuses_when_generation_file_ahead_with_no_snapshots() {
+        // Generation 5 was committed but no snapshot exists at all. Only
+        // generation 0 may legitimately lack a snapshot (fresh directory),
+        // so this state is uncharacterizable: nothing may be deleted.
+        let dir = tempdir().unwrap();
+
+        write_generation(dir.path(), 5).unwrap();
+        File::create(events_path(dir.path(), 2)).unwrap();
+
+        let result = cleanup_stale_generations(dir.path());
+        assert!(
+            matches!(
+                result,
+                Err(CompactionError::MissingSnapshot {
+                    file_gen: 5,
+                    max_snapshot_gen: None,
+                })
+            ),
+            "got {:?}",
+            result
+        );
+        assert!(
+            events_path(dir.path(), 2).exists(),
+            "no file may be deleted in an uncharacterizable state"
+        );
+        assert_eq!(read_generation(dir.path()).unwrap(), 5);
+    }
+
+    #[test]
+    fn cleanup_refuses_when_event_log_ahead_of_all_snapshots() {
+        // events.5.log exists but the highest snapshot is generation 3 and
+        // the generation file is corrupt. Event logs are only created for
+        // committed generations, so generation 5's snapshot (and the
+        // generation file) have been lost. Falling back to generation 3
+        // would delete events.5.log.
+        let dir = tempdir().unwrap();
+
+        write_valid_snapshot(dir.path(), 3);
+        File::create(events_path(dir.path(), 3)).unwrap();
+        File::create(events_path(dir.path(), 5)).unwrap();
+        std::fs::write(dir.path().join("generation"), "garbage\n").unwrap();
+
+        let result = cleanup_stale_generations(dir.path());
+        assert!(
+            matches!(
+                result,
+                Err(CompactionError::EventLogAheadOfSnapshots {
+                    log_generation: 5,
+                    max_snapshot_gen: Some(3),
+                    ..
+                })
+            ),
+            "got {:?}",
+            result
+        );
+
+        assert!(snapshot_path(dir.path(), 3).exists());
+        assert!(events_path(dir.path(), 3).exists());
+        assert!(
+            events_path(dir.path(), 5).exists(),
+            "the committed generation's event log must survive"
         );
     }
 
