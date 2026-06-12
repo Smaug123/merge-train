@@ -185,8 +185,10 @@ pub enum CompactionError {
     },
 
     /// FATAL: a step of compaction failed in a way that may have left an
-    /// orphaned `snapshot.<N+1>` on disk (the snapshot write or the
-    /// generation file update failed) AND rolling the orphan back also
+    /// orphaned `snapshot.<N+1>` on disk (the snapshot write failed, or the
+    /// generation file update failed *before its rename* — a post-rename
+    /// failure is [`AmbiguousCommit`](Self::AmbiguousCommit) instead, and
+    /// never attempts a rollback) AND rolling the orphan back also
     /// failed. On the next startup `cleanup_stale_generations` will promote
     /// the surviving orphan to generation N+1 and delete `events.<N>.log`,
     /// so any event appended to generation N after this error would be
@@ -208,6 +210,35 @@ pub enum CompactionError {
         snapshot_path: PathBuf,
         original: Box<CompactionError>,
         rollback_error: io::Error,
+    },
+
+    /// FATAL: the generation-file update failed after its rename: the new
+    /// generation is already live in the filesystem namespace, but whether
+    /// it survives a crash is unknown. No running-process reaction is safe
+    /// in both worlds — in particular, deleting `snapshot.<N+1>` as
+    /// "rollback" would, in the world where the rename is durable, leave
+    /// the generation file pointing at a missing snapshot, which recovery
+    /// refuses to repair ([`MissingSnapshot`](Self::MissingSnapshot)).
+    /// Nothing is deleted on this error, and
+    /// [`super::recovery::PersistenceHandle::compact`] poisons the handle;
+    /// the process must restart and let recovery settle the directory.
+    /// Restarting is safe in both worlds: if the rename survived, recovery
+    /// loads `snapshot.<N+1>` (which folds in every event appended before
+    /// the compaction — the folded-everything guards); if it did not,
+    /// recovery promotes the surviving orphan `snapshot.<N+1>` — the same
+    /// data either way, and poisoning ensures no event was appended in
+    /// between.
+    #[error(
+        "FATAL: generation update to {new_gen} is ambiguous (renamed, then: \
+         {source}); the new generation is live in the namespace but its \
+         crash durability is unknown; snapshot {} was NOT deleted; no \
+         further events may be appended; restart and recover",
+        snapshot_path.display()
+    )]
+    AmbiguousCommit {
+        new_gen: u64,
+        snapshot_path: PathBuf,
+        source: io::Error,
     },
 }
 
@@ -274,17 +305,40 @@ pub enum CompactionOutcome {
 /// # Error Handling
 ///
 /// If validation, the snapshot write, or the generation file update fails,
-/// the in-memory `snapshot` is left unchanged. Failures that may have left
-/// an orphaned `snapshot.<N+1>` on disk (the snapshot write failing after
-/// its rename, or the generation file update failing) roll the orphan back,
-/// so that on a non-[`RollbackFailed`](CompactionError::RollbackFailed)
-/// error the old generation really is authoritative and the caller can
-/// safely retry or continue with it. If the rollback itself fails, the
-/// error is the fatal [`CompactionError::RollbackFailed`]: the surviving
-/// orphan would cause `events.<N>.log` to be deleted on the next startup,
-/// so no further event may be appended to it —
-/// [`super::recovery::PersistenceHandle::compact`] poisons the handle in
-/// this state, and the process must restart and recover.
+/// the in-memory `snapshot` is left unchanged. What happens on disk depends
+/// on which side of the commit point (the generation file's rename) the
+/// failure fell:
+///
+/// - **Provably uncommitted** (the snapshot write failed, or the generation
+///   update failed before its rename): the possibly-present orphan
+///   `snapshot.<N+1>` is rolled back, so that on a
+///   non-[`RollbackFailed`](CompactionError::RollbackFailed) error the old
+///   generation really is authoritative and the caller can safely retry or
+///   continue with it. Rolling back is safe precisely because the
+///   generation file provably still points at the old generation. If the
+///   rollback itself fails, the error is the fatal
+///   [`CompactionError::RollbackFailed`]: the surviving orphan would cause
+///   `events.<N>.log` to be deleted on the next startup, so no further
+///   event may be appended to it.
+///
+/// - **Ambiguously committed** (the generation update failed after its
+///   rename): nothing is deleted, and the error is the fatal
+///   [`CompactionError::AmbiguousCommit`]. The new generation is already
+///   live in the filesystem namespace and may or may not survive a crash;
+///   only the next recovery can settle which world this is, and it loses
+///   nothing in either (see the variant's documentation).
+///
+/// On both fatal errors [`super::recovery::PersistenceHandle::compact`]
+/// poisons the handle, and the process must restart and recover.
+///
+/// # Ordering invariant
+///
+/// `snapshot.<N+1>` is made fully durable (its own directory fsync
+/// included) strictly **before** the generation-file update begins. The
+/// crash-safety of [`AmbiguousCommit`](CompactionError::AmbiguousCommit)
+/// depends on this: in the world where the generation rename survives, the
+/// snapshot it points to must already be on disk. Do not reorder these
+/// steps.
 ///
 /// If cleanup of old generation files fails (after the new generation is
 /// committed), the in-memory `snapshot` already reflects the new generation
@@ -345,8 +399,16 @@ pub(crate) fn compact(
     // 3. Write new snapshot (atomic)
     // "Atomic" covers the rename, not the whole call: a failure of the
     // directory fsync AFTER the rename leaves snapshot.<N+1> on disk, the
-    // same orphan hazard as a failed generation-file update below. Roll the
-    // orphan back on any failure (a no-op when the rename never happened).
+    // same orphan hazard as a pre-rename generation-file update failure
+    // below. Roll the orphan back on any failure (a no-op when the rename
+    // never happened). Unlike the generation update, rolling back is safe
+    // wherever this step failed: the generation file is untouched at this
+    // point, so the old generation is provably still authoritative.
+    //
+    // Ordering invariant: this step (including its directory fsync) must
+    // complete before write_generation below begins — in the world where a
+    // failed write_generation's rename nonetheless survives a crash, the
+    // snapshot it points at must already be durable.
     let new_snapshot_path = snapshot_path(state_dir, new_gen);
     if let Err(e) = save_snapshot_atomic(&new_snapshot_path, &staged) {
         return Err(rollback_orphaned_snapshot(
@@ -358,16 +420,36 @@ pub(crate) fn compact(
 
     // 4. Update generation file (atomic)
     // This is the commit point - once this completes, the new generation is active.
-    // If this fails, we must clean up the orphaned snapshot to prevent data loss:
-    // without cleanup, the process could continue appending to events.<N>.log,
-    // then on restart cleanup_stale_generations() would promote to N+1 and delete
-    // those new events.
-    if let Err(e) = write_generation(state_dir, new_gen) {
-        return Err(rollback_orphaned_snapshot(
-            state_dir,
-            &new_snapshot_path,
-            e.into(),
-        ));
+    //
+    // A failure BEFORE the commit point (NotCommitted) is a clean abort: the
+    // old generation is still authoritative, but the orphaned snapshot.<N+1>
+    // must be removed to prevent data loss — without cleanup, the process
+    // could continue appending to events.<N>.log, then on restart
+    // cleanup_stale_generations() would promote to N+1 and delete those
+    // events.
+    //
+    // A failure AFTER the commit point (Ambiguous) is the opposite: the new
+    // generation may already be committed, so snapshot.<N+1> must NOT be
+    // removed — in the world where the rename survives, deleting it would
+    // leave the generation file pointing at a missing snapshot, which
+    // recovery refuses to repair (MissingSnapshot). Nothing may be deleted
+    // here; only the next recovery can settle which world this is.
+    match write_generation(state_dir, new_gen) {
+        Ok(()) => {}
+        Err(e @ WriteGenerationError::NotCommitted(_)) => {
+            return Err(rollback_orphaned_snapshot(
+                state_dir,
+                &new_snapshot_path,
+                e.into(),
+            ));
+        }
+        Err(WriteGenerationError::Ambiguous(source)) => {
+            return Err(CompactionError::AmbiguousCommit {
+                new_gen,
+                snapshot_path: new_snapshot_path,
+                source,
+            });
+        }
     }
 
     // 5. Commit to in-memory state BEFORE deleting old files.
@@ -386,8 +468,16 @@ pub(crate) fn compact(
 }
 
 /// Removes the (possibly existing) orphaned `snapshot.<N+1>` after a failed
-/// snapshot write or generation-file update, returning the error `compact`
-/// should report.
+/// snapshot write or a *pre-rename*
+/// ([`NotCommitted`](WriteGenerationError::NotCommitted)) generation-file
+/// update failure, returning the error `compact` should report.
+///
+/// Must only be called while the generation file provably still points at
+/// the old generation: removing `snapshot.<N+1>` when the generation file
+/// may already point at N+1 manufactures the unrecoverable
+/// [`MissingSnapshot`](CompactionError::MissingSnapshot) state. A
+/// post-rename failure is [`CompactionError::AmbiguousCommit`] and never
+/// reaches this function.
 ///
 /// On rollback success (including the orphan never having reached disk) the
 /// original error is returned: the compaction failed cleanly and the old

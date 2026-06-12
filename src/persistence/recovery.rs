@@ -233,9 +233,9 @@ impl PersistenceHandle {
     ///
     /// On a clean failure before the commit point the old generation remains
     /// authoritative and this handle still appends to it; the caller may
-    /// retry or carry on. Two failures are fatal for the handle (it poisons
-    /// itself so appends fail loudly, and the process must restart and
-    /// recover):
+    /// retry or carry on. Three failures are fatal for the handle (it
+    /// poisons itself so appends fail loudly, and the process must restart
+    /// and recover):
     ///
     /// - [`CompactionError::RollbackFailed`]: the orphaned `snapshot.<N+1>`
     ///   may survive on disk while the generation file still points at N.
@@ -243,6 +243,13 @@ impl PersistenceHandle {
     ///   generation's log, so an event appended through this handle now
     ///   would be silently destroyed then. Nothing already appended is lost:
     ///   the orphan folds in every appended event.
+    /// - [`CompactionError::AmbiguousCommit`]: the generation file may
+    ///   already (durably or not) point at N+1 while this handle still
+    ///   writes `events.<N>.log`, so an append now could land in a log the
+    ///   settled generation never replays. Nothing on disk was deleted, and
+    ///   recovery settles either world losing nothing: `snapshot.<N+1>`
+    ///   folds in every appended event, whether recovery finds it committed
+    ///   or promotes it as an orphan.
     /// - The commit succeeded but the new generation's log cannot be opened:
     ///   the durable state is intact (the snapshot holds everything; the new
     ///   log has no events yet) but this handle's file is the old
@@ -280,8 +287,17 @@ impl PersistenceHandle {
                 // generation file still points at N: the next recovery
                 // promotes the orphan and deletes events.<N>.log, so an
                 // event appended through this handle now would be silently
-                // destroyed then. Refuse post-failure appends instead.
-                if matches!(e, CompactionError::RollbackFailed { .. }) {
+                // destroyed then. AmbiguousCommit means the generation file
+                // may already (durably or not) point at N+1 while this
+                // handle still writes events.<N>.log: an append now could
+                // land in a log the settled generation never replays. In
+                // both states, refuse post-failure appends; a restart's
+                // recovery settles the directory losing nothing.
+                if matches!(
+                    e,
+                    CompactionError::RollbackFailed { .. }
+                        | CompactionError::AmbiguousCommit { .. }
+                ) {
                     self.log.poison();
                 }
                 return Err(e);
@@ -717,24 +733,42 @@ mod tests {
         guard.take_recording()
     }
 
-    /// Index of `write_generation`'s tmp-file fsync within a recorded
-    /// compact: the `FsyncFile` immediately preceding the rename onto
-    /// `generation`.
-    fn write_generation_tmp_fsync_index(ops: &[fault::RecordedOp]) -> usize {
-        let rename_idx = ops
-            .iter()
+    /// Index of the rename onto `generation` within a recorded compact:
+    /// the commit point of the generation-file update.
+    fn generation_rename_index(ops: &[fault::RecordedOp]) -> usize {
+        ops.iter()
             .position(|op| {
                 op.kind == fault::OpKind::Rename
                     && op.path.file_name() == Some(std::ffi::OsStr::new("generation"))
             })
-            .expect("a successful compact must rename onto the generation file");
-        let idx = rename_idx
+            .expect("a successful compact must rename onto the generation file")
+    }
+
+    /// Index of `write_generation`'s tmp-file fsync within a recorded
+    /// compact: the `FsyncFile` immediately preceding the rename onto
+    /// `generation`.
+    fn write_generation_tmp_fsync_index(ops: &[fault::RecordedOp]) -> usize {
+        let idx = generation_rename_index(ops)
             .checked_sub(1)
             .expect("the generation rename cannot be the first op");
         assert_eq!(
             ops[idx].kind,
             fault::OpKind::FsyncFile,
             "the op before the generation rename must be the tmp-file fsync"
+        );
+        idx
+    }
+
+    /// Index of the directory fsync immediately following the rename onto
+    /// `generation`: the op whose failure leaves the generation update
+    /// ambiguous (already renamed in the live namespace, crash durability
+    /// unknown).
+    fn generation_commit_fsync_dir_index(ops: &[fault::RecordedOp]) -> usize {
+        let idx = generation_rename_index(ops) + 1;
+        assert_eq!(
+            ops[idx].kind,
+            fault::OpKind::FsyncDir,
+            "the op after the generation rename must be the directory fsync"
         );
         idx
     }
@@ -983,6 +1017,103 @@ mod tests {
         drop(handle);
         let recovered = recover(dir.path(), "main").unwrap();
         assert_eq!(recovered.snapshot.log_generation, 1);
+        assert_eq!(recovered.snapshot.next_seq, 3);
+        assert!(recovered.events.is_empty());
+        assert_eq!(recovered.handle.next_seq(), 3);
+    }
+
+    #[test]
+    fn ambiguous_generation_commit_poisons_handle_and_keeps_snapshot() {
+        // The P1 regression: write_generation fails AFTER its rename (the
+        // final directory fsync), so the generation file already points at
+        // N+1 in the live namespace — possibly durably. Deleting
+        // snapshot.<N+1> as "rollback" would manufacture the unrecoverable
+        // MissingSnapshot state: a generation file pointing at a snapshot
+        // that no longer exists. compact must instead treat the commit as
+        // ambiguous: delete nothing, report fatally, and poison the handle;
+        // restart-and-recover settles the directory in either world.
+        let fail_at = generation_commit_fsync_dir_index(&record_compact_ops(3));
+
+        let dir = tempdir().unwrap();
+        let recovered = recover(dir.path(), "main").unwrap();
+        let mut snapshot = recovered.snapshot;
+        let mut handle = recovered.handle;
+        for i in 0..3 {
+            handle.append(payload(i)).unwrap();
+        }
+        snapshot.next_seq = handle.next_seq();
+
+        let guard = fault::arm(fault::FaultMode::FailOnly(fail_at));
+        let err = handle.compact(&mut snapshot).unwrap_err();
+        drop(guard);
+
+        assert!(
+            snapshot_path(dir.path(), 1).exists(),
+            "the possibly-committed generation's snapshot must NOT be deleted"
+        );
+        assert!(
+            matches!(err, CompactionError::AmbiguousCommit { .. }),
+            "a post-rename generation-update failure must be ambiguous, got {:?}",
+            err
+        );
+        assert_eq!(snapshot.log_generation, 0, "in-memory snapshot unchanged");
+        assert!(
+            matches!(
+                handle.append(payload(9)),
+                Err(EventLogError::PoisonedLog { .. })
+            ),
+            "the handle must refuse appends after an ambiguous commit"
+        );
+
+        // World 1: the rename survives (here: no crash at all, so the live
+        // namespace carries it). Recovery must settle on generation 1 with
+        // every appended event folded in.
+        drop(handle);
+        let recovered = recover(dir.path(), "main").unwrap();
+        assert_eq!(recovered.snapshot.log_generation, 1);
+        assert_eq!(recovered.snapshot.next_seq, 3);
+        assert!(recovered.events.is_empty());
+        assert_eq!(recovered.handle.next_seq(), 3);
+    }
+
+    #[test]
+    fn ambiguous_generation_commit_is_recoverable_in_both_crash_worlds() {
+        // Same ambiguous failure, but the crash lands in the OTHER world:
+        // the rename did not survive (after a failed fsync the page-cache
+        // state is undefined), simulated by rewriting the generation file
+        // back to the old value underneath the failed compact. Recovery
+        // must promote the orphan snapshot.<N+1> — safe because the
+        // folded-everything guards guarantee it contains every appended
+        // event, and poisoning guaranteed nothing was appended after.
+        let fail_at = generation_commit_fsync_dir_index(&record_compact_ops(3));
+
+        let dir = tempdir().unwrap();
+        let recovered = recover(dir.path(), "main").unwrap();
+        let mut snapshot = recovered.snapshot;
+        let mut handle = recovered.handle;
+        for i in 0..3 {
+            handle.append(payload(i)).unwrap();
+        }
+        snapshot.next_seq = handle.next_seq();
+
+        let guard = fault::arm(fault::FaultMode::FailOnly(fail_at));
+        let err = handle.compact(&mut snapshot).unwrap_err();
+        drop(guard);
+        assert!(
+            matches!(err, CompactionError::AmbiguousCommit { .. }),
+            "got {:?}",
+            err
+        );
+        drop(handle);
+
+        // The crash: the renamed generation file reverts to the old value.
+        std::fs::write(dir.path().join("generation"), "0\n").unwrap();
+
+        let recovered = recover(dir.path(), "main").unwrap();
+        assert_eq!(
+            recovered.snapshot.log_generation, 1,
+            "recovery must promote the orphan, not resurrect generation 0"
+        );
         assert_eq!(recovered.snapshot.next_seq, 3);
         assert!(recovered.events.is_empty());
         assert_eq!(recovered.handle.next_seq(), 3);
