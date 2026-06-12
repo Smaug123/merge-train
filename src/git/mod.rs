@@ -35,14 +35,6 @@ pub enum GitError {
     #[error("git command failed: {command}\nstderr: {stderr}")]
     CommandFailed { command: String, stderr: String },
 
-    /// Merge conflict occurred.
-    #[error("merge conflict: {details}")]
-    MergeConflict { details: String },
-
-    /// Push was rejected (non-fast-forward).
-    #[error("push rejected: {details}")]
-    PushRejected { details: String },
-
     /// Worktree operation failed.
     #[error("worktree error: {details}")]
     WorktreeError { details: String },
@@ -59,9 +51,42 @@ pub enum GitError {
     #[error("failed to fetch ref {refspec}: {details}")]
     FetchFailed { refspec: String, details: String },
 
-    /// Ref not found (e.g., PR ref was garbage-collected).
-    #[error("ref not found: {refspec}")]
-    RefNotFound { refspec: String },
+    /// Checkout target is not in a form that is safe to pass to
+    /// `git checkout --detach` (see [`checkout_detached`]).
+    #[error("checkout target must be refs/..., origin/..., or a SHA: {target}")]
+    InvalidCheckoutTarget { target: String },
+
+    /// The supplied commit is not a valid squash-merge of the expected parent.
+    #[error("invalid squash commit {squash_sha}: {details}")]
+    InvalidSquashCommit { squash_sha: Sha, details: String },
+
+    /// Reconciliation refused: the descendant does not contain the
+    /// predecessor's pre-squash head, so the ours-merge would record the
+    /// squash as merged while the tree lacks its content.
+    #[error(
+        "preparation missing or stale for {descendant_branch}: predecessor pre-squash head \
+         {predecessor_head} is not an ancestor of descendant head {descendant_head}"
+    )]
+    PreparationNotCompleted {
+        descendant_branch: String,
+        predecessor_head: Sha,
+        descendant_head: Sha,
+    },
+
+    /// Reconciliation refused: the head that was actually squash-merged (per
+    /// the predecessor's PR ref, which is frozen at merge time) differs from
+    /// the head preparation merged into the descendant. The predecessor was
+    /// force-pushed between preparation and squash; the ours-merge would
+    /// record the squash as merged while the descendant lacks its content.
+    #[error(
+        "predecessor PR #{predecessor_pr} head changed after preparation: \
+         prepared {prepared}, but {squashed} was squash-merged"
+    )]
+    PredecessorHeadChanged {
+        predecessor_pr: u64,
+        prepared: Sha,
+        squashed: Sha,
+    },
 }
 
 /// Result type for git operations.
@@ -177,27 +202,58 @@ pub fn parse_stack_dir_name(path: &Path) -> Option<PrNumber> {
     Some(PrNumber(num))
 }
 
-/// Create a git Command with clean environment (no system/user config).
+/// Create a git Command with a scrubbed environment, pinned locale, and no
+/// system/user config.
 ///
-/// This ensures consistent behavior across different machines by ignoring
-/// system and user git configuration (e.g., rerere, hooks, aliases).
+/// The environment is cleared; only `PATH` is propagated (required to locate
+/// git and the subprocesses it spawns). Inherited `GIT_*` variables would
+/// otherwise redirect operations away from `workdir` (`GIT_DIR`,
+/// `GIT_WORK_TREE`, `GIT_INDEX_FILE`), re-enable the config injection that
+/// `GIT_CONFIG_NOSYSTEM`/`GIT_CONFIG_GLOBAL` block (`GIT_CONFIG_PARAMETERS`,
+/// `GIT_CONFIG_COUNT`), or override the `-c user.name`/`-c user.email`
+/// identity (`GIT_AUTHOR_*`, `GIT_COMMITTER_*`). `HOME` is not needed:
+/// `GIT_CONFIG_GLOBAL=/dev/null` replaces both `~/.gitconfig` and the XDG
+/// config path.
 ///
-/// Security: Disables local hooks via `-c core.hooksPath=/dev/null` to prevent
-/// untrusted repos from executing code during merge/commit operations.
+/// `LC_ALL=C` pins git's output language. Error classification that
+/// string-matches git output (e.g. fetch's "couldn't find remote ref")
+/// depends on this.
+///
+/// Terminal prompts are disabled so commands fail instead of hanging on
+/// credential prompts.
+///
+/// Security: local hooks are disabled via `-c core.hooksPath=/dev/null` to
+/// prevent untrusted repos from executing code during merge/commit operations.
 pub(crate) fn git_command(workdir: &Path) -> std::process::Command {
     use std::process::Command;
 
     let mut cmd = Command::new("git");
     cmd.current_dir(workdir);
 
-    // Disable system and user config for reproducible behavior
+    cmd.env_clear();
+    // Allowlist, not denylist: anything not named here is scrubbed.
+    // - PATH: to find git (and its transport helpers).
+    // - HOME: ssh needs it for ~/.ssh/config, keys, and known_hosts. Git
+    //   config injection via ~/.gitconfig is still blocked: GIT_CONFIG_GLOBAL
+    //   and GIT_CONFIG_NOSYSTEM below are pinned regardless of HOME.
+    // - SSH_AUTH_SOCK: agent-based SSH auth for fetch/push/ls-remote.
+    // Deliberately NOT preserved: GIT_SSH/GIT_SSH_COMMAND (arbitrary command
+    // execution; deployments needing a custom SSH wrapper must configure it
+    // explicitly when such a knob exists) and credential-helper overrides.
+    for var in ["PATH", "HOME", "SSH_AUTH_SOCK"] {
+        if let Some(value) = std::env::var_os(var) {
+            cmd.env(var, value);
+        }
+    }
+
+    cmd.env("LC_ALL", "C");
+
     cmd.env("GIT_CONFIG_NOSYSTEM", "1");
     cmd.env("GIT_CONFIG_GLOBAL", "/dev/null");
+    cmd.env("GIT_CONFIG_COUNT", "0");
 
-    // Disable terminal prompts
     cmd.env("GIT_TERMINAL_PROMPT", "0");
 
-    // Security: disable all hooks to prevent untrusted repos from executing code
     cmd.args(["-c", "core.hooksPath=/dev/null"]);
 
     cmd
@@ -322,12 +378,29 @@ pub fn fetch(workdir: &Path, refspecs: &[&str]) -> GitResult<()> {
 
 /// Checkout a target in detached HEAD mode.
 ///
-/// Note: Unlike `git fetch`, `git checkout --detach` does not need a `--`
-/// separator because the target ref always follows `--detach`. Additionally,
-/// all callers use `origin/<branch>` format which is safe from flag injection.
+/// `git checkout --detach <target>` parses a leading `-` in the target as a
+/// flag, and a `--` separator would turn the target into a pathspec rather
+/// than a commit, so flag injection cannot be prevented positionally. The
+/// target must therefore be in a form that can never begin with `-`: a
+/// `refs/...` ref, an `origin/`-prefixed remote-tracking name, or a SHA.
 pub fn checkout_detached(workdir: &Path, target: &str) -> GitResult<()> {
+    let fully_qualified =
+        target.starts_with("refs/") || target.starts_with("origin/") || Sha::parse(target).is_ok();
+    if !fully_qualified {
+        return Err(GitError::InvalidCheckoutTarget {
+            target: target.to_string(),
+        });
+    }
     run_git_sync(workdir, &["checkout", "--detach", target])?;
     Ok(())
+}
+
+/// Worktree paths are passed to git as command-line arguments, which requires
+/// valid UTF-8.
+pub(crate) fn worktree_path_str(path: &Path) -> GitResult<&str> {
+    path.to_str().ok_or_else(|| GitError::WorktreeError {
+        details: format!("worktree path is not valid UTF-8: {}", path.display()),
+    })
 }
 
 #[cfg(test)]
@@ -398,6 +471,20 @@ mod tests {
             config.worktree_path(PrNumber(123)),
             PathBuf::from("/var/lib/merge-train/repos/owner-repo/worktrees/stack-123")
         );
+    }
+
+    #[test]
+    fn checkout_detached_rejects_unqualified_targets() {
+        let dir = std::env::temp_dir();
+        for target in ["-evil", "--", "main", "HEAD", "feature/x", ""] {
+            let err = checkout_detached(&dir, target).unwrap_err();
+            assert!(
+                matches!(err, GitError::InvalidCheckoutTarget { .. }),
+                "target {:?} must be rejected without running git, got {:?}",
+                target,
+                err
+            );
+        }
     }
 
     #[test]

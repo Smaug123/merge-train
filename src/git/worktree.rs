@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::types::PrNumber;
 
-use super::{GitConfig, GitResult, parse_stack_dir_name, run_git_sync};
+use super::{GitConfig, GitResult, parse_stack_dir_name, run_git_sync, worktree_path_str};
 
 /// Check if a path is a valid git worktree.
 ///
@@ -78,7 +78,7 @@ pub fn worktree_for_stack(config: &GitConfig, root_pr: PrNumber) -> GitResult<Pa
             "worktree",
             "add",
             "--detach",
-            worktree_path.to_str().unwrap(),
+            worktree_path_str(&worktree_path)?,
             "HEAD",
         ],
     )?;
@@ -108,7 +108,7 @@ pub fn remove_worktree(config: &GitConfig, root_pr: PrNumber) -> GitResult<()> {
             "worktree",
             "remove",
             "--force",
-            worktree_path.to_str().unwrap(),
+            worktree_path_str(&worktree_path)?,
         ],
     );
 
