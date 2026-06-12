@@ -8,6 +8,11 @@
 //!
 //! The generation file is written atomically using write-to-temp-then-rename.
 //! At any crash point, either the old or new generation file is complete.
+//! The write path reports failures relative to its commit point (the
+//! rename): a [`WriteGenerationError::NotCommitted`] failure provably left
+//! the old value in force, while [`WriteGenerationError::Ambiguous`] means
+//! the new value is live in the namespace with unknown crash durability —
+//! the caller must act as if it committed.
 //!
 //! # Recovery
 //!

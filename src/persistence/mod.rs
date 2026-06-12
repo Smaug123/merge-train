@@ -37,6 +37,9 @@
 //! - Snapshots: Written atomically using write-to-temp-then-rename
 //! - Compaction: Generation-based scheme ensures either old or new generation is complete
 //! - All critical operations use fsync on both files and directories
+//! - Settlement: the live process never deletes a snapshot whose generation
+//!   might be committed; an ambiguous compaction commit is fatal for the
+//!   handle and settled — losing nothing — by the next startup's recovery
 
 pub mod compaction;
 pub mod event;

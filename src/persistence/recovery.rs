@@ -1023,6 +1023,85 @@ mod tests {
     }
 
     #[test]
+    fn no_acked_event_lost_under_fault_at_every_compact_op() {
+        // Exhaustive crash-point sweep: for every instrumented filesystem
+        // op a compact performs, fail (a) exactly that op and (b) every op
+        // from it on (a dead disk), and assert the no-data-loss contract
+        // from the outcome alone:
+        // - compact succeeded (cleanup possibly pending): the handle works
+        //   on the new generation, and recovery accounts for everything;
+        // - compact failed without poisoning: the old generation is
+        //   authoritative, appends continue, recovery accounts for
+        //   everything;
+        // - the handle poisoned itself: a restart recovers every event
+        //   appended before the attempt.
+        // Outcomes are classified by result + poison state, never by op
+        // index, so the sweep stays valid when the procedure changes shape
+        // (the pinned-op-sequence test flags that on its own).
+        let op_count = record_compact_ops(3).len();
+        assert!(op_count > 0, "the recording must see the compact's ops");
+
+        const PRE: u64 = 3;
+
+        for k in 0..op_count {
+            for mode in [fault::FaultMode::FailOnly(k), fault::FaultMode::FailFrom(k)] {
+                let ctx = format!("{mode:?}");
+
+                let dir = tempdir().unwrap();
+                let recovered = recover(dir.path(), "main").unwrap();
+                let mut snapshot = recovered.snapshot;
+                let mut handle = recovered.handle;
+                for i in 0..PRE {
+                    handle.append(payload(i)).unwrap();
+                }
+                snapshot.next_seq = handle.next_seq();
+
+                let guard = fault::arm(mode);
+                let result = handle.compact(&mut snapshot);
+                // The injected disk failure ends with the compact; the
+                // post-failure appends and final recovery run on a healthy
+                // disk.
+                drop(guard);
+
+                let mut expected = PRE;
+                let poisoned = handle.log.is_poisoned();
+                match result {
+                    Ok(_) => {
+                        assert!(!poisoned, "{ctx}: a successful compact must not poison");
+                        let ev = handle.append(payload(100)).unwrap();
+                        assert_eq!(ev.seq, PRE, "{ctx}: sequence continues after compact");
+                        expected += 1;
+                    }
+                    Err(_) if !poisoned => {
+                        // Non-fatal: the old generation must accept appends.
+                        let ev = handle.append(payload(100)).unwrap();
+                        assert_eq!(ev.seq, PRE, "{ctx}: sequence continues on old log");
+                        expected += 1;
+                    }
+                    Err(_) => {
+                        // Fatal: nothing more may be appended; the restart
+                        // below must still account for every prior event.
+                        assert!(matches!(
+                            handle.append(payload(100)),
+                            Err(EventLogError::PoisonedLog { .. })
+                        ));
+                    }
+                }
+
+                drop(handle);
+                let recovered = recover(dir.path(), "main")
+                    .unwrap_or_else(|e| panic!("{ctx}: recovery must succeed, got {e}"));
+                assert_eq!(
+                    recovered.snapshot.next_seq + recovered.events.len() as u64,
+                    expected,
+                    "{ctx}: every acknowledged event must be accounted for"
+                );
+                assert_eq!(recovered.handle.next_seq(), expected, "{ctx}");
+            }
+        }
+    }
+
+    #[test]
     fn ambiguous_generation_commit_poisons_handle_and_keeps_snapshot() {
         // The P1 regression: write_generation fails AFTER its rename (the
         // final directory fsync), so the generation file already points at

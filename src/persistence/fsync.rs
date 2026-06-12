@@ -12,7 +12,7 @@
 //! # Fault injection
 //!
 //! Every function here is an instrumented seam: under `cfg(test)`, the
-//! [`fault`] module can fail the k-th operation on the current thread (or
+//! `fault` module can fail the k-th operation on the current thread (or
 //! every operation from the k-th on, modelling a dead disk). Crash-safety
 //! tests use this to sweep "what if the disk failed exactly here?" across
 //! whole multi-step procedures like compaction, instead of hand-simulating

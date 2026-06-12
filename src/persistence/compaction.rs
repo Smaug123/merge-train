@@ -15,6 +15,18 @@
 //!
 //! At any crash point, either the old or new generation is complete and usable.
 //!
+//! # The settlement invariant
+//!
+//! The live process never deletes a snapshot whose generation might be
+//! committed; only startup recovery (`cleanup_stale_generations`, under the
+//! state-directory lock) settles ambiguous states. Concretely: compaction's
+//! rollback path runs only on provably-uncommitted failures
+//! ([`WriteGenerationError::NotCommitted`] or a failed snapshot write, both
+//! of which leave the generation file pointing at the old generation), while
+//! a possibly-committed failure ([`WriteGenerationError::Ambiguous`]) deletes
+//! nothing, is fatal for the handle, and is resolved by the next recovery —
+//! which loses nothing in either world.
+//!
 //! # Recovery
 //!
 //! On startup (via `cleanup_stale_generations`):

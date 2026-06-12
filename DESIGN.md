@@ -705,8 +705,8 @@ Without these fields durably logged, recovery cannot determine which PR the trai
 
 **Bootstrap from local storage:**
 
-1. Read the `generation` file to find current generation `N`
-2. Load `snapshot.<N>.json` if it exists (fall back to `snapshot.<N-1>.json` if crash during compaction)
+1. Settle generations: the snapshot with the highest generation on disk wins (a crash during compaction can leave it above the `generation` file's value). Validate it — including against its event log — before touching anything; on any evidence that a *committed* generation's snapshot has been lost, fail loudly and delete nothing
+2. Load the settled generation's `snapshot.<N>.json`
 3. Seek to byte offset `log_position` in `events.<N>.log` and replay from there
 4. Skip any trailing partial line (incomplete JSON due to crash mid-append)
 5. Rebuild in-memory state
@@ -721,15 +721,17 @@ Compaction cannot atomically update both the snapshot and truncate the log — a
 - Increment the generation number (stored in a `generation` file, starting at 0)
 - Write snapshot to `snapshot.<gen>.json` (e.g., `snapshot.1.json`) with `log_generation = <gen>` and `log_position = 0`
 - fsync the snapshot file, then fsync the directory
-- Start a new log file `events.<gen>.log` (new events append here)
-- Update `generation` file to the new generation, fsync, fsync directory
+- Update `generation` file to the new generation, fsync, fsync directory — **the commit point**
 - **Only after** the new generation is durable, delete the old snapshot and log files
+- New events append to a new log file `events.<gen>.log`, created only after the commit (so a log above every snapshot is evidence of a lost committed generation)
+
+Failure handling around the commit point: a failure *before* the generation file's rename provably left the old generation in force, so the new snapshot is rolled back and the caller may retry. A failure *after* the rename (the directory fsync) is **ambiguous** — the new generation is live in the namespace with unknown crash durability — so the process deletes nothing, stops appending, and must restart; recovery settles whichever world survived, losing nothing. The live process never deletes a snapshot whose generation might be committed.
 
 On startup:
-1. Read the `generation` file to find the current generation `N`
-2. Load `snapshot.<N>.json` (or `snapshot.<N-1>.json` if N doesn't exist — crash during compaction)
+1. Read the `generation` file and scan for the highest snapshot generation `N` on disk (a crash or ambiguous commit can leave them disagreeing in either direction)
+2. Validate `snapshot.<N>.json` against its event log; repair the `generation` file upward to `N` if it lags, but fail loudly — deleting nothing — if the generation file points *above* every snapshot (a committed generation's snapshot has been lost)
 3. Replay from the corresponding `events.<N>.log` starting at `log_position`
-4. Clean up any stale files from older generations
+4. Only then clean up files from other generations
 
 This ensures that at any crash point, either the old or new generation is complete and consistent. Events for completed/stopped trains can be omitted from the snapshot.
 
@@ -853,7 +855,7 @@ On startup (and on first webhook for an unknown repo), the bot follows a two-pha
 1. Transition to `Bootstrapping` state (queue incoming events)
 2. Attempt to load repo state from disk:
    a. Read the `generation` file to find current generation `N`
-   b. Load `<state_dir>/<owner>/<repo>/snapshot.<N>.json` if it exists (fall back to `snapshot.<N-1>.json` if crash during compaction)
+   b. Settle generations and load the highest validated snapshot `<state_dir>/<owner>/<repo>/snapshot.<N>.json` (see Compaction: a crash during compaction never silently rolls back committed state)
    c. Replay events from `events.<N>.log` starting at byte offset `log_position` (not by timestamp — timestamps can drift or be non-monotonic)
    d. Rebuild in-memory state
 3. If snapshot found and not stale (`snapshot_at` within threshold):
