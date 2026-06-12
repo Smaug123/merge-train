@@ -6,7 +6,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::types::{CascadePhase, PrNumber, Sha, TrainError};
+use crate::types::{CascadePhase, CommentId, PrNumber, Sha, TrainError};
 
 /// An event in the event log.
 ///
@@ -254,7 +254,8 @@ pub enum StateEventPayload {
         /// The PR that was merged.
         pr: PrNumber,
         /// The merge commit SHA.
-        sha: Sha,
+        #[serde(alias = "sha")]
+        merge_sha: Sha,
     },
 
     /// A PR's state has changed (opened, closed, etc.).
@@ -267,12 +268,145 @@ pub enum StateEventPayload {
     },
 
     /// A predecessor has been declared via `@merge-train predecessor`.
+    ///
+    /// The `comment_id` tracks which comment is authoritative for this declaration.
+    /// This enables proper handling of comment edits and deletions per DESIGN.md.
     #[serde(rename = "predecessor_declared")]
     PredecessorDeclared {
         /// The PR declaring a predecessor.
         pr: PrNumber,
         /// The declared predecessor PR.
         predecessor: PrNumber,
+        /// The comment ID containing the authoritative declaration.
+        comment_id: CommentId,
+    },
+
+    /// A predecessor declaration has been removed.
+    ///
+    /// This occurs when the authoritative predecessor comment is deleted or edited
+    /// to remove the `@merge-train predecessor` command.
+    #[serde(rename = "predecessor_removed")]
+    PredecessorRemoved {
+        /// The PR whose predecessor declaration was removed.
+        pr: PrNumber,
+        /// The comment ID that was removed/edited.
+        comment_id: CommentId,
+    },
+
+    // ─── PR lifecycle events (non-critical, for cache updates) ───
+    /// A new PR has been opened.
+    #[serde(rename = "pr_opened")]
+    PrOpened {
+        /// The PR number.
+        pr: PrNumber,
+        /// The head SHA of the PR.
+        head_sha: Sha,
+        /// The head branch name.
+        head_ref: String,
+        /// The base branch name.
+        base_ref: String,
+        /// Whether the PR is a draft.
+        is_draft: bool,
+    },
+
+    /// A PR has been closed without merging.
+    #[serde(rename = "pr_closed")]
+    PrClosed {
+        /// The PR that was closed.
+        pr: PrNumber,
+    },
+
+    /// A PR has been reopened.
+    #[serde(rename = "pr_reopened")]
+    PrReopened {
+        /// The PR that was reopened.
+        pr: PrNumber,
+    },
+
+    /// A PR's base branch has been changed.
+    #[serde(rename = "pr_base_changed")]
+    PrBaseChanged {
+        /// The PR whose base changed.
+        pr: PrNumber,
+        /// The old base branch.
+        old_base: String,
+        /// The new base branch.
+        new_base: String,
+    },
+
+    /// A PR has been synchronized (new commits pushed).
+    #[serde(rename = "pr_synchronized")]
+    PrSynchronized {
+        /// The PR that was synchronized.
+        pr: PrNumber,
+        /// The new head SHA.
+        new_head_sha: Sha,
+    },
+
+    /// A PR has been converted to draft.
+    #[serde(rename = "pr_converted_to_draft")]
+    PrConvertedToDraft {
+        /// The PR that was converted to draft.
+        pr: PrNumber,
+    },
+
+    /// A PR is ready for review (no longer a draft).
+    #[serde(rename = "pr_ready_for_review")]
+    PrReadyForReview {
+        /// The PR that is ready for review.
+        pr: PrNumber,
+    },
+
+    /// A descendant PR was skipped during cascade.
+    #[serde(rename = "descendant_skipped")]
+    DescendantSkipped {
+        /// The train root.
+        root_pr: PrNumber,
+        /// The descendant that was skipped.
+        descendant_pr: PrNumber,
+        /// The reason for skipping.
+        reason: String,
+    },
+
+    // ─── CI/Review events (non-critical, for cache updates) ───
+    /// A check suite has completed.
+    #[serde(rename = "check_suite_completed")]
+    CheckSuiteCompleted {
+        /// The commit SHA the check suite ran on.
+        sha: Sha,
+        /// The conclusion (success, failure, etc.).
+        conclusion: String,
+    },
+
+    /// A commit status has been received.
+    #[serde(rename = "status_received")]
+    StatusReceived {
+        /// The commit SHA the status is for.
+        sha: Sha,
+        /// The context (name) of the status check.
+        context: String,
+        /// The state of the status.
+        state: String,
+    },
+
+    /// A review has been submitted.
+    #[serde(rename = "review_submitted")]
+    ReviewSubmitted {
+        /// The PR that was reviewed.
+        pr: PrNumber,
+        /// The reviewer's login.
+        reviewer: String,
+        /// The review state (approved, changes_requested, etc.).
+        state: String,
+    },
+
+    /// A review has been dismissed.
+    #[serde(rename = "review_dismissed")]
+    ReviewDismissed {
+        /// The PR whose review was dismissed.
+        pr: PrNumber,
+        /// The reviewer whose review was dismissed.
+        reviewer: String,
     },
 }
 
@@ -310,7 +444,20 @@ impl StateEventPayload {
             // Observational events (not critical for recovery)
             StateEventPayload::PrMerged { .. }
             | StateEventPayload::PrStateChanged { .. }
-            | StateEventPayload::PredecessorDeclared { .. } => false,
+            | StateEventPayload::PredecessorDeclared { .. }
+            | StateEventPayload::PredecessorRemoved { .. }
+            | StateEventPayload::PrOpened { .. }
+            | StateEventPayload::PrClosed { .. }
+            | StateEventPayload::PrReopened { .. }
+            | StateEventPayload::PrBaseChanged { .. }
+            | StateEventPayload::PrSynchronized { .. }
+            | StateEventPayload::PrConvertedToDraft { .. }
+            | StateEventPayload::PrReadyForReview { .. }
+            | StateEventPayload::DescendantSkipped { .. }
+            | StateEventPayload::CheckSuiteCompleted { .. }
+            | StateEventPayload::StatusReceived { .. }
+            | StateEventPayload::ReviewSubmitted { .. }
+            | StateEventPayload::ReviewDismissed { .. } => false,
         }
     }
 }
@@ -436,7 +583,7 @@ mod tests {
         let non_critical_payloads = vec![
             StateEventPayload::PrMerged {
                 pr: PrNumber(1),
-                sha: Sha::parse("0".repeat(40)).unwrap(),
+                merge_sha: Sha::parse("0".repeat(40)).unwrap(),
             },
             StateEventPayload::PrStateChanged {
                 pr: PrNumber(1),
@@ -445,6 +592,11 @@ mod tests {
             StateEventPayload::PredecessorDeclared {
                 pr: PrNumber(2),
                 predecessor: PrNumber(1),
+                comment_id: CommentId(12345),
+            },
+            StateEventPayload::PredecessorRemoved {
+                pr: PrNumber(2),
+                comment_id: CommentId(12345),
             },
         ];
 
@@ -455,5 +607,51 @@ mod tests {
                 payload
             );
         }
+    }
+
+    // ─── Backwards compatibility tests ───
+
+    #[test]
+    fn pr_merged_deserializes_with_old_sha_field() {
+        // Old format used "sha" field name
+        let old_json =
+            r#"{"type":"pr_merged","pr":42,"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#;
+        let parsed: StateEventPayload = serde_json::from_str(old_json).unwrap();
+
+        assert!(matches!(
+            parsed,
+            StateEventPayload::PrMerged { pr, merge_sha }
+            if pr == PrNumber(42) && merge_sha.as_str() == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
+    }
+
+    #[test]
+    fn pr_merged_deserializes_with_new_merge_sha_field() {
+        // New format uses "merge_sha" field name
+        let new_json = r#"{"type":"pr_merged","pr":42,"merge_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}"#;
+        let parsed: StateEventPayload = serde_json::from_str(new_json).unwrap();
+
+        assert!(matches!(
+            parsed,
+            StateEventPayload::PrMerged { pr, merge_sha }
+            if pr == PrNumber(42) && merge_sha.as_str() == "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        ));
+    }
+
+    #[test]
+    fn predecessor_declared_serde_roundtrip() {
+        let json = r#"{"type":"predecessor_declared","pr":2,"predecessor":1,"comment_id":12345}"#;
+        let parsed: StateEventPayload = serde_json::from_str(json).unwrap();
+
+        assert!(matches!(
+            parsed,
+            StateEventPayload::PredecessorDeclared { pr, predecessor, comment_id }
+            if pr == PrNumber(2) && predecessor == PrNumber(1) && comment_id == CommentId(12345)
+        ));
+
+        // Verify roundtrip
+        let reserialized = serde_json::to_string(&parsed).unwrap();
+        let reparsed: StateEventPayload = serde_json::from_str(&reserialized).unwrap();
+        assert_eq!(parsed, reparsed);
     }
 }

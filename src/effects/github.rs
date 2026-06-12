@@ -71,6 +71,13 @@ pub enum GitHubEffect {
     /// Get the merge state status for a PR (via GraphQL).
     GetMergeState { pr: PrNumber },
 
+    /// Refetch a PR's full data and merge state.
+    ///
+    /// This is a combined operation that updates the cached PR data including
+    /// its merge state. Used when CI completes, reviews are submitted, or
+    /// other events that may change a PR's mergeability.
+    RefetchPr { pr: PrNumber },
+
     // ─── PR Mutations ─────────────────────────────────────────────────────────
     /// Squash-merge a PR into its base branch.
     ///
@@ -221,6 +228,14 @@ pub enum GitHubResponse {
 
     /// Response to `GetMergeState`.
     MergeState(MergeStateStatus),
+
+    /// Response to `RefetchPr`.
+    ///
+    /// Contains both the PR data and its merge state.
+    PrRefetched {
+        pr: PrData,
+        merge_state: MergeStateStatus,
+    },
 
     /// Response to `SquashMerge`.
     Merged {
@@ -437,6 +452,7 @@ mod tests {
             Just(GitHubEffect::ListOpenPrs),
             (1u32..365).prop_map(|since_days| GitHubEffect::ListRecentlyMergedPrs { since_days }),
             arb_pr_number().prop_map(|pr| GitHubEffect::GetMergeState { pr }),
+            arb_pr_number().prop_map(|pr| GitHubEffect::RefetchPr { pr }),
             (arb_pr_number(), arb_sha())
                 .prop_map(|(pr, expected_sha)| GitHubEffect::SquashMerge { pr, expected_sha }),
             (arb_pr_number(), arb_branch_name())
@@ -469,6 +485,8 @@ mod tests {
                 }
             ),
             arb_merge_state_status().prop_map(GitHubResponse::MergeState),
+            (arb_pr_data(), arb_merge_state_status())
+                .prop_map(|(pr, merge_state)| { GitHubResponse::PrRefetched { pr, merge_state } }),
             arb_sha().prop_map(|sha| GitHubResponse::Merged { sha }),
             Just(GitHubResponse::Retargeted),
             arb_comment_id().prop_map(|id| GitHubResponse::CommentPosted { id }),
