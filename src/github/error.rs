@@ -152,8 +152,6 @@ impl GitHubApiError {
     /// - Error message patterns for known GitHub API responses
     pub fn from_octocrab(err: octocrab::Error) -> Self {
         let status_code = Self::extract_status_code(&err);
-        // octocrab's Display just returns "GitHub", so we traverse the error source
-        // chain to find the actual error message
         let message = Self::extract_message(&err);
 
         // Check for specific transient messages first
@@ -202,95 +200,41 @@ impl GitHubApiError {
 
     /// Extracts the HTTP status code from an octocrab error, if present.
     ///
-    /// # Implementation Note
-    ///
-    /// This uses string parsing which is inherently fragile and may break if
-    /// octocrab changes its error message format. However, this is a pragmatic
-    /// choice because:
-    ///
-    /// 1. octocrab's `Error` type doesn't expose a stable API for extracting
-    ///    HTTP status codes across all error variants
-    /// 2. The fallback behavior (returning `None`) is safe — it results in
-    ///    conservative error categorization via `from_octocrab`
-    /// 3. The patterns matched are well-established HTTP error conventions
-    ///    (e.g., "404" with "not found") that are unlikely to change
-    /// 4. Critical error handling (SHA mismatch detection) also checks error
-    ///    messages directly, so this approach is consistent
-    ///
-    /// If octocrab adds a proper status code accessor in the future, this
-    /// function should be updated to use it.
+    /// Only `Error::GitHub` carries a status code; transport-level variants
+    /// (Hyper, Service, ...) have none.
     fn extract_status_code(err: &octocrab::Error) -> Option<u16> {
-        let err_str = err.to_string();
-
-        // Try to extract status code from common error message patterns
-        // octocrab formats errors like "GitHub API returned error 404"
-        // or includes "status code: 404" in messages
-        if let Some(idx) = err_str.find("status: ") {
-            let rest = &err_str[idx + 8..];
-            if let Some(end) = rest.find(|c: char| !c.is_ascii_digit()) {
-                if let Ok(code) = rest[..end].parse() {
-                    return Some(code);
-                }
-            } else if let Ok(code) = rest.trim().parse() {
-                return Some(code);
-            }
+        match err {
+            octocrab::Error::GitHub { source, .. } => Some(source.status_code.as_u16()),
+            _ => None,
         }
-
-        // Another common pattern
-        if err_str.contains("404") && err_str.to_lowercase().contains("not found") {
-            return Some(404);
-        }
-        if err_str.contains("409") && err_str.to_lowercase().contains("conflict") {
-            return Some(409);
-        }
-        if err_str.contains("422") {
-            return Some(422);
-        }
-        if err_str.contains("403") {
-            return Some(403);
-        }
-        if err_str.contains("401") {
-            return Some(401);
-        }
-        if err_str.contains("429") {
-            return Some(429);
-        }
-        if err_str.contains("500") {
-            return Some(500);
-        }
-        if err_str.contains("502") {
-            return Some(502);
-        }
-        if err_str.contains("503") {
-            return Some(503);
-        }
-
-        None
     }
 
-    /// Extracts a useful error message from an octocrab error.
+    /// Extracts the error message from an octocrab error.
     ///
-    /// octocrab's Display impl just returns "GitHub", so we traverse the error
-    /// source chain to find the actual message from the underlying GitHubError.
+    /// For API errors this is the `message` field of GitHub's error body.
+    /// For other variants we join the source chain, skipping the top-level
+    /// snafu `Display` (it embeds a captured backtrace whose frame text must
+    /// not leak into message-pattern checks).
     pub fn extract_message(err: &octocrab::Error) -> String {
         use std::error::Error;
 
-        // Walk the source chain to find useful messages
+        if let octocrab::Error::GitHub { source, .. } = err {
+            return source.message.clone();
+        }
+
         let mut messages = Vec::new();
-        let mut current: Option<&(dyn Error + 'static)> = Some(err);
+        let mut current: Option<&(dyn Error + 'static)> = err.source();
 
         while let Some(e) = current {
             let msg = e.to_string();
-            // Skip the unhelpful "GitHub" message from octocrab's Display
-            if msg != "GitHub" && !msg.is_empty() {
+            if !msg.is_empty() {
                 messages.push(msg);
             }
             current = e.source();
         }
 
         if messages.is_empty() {
-            // Fallback to Debug if we couldn't find anything useful
-            format!("{:?}", err)
+            err.to_string()
         } else {
             messages.join(": ")
         }
@@ -343,8 +287,104 @@ pub fn is_network_error(message: &str) -> bool {
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use axum::body::Bytes;
+    use http_body_util::BodyExt;
+
+    /// Builds a real `octocrab::Error::GitHub` by passing a synthetic HTTP
+    /// response through octocrab's own error-mapping path
+    /// (`octocrab::map_github_error`). `GitHubError` is `#[non_exhaustive]`,
+    /// so this is the only way to construct one outside octocrab.
+    pub(crate) async fn github_error(status: u16, message: &str) -> octocrab::Error {
+        let body = serde_json::json!({ "message": message }).to_string();
+        let response = axum::http::Response::builder()
+            .status(status)
+            .body(
+                http_body_util::Full::new(Bytes::from(body))
+                    .map_err(|never: std::convert::Infallible| match never {})
+                    .boxed(),
+            )
+            .expect("synthetic response must be valid");
+        octocrab::map_github_error(response)
+            .await
+            .expect_err("non-success status must map to an error")
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    use super::test_support::github_error;
     use super::*;
+
+    #[tokio::test]
+    async fn github_5xx_is_transient() {
+        for status in 500..=599u16 {
+            let err = github_error(status, "Server Error").await;
+            let categorized = GitHubApiError::from_octocrab(err);
+            assert_eq!(
+                categorized.kind,
+                GitHubErrorKind::Transient,
+                "HTTP {} must be transient",
+                status
+            );
+            assert_eq!(categorized.status_code, Some(status));
+        }
+    }
+
+    #[tokio::test]
+    async fn github_429_is_transient() {
+        let err = github_error(429, "You have exceeded a secondary rate limit").await;
+        let categorized = GitHubApiError::from_octocrab(err);
+        assert_eq!(categorized.kind, GitHubErrorKind::Transient);
+        assert_eq!(categorized.status_code, Some(429));
+    }
+
+    #[tokio::test]
+    async fn github_403_rate_limit_is_transient() {
+        let err = github_error(403, "API rate limit exceeded for installation ID 123456.").await;
+        let categorized = GitHubApiError::from_octocrab(err);
+        assert_eq!(categorized.kind, GitHubErrorKind::Transient);
+        assert_eq!(categorized.status_code, Some(403));
+    }
+
+    #[tokio::test]
+    async fn github_4xx_is_permanent() {
+        // Real GitHub messages deliberately free of status-code digits, so a
+        // string-sniffing implementation cannot pass by accident.
+        let cases: &[(u16, &str)] = &[
+            (400, "Problems parsing JSON"),
+            (401, "Bad credentials"),
+            (403, "Resource not accessible by integration"),
+            (404, "Not Found"),
+            (405, "Pull Request is not mergeable"),
+            (409, "Merge conflict"),
+            (410, "This repository is empty."),
+            (422, "Validation Failed"),
+        ];
+        for &(status, message) in cases {
+            let err = github_error(status, message).await;
+            let categorized = GitHubApiError::from_octocrab(err);
+            assert_eq!(
+                categorized.kind,
+                GitHubErrorKind::Permanent,
+                "HTTP {} ({}) must be permanent",
+                status,
+                message
+            );
+            assert_eq!(categorized.status_code, Some(status));
+        }
+    }
+
+    #[tokio::test]
+    async fn github_error_message_is_extracted() {
+        let err = github_error(404, "Branch not protected").await;
+        let categorized = GitHubApiError::from_octocrab(err);
+        assert!(
+            categorized.message.contains("Branch not protected"),
+            "message was: {}",
+            categorized.message
+        );
+    }
 
     #[test]
     fn transient_message_detection() {

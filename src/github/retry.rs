@@ -4,7 +4,6 @@
 //! GitHub API errors. The design follows DESIGN.md specifications:
 //!
 //! - Default: 3 retries with 2s, 4s, 8s delays (for normal operations)
-//! - Recovery: 10 retries with 1s base, 30s cap (for crash recovery scenarios)
 //!
 //! The retry logic only applies to transient errors. Permanent errors and
 //! SHA mismatches are returned immediately.
@@ -34,25 +33,11 @@ impl RetryConfig {
     /// Default retry configuration for normal GitHub API operations.
     ///
     /// - 3 retries with 2s, 4s, 8s delays
-    /// - Total max wait: ~14 seconds
+    /// - Total max wait: 14 seconds (2 + 4 + 8)
     pub const DEFAULT: Self = Self {
         max_retries: 3,
         initial_delay: Duration::from_secs(2),
-        max_delay: Duration::from_secs(16), // Won't hit this with 3 retries
-        backoff_multiplier: 2.0,
-    };
-
-    /// Retry configuration for crash recovery scenarios.
-    ///
-    /// When recovering from a crash, we may need to wait for GitHub's eventual
-    /// consistency (e.g., `merge_commit_sha` propagation).
-    ///
-    /// - 10 retries with 1s base, 30s cap
-    /// - Total max wait: ~150 seconds (1+2+4+8+16+30+30+30+30+30)
-    pub const RECOVERY: Self = Self {
-        max_retries: 10,
-        initial_delay: Duration::from_secs(1),
-        max_delay: Duration::from_secs(30),
+        max_delay: Duration::from_secs(16),
         backoff_multiplier: 2.0,
     };
 
@@ -121,9 +106,6 @@ pub enum RetryResult<T> {
         /// The last error encountered.
         last_error: GitHubApiError,
         /// Number of attempts made (including the initial attempt).
-        ///
-        /// Useful for logging/diagnostics when handling exhausted retries.
-        #[allow(dead_code)]
         attempts: u32,
     },
 
@@ -143,15 +125,6 @@ impl<T> RetryResult<T> {
             RetryResult::PermanentError(e) => Err(e),
             RetryResult::ShaMismatch(e) => Err(e),
         }
-    }
-
-    /// Returns true if the result is a success.
-    ///
-    /// Part of the public API for callers who want to inspect the result
-    /// without consuming it.
-    #[allow(dead_code)]
-    pub fn is_success(&self) -> bool {
-        matches!(self, RetryResult::Success(_))
     }
 }
 
@@ -233,14 +206,6 @@ mod tests {
     }
 
     #[test]
-    fn recovery_config_values() {
-        let config = RetryConfig::RECOVERY;
-        assert_eq!(config.max_retries, 10);
-        assert_eq!(config.initial_delay, Duration::from_secs(1));
-        assert_eq!(config.max_delay, Duration::from_secs(30));
-    }
-
-    #[test]
     fn default_delays_are_2_4_8() {
         let config = RetryConfig::DEFAULT;
         let delays: Vec<_> = config.delays().collect();
@@ -251,37 +216,10 @@ mod tests {
     }
 
     #[test]
-    fn recovery_delays_respect_cap() {
-        let config = RetryConfig::RECOVERY;
-        let delays: Vec<_> = config.delays().collect();
-
-        // First few delays grow exponentially
-        assert_eq!(delays[0], Duration::from_secs(1));
-        assert_eq!(delays[1], Duration::from_secs(2));
-        assert_eq!(delays[2], Duration::from_secs(4));
-        assert_eq!(delays[3], Duration::from_secs(8));
-        assert_eq!(delays[4], Duration::from_secs(16));
-
-        // After that, delays are capped at 30s
-        for delay in &delays[5..] {
-            assert_eq!(*delay, Duration::from_secs(30));
-        }
-    }
-
-    #[test]
     fn total_max_wait_default() {
         let config = RetryConfig::DEFAULT;
         // 2 + 4 + 8 = 14 seconds
         assert_eq!(config.total_max_wait(), Duration::from_secs(14));
-    }
-
-    #[test]
-    fn total_max_wait_recovery() {
-        let config = RetryConfig::RECOVERY;
-        // 1 + 2 + 4 + 8 + 16 + 30*5 = 181 seconds
-        let total = config.total_max_wait();
-        assert!(total >= Duration::from_secs(150)); // Design says ~150
-        assert!(total <= Duration::from_secs(200)); // But allow some margin
     }
 
     #[tokio::test]
@@ -299,7 +237,6 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_success());
         match result {
             RetryResult::Success(v) => assert_eq!(v, 42),
             _ => panic!("Expected success"),
@@ -374,7 +311,7 @@ mod tests {
         })
         .await;
 
-        assert!(result.is_success());
+        assert!(matches!(result, RetryResult::Success(42)));
         assert_eq!(counter.load(Ordering::SeqCst), 3);
     }
 
