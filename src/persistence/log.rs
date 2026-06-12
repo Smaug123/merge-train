@@ -78,11 +78,14 @@ pub enum EventLogError {
         reason: &'static str,
     },
 
-    /// The log was poisoned by an earlier failed write or fsync: bytes of
-    /// unknown extent may be on disk while `next_seq` was not incremented,
-    /// so any further append could write a duplicate sequence number.
+    /// The log was poisoned: this handle no longer describes durable state.
+    /// Either a write/fsync failed (bytes of unknown extent may be on disk
+    /// while `next_seq` was not incremented, so any further append could
+    /// write a duplicate sequence number), or a compaction committed but the
+    /// new generation's log could not be opened (this handle's file is the
+    /// old generation's deleted log).
     #[error(
-        "event log {} is poisoned by an earlier write/fsync failure; refusing further \
+        "event log {} is poisoned by an earlier failure; refusing further \
          operations; restart and recover",
         path.display()
     )]
@@ -120,9 +123,11 @@ impl EventLog {
     ///
     /// Crate-private on purpose: opening an existing log with the wrong
     /// `next_seq` writes duplicate sequence numbers, which replay then
-    /// rejects as corruption. The only way to obtain an `EventLog` from
-    /// outside this crate is [`super::recovery::recover`], which derives
-    /// `next_seq` from replay.
+    /// rejects as corruption. From outside this crate the log is reachable
+    /// only through [`super::recovery::PersistenceHandle`]: its constructor
+    /// [`super::recovery::recover`] derives `next_seq` from replay, and
+    /// [`super::recovery::PersistenceHandle::compact`] swaps the handle to
+    /// the new generation's log.
     ///
     /// If the file doesn't exist, it's created and the parent directory is
     /// fsynced to ensure the new file survives a crash.
@@ -238,9 +243,19 @@ impl EventLog {
 
     /// Returns the current byte position in the log file.
     ///
-    /// This is used to record `log_position` in snapshots.
-    pub fn position(&mut self) -> io::Result<u64> {
-        self.file.stream_position()
+    /// This is used to record `log_position` in snapshots, so a poisoned
+    /// log refuses it like every other operation: after a failed write the
+    /// file may hold a torn tail beyond the last durable event, and
+    /// recording such an offset as a snapshot's `log_position` would make
+    /// the next recovery fail (its torn-tail truncation would cut the log
+    /// below the snapshot's position).
+    pub fn position(&mut self) -> Result<u64> {
+        if self.poisoned {
+            return Err(EventLogError::PoisonedLog {
+                path: self.path.clone(),
+            });
+        }
+        Ok(self.file.stream_position()?)
     }
 
     /// Returns the next sequence number that will be assigned.
@@ -251,6 +266,23 @@ impl EventLog {
     /// Returns the path to the log file.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Whether the log is poisoned (see [`EventLogError::PoisonedLog`]).
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    /// Poisons the log so all further operations fail with
+    /// [`EventLogError::PoisonedLog`].
+    ///
+    /// For when this handle is known to no longer describe durable state
+    /// even though no write failed: after a committed compaction, this
+    /// handle's file is the old generation's deleted log, so if the new
+    /// generation's log cannot be opened the handle must refuse appends
+    /// rather than silently write to an unlinked file.
+    pub(crate) fn poison(&mut self) {
+        self.poisoned = true;
     }
 
     /// Replays events from a byte offset, truncating any partial line at EOF.
@@ -430,7 +462,7 @@ impl EventLog {
 mod tests {
     use super::*;
     use crate::test_utils::arb_state_event_payload;
-    use crate::types::{CascadePhase, DescendantProgress, PrNumber, Sha};
+    use crate::types::{CascadePhase, CommentId, DescendantProgress, PrNumber, Sha};
     use proptest::prelude::*;
     use std::io::Write;
     use tempfile::tempdir;
@@ -564,6 +596,49 @@ mod tests {
         let (events, next_seq) = EventLog::replay_from(&path, 0).unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(next_seq, 2);
+    }
+
+    #[test]
+    fn position_fails_on_poisoned_log() {
+        // The hazard: a torn append leaves bytes on disk past the last
+        // durable event. If position() still reported the (advanced) file
+        // offset and a snapshot recorded it as log_position, the next
+        // recovery would truncate the torn tail below that position and
+        // fail with LogTruncated.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.log");
+
+        let mut log = open_log(&path);
+        log.append(StateEventPayload::TrainStarted {
+            root_pr: PrNumber(1),
+            current_pr: PrNumber(1),
+        })
+        .unwrap();
+        let safe_position = log.position().unwrap();
+
+        log.fail_next_write = true;
+        let _ = log
+            .append(StateEventPayload::TrainStopped {
+                root_pr: PrNumber(1),
+            })
+            .unwrap_err();
+
+        let err = log.position().unwrap_err();
+        assert!(
+            matches!(err, EventLogError::PoisonedLog { .. }),
+            "position after a failed write must report PoisonedLog, got {:?}",
+            err
+        );
+
+        // The torn bytes really do extend past the last safe position (the
+        // offset position() would have leaked), and recovery from the safe
+        // position still works.
+        let file_len = std::fs::metadata(&path).unwrap().len();
+        assert!(file_len > safe_position);
+        drop(log);
+        let (events, next_seq) = EventLog::replay_from(&path, safe_position).unwrap();
+        assert!(events.is_empty());
+        assert_eq!(next_seq, 1);
     }
 
     #[test]
@@ -814,6 +889,7 @@ mod tests {
             log.append(StateEventPayload::PredecessorDeclared {
                 pr: PrNumber(i),
                 predecessor: PrNumber(i + 1),
+                comment_id: CommentId(1000 + i),
             })
             .unwrap();
         }
@@ -1326,6 +1402,54 @@ mod tests {
             if payloads.is_empty() {
                 let pos = log.position().unwrap();
                 prop_assert_eq!(pos, 0, "Empty log should have position 0");
+            }
+        }
+
+        /// Every offset position() successfully returns is a safe snapshot
+        /// `log_position`: recovery from that offset succeeds and replays
+        /// exactly the events appended after it — even when a later append
+        /// tears (fails partway through its write) and poisons the log.
+        #[test]
+        fn returned_positions_are_safe_snapshot_positions(
+            payloads in prop::collection::vec(arb_state_event_payload(), 1..8),
+            torn_append in proptest::bool::ANY,
+        ) {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("events.log");
+
+            let mut log = open_log(&path);
+            let mut positions = vec![log.position().unwrap()];
+            for p in &payloads {
+                log.append(p.clone()).unwrap();
+                positions.push(log.position().unwrap());
+            }
+
+            if torn_append {
+                log.fail_next_write = true;
+                let _ = log.append(payloads[0].clone()).unwrap_err();
+                // Once poisoned the log must stop handing out positions:
+                // the file now holds torn bytes beyond the last durable
+                // event, so an offset reported here would record
+                // un-replayable bytes into a snapshot.
+                let position_result = log.position();
+                prop_assert!(
+                    matches!(position_result, Err(EventLogError::PoisonedLog { .. })),
+                    "position on a poisoned log must be refused, got {:?}",
+                    position_result
+                );
+            }
+            drop(log);
+
+            // The first recovery repairs the torn tail (if any); every
+            // offset handed out earlier must then be a valid replay point.
+            let (_, next_seq) = EventLog::replay_from(&path, 0).unwrap();
+            prop_assert_eq!(next_seq, payloads.len() as u64);
+            for (i, offset) in positions.iter().enumerate() {
+                let (events, _) = EventLog::replay_from(&path, *offset).unwrap();
+                prop_assert_eq!(events.len(), payloads.len() - i);
+                for (j, event) in events.iter().enumerate() {
+                    prop_assert_eq!(event.seq, (i + j) as u64);
+                }
             }
         }
 

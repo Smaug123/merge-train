@@ -5,7 +5,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::ids::{PrNumber, Sha};
+use super::ids::{CommentId, PrNumber, Sha};
 
 /// The state of a pull request.
 ///
@@ -134,6 +134,10 @@ pub struct CachedPr {
     /// The predecessor PR number, if declared via `@merge-train predecessor #N`.
     pub predecessor: Option<PrNumber>,
 
+    /// The comment ID containing the authoritative predecessor declaration.
+    /// Used to identify when the declaration is deleted or edited.
+    pub predecessor_comment_id: Option<CommentId>,
+
     /// The current state of the PR.
     pub state: PrState,
 
@@ -183,6 +187,7 @@ impl CachedPr {
             head_ref,
             base_ref,
             predecessor,
+            predecessor_comment_id: None,
             state,
             merge_state_status,
             is_draft,

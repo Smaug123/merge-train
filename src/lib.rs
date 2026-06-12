@@ -5,6 +5,7 @@
 #[cfg(test)]
 pub mod test_utils;
 
+pub mod cascade;
 pub mod commands;
 pub mod effects;
 pub mod git;
@@ -17,3 +18,4 @@ pub mod state;
 pub mod status;
 pub mod types;
 pub mod webhooks;
+pub mod worker;
