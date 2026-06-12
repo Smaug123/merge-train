@@ -40,6 +40,9 @@
         nativeBuildInputs = with pkgs; [
           pkg-config
           git # needed for property tests that create git repos
+          cacert # octocrab eagerly loads native CA roots in its builder; the
+          # Nix sandbox otherwise sets SSL_CERT_FILE=/no-cert-file.crt and the
+          # mock-HTTP tests would fail constructing a client.
         ];
 
         buildInputs = with pkgs; [
