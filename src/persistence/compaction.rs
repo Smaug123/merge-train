@@ -234,6 +234,11 @@ pub enum CompactionOutcome {
 /// This creates a new generation with a fresh snapshot and empty event log,
 /// then cleans up old generation files.
 ///
+/// Crate-private on purpose: committing a compaction deletes the old
+/// generation's log file, so any live [`EventLog`] on it must be switched to
+/// the new generation at the same time. The public entry point is
+/// [`super::recovery::PersistenceHandle::compact`], which does exactly that.
+///
 /// # Arguments
 ///
 /// * `state_dir` - The state directory containing snapshot and event files
@@ -270,7 +275,7 @@ pub enum CompactionOutcome {
 /// file is updated, events must be written to the new generation's log. The
 /// old files are cleaned up on the next startup via
 /// `cleanup_stale_generations`.
-pub fn compact(
+pub(crate) fn compact(
     state_dir: &Path,
     snapshot: &mut PersistedRepoSnapshot,
 ) -> Result<CompactionOutcome> {
@@ -457,7 +462,10 @@ pub(super) fn validate_snapshot_against_log(
 
 /// Cleans up stale generation files that may remain from interrupted compaction.
 ///
-/// This should be called during startup to ensure a clean state.
+/// Called by [`super::recovery::recover`] during startup, under the
+/// state-directory lock. Crate-private on purpose: it mutates the state
+/// directory and must never run concurrently with a live
+/// [`super::recovery::PersistenceHandle`].
 ///
 /// # Logic
 ///
@@ -499,7 +507,7 @@ pub(super) fn validate_snapshot_against_log(
 /// Silently falling back to an older snapshot in these states would roll
 /// back committed state, and the cleanup loop would delete the committed
 /// generation's remaining files.
-pub fn cleanup_stale_generations(state_dir: &Path) -> Result<()> {
+pub(crate) fn cleanup_stale_generations(state_dir: &Path) -> Result<()> {
     let (file_gen, gen_file_corrupt) = match read_generation(state_dir) {
         Ok(g) => (g, false),
         Err(super::generation::GenerationError::InvalidNumber(_)) => {

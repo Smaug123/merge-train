@@ -10,10 +10,13 @@
 //! 4. Replay events from the snapshot's `log_position`
 //! 5. Construct an [`EventLog`] whose `next_seq` is derived from replay
 //!
-//! [`recover`] is the only way to obtain an [`EventLog`] from outside this
-//! crate: the raw constructors are crate-private because opening an existing
-//! log with the wrong sequence number writes duplicate sequence numbers,
-//! which replay then rejects as corruption.
+//! [`recover`] returns the log inside a [`PersistenceHandle`] that also owns
+//! the state-directory lock: the lock cannot be released while the log is
+//! still usable, and compaction (which retires the log's file) goes through
+//! [`PersistenceHandle::compact`], which swaps the handle to the new
+//! generation's log. The raw [`EventLog`] constructors are crate-private
+//! because opening an existing log with the wrong sequence number writes
+//! duplicate sequence numbers, which replay then rejects as corruption.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -23,11 +26,11 @@ use fs2::FileExt;
 use thiserror::Error;
 
 use super::compaction::{
-    CompactionError, cleanup_stale_generations, validate_snapshot_against_log,
+    CompactionError, CompactionOutcome, cleanup_stale_generations, validate_snapshot_against_log,
 };
-use super::event::StateEvent;
+use super::event::{StateEvent, StateEventPayload};
 use super::generation::{GenerationError, events_path, read_generation, snapshot_path};
-use super::log::EventLog;
+use super::log::{EventLog, EventLogError};
 use super::snapshot::{PersistedRepoSnapshot, SnapshotError, try_load_snapshot};
 
 /// Name of the lock file inside the state directory.
@@ -90,10 +93,10 @@ pub enum RecoverError {
 /// Exclusive advisory lock on a state directory.
 ///
 /// Held for the lifetime of this value; dropping it releases the lock.
-/// Keep it alive for as long as the [`EventLog`] returned by [`recover`]
-/// is in use.
+/// Crate-private: it only ever lives inside a [`PersistenceHandle`], which
+/// keeps it alive for exactly as long as the [`EventLog`] is usable.
 #[derive(Debug)]
-pub struct StateDirLock {
+pub(crate) struct StateDirLock {
     file: File,
     path: PathBuf,
 }
@@ -136,7 +139,11 @@ impl Drop for StateDirLock {
     }
 }
 
-/// A fully recovered, ready-to-use persistence handle.
+/// The result of recovering a state directory: the recovered data plus the
+/// live [`PersistenceHandle`] for writing.
+///
+/// `snapshot` and `events` are plain data and may be moved out freely; the
+/// handle is the only live resource.
 pub struct RecoveredState {
     /// The loaded snapshot (or a fresh one, for a brand-new state directory).
     /// Does NOT include the replayed `events`; the caller must apply them to
@@ -144,15 +151,133 @@ pub struct RecoveredState {
     pub snapshot: PersistedRepoSnapshot,
     /// Events recorded after the snapshot was taken, in log order.
     pub events: Vec<StateEvent>,
-    /// Event log positioned for appending; its `next_seq` is replay-derived.
-    pub log: EventLog,
-    /// Exclusive lock on the state directory. Keep it alive for as long as
-    /// `log` is in use; dropping it releases the lock.
-    pub lock: StateDirLock,
+    /// The event log bound to the exclusive state-directory lock.
+    pub handle: PersistenceHandle,
 }
 
-/// Recovers a state directory into a ready-to-use `(snapshot, events, log)`,
-/// holding an exclusive lock on the directory.
+/// The live persistence handle: the event log bound to the exclusive
+/// state-directory lock.
+///
+/// Fields are private so the log cannot outlive the lock: the lock is
+/// released exactly when this handle — and with it the log — is dropped.
+/// Compaction goes through [`PersistenceHandle::compact`], which switches
+/// the handle to the new generation's log; the old log's file is deleted by
+/// compaction, so no separately-held log handle may survive it, and the
+/// crate-private [`EventLog`] constructors ensure none can exist.
+pub struct PersistenceHandle {
+    /// Declared before `lock` so the log's file handle is dropped before
+    /// the lock is released.
+    log: EventLog,
+    lock: StateDirLock,
+    state_dir: PathBuf,
+}
+
+impl PersistenceHandle {
+    /// Appends an event to the log. See [`EventLog::append`].
+    pub fn append(&mut self, payload: StateEventPayload) -> Result<StateEvent, EventLogError> {
+        self.log.append(payload)
+    }
+
+    /// Forces fsync of the log file. See [`EventLog::sync`].
+    pub fn sync(&mut self) -> Result<(), EventLogError> {
+        self.log.sync()
+    }
+
+    /// Returns the current byte position in the log file, for recording as
+    /// `log_position` in snapshots. See [`EventLog::position`].
+    pub fn position(&mut self) -> io::Result<u64> {
+        self.log.position()
+    }
+
+    /// Returns the next sequence number that will be assigned.
+    pub fn next_seq(&self) -> u64 {
+        self.log.next_seq()
+    }
+
+    /// Returns the path to the current generation's log file.
+    pub fn log_path(&self) -> &Path {
+        self.log.path()
+    }
+
+    /// Returns the path of the held lock file.
+    pub fn lock_path(&self) -> &Path {
+        self.lock.path()
+    }
+
+    /// Returns the state directory this handle owns.
+    pub fn state_dir(&self) -> &Path {
+        &self.state_dir
+    }
+
+    /// Whether the current generation's log has grown past `threshold_bytes`
+    /// and is worth compacting.
+    pub fn should_compact(&self, threshold_bytes: u64) -> io::Result<bool> {
+        Ok(std::fs::metadata(self.log.path())?.len() >= threshold_bytes)
+    }
+
+    /// Compacts the state directory and switches this handle to the new
+    /// generation's event log.
+    ///
+    /// `snapshot` is the caller's current in-memory state. Every event ever
+    /// appended must already be folded into it (`snapshot.next_seq` equal to
+    /// this handle's [`next_seq`](Self::next_seq)): compaction deletes the
+    /// old log, so an unfolded event would survive nowhere. On success the
+    /// snapshot's `log_generation`/`log_position` are updated in place and
+    /// subsequent appends go to the new generation's log, continuing the
+    /// same sequence numbering.
+    ///
+    /// # Failure
+    ///
+    /// On any failure before the commit point the old generation remains
+    /// authoritative and this handle still appends to it; the caller may
+    /// retry or carry on. If the commit succeeds but the new generation's
+    /// log cannot be opened, the durable state is intact (the snapshot holds
+    /// everything; the new log has no events yet) but this process can no
+    /// longer write: the handle poisons itself so appends fail loudly
+    /// instead of landing in the old generation's deleted file, and the
+    /// process must restart and recover.
+    pub fn compact(
+        &mut self,
+        snapshot: &mut PersistedRepoSnapshot,
+    ) -> Result<CompactionOutcome, CompactionError> {
+        // A poisoned log's in-memory next_seq no longer describes its file:
+        // the state is uncharacterizable, so refuse to compact from it.
+        if self.log.is_poisoned() {
+            return Err(EventLogError::PoisonedLog {
+                path: self.log.path().to_path_buf(),
+            }
+            .into());
+        }
+
+        // Stronger form of compaction's folded-everything guard: the handle
+        // knows exactly how many events were appended, so a stale snapshot
+        // is caught even when the current log file is empty (where the
+        // on-disk check is vacuous).
+        if snapshot.next_seq != self.log.next_seq() {
+            return Err(CompactionError::NextSeqInconsistent {
+                path: self.log.path().to_path_buf(),
+                snapshot_next_seq: snapshot.next_seq,
+                log_next_seq: self.log.next_seq(),
+            });
+        }
+
+        let outcome = super::compaction::compact(&self.state_dir, snapshot)?;
+
+        // The commit is durable: from here appends must go to the new
+        // generation's log, and this handle's file is the old generation's
+        // deleted log. Poison it before the reopen so that a reopen failure
+        // leaves the handle refusing appends rather than losing them.
+        self.log.poison();
+        self.log = EventLog::open_with_seq(
+            events_path(&self.state_dir, snapshot.log_generation),
+            snapshot.next_seq,
+        )?;
+        Ok(outcome)
+    }
+}
+
+/// Recovers a state directory into its `(snapshot, events)` data plus a
+/// [`PersistenceHandle`] holding an exclusive lock on the directory.
 ///
 /// This is the single entry point for opening persisted state. A brand-new
 /// state directory (generation 0, no snapshot) yields an empty snapshot
@@ -166,7 +291,8 @@ pub struct RecoveredState {
 /// - exactly one generation's files remain on disk,
 /// - `snapshot` plus `events` (applied in order) reconstruct the durable
 ///   state, and
-/// - `log.next_seq()` is consistent with both the snapshot and the log file.
+/// - the handle's `next_seq` is consistent with both the snapshot and the
+///   log file.
 ///
 /// Any state that cannot be characterized (mid-file corruption, missing
 /// snapshot, sequence mismatch between snapshot and log) is a hard error:
@@ -225,16 +351,17 @@ pub fn recover(
     Ok(RecoveredState {
         snapshot,
         events,
-        log,
-        lock,
+        handle: PersistenceHandle {
+            log,
+            lock,
+            state_dir: state_dir.to_path_buf(),
+        },
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::persistence::compaction::{CompactionOutcome, compact};
-    use crate::persistence::event::StateEventPayload;
     use crate::persistence::generation::write_generation;
     use crate::persistence::snapshot::save_snapshot_atomic;
     use crate::test_utils::arb_state_event_payload;
@@ -250,6 +377,21 @@ mod tests {
         }
     }
 
+    /// One step of a caller's lifetime: append an event or compact.
+    #[derive(Debug, Clone)]
+    #[allow(clippy::large_enum_variant)]
+    enum Step {
+        Append(StateEventPayload),
+        Compact,
+    }
+
+    fn arb_step() -> impl Strategy<Value = Step> {
+        prop_oneof![
+            4 => arb_state_event_payload().prop_map(Step::Append),
+            1 => Just(Step::Compact),
+        ]
+    }
+
     // ─── Fresh directory ───
 
     #[test]
@@ -260,7 +402,7 @@ mod tests {
         assert_eq!(recovered.snapshot.default_branch, "main");
         assert_eq!(recovered.snapshot.next_seq, 0);
         assert!(recovered.events.is_empty());
-        assert_eq!(recovered.log.next_seq(), 0);
+        assert_eq!(recovered.handle.next_seq(), 0);
     }
 
     #[test]
@@ -270,7 +412,7 @@ mod tests {
         {
             let mut recovered = recover(dir.path(), "main").unwrap();
             for i in 0..3 {
-                recovered.log.append(payload(i)).unwrap();
+                recovered.handle.append(payload(i)).unwrap();
             }
             // recovered (and its lock) dropped here: simulated shutdown
         }
@@ -280,7 +422,7 @@ mod tests {
         for (i, event) in recovered.events.iter().enumerate() {
             assert_eq!(event.seq, i as u64);
         }
-        assert_eq!(recovered.log.next_seq(), 3);
+        assert_eq!(recovered.handle.next_seq(), 3);
     }
 
     // ─── Locking ───
@@ -307,6 +449,31 @@ mod tests {
         drop(first);
         let second = recover(dir.path(), "main");
         assert!(second.is_ok(), "lock must be released when handle dropped");
+    }
+
+    #[test]
+    fn handle_moved_out_of_recovered_state_keeps_lock() {
+        // The misuse the review flagged: `recover(..).unwrap().log` used to
+        // drop the lock at the end of the statement while the log stayed
+        // usable. The handle now carries the lock with it.
+        let dir = tempdir().unwrap();
+
+        let mut handle = recover(dir.path(), "main").unwrap().handle;
+        let second = recover(dir.path(), "main");
+        assert!(
+            matches!(second, Err(RecoverError::AlreadyLocked { .. })),
+            "the lock must travel with the handle, got {:?}",
+            second.as_ref().map(|_| "Ok").map_err(|e| e.to_string())
+        );
+
+        // The handle is fully usable on its own.
+        handle.append(payload(0)).unwrap();
+
+        drop(handle);
+        assert!(
+            recover(dir.path(), "main").is_ok(),
+            "dropping the handle must release the lock"
+        );
     }
 
     // ─── Hard error cases ───
@@ -492,27 +659,182 @@ mod tests {
 
     // ─── Integration with compaction ───
 
+    /// Compacts through the handle, asserting commit and cleanup succeeded.
+    fn compact_clean(handle: &mut PersistenceHandle, snapshot: &mut PersistedRepoSnapshot) {
+        match handle.compact(snapshot).unwrap() {
+            CompactionOutcome::Clean => {}
+            CompactionOutcome::CleanupPending(e) => panic!("cleanup failed: {}", e),
+        }
+    }
+
+    #[test]
+    fn append_after_compaction_is_durable() {
+        // Regression test: compacting used to leave a live log handle
+        // writing to the old generation's deleted log file, silently losing
+        // every subsequent append. The handle now switches itself to the new
+        // generation's log.
+        let dir = tempdir().unwrap();
+
+        let recovered = recover(dir.path(), "main").unwrap();
+        let mut snapshot = recovered.snapshot;
+        let mut handle = recovered.handle;
+
+        handle.append(payload(0)).unwrap();
+        // The caller folds the appended event into its snapshot and compacts.
+        snapshot.next_seq = handle.next_seq();
+        compact_clean(&mut handle, &mut snapshot);
+
+        assert_eq!(snapshot.log_generation, 1);
+        assert_eq!(
+            handle.log_path(),
+            events_path(dir.path(), 1).as_path(),
+            "the handle must now write to the new generation's log"
+        );
+        assert_eq!(handle.next_seq(), 1, "sequence continues across compaction");
+
+        // An append after compaction must land in the new generation's log.
+        let event = handle.append(payload(1)).unwrap();
+        assert_eq!(event.seq, 1);
+        drop(handle);
+
+        let recovered = recover(dir.path(), "main").unwrap();
+        assert_eq!(recovered.snapshot.log_generation, 1);
+        assert_eq!(recovered.snapshot.next_seq, 1);
+        assert_eq!(
+            recovered.events.len(),
+            1,
+            "the post-compaction append must survive recovery"
+        );
+        assert_eq!(recovered.events[0].seq, 1);
+        assert_eq!(recovered.handle.next_seq(), 2);
+    }
+
+    #[test]
+    fn compact_with_unfolded_event_is_refused_and_handle_survives() {
+        let dir = tempdir().unwrap();
+
+        let recovered = recover(dir.path(), "main").unwrap();
+        let mut snapshot = recovered.snapshot;
+        let mut handle = recovered.handle;
+
+        handle.append(payload(0)).unwrap();
+        // snapshot.next_seq deliberately NOT updated: the event is unfolded,
+        // and compacting would delete the only copy of it.
+
+        let result = handle.compact(&mut snapshot);
+        assert!(
+            matches!(result, Err(CompactionError::NextSeqInconsistent { .. })),
+            "compacting with an unfolded event must be refused, got {:?}",
+            result
+        );
+
+        // The old generation is still authoritative and the handle usable.
+        handle.append(payload(1)).unwrap();
+        drop(handle);
+        let recovered = recover(dir.path(), "main").unwrap();
+        assert_eq!(recovered.events.len(), 2);
+    }
+
+    #[test]
+    fn compact_with_stale_snapshot_and_empty_log_is_refused() {
+        // The on-disk folded-everything check is vacuous when the log file
+        // is empty; the handle's own next_seq check must still catch a
+        // snapshot claiming events that were never appended.
+        let dir = tempdir().unwrap();
+
+        let recovered = recover(dir.path(), "main").unwrap();
+        let mut snapshot = recovered.snapshot;
+        let mut handle = recovered.handle;
+
+        snapshot.next_seq = 5;
+        let result = handle.compact(&mut snapshot);
+        assert!(
+            matches!(
+                result,
+                Err(CompactionError::NextSeqInconsistent {
+                    snapshot_next_seq: 5,
+                    log_next_seq: 0,
+                    ..
+                })
+            ),
+            "a snapshot claiming unappended events must be refused, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn failed_compact_leaves_handle_on_old_log() {
+        let dir = tempdir().unwrap();
+
+        let recovered = recover(dir.path(), "main").unwrap();
+        let mut snapshot = recovered.snapshot;
+        let mut handle = recovered.handle;
+
+        handle.append(payload(0)).unwrap();
+        snapshot.next_seq = handle.next_seq();
+        snapshot.log_generation = 7; // does not describe the on-disk state
+
+        let result = handle.compact(&mut snapshot);
+        assert!(
+            matches!(
+                result,
+                Err(CompactionError::SnapshotGenerationMismatch { .. })
+            ),
+            "got {:?}",
+            result
+        );
+        assert_eq!(
+            handle.log_path(),
+            events_path(dir.path(), 0).as_path(),
+            "a failed compaction must leave the handle on the old log"
+        );
+
+        // The old generation remains authoritative; appends still land.
+        handle.append(payload(1)).unwrap();
+        drop(handle);
+        let recovered = recover(dir.path(), "main").unwrap();
+        assert_eq!(recovered.events.len(), 2);
+    }
+
+    #[test]
+    fn compact_on_poisoned_log_is_refused() {
+        let dir = tempdir().unwrap();
+
+        let recovered = recover(dir.path(), "main").unwrap();
+        let mut snapshot = recovered.snapshot;
+        let mut handle = recovered.handle;
+
+        // Simulate an earlier failed write (test-only direct field access:
+        // the handle's in-memory next_seq no longer describes the file).
+        handle.log.poison();
+
+        let result = handle.compact(&mut snapshot);
+        assert!(
+            matches!(
+                result,
+                Err(CompactionError::EventLog(EventLogError::PoisonedLog { .. }))
+            ),
+            "compacting a poisoned log must be refused, got {:?}",
+            result
+        );
+    }
+
     #[test]
     fn recover_after_compaction_uses_new_generation() {
         let dir = tempdir().unwrap();
 
-        // Build some state: events at generation 0.
-        let next_seq = {
-            let mut recovered = recover(dir.path(), "main").unwrap();
+        // Build some state: events at generation 0, then compact. In a real
+        // system the snapshot would have the events applied; here it is
+        // enough that next_seq is carried.
+        {
+            let recovered = recover(dir.path(), "main").unwrap();
+            let mut snapshot = recovered.snapshot;
+            let mut handle = recovered.handle;
             for i in 0..3 {
-                recovered.log.append(payload(i)).unwrap();
+                handle.append(payload(i)).unwrap();
             }
-            recovered.log.next_seq()
-        };
-
-        // Compact: in a real system the snapshot would have the events
-        // applied; here it is enough that next_seq is carried.
-        let mut snapshot = PersistedRepoSnapshot::new("main");
-        snapshot.log_generation = 0;
-        snapshot.next_seq = next_seq;
-        match compact(dir.path(), &mut snapshot).unwrap() {
-            CompactionOutcome::Clean => {}
-            CompactionOutcome::CleanupPending(e) => panic!("cleanup failed: {}", e),
+            snapshot.next_seq = handle.next_seq();
+            compact_clean(&mut handle, &mut snapshot);
         }
 
         // Recovery must use the new generation and carry next_seq forward.
@@ -520,10 +842,10 @@ mod tests {
         assert_eq!(recovered.snapshot.log_generation, 1);
         assert_eq!(recovered.snapshot.next_seq, 3);
         assert!(recovered.events.is_empty());
-        assert_eq!(recovered.log.next_seq(), 3);
+        assert_eq!(recovered.handle.next_seq(), 3);
 
         // Appends continue the global sequence.
-        let event = recovered.log.append(payload(99)).unwrap();
+        let event = recovered.handle.append(payload(99)).unwrap();
         assert_eq!(event.seq, 3);
     }
 
@@ -541,7 +863,7 @@ mod tests {
             {
                 let mut recovered = recover(dir.path(), "main").unwrap();
                 for p in &payloads {
-                    recovered.log.append(p.clone()).unwrap();
+                    recovered.handle.append(p.clone()).unwrap();
                 }
             }
 
@@ -553,7 +875,7 @@ mod tests {
                 prop_assert_eq!(event.seq, i as u64);
                 prop_assert_eq!(&event.payload, expected);
             }
-            prop_assert_eq!(recovered.log.next_seq(), payloads.len() as u64);
+            prop_assert_eq!(recovered.handle.next_seq(), payloads.len() as u64);
         }
 
         /// Recovery is idempotent in the absence of writes: a second recovery
@@ -567,14 +889,14 @@ mod tests {
             {
                 let mut recovered = recover(dir.path(), "main").unwrap();
                 for p in &payloads {
-                    recovered.log.append(p.clone()).unwrap();
+                    recovered.handle.append(p.clone()).unwrap();
                 }
             }
 
             let first = recover(dir.path(), "main").unwrap();
             let first_events = first.events.clone();
             let first_snapshot = first.snapshot.clone();
-            let first_next = first.log.next_seq();
+            let first_next = first.handle.next_seq();
             drop(first);
 
             let second = recover(dir.path(), "main").unwrap();
@@ -585,7 +907,7 @@ mod tests {
             let mut second_snapshot = second.snapshot.clone();
             second_snapshot.snapshot_at = first_snapshot.snapshot_at;
             prop_assert_eq!(first_snapshot, second_snapshot);
-            prop_assert_eq!(first_next, second.log.next_seq());
+            prop_assert_eq!(first_next, second.handle.next_seq());
         }
 
         /// A torn tail write (arbitrary garbage at EOF) does not prevent
@@ -603,7 +925,7 @@ mod tests {
             {
                 let mut recovered = recover(dir.path(), "main").unwrap();
                 for p in &payloads {
-                    recovered.log.append(p.clone()).unwrap();
+                    recovered.handle.append(p.clone()).unwrap();
                 }
             }
 
@@ -619,7 +941,54 @@ mod tests {
 
             let recovered = recover(dir.path(), "main").unwrap();
             prop_assert_eq!(recovered.events.len(), payloads.len());
-            prop_assert_eq!(recovered.log.next_seq(), payloads.len() as u64);
+            prop_assert_eq!(recovered.handle.next_seq(), payloads.len() as u64);
+        }
+
+        /// Any interleaving of appends and compactions through the handle
+        /// loses nothing: recovery accounts for every append, and replays
+        /// exactly the events appended since the last compaction.
+        #[test]
+        fn interleaved_appends_and_compactions_lose_nothing(
+            steps in prop::collection::vec(arb_step(), 1..20)
+        ) {
+            let dir = tempdir().unwrap();
+
+            let recovered = recover(dir.path(), "main").unwrap();
+            let mut snapshot = recovered.snapshot;
+            let mut handle = recovered.handle;
+
+            let mut total: u64 = 0;
+            let mut since_compact: Vec<StateEventPayload> = Vec::new();
+
+            for step in &steps {
+                match step {
+                    Step::Append(p) => {
+                        let event = handle.append(p.clone()).unwrap();
+                        prop_assert_eq!(event.seq, total);
+                        total += 1;
+                        since_compact.push(p.clone());
+                        // The caller folds each event into its in-memory state.
+                        snapshot.next_seq = handle.next_seq();
+                    }
+                    Step::Compact => {
+                        compact_clean(&mut handle, &mut snapshot);
+                        since_compact.clear();
+                    }
+                }
+            }
+            drop(handle);
+
+            let recovered = recover(dir.path(), "main").unwrap();
+            prop_assert_eq!(recovered.handle.next_seq(), total);
+            prop_assert_eq!(
+                recovered.snapshot.next_seq + recovered.events.len() as u64,
+                total,
+                "snapshot plus replayed events must account for every append"
+            );
+            prop_assert_eq!(recovered.events.len(), since_compact.len());
+            for (event, expected) in recovered.events.iter().zip(since_compact.iter()) {
+                prop_assert_eq!(&event.payload, expected);
+            }
         }
     }
 }
