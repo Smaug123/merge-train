@@ -127,6 +127,39 @@ pub enum PrAction {
     ReadyForReview,
 }
 
+/// Merge outcome reported by a pull request event.
+///
+/// Mirrors the shape of [`crate::types::PrState::Merged`]: a merged PR always
+/// has a merge commit SHA on GitHub, so the SHA is not optional. The parser
+/// rejects payloads that claim `merged: true` without a merge commit SHA.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum MergeStatus {
+    /// The PR was merged. The SHA of the merge commit is required.
+    Merged {
+        /// The SHA of the commit created by the merge (squash commit on main).
+        merge_commit_sha: Sha,
+    },
+
+    /// The PR was not merged.
+    NotMerged,
+}
+
+impl MergeStatus {
+    /// Returns true if the PR was merged.
+    pub fn is_merged(&self) -> bool {
+        matches!(self, MergeStatus::Merged { .. })
+    }
+
+    /// Returns the merge commit SHA if the PR was merged.
+    pub fn merge_commit_sha(&self) -> Option<&Sha> {
+        match self {
+            MergeStatus::Merged { merge_commit_sha } => Some(merge_commit_sha),
+            MergeStatus::NotMerged => None,
+        }
+    }
+}
+
 /// A pull request event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullRequestEvent {
@@ -139,13 +172,11 @@ pub struct PullRequestEvent {
     /// The PR number.
     pub pr_number: PrNumber,
 
-    /// Whether the PR was merged (only meaningful for `closed` action).
-    pub merged: bool,
-
-    /// The merge commit SHA.
+    /// Whether the PR was merged, and the merge commit SHA if so.
     ///
-    /// Only set when `merged` is true. The parser enforces this invariant.
-    pub merge_commit_sha: Option<Sha>,
+    /// Only meaningful for the `closed` action; GitHub reports `merged: true`
+    /// only when a PR is closed by merging.
+    pub merge_status: MergeStatus,
 
     /// The current head SHA of the PR branch.
     pub head_sha: Sha,
@@ -179,10 +210,7 @@ pub struct CheckSuiteEvent {
     pub head_sha: Sha,
 
     /// The conclusion of the check suite (only set for `completed` action).
-    ///
-    /// Possible values: success, failure, neutral, cancelled, timed_out,
-    /// action_required, stale, skipped.
-    pub conclusion: Option<String>,
+    pub conclusion: Option<CheckSuiteConclusion>,
 
     /// Pull request numbers associated with this check suite.
     ///
@@ -203,6 +231,74 @@ pub enum CheckSuiteAction {
     Rerequested,
     /// Check suite completed.
     Completed,
+}
+
+/// Conclusion of a completed check suite.
+///
+/// The named variants are GitHub's documented conclusions. `Other` preserves
+/// values this version does not know about (forward compatibility).
+///
+/// Serializes to/from GitHub's raw strings (e.g. `"success"`, `"timed_out"`);
+/// unrecognised strings deserialize as `Other`. Construct via
+/// [`CheckSuiteConclusion::parse`] so that known strings always map to the
+/// named variants — an `Other` holding a known string would not survive a
+/// serde roundtrip.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckSuiteConclusion {
+    /// All checks succeeded.
+    Success,
+    /// At least one check failed.
+    Failure,
+    /// Checks finished in a neutral state.
+    Neutral,
+    /// The check suite was cancelled.
+    Cancelled,
+    /// The check suite timed out.
+    TimedOut,
+    /// A check requires action before the suite can complete.
+    ActionRequired,
+    /// The check suite result is stale (e.g. new commits pushed).
+    Stale,
+    /// All checks were skipped.
+    Skipped,
+    /// A conclusion this version does not recognise.
+    #[serde(untagged)]
+    Other(String),
+}
+
+impl CheckSuiteConclusion {
+    /// Parses a raw GitHub conclusion string.
+    ///
+    /// Never fails: unrecognised values become [`CheckSuiteConclusion::Other`].
+    pub fn parse(raw: &str) -> Self {
+        match raw {
+            "success" => CheckSuiteConclusion::Success,
+            "failure" => CheckSuiteConclusion::Failure,
+            "neutral" => CheckSuiteConclusion::Neutral,
+            "cancelled" => CheckSuiteConclusion::Cancelled,
+            "timed_out" => CheckSuiteConclusion::TimedOut,
+            "action_required" => CheckSuiteConclusion::ActionRequired,
+            "stale" => CheckSuiteConclusion::Stale,
+            "skipped" => CheckSuiteConclusion::Skipped,
+            other => CheckSuiteConclusion::Other(other.to_string()),
+        }
+    }
+
+    /// Returns the raw GitHub string for this conclusion.
+    pub fn as_str(&self) -> &str {
+        match self {
+            CheckSuiteConclusion::Success => "success",
+            CheckSuiteConclusion::Failure => "failure",
+            CheckSuiteConclusion::Neutral => "neutral",
+            CheckSuiteConclusion::Cancelled => "cancelled",
+            CheckSuiteConclusion::TimedOut => "timed_out",
+            CheckSuiteConclusion::ActionRequired => "action_required",
+            CheckSuiteConclusion::Stale => "stale",
+            CheckSuiteConclusion::Skipped => "skipped",
+            CheckSuiteConclusion::Other(raw) => raw,
+        }
+    }
 }
 
 /// State of a commit status (legacy Status API).
@@ -408,13 +504,21 @@ mod tests {
             )
     }
 
+    fn arb_merge_status() -> impl Strategy<Value = MergeStatus> {
+        prop_oneof![
+            Just(MergeStatus::NotMerged),
+            arb_sha().prop_map(|sha| MergeStatus::Merged {
+                merge_commit_sha: sha
+            }),
+        ]
+    }
+
     fn arb_pull_request_event() -> impl Strategy<Value = PullRequestEvent> {
         (
             arb_repo_id(),
             arb_pr_action(),
             1u64..10000u64,
-            proptest::bool::ANY,
-            proptest::option::of(arb_sha()),
+            arb_merge_status(),
             arb_sha(),
             "[a-z][a-z0-9/-]{0,20}",
             "[a-z][a-z0-9/-]{0,20}",
@@ -426,8 +530,7 @@ mod tests {
                     repo,
                     action,
                     pr_number,
-                    merged,
-                    merge_commit_sha,
+                    merge_status,
                     head_sha,
                     base_branch,
                     head_branch,
@@ -438,8 +541,7 @@ mod tests {
                         repo,
                         action,
                         pr_number: PrNumber(pr_number),
-                        merged,
-                        merge_commit_sha,
+                        merge_status,
                         head_sha,
                         base_branch,
                         head_branch,
@@ -450,12 +552,28 @@ mod tests {
             )
     }
 
+    fn arb_check_suite_conclusion() -> impl Strategy<Value = CheckSuiteConclusion> {
+        // `parse` canonicalises known strings to the named variants, so the
+        // generated values always roundtrip through serde.
+        prop_oneof![
+            Just(CheckSuiteConclusion::Success),
+            Just(CheckSuiteConclusion::Failure),
+            Just(CheckSuiteConclusion::Neutral),
+            Just(CheckSuiteConclusion::Cancelled),
+            Just(CheckSuiteConclusion::TimedOut),
+            Just(CheckSuiteConclusion::ActionRequired),
+            Just(CheckSuiteConclusion::Stale),
+            Just(CheckSuiteConclusion::Skipped),
+            "[a-z_]{1,20}".prop_map(|s| CheckSuiteConclusion::parse(&s)),
+        ]
+    }
+
     fn arb_check_suite_event() -> impl Strategy<Value = CheckSuiteEvent> {
         (
             arb_repo_id(),
             arb_check_suite_action(),
             arb_sha(),
-            proptest::option::of("[a-z_]{1,20}"),
+            proptest::option::of(arb_check_suite_conclusion()),
             proptest::collection::vec(1u64..10000u64, 0..3),
         )
             .prop_map(
@@ -626,6 +744,31 @@ mod tests {
             prop_assert_eq!(state, parsed);
         }
 
+        /// MergeStatus serialization roundtrip.
+        #[test]
+        fn merge_status_serde_roundtrip(status in arb_merge_status()) {
+            let json = serde_json::to_string(&status).unwrap();
+            let parsed: MergeStatus = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(status, parsed);
+        }
+
+        /// CheckSuiteConclusion serialization roundtrip.
+        #[test]
+        fn check_suite_conclusion_serde_roundtrip(conclusion in arb_check_suite_conclusion()) {
+            let json = serde_json::to_string(&conclusion).unwrap();
+            let parsed: CheckSuiteConclusion = serde_json::from_str(&json).unwrap();
+            prop_assert_eq!(conclusion, parsed);
+        }
+
+        /// CheckSuiteConclusion serializes to its raw GitHub string, and `parse`
+        /// inverts `as_str`.
+        #[test]
+        fn check_suite_conclusion_parse_inverts_as_str(conclusion in arb_check_suite_conclusion()) {
+            let json = serde_json::to_string(&conclusion).unwrap();
+            prop_assert_eq!(&json, &format!("\"{}\"", conclusion.as_str()));
+            prop_assert_eq!(CheckSuiteConclusion::parse(conclusion.as_str()), conclusion);
+        }
+
         /// repo_id() returns the correct repo for all event types.
         #[test]
         fn repo_id_is_consistent(event in arb_github_event()) {
@@ -732,6 +875,52 @@ mod tests {
             serde_json::to_string(&CheckSuiteAction::Rerequested).unwrap(),
             "\"rerequested\""
         );
+    }
+
+    #[test]
+    fn check_suite_conclusion_json_format() {
+        // Known conclusions use GitHub's raw snake_case strings
+        assert_eq!(
+            serde_json::to_string(&CheckSuiteConclusion::Success).unwrap(),
+            "\"success\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CheckSuiteConclusion::TimedOut).unwrap(),
+            "\"timed_out\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CheckSuiteConclusion::ActionRequired).unwrap(),
+            "\"action_required\""
+        );
+        // Unknown conclusions serialize as the raw string they hold
+        assert_eq!(
+            serde_json::to_string(&CheckSuiteConclusion::Other("startup_failure".to_string()))
+                .unwrap(),
+            "\"startup_failure\""
+        );
+        // Deserialization: known strings hit the named variants, unknown fall
+        // back to Other
+        assert_eq!(
+            serde_json::from_str::<CheckSuiteConclusion>("\"skipped\"").unwrap(),
+            CheckSuiteConclusion::Skipped
+        );
+        assert_eq!(
+            serde_json::from_str::<CheckSuiteConclusion>("\"startup_failure\"").unwrap(),
+            CheckSuiteConclusion::Other("startup_failure".to_string())
+        );
+    }
+
+    #[test]
+    fn merge_status_accessors() {
+        let sha = Sha::parse("1234567890abcdef1234567890abcdef12345678").unwrap();
+        let merged = MergeStatus::Merged {
+            merge_commit_sha: sha.clone(),
+        };
+        assert!(merged.is_merged());
+        assert_eq!(merged.merge_commit_sha(), Some(&sha));
+
+        assert!(!MergeStatus::NotMerged.is_merged());
+        assert_eq!(MergeStatus::NotMerged.merge_commit_sha(), None);
     }
 
     #[test]

@@ -46,10 +46,13 @@ fn handle_completed(
     let mut state_events = Vec::new();
     let mut effects = Vec::new();
 
-    // Record the check suite completion
+    // Record the check suite completion. The persisted event log stores the
+    // conclusion as its raw GitHub string; `conclusion` is absent only for
+    // non-`completed` actions, which we don't reach here.
     let conclusion = event
         .conclusion
-        .clone()
+        .as_ref()
+        .map(|c| c.as_str().to_string())
         .unwrap_or_else(|| "unknown".to_string());
     state_events.push(StateEventPayload::CheckSuiteCompleted {
         sha: event.head_sha.clone(),
@@ -112,6 +115,7 @@ fn find_train_containing_pr(
 mod tests {
     use super::*;
     use crate::types::{CachedPr, MergeStateStatus, PrState, RepoId, Sha};
+    use crate::webhooks::events::CheckSuiteConclusion;
 
     fn make_state() -> PersistedRepoSnapshot {
         PersistedRepoSnapshot::new("main")
@@ -127,7 +131,7 @@ mod tests {
             action,
             head_sha: Sha::parse(sha).unwrap(),
             conclusion: if action == CheckSuiteAction::Completed {
-                Some("success".to_string())
+                Some(CheckSuiteConclusion::Success)
             } else {
                 None
             },

@@ -21,7 +21,9 @@
 
 use std::fmt;
 
-use crate::effects::{GitHubResponse, RulesetData};
+use thiserror::Error;
+
+use crate::effects::{BranchProtectionData, GitHubResponse, RulesetData};
 
 /// Warning returned when dismiss stale approvals is detected or unknown.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,18 +124,124 @@ impl fmt::Display for PreflightWarning {
     }
 }
 
+/// Branch protection state, as needed by the dismiss stale approvals check.
+///
+/// A typed projection of the relevant [`GitHubResponse`] variants: the pure
+/// check function receives exactly the states it can handle, rather than the
+/// whole response union.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BranchProtectionInput {
+    /// Branch protection settings were fetched successfully.
+    Known(BranchProtectionData),
+    /// Branch protection could not be queried (404/403): may be no protection,
+    /// insufficient permissions, or a missing branch.
+    Unknown,
+}
+
+/// Ruleset state, as needed by the dismiss stale approvals check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RulesetsInput {
+    /// Rulesets were fetched successfully.
+    Known(Vec<RulesetData>),
+    /// Rulesets could not be queried (404/403): may be no rulesets,
+    /// insufficient permissions, or an unsupported API.
+    Unknown,
+}
+
+/// Error converting [`GitHubResponse`] values into a
+/// [`DismissStaleApprovalsCheckInput`].
+///
+/// A mismatched variant means the interpreter answered a different request
+/// than the one issued - a bug, not a user-facing condition.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum DismissStaleInputError {
+    /// The response supplied for branch protection was not a
+    /// branch-protection variant.
+    #[error("expected a branch protection response, got {response_type}")]
+    UnexpectedBranchProtectionResponse {
+        /// Name of the variant actually received.
+        response_type: &'static str,
+    },
+    /// The response supplied for rulesets was not a rulesets variant.
+    #[error("expected a rulesets response, got {response_type}")]
+    UnexpectedRulesetsResponse {
+        /// Name of the variant actually received.
+        response_type: &'static str,
+    },
+}
+
+/// Stable variant name of a [`GitHubResponse`], for error reporting.
+fn response_variant_name(response: &GitHubResponse) -> &'static str {
+    match response {
+        GitHubResponse::Pr(_) => "Pr",
+        GitHubResponse::PrList(_) => "PrList",
+        GitHubResponse::RecentlyMergedPrList { .. } => "RecentlyMergedPrList",
+        GitHubResponse::MergeState(_) => "MergeState",
+        GitHubResponse::PrRefetched { .. } => "PrRefetched",
+        GitHubResponse::Merged { .. } => "Merged",
+        GitHubResponse::Retargeted => "Retargeted",
+        GitHubResponse::CommentPosted { .. } => "CommentPosted",
+        GitHubResponse::CommentUpdated => "CommentUpdated",
+        GitHubResponse::ReactionAdded => "ReactionAdded",
+        GitHubResponse::Comments(_) => "Comments",
+        GitHubResponse::BranchProtection(_) => "BranchProtection",
+        GitHubResponse::BranchProtectionUnknown => "BranchProtectionUnknown",
+        GitHubResponse::Rulesets(_) => "Rulesets",
+        GitHubResponse::RulesetsUnknown => "RulesetsUnknown",
+        GitHubResponse::RepoSettings(_) => "RepoSettings",
+    }
+}
+
 /// Input for the dismiss stale approvals check.
 ///
 /// This bundles together all the data needed to perform the check, making
-/// the pure check function easy to test.
-#[derive(Debug, Clone)]
+/// the pure check function easy to test. Build it from raw GitHub responses
+/// with [`DismissStaleApprovalsCheckInput::from_responses`].
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DismissStaleApprovalsCheckInput {
     /// The repository's default branch name (e.g., "main").
     pub default_branch: String,
-    /// Branch protection response (could be data or Unknown).
-    pub branch_protection: GitHubResponse,
-    /// Rulesets response (could be data or Unknown).
-    pub rulesets: GitHubResponse,
+    /// Branch protection state (known data or unknown).
+    pub branch_protection: BranchProtectionInput,
+    /// Rulesets state (known data or unknown).
+    pub rulesets: RulesetsInput,
+}
+
+impl DismissStaleApprovalsCheckInput {
+    /// Builds the check input from raw GitHub responses.
+    ///
+    /// This is the single conversion point from the [`GitHubResponse`] union
+    /// to the typed input. Mismatched variants are surfaced as a structured
+    /// error instead of leaking into user-facing warning text.
+    pub fn from_responses(
+        default_branch: String,
+        branch_protection: GitHubResponse,
+        rulesets: GitHubResponse,
+    ) -> Result<Self, DismissStaleInputError> {
+        let branch_protection = match branch_protection {
+            GitHubResponse::BranchProtection(data) => BranchProtectionInput::Known(data),
+            GitHubResponse::BranchProtectionUnknown => BranchProtectionInput::Unknown,
+            other => {
+                return Err(DismissStaleInputError::UnexpectedBranchProtectionResponse {
+                    response_type: response_variant_name(&other),
+                });
+            }
+        };
+        let rulesets = match rulesets {
+            GitHubResponse::Rulesets(data) => RulesetsInput::Known(data),
+            GitHubResponse::RulesetsUnknown => RulesetsInput::Unknown,
+            other => {
+                return Err(DismissStaleInputError::UnexpectedRulesetsResponse {
+                    response_type: response_variant_name(&other),
+                });
+            }
+        };
+        Ok(DismissStaleApprovalsCheckInput {
+            default_branch,
+            branch_protection,
+            rulesets,
+        })
+    }
 }
 
 /// Result of checking dismiss stale approvals.
@@ -180,7 +288,7 @@ pub fn check_dismiss_stale_approvals(
 
     // Check branch protection
     match &input.branch_protection {
-        GitHubResponse::BranchProtection(data) => {
+        BranchProtectionInput::Known(data) => {
             if data.dismiss_stale_reviews {
                 return DismissStaleApprovalsCheck::Warning(
                     PreflightWarning::DismissStaleApprovalsEnabled {
@@ -189,43 +297,29 @@ pub fn check_dismiss_stale_approvals(
                 );
             }
         }
-        GitHubResponse::BranchProtectionUnknown => {
+        BranchProtectionInput::Unknown => {
             unknown_reasons.push(
                 "Branch protection settings could not be queried (404/403) - \
                  may be no protection, insufficient permissions, or missing branch"
                     .to_string(),
             );
         }
-        other => {
-            // Unexpected response type - treat as unknown
-            unknown_reasons.push(format!(
-                "Unexpected branch protection response type: {:?}",
-                std::mem::discriminant(other)
-            ));
-        }
     }
 
     // Check rulesets
     match &input.rulesets {
-        GitHubResponse::Rulesets(rulesets) => {
+        RulesetsInput::Known(rulesets) => {
             if let Some(warning) = check_rulesets_for_dismiss_stale(rulesets, &input.default_branch)
             {
                 return DismissStaleApprovalsCheck::Warning(warning);
             }
         }
-        GitHubResponse::RulesetsUnknown => {
+        RulesetsInput::Unknown => {
             unknown_reasons.push(
                 "Repository rulesets could not be queried (404/403) - \
                  may be no rulesets, insufficient permissions, or unsupported API"
                     .to_string(),
             );
-        }
-        other => {
-            // Unexpected response type - treat as unknown
-            unknown_reasons.push(format!(
-                "Unexpected rulesets response type: {:?}",
-                std::mem::discriminant(other)
-            ));
         }
     }
 
@@ -274,10 +368,10 @@ fn check_rulesets_for_dismiss_stale(
 /// 1. It matches any pattern in `target_branches` (or `target_branches` is empty)
 /// 2. AND it doesn't match any pattern in `exclude_patterns`
 ///
-/// Patterns use GitHub's ref pattern format:
+/// Patterns use GitHub's ref pattern format (see [`pattern_matches`]):
 /// - `refs/heads/main` - exact match
-/// - `refs/heads/*` - matches all branches
-/// - `~DEFAULT_BRANCH` - special pattern for default branch
+/// - `refs/heads/**` - matches all branches
+/// - `~ALL` / `~DEFAULT_BRANCH` - special tokens
 fn ruleset_targets_branch(ruleset: &RulesetData, branch: &str) -> bool {
     let branch_ref = format!("refs/heads/{}", branch);
 
@@ -303,53 +397,100 @@ fn ruleset_targets_branch(ruleset: &RulesetData, branch: &str) -> bool {
     false
 }
 
-/// Checks if a branch ref matches a GitHub ref pattern.
+/// Checks if a branch ref matches a GitHub ruleset ref pattern.
 ///
-/// Supports:
-/// - Exact match: `refs/heads/main`
-/// - Wildcard: `refs/heads/*` (matches any branch)
-/// - Wildcard prefix: `refs/heads/feature/*` (matches feature branches)
-/// - Default branch marker: `~DEFAULT_BRANCH`
-/// - Branch name without prefix: `main` (matches as `refs/heads/main`)
-fn pattern_matches(branch_ref: &str, pattern: &str, branch_name: &str) -> bool {
-    // Special case: ~DEFAULT_BRANCH matches the default branch
+/// GitHub ruleset conditions use fnmatch-style patterns plus special tokens:
+/// - `~ALL` matches every branch
+/// - `~DEFAULT_BRANCH` matches the repository's default branch
+/// - `*` matches any characters within one path segment (never `/`)
+/// - `**` matches any characters across segments
+///   (`refs/heads/**` is GitHub's canonical "all branches" include)
+/// - A pattern without a `refs/` prefix is matched as `refs/heads/{pattern}`
+fn pattern_matches(branch_ref: &str, pattern: &str, default_branch: &str) -> bool {
+    if pattern == "~ALL" {
+        return true;
+    }
     if pattern == "~DEFAULT_BRANCH" {
-        return true; // We're always checking the default branch
+        return branch_ref == format!("refs/heads/{}", default_branch);
+    }
+    // Git ref names cannot contain '~', so any other '~' token matches nothing
+    if pattern.starts_with('~') {
+        return false;
     }
 
-    // Normalize pattern to refs/heads/ form if it's just a branch name
-    let normalized_pattern = if !pattern.starts_with("refs/") && !pattern.starts_with('~') {
-        format!("refs/heads/{}", pattern)
+    if pattern.starts_with("refs/") {
+        glob_match(pattern, branch_ref)
     } else {
-        pattern.to_string()
-    };
-
-    // Exact match
-    if normalized_pattern == branch_ref {
-        return true;
+        glob_match(&format!("refs/heads/{}", pattern), branch_ref)
     }
+}
 
-    // Wildcard match: pattern ends with /*
-    // Strip only the `*` to keep the trailing `/` in the prefix,
-    // ensuring we don't match e.g. `release-1` against `release/*`
-    if let Some(prefix) = normalized_pattern.strip_suffix('*')
-        && prefix.ends_with('/')
-        && branch_ref.starts_with(prefix)
-    {
-        return true;
+/// A single element of a glob pattern.
+enum GlobToken {
+    /// A literal byte.
+    Literal(u8),
+    /// `*`: any run of non-`/` bytes (possibly empty).
+    Star,
+    /// `**`: any run of bytes (possibly empty), crossing `/`.
+    DoubleStar,
+}
+
+/// Splits a pattern into glob tokens. Runs of two or more `*` collapse to
+/// `**`.
+fn glob_tokens(pattern: &str) -> Vec<GlobToken> {
+    let bytes = pattern.as_bytes();
+    let mut tokens = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'*' {
+            let start = i;
+            while i < bytes.len() && bytes[i] == b'*' {
+                i += 1;
+            }
+            tokens.push(if i - start >= 2 {
+                GlobToken::DoubleStar
+            } else {
+                GlobToken::Star
+            });
+        } else {
+            tokens.push(GlobToken::Literal(bytes[i]));
+            i += 1;
+        }
     }
+    tokens
+}
 
-    // Full wildcard: refs/heads/*
-    if normalized_pattern == "refs/heads/*" {
-        return true;
+/// Hand-rolled fnmatch-style glob matcher: `*` does not cross `/`, `**` does.
+/// No escapes or character classes - GitHub ruleset patterns have none.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let text = text.as_bytes();
+    // dp[j]: the tokens consumed so far can match text[..j]
+    let mut dp = vec![false; text.len() + 1];
+    dp[0] = true;
+    for token in glob_tokens(pattern) {
+        let mut next = vec![false; text.len() + 1];
+        match token {
+            GlobToken::Literal(c) => {
+                for j in 1..=text.len() {
+                    next[j] = dp[j - 1] && text[j - 1] == c;
+                }
+            }
+            GlobToken::Star => {
+                next[0] = dp[0];
+                for j in 1..=text.len() {
+                    next[j] = dp[j] || (next[j - 1] && text[j - 1] != b'/');
+                }
+            }
+            GlobToken::DoubleStar => {
+                next[0] = dp[0];
+                for j in 1..=text.len() {
+                    next[j] = dp[j] || next[j - 1];
+                }
+            }
+        }
+        dp = next;
     }
-
-    // Also try matching against just the branch name (some patterns may be plain names)
-    if pattern == branch_name {
-        return true;
-    }
-
-    false
+    dp[text.len()]
 }
 
 #[cfg(test)]
@@ -360,8 +501,8 @@ mod tests {
 
     // ─── Test Helpers ─────────────────────────────────────────────────────────
 
-    fn make_branch_protection(dismiss_stale_reviews: bool) -> GitHubResponse {
-        GitHubResponse::BranchProtection(BranchProtectionData {
+    fn make_branch_protection(dismiss_stale_reviews: bool) -> BranchProtectionInput {
+        BranchProtectionInput::Known(BranchProtectionData {
             dismiss_stale_reviews,
             required_status_checks: vec![],
         })
@@ -383,8 +524,8 @@ mod tests {
 
     fn make_input(
         default_branch: &str,
-        protection: GitHubResponse,
-        rulesets: GitHubResponse,
+        protection: BranchProtectionInput,
+        rulesets: RulesetsInput,
     ) -> DismissStaleApprovalsCheckInput {
         DismissStaleApprovalsCheckInput {
             default_branch: default_branch.to_string(),
@@ -400,7 +541,7 @@ mod tests {
         let input = make_input(
             "main",
             make_branch_protection(true),
-            GitHubResponse::Rulesets(vec![]),
+            RulesetsInput::Known(vec![]),
         );
         let result = check_dismiss_stale_approvals(&input);
         assert!(matches!(
@@ -416,7 +557,7 @@ mod tests {
         let input = make_input(
             "main",
             make_branch_protection(false),
-            GitHubResponse::Rulesets(vec![]),
+            RulesetsInput::Known(vec![]),
         );
         let result = check_dismiss_stale_approvals(&input);
         assert_eq!(result, DismissStaleApprovalsCheck::NotEnabled);
@@ -426,8 +567,8 @@ mod tests {
     fn branch_protection_unknown_warns() {
         let input = make_input(
             "main",
-            GitHubResponse::BranchProtectionUnknown,
-            GitHubResponse::Rulesets(vec![]),
+            BranchProtectionInput::Unknown,
+            RulesetsInput::Known(vec![]),
         );
         let result = check_dismiss_stale_approvals(&input);
         assert!(matches!(
@@ -446,7 +587,7 @@ mod tests {
         let input = make_input(
             "main",
             make_branch_protection(false),
-            GitHubResponse::Rulesets(vec![ruleset]),
+            RulesetsInput::Known(vec![ruleset]),
         );
         let result = check_dismiss_stale_approvals(&input);
         assert!(matches!(
@@ -463,10 +604,69 @@ mod tests {
         let input = make_input(
             "main",
             make_branch_protection(false),
-            GitHubResponse::Rulesets(vec![ruleset]),
+            RulesetsInput::Known(vec![ruleset]),
         );
         let result = check_dismiss_stale_approvals(&input);
         assert!(result.has_warning());
+    }
+
+    #[test]
+    fn ruleset_dismiss_stale_enabled_double_star_targets_all() {
+        // `refs/heads/**` is GitHub's canonical "all branches" include
+        for branch in ["main", "feature/foo", "a/b/c"] {
+            let ruleset = make_ruleset("all-branches", true, vec!["refs/heads/**"], vec![]);
+            let input = make_input(
+                branch,
+                make_branch_protection(false),
+                RulesetsInput::Known(vec![ruleset]),
+            );
+            let result = check_dismiss_stale_approvals(&input);
+            assert!(
+                result.has_warning(),
+                "refs/heads/** must target branch {:?}",
+                branch
+            );
+        }
+    }
+
+    #[test]
+    fn ruleset_dismiss_stale_enabled_tilde_all_targets_all() {
+        let ruleset = make_ruleset("everything", true, vec!["~ALL"], vec![]);
+        let input = make_input(
+            "main",
+            make_branch_protection(false),
+            RulesetsInput::Known(vec![ruleset]),
+        );
+        let result = check_dismiss_stale_approvals(&input);
+        assert!(result.has_warning(), "~ALL must target every branch");
+    }
+
+    #[test]
+    fn ruleset_dismiss_stale_enabled_midstring_wildcard() {
+        let ruleset = make_ruleset("releases", true, vec!["refs/heads/release*"], vec![]);
+        let input = make_input(
+            "release1",
+            make_branch_protection(false),
+            RulesetsInput::Known(vec![ruleset.clone()]),
+        );
+        let result = check_dismiss_stale_approvals(&input);
+        assert!(
+            result.has_warning(),
+            "refs/heads/release* must target release1"
+        );
+
+        // Negative: the same ruleset does not target main
+        let input = make_input(
+            "main",
+            make_branch_protection(false),
+            RulesetsInput::Known(vec![ruleset]),
+        );
+        let result = check_dismiss_stale_approvals(&input);
+        assert_eq!(
+            result,
+            DismissStaleApprovalsCheck::NotEnabled,
+            "refs/heads/release* must not target main"
+        );
     }
 
     #[test]
@@ -476,7 +676,7 @@ mod tests {
         let input = make_input(
             "main",
             make_branch_protection(false),
-            GitHubResponse::Rulesets(vec![ruleset]),
+            RulesetsInput::Known(vec![ruleset]),
         );
         let result = check_dismiss_stale_approvals(&input);
         assert!(result.has_warning());
@@ -488,7 +688,7 @@ mod tests {
         let input = make_input(
             "main",
             make_branch_protection(false),
-            GitHubResponse::Rulesets(vec![ruleset]),
+            RulesetsInput::Known(vec![ruleset]),
         );
         let result = check_dismiss_stale_approvals(&input);
         assert!(result.has_warning());
@@ -506,7 +706,7 @@ mod tests {
         let input = make_input(
             "main",
             make_branch_protection(false),
-            GitHubResponse::Rulesets(vec![ruleset]),
+            RulesetsInput::Known(vec![ruleset]),
         );
         let result = check_dismiss_stale_approvals(&input);
         assert_eq!(result, DismissStaleApprovalsCheck::NotEnabled);
@@ -519,7 +719,7 @@ mod tests {
         let input = make_input(
             "main",
             make_branch_protection(false),
-            GitHubResponse::Rulesets(vec![ruleset]),
+            RulesetsInput::Known(vec![ruleset]),
         );
         let result = check_dismiss_stale_approvals(&input);
         assert_eq!(result, DismissStaleApprovalsCheck::NotEnabled);
@@ -536,7 +736,7 @@ mod tests {
         let input = make_input(
             "main",
             make_branch_protection(false),
-            GitHubResponse::Rulesets(vec![ruleset]),
+            RulesetsInput::Known(vec![ruleset]),
         );
         let result = check_dismiss_stale_approvals(&input);
         assert_eq!(result, DismissStaleApprovalsCheck::NotEnabled);
@@ -547,7 +747,7 @@ mod tests {
         let input = make_input(
             "main",
             make_branch_protection(false),
-            GitHubResponse::RulesetsUnknown,
+            RulesetsInput::Unknown,
         );
         let result = check_dismiss_stale_approvals(&input);
         assert!(matches!(
@@ -562,8 +762,8 @@ mod tests {
     fn both_unknown_warns_with_both_reasons() {
         let input = make_input(
             "main",
-            GitHubResponse::BranchProtectionUnknown,
-            GitHubResponse::RulesetsUnknown,
+            BranchProtectionInput::Unknown,
+            RulesetsInput::Unknown,
         );
         let result = check_dismiss_stale_approvals(&input);
         if let DismissStaleApprovalsCheck::Warning(
@@ -578,6 +778,81 @@ mod tests {
         } else {
             panic!("Expected unknown warning");
         }
+    }
+
+    // ─── Input Conversion Tests ───────────────────────────────────────────────
+
+    #[test]
+    fn from_responses_accepts_known_data() {
+        let input = DismissStaleApprovalsCheckInput::from_responses(
+            "main".to_string(),
+            GitHubResponse::BranchProtection(BranchProtectionData {
+                dismiss_stale_reviews: true,
+                required_status_checks: vec![],
+            }),
+            GitHubResponse::Rulesets(vec![]),
+        )
+        .expect("matching variants must convert");
+        assert_eq!(input.default_branch, "main");
+        assert!(matches!(
+            input.branch_protection,
+            BranchProtectionInput::Known(ref data) if data.dismiss_stale_reviews
+        ));
+        assert_eq!(input.rulesets, RulesetsInput::Known(vec![]));
+    }
+
+    #[test]
+    fn from_responses_accepts_unknown_responses() {
+        let input = DismissStaleApprovalsCheckInput::from_responses(
+            "main".to_string(),
+            GitHubResponse::BranchProtectionUnknown,
+            GitHubResponse::RulesetsUnknown,
+        )
+        .expect("unknown variants must convert");
+        assert_eq!(input.branch_protection, BranchProtectionInput::Unknown);
+        assert_eq!(input.rulesets, RulesetsInput::Unknown);
+    }
+
+    #[test]
+    fn from_responses_rejects_mismatched_branch_protection() {
+        let result = DismissStaleApprovalsCheckInput::from_responses(
+            "main".to_string(),
+            // A rulesets response where branch protection was expected
+            GitHubResponse::Rulesets(vec![]),
+            GitHubResponse::RulesetsUnknown,
+        );
+        assert_eq!(
+            result,
+            Err(DismissStaleInputError::UnexpectedBranchProtectionResponse {
+                response_type: "Rulesets"
+            })
+        );
+    }
+
+    #[test]
+    fn from_responses_rejects_mismatched_rulesets() {
+        let result = DismissStaleApprovalsCheckInput::from_responses(
+            "main".to_string(),
+            GitHubResponse::BranchProtectionUnknown,
+            GitHubResponse::Retargeted,
+        );
+        assert_eq!(
+            result,
+            Err(DismissStaleInputError::UnexpectedRulesetsResponse {
+                response_type: "Retargeted"
+            })
+        );
+    }
+
+    #[test]
+    fn input_error_display_names_the_variant() {
+        let err = DismissStaleInputError::UnexpectedRulesetsResponse {
+            response_type: "Retargeted",
+        };
+        assert_eq!(
+            err.to_string(),
+            "expected a rulesets response, got Retargeted"
+        );
     }
 
     // ─── Pattern Matching Tests ───────────────────────────────────────────────
@@ -599,10 +874,86 @@ mod tests {
     #[test]
     fn pattern_matches_wildcard() {
         assert!(pattern_matches("refs/heads/main", "refs/heads/*", "main"));
-        assert!(pattern_matches(
+        // fnmatch semantics: a single `*` does not cross `/`, so
+        // `refs/heads/*` matches only top-level branches
+        assert!(!pattern_matches(
             "refs/heads/feature/foo",
             "refs/heads/*",
             "feature/foo"
+        ));
+        // `**` is the all-branches form
+        assert!(pattern_matches(
+            "refs/heads/feature/foo",
+            "refs/heads/**",
+            "feature/foo"
+        ));
+    }
+
+    #[test]
+    fn pattern_matches_double_star() {
+        for branch in ["main", "feature/foo", "a/b/c"] {
+            assert!(
+                pattern_matches(&format!("refs/heads/{}", branch), "refs/heads/**", branch),
+                "refs/heads/** must match {:?}",
+                branch
+            );
+        }
+        // `**` mid-pattern crosses segments
+        assert!(pattern_matches(
+            "refs/heads/release/a/b/final",
+            "refs/heads/release/**/final",
+            "release/a/b/final"
+        ));
+    }
+
+    #[test]
+    fn pattern_matches_tilde_all() {
+        for branch in ["main", "feature/foo"] {
+            assert!(
+                pattern_matches(&format!("refs/heads/{}", branch), "~ALL", branch),
+                "~ALL must match {:?}",
+                branch
+            );
+        }
+    }
+
+    #[test]
+    fn pattern_matches_unknown_tilde_token_matches_nothing() {
+        assert!(!pattern_matches(
+            "refs/heads/main",
+            "~SOMETHING_ELSE",
+            "main"
+        ));
+    }
+
+    #[test]
+    fn pattern_matches_midstring_wildcard() {
+        assert!(pattern_matches(
+            "refs/heads/release1",
+            "refs/heads/release*",
+            "release1"
+        ));
+        assert!(pattern_matches(
+            "refs/heads/release-2.0",
+            "refs/heads/release*",
+            "release-2.0"
+        ));
+        assert!(!pattern_matches(
+            "refs/heads/main",
+            "refs/heads/release*",
+            "main"
+        ));
+        // The single `*` still does not cross a segment boundary
+        assert!(!pattern_matches(
+            "refs/heads/release/v1",
+            "refs/heads/release*",
+            "release/v1"
+        ));
+        // Wildcard in the middle of a segment
+        assert!(pattern_matches(
+            "refs/heads/v1-release-x",
+            "refs/heads/v*-release-*",
+            "v1-release-x"
         ));
     }
 
@@ -655,6 +1006,12 @@ mod tests {
             "refs/heads/develop",
             "~DEFAULT_BRANCH",
             "develop"
+        ));
+        // The marker matches only the default branch, not any branch
+        assert!(!pattern_matches(
+            "refs/heads/feature",
+            "~DEFAULT_BRANCH",
+            "main"
         ));
     }
 
@@ -717,7 +1074,7 @@ mod tests {
             let input = make_input(
                 &branch,
                 make_branch_protection(true),
-                GitHubResponse::Rulesets(vec![]),
+                RulesetsInput::Known(vec![]),
             );
             let result = check_dismiss_stale_approvals(&input);
             prop_assert!(
@@ -734,7 +1091,7 @@ mod tests {
             let input = make_input(
                 &branch,
                 make_branch_protection(false),
-                GitHubResponse::Rulesets(vec![]),
+                RulesetsInput::Known(vec![]),
             );
             let result = check_dismiss_stale_approvals(&input);
             prop_assert_eq!(
@@ -751,8 +1108,8 @@ mod tests {
         ) {
             let input = make_input(
                 &branch,
-                GitHubResponse::BranchProtectionUnknown,
-                GitHubResponse::Rulesets(vec![]),
+                BranchProtectionInput::Unknown,
+                RulesetsInput::Known(vec![]),
             );
             let result = check_dismiss_stale_approvals(&input);
             prop_assert!(
@@ -769,7 +1126,7 @@ mod tests {
             let input = make_input(
                 &branch,
                 make_branch_protection(false),
-                GitHubResponse::RulesetsUnknown,
+                RulesetsInput::Unknown,
             );
             let result = check_dismiss_stale_approvals(&input);
             prop_assert!(
@@ -817,6 +1174,45 @@ mod tests {
             );
         }
 
+        /// Property: a glob pattern with no wildcards matches exactly itself
+        #[test]
+        fn prop_literal_glob_is_exact_match(
+            a in "[a-z/]{1,20}",
+            b in "[a-z/]{1,20}",
+        ) {
+            prop_assert_eq!(glob_match(&a, &b), a == b);
+        }
+
+        /// Property: `refs/heads/**` matches every branch, slashes or not
+        #[test]
+        fn prop_double_star_matches_any_branch(
+            branch in "[a-z][a-z0-9/_-]{0,30}",
+        ) {
+            let branch_ref = format!("refs/heads/{}", branch);
+            let matches = pattern_matches(&branch_ref, "refs/heads/**", &branch);
+            prop_assert!(matches, "refs/heads/** must match {}", branch_ref);
+        }
+
+        /// Property: a single `*` never matches across a `/` boundary
+        #[test]
+        fn prop_single_star_never_crosses_segments(
+            branch in "[a-z][a-z0-9_-]{0,10}/[a-z][a-z0-9_-]{0,10}",
+        ) {
+            let branch_ref = format!("refs/heads/{}", branch);
+            let matches = pattern_matches(&branch_ref, "refs/heads/*", &branch);
+            prop_assert!(!matches, "refs/heads/* must not match {}", branch_ref);
+        }
+
+        /// Property: `~ALL` matches every branch
+        #[test]
+        fn prop_tilde_all_matches_everything(
+            branch in "[a-z][a-z0-9/_-]{0,30}",
+        ) {
+            let branch_ref = format!("refs/heads/{}", branch);
+            let matches = pattern_matches(&branch_ref, "~ALL", &branch);
+            prop_assert!(matches, "~ALL must match {}", branch_ref);
+        }
+
         /// Property: Ruleset excluded from default branch doesn't trigger warning
         #[test]
         fn prop_excluded_ruleset_no_warning(
@@ -831,7 +1227,7 @@ mod tests {
             let input = make_input(
                 &branch,
                 make_branch_protection(false),
-                GitHubResponse::Rulesets(vec![ruleset]),
+                RulesetsInput::Known(vec![ruleset]),
             );
             let result = check_dismiss_stale_approvals(&input);
             prop_assert_eq!(

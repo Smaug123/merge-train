@@ -343,7 +343,9 @@ mod tests {
     use super::*;
     use crate::types::Sha;
     use crate::types::{CommentId, PrNumber, RepoId};
-    use crate::webhooks::events::{CommentAction, IssueCommentEvent, PrAction, PullRequestEvent};
+    use crate::webhooks::events::{
+        CommentAction, IssueCommentEvent, MergeStatus, PrAction, PullRequestEvent,
+    };
     use proptest::prelude::*;
 
     /// Builds a [`DeliveryId`] from a known-good test literal, panicking on
@@ -369,8 +371,7 @@ mod tests {
             repo: RepoId::new("owner", "repo"),
             action: PrAction::Opened,
             pr_number: PrNumber(pr_number),
-            merged: false,
-            merge_commit_sha: None,
+            merge_status: MergeStatus::NotMerged,
             head_sha: Sha::parse("a".repeat(40)).unwrap(),
             base_branch: "main".to_string(),
             head_branch: "feature".to_string(),

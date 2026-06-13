@@ -39,8 +39,9 @@ pub mod signature;
 
 // Re-export commonly used types
 pub use events::{
-    CheckSuiteAction, CheckSuiteEvent, CommentAction, GitHubEvent, IssueCommentEvent, PrAction,
-    PullRequestEvent, PullRequestReviewEvent, ReviewAction, ReviewState, StatusEvent, StatusState,
+    CheckSuiteAction, CheckSuiteConclusion, CheckSuiteEvent, CommentAction, GitHubEvent,
+    IssueCommentEvent, MergeStatus, PrAction, PullRequestEvent, PullRequestReviewEvent,
+    ReviewAction, ReviewState, StatusEvent, StatusState,
 };
 pub use handlers::{
     HandlerError, HandlerResult, handle_check_suite, handle_event, handle_issue_comment,

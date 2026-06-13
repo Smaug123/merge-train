@@ -21,6 +21,11 @@ use super::types::Command;
 /// - Command names (`start`, `stop`, `predecessor`) are case-insensitive
 /// - Whitespace between tokens is flexible (spaces, tabs)
 /// - If multiple commands are present, the first valid one wins
+/// - Commands inside fenced code blocks (``` or ~~~), inline code spans
+///   (backticks), or blockquoted lines (`>`) are ignored: quoting or
+///   documenting a command must not issue it
+/// - Trailing punctuation after a predecessor number is ignored
+///   (`#42.` parses as 42), but the number itself must be all digits
 /// - Returns `None` if no valid command is found
 ///
 /// # Examples
@@ -39,12 +44,16 @@ use super::types::Command;
 /// assert_eq!(parse_command("no command here", "merge-train"), None);
 /// // Not a valid mention (preceded by alphanumeric):
 /// assert_eq!(parse_command("foo@merge-train start", "merge-train"), None);
+/// // Quoted commands are not issued:
+/// assert_eq!(parse_command("> @merge-train start", "merge-train"), None);
+/// assert_eq!(parse_command("`@merge-train start`", "merge-train"), None);
 /// ```
 pub fn parse_command(text: &str, bot_name: &str) -> Option<Command> {
+    let text = mask_non_command_regions(text);
     let trigger = format!("@{}", bot_name);
     // Find all occurrences of @bot_name (case-insensitive, at word boundary)
     let mut search_start = 0;
-    while let Some(abs_pos) = find_trigger(text, search_start, &trigger) {
+    while let Some(abs_pos) = find_trigger(&text, search_start, &trigger) {
         let after_trigger = &text[abs_pos + trigger.len()..];
 
         if let Some(cmd) = try_parse_after_trigger(after_trigger) {
@@ -55,6 +64,138 @@ pub fn parse_command(text: &str, bot_name: &str) -> Option<Command> {
         search_start = abs_pos + trigger.len();
     }
     None
+}
+
+/// Replaces markdown regions in which commands must not be recognised with
+/// spaces: fenced code blocks (``` or ~~~), blockquoted lines (`>`), and
+/// inline code spans (backticks). Spaces preserve word boundaries for the
+/// surrounding text.
+fn mask_non_command_regions(text: &str) -> String {
+    let mut masked = vec![false; text.len()];
+    mask_block_regions(text, &mut masked);
+    mask_inline_code_spans(text, &mut masked);
+
+    let mut out = String::with_capacity(text.len());
+    for (idx, c) in text.char_indices() {
+        if masked[idx] {
+            out.push(' ');
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn mask_range(masked: &mut [bool], start: usize, end: usize) {
+    for flag in &mut masked[start..end] {
+        *flag = true;
+    }
+}
+
+/// Length of the leading run of '`' or '~' characters (0 if neither).
+fn leading_fence_run(s: &str) -> usize {
+    match s.chars().next() {
+        Some(c @ ('`' | '~')) => s.chars().take_while(|&x| x == c).count(),
+        _ => 0,
+    }
+}
+
+/// Masks fenced code blocks and blockquoted lines.
+fn mask_block_regions(text: &str, masked: &mut [bool]) {
+    // (fence char, opening run length) while inside a fenced code block
+    let mut fence: Option<(char, usize)> = None;
+    let mut pos = 0;
+    while pos < text.len() {
+        let line_end = text[pos..].find('\n').map_or(text.len(), |i| pos + i + 1);
+        let line = text[pos..line_end].trim_end_matches(['\n', '\r']);
+        let trimmed = line.trim_start();
+        let fence_run = leading_fence_run(trimmed);
+
+        match fence {
+            Some((ch, open_len)) => {
+                // The whole line is code, including the closing fence itself
+                mask_range(masked, pos, line_end);
+                let closes = trimmed.starts_with(ch)
+                    && fence_run >= open_len
+                    && trimmed.trim_end().chars().all(|c| c == ch);
+                if closes {
+                    fence = None;
+                }
+            }
+            None => {
+                if trimmed.starts_with('>') {
+                    mask_range(masked, pos, line_end);
+                } else if fence_run >= 3 {
+                    // A backtick fence's info string may not contain backticks
+                    // (such a line is inline code, handled in the inline pass)
+                    let is_fence = trimmed.starts_with('~') || !trimmed[fence_run..].contains('`');
+                    if is_fence {
+                        mask_range(masked, pos, line_end);
+                        // An unclosed fence swallows the rest of the comment
+                        fence = Some((trimmed.chars().next().unwrap(), fence_run));
+                    }
+                }
+            }
+        }
+        pos = line_end;
+    }
+}
+
+/// Masks inline code spans: a run of N backticks closed by the next run of
+/// exactly N backticks; unmatched runs are literal. Spans are sought only
+/// within contiguous unmasked regions, so backticks inside fenced code or
+/// blockquotes neither open nor close spans.
+fn mask_inline_code_spans(text: &str, masked: &mut [bool]) {
+    let mut region_start = 0;
+    while region_start < text.len() {
+        if masked[region_start] {
+            region_start += 1;
+            continue;
+        }
+        let mut region_end = region_start;
+        while region_end < text.len() && !masked[region_end] {
+            region_end += 1;
+        }
+        mask_spans_in_segment(text, region_start, region_end, masked);
+        region_start = region_end;
+    }
+}
+
+/// Masks inline code spans within `text[start..end]`.
+fn mask_spans_in_segment(text: &str, start: usize, end: usize, masked: &mut [bool]) {
+    // Backtick runs as (byte offset, length)
+    let bytes = text.as_bytes();
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut i = start;
+    while i < end {
+        if bytes[i] == b'`' {
+            let run_start = i;
+            while i < end && bytes[i] == b'`' {
+                i += 1;
+            }
+            runs.push((run_start, i - run_start));
+        } else {
+            i += 1;
+        }
+    }
+
+    let mut idx = 0;
+    while idx < runs.len() {
+        let (open_pos, open_len) = runs[idx];
+        // The closer must have exactly the opener's length; shorter or longer
+        // runs in between are span content
+        match (idx + 1..runs.len()).find(|&j| runs[j].1 == open_len) {
+            Some(j) => {
+                let (close_pos, close_len) = runs[j];
+                mask_range(masked, open_pos, close_pos + close_len);
+                idx = j + 1;
+            }
+            None => {
+                // An unmatched backtick run is literal text
+                idx += 1;
+            }
+        }
+    }
 }
 
 /// Finds the next occurrence of the trigger (case-insensitive) at a valid word boundary.
@@ -113,10 +254,20 @@ fn parse_predecessor(text: &str) -> Option<Command> {
     let text = text.trim_start();
     // Must have a # prefix
     let text = text.strip_prefix('#')?;
-    // Extract the number (up to whitespace or end)
-    let (num_str, _) = split_first_word(text);
+    // Extract the number token (up to whitespace or end)
+    let (token, _) = split_first_word(text);
 
-    // Parse as u64
+    // Trailing punctuation is conversational, not part of the number
+    // ("predecessor #42." / "#42,"). Anything else mixed into the token is
+    // ambiguous and rejected by the digits check below.
+    let num_str = token.trim_end_matches(|c: char| c.is_ascii_punctuation());
+
+    // Digits only: u64::from_str would also accept a leading '+'
+    if num_str.is_empty() || !num_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+
+    // Fails on overflow
     let n: u64 = num_str.parse().ok()?;
 
     // PR numbers start at 1; 0 is invalid
@@ -570,12 +721,6 @@ mod tests {
             Some(Command::Start)
         );
 
-        // In a code fence (still matches - caller should handle context)
-        assert_eq!(
-            parse_command("```\n@merge-train start\n```", BOT),
-            Some(Command::Start)
-        );
-
         // With emoji
         assert_eq!(
             parse_command("Let's go! @merge-train start", BOT),
@@ -602,6 +747,131 @@ This builds on top of the auth refactor in #123."#,
             ),
             Some(Command::Predecessor(PrNumber(123)))
         );
+    }
+
+    // ==================== Markdown context: code and quotes ====================
+
+    #[test]
+    fn command_in_code_fence_is_ignored() {
+        assert_eq!(parse_command("```\n@merge-train start\n```", BOT), None);
+        // With an info string on the opening fence
+        assert_eq!(parse_command("```text\n@merge-train stop\n```", BOT), None);
+        // Tilde fences
+        assert_eq!(parse_command("~~~\n@merge-train start\n~~~", BOT), None);
+        // Unclosed fence swallows the rest of the comment
+        assert_eq!(parse_command("```\n@merge-train start --force", BOT), None);
+    }
+
+    #[test]
+    fn command_in_inline_code_is_ignored() {
+        assert_eq!(
+            parse_command("use `@merge-train start` to begin", BOT),
+            None
+        );
+        // Multi-backtick spans
+        assert_eq!(
+            parse_command("use ``@merge-train start`` to begin", BOT),
+            None
+        );
+        // An unmatched backtick is literal, not a span opener
+        assert_eq!(
+            parse_command("a stray ` then @merge-train start", BOT),
+            Some(Command::Start)
+        );
+    }
+
+    #[test]
+    fn command_in_blockquote_is_ignored() {
+        assert_eq!(parse_command("> @merge-train start", BOT), None);
+        assert_eq!(
+            parse_command("quoting:\n> @merge-train stop --force\nend", BOT),
+            None
+        );
+        // Indented blockquote marker
+        assert_eq!(parse_command("   > @merge-train start", BOT), None);
+    }
+
+    #[test]
+    fn command_after_fence_closes_is_parsed() {
+        assert_eq!(
+            parse_command("```\n@merge-train stop\n```\n@merge-train start", BOT),
+            Some(Command::Start)
+        );
+        assert_eq!(
+            parse_command("~~~\nexample\n~~~\n\n@merge-train predecessor #7", BOT),
+            Some(Command::Predecessor(PrNumber(7)))
+        );
+    }
+
+    #[test]
+    fn command_outside_quote_and_code_is_parsed() {
+        assert_eq!(
+            parse_command(
+                "> someone said @merge-train stop\n\n@merge-train start",
+                BOT
+            ),
+            Some(Command::Start)
+        );
+        assert_eq!(
+            parse_command("see `the docs` then @merge-train start", BOT),
+            Some(Command::Start)
+        );
+    }
+
+    proptest! {
+        /// Any backtick/tilde-free text wrapped in a code fence never parses
+        /// as a command (the fence cannot be closed early).
+        #[test]
+        fn prop_fenced_text_never_parses(text in "[^`~]{0,200}") {
+            let fenced = format!("```\n{}\n```", text);
+            prop_assert_eq!(parse_command(&fenced, BOT), None);
+        }
+
+        /// Any single-line text behind a blockquote marker never parses.
+        #[test]
+        fn prop_blockquoted_line_never_parses(line in "[^\n\r]{0,200}") {
+            let quoted = format!("> {}", line);
+            prop_assert_eq!(parse_command(&quoted, BOT), None);
+        }
+
+        /// Any backtick-free single-line text inside an inline code span never
+        /// parses.
+        #[test]
+        fn prop_inline_code_never_parses(text in "[^`\n\r]{0,200}") {
+            let body = format!("see `{}` for details", text);
+            prop_assert_eq!(parse_command(&body, BOT), None);
+        }
+    }
+
+    // ==================== Trailing punctuation after PR number ====================
+
+    #[test]
+    fn predecessor_accepts_trailing_punctuation() {
+        assert_eq!(
+            parse_command("@merge-train predecessor #42.", BOT),
+            Some(Command::Predecessor(PrNumber(42)))
+        );
+        assert_eq!(
+            parse_command("@merge-train predecessor #42,", BOT),
+            Some(Command::Predecessor(PrNumber(42)))
+        );
+        assert_eq!(
+            parse_command("@merge-train predecessor #42!", BOT),
+            Some(Command::Predecessor(PrNumber(42)))
+        );
+        assert_eq!(
+            parse_command("Stacked on #41: @merge-train predecessor #41).", BOT),
+            Some(Command::Predecessor(PrNumber(41)))
+        );
+    }
+
+    #[test]
+    fn predecessor_requires_digits_only() {
+        // u64::from_str accepts a leading '+'; the parser must not
+        assert_eq!(parse_command("@merge-train predecessor #+42", BOT), None);
+        // Digits after non-digit junk are ambiguous: reject
+        assert_eq!(parse_command("@merge-train predecessor #1.5", BOT), None);
+        assert_eq!(parse_command("@merge-train predecessor #-1", BOT), None);
     }
 
     // ==================== Helper function tests ====================
