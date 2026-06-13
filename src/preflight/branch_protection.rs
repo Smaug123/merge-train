@@ -177,6 +177,7 @@ fn response_variant_name(response: &GitHubResponse) -> &'static str {
         GitHubResponse::PrList(_) => "PrList",
         GitHubResponse::RecentlyMergedPrList { .. } => "RecentlyMergedPrList",
         GitHubResponse::MergeState(_) => "MergeState",
+        GitHubResponse::PrRefetched { .. } => "PrRefetched",
         GitHubResponse::Merged { .. } => "Merged",
         GitHubResponse::Retargeted => "Retargeted",
         GitHubResponse::CommentPosted { .. } => "CommentPosted",

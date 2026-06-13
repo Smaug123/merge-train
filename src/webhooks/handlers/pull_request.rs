@@ -12,7 +12,7 @@ use crate::effects::{Effect, GitHubEffect};
 use crate::persistence::event::StateEventPayload;
 use crate::persistence::snapshot::PersistedRepoSnapshot;
 use crate::types::{PrNumber, TrainError};
-use crate::webhooks::events::{PrAction, PullRequestEvent};
+use crate::webhooks::events::{MergeStatus, PrAction, PullRequestEvent};
 
 use super::{HandlerError, HandlerResult};
 
@@ -71,57 +71,56 @@ fn handle_closed(
     let mut state_events = Vec::new();
     let effects = Vec::new();
 
-    if event.merged {
-        let merge_sha = event.merge_commit_sha.clone().ok_or_else(|| {
-            HandlerError::InvalidState(format!(
-                "PR #{} is merged but has no merge_commit_sha",
-                event.pr_number
-            ))
-        })?;
+    match &event.merge_status {
+        // A merged PR always carries its merge commit SHA: `MergeStatus::Merged`
+        // makes that an invariant of the type, and the parser rejects payloads
+        // that violate it. Interior code therefore receives proof, not a promise.
+        MergeStatus::Merged { merge_commit_sha } => {
+            state_events.push(StateEventPayload::PrMerged {
+                pr: event.pr_number,
+                merge_sha: merge_commit_sha.clone(),
+            });
 
-        state_events.push(StateEventPayload::PrMerged {
-            pr: event.pr_number,
-            merge_sha: merge_sha.clone(),
-        });
+            // Check if this PR is in an active train
+            if let Some(train_root) = find_train_containing_pr(event.pr_number, state) {
+                let train = state.active_trains.get(&train_root).unwrap();
 
-        // Check if this PR is in an active train
-        if let Some(train_root) = find_train_containing_pr(event.pr_number, state) {
-            let train = state.active_trains.get(&train_root).unwrap();
-
-            // If this is the current PR being processed, the cascade engine
-            // handles advancement. But we need to check for external merges
-            // during preparation phase.
-            if train.current_pr == event.pr_number {
-                // The cascade engine's evaluate_train handles this via
-                // AdvanceAfterExternalMerge action
-                // No additional state events needed here
+                // If this is the current PR being processed, the cascade engine
+                // handles advancement. But we need to check for external merges
+                // during preparation phase.
+                if train.current_pr == event.pr_number {
+                    // The cascade engine's evaluate_train handles this via
+                    // AdvanceAfterExternalMerge action
+                    // No additional state events needed here
+                }
             }
         }
-    } else {
-        state_events.push(StateEventPayload::PrClosed {
-            pr: event.pr_number,
-        });
+        MergeStatus::NotMerged => {
+            state_events.push(StateEventPayload::PrClosed {
+                pr: event.pr_number,
+            });
 
-        // If this PR is in an active train, we may need to abort or skip
-        if let Some(train_root) = find_train_containing_pr(event.pr_number, state) {
-            let train = state.active_trains.get(&train_root).unwrap();
+            // If this PR is in an active train, we may need to abort or skip
+            if let Some(train_root) = find_train_containing_pr(event.pr_number, state) {
+                let train = state.active_trains.get(&train_root).unwrap();
 
-            if train.current_pr == event.pr_number {
-                // Current PR closed without merge - abort the train
-                state_events.push(StateEventPayload::TrainAborted {
-                    root_pr: train_root,
-                    error: TrainError::new(
-                        "pr_closed",
-                        format!("PR #{} was closed without being merged", event.pr_number),
-                    ),
-                });
-            } else {
-                // A descendant was closed - mark it as skipped
-                state_events.push(StateEventPayload::DescendantSkipped {
-                    root_pr: train_root,
-                    descendant_pr: event.pr_number,
-                    reason: "PR closed without merge".to_string(),
-                });
+                if train.current_pr == event.pr_number {
+                    // Current PR closed without merge - abort the train
+                    state_events.push(StateEventPayload::TrainAborted {
+                        root_pr: train_root,
+                        error: TrainError::new(
+                            "pr_closed",
+                            format!("PR #{} was closed without being merged", event.pr_number),
+                        ),
+                    });
+                } else {
+                    // A descendant was closed - mark it as skipped
+                    state_events.push(StateEventPayload::DescendantSkipped {
+                        root_pr: train_root,
+                        descendant_pr: event.pr_number,
+                        reason: "PR closed without merge".to_string(),
+                    });
+                }
             }
         }
     }
@@ -334,8 +333,7 @@ mod tests {
             head_branch: format!("branch-{}", pr_number),
             base_branch: "main".to_string(),
             is_draft: false,
-            merged: false,
-            merge_commit_sha: None,
+            merge_status: MergeStatus::NotMerged,
             author_id: 1,
         }
     }
@@ -371,8 +369,9 @@ mod tests {
     #[test]
     fn closed_merged_creates_pr_merged_event() {
         let mut event = make_pr_event(PrAction::Closed, 1);
-        event.merged = true;
-        event.merge_commit_sha = Some(Sha::parse("b".repeat(40)).unwrap());
+        event.merge_status = MergeStatus::Merged {
+            merge_commit_sha: Sha::parse("b".repeat(40)).unwrap(),
+        };
 
         let state = make_state();
 
