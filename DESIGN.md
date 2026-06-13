@@ -586,7 +586,7 @@ The spool is a durable queue, not just a transient buffer. Deliveries progress t
 ```
 
 **File semantics:**
-- `.json` file: Contains the actual webhook payload (headers + body). Created atomically via temp file + rename + fsync + directory fsync.
+- `.json` file: A JSON envelope holding the raw signed body plus the minimal metadata needed to replay the delivery — `event_type` (the `X-GitHub-Event` header), `signature` (the `X-Hub-Signature-256` header), `body` (the exact signed bytes), and `arrival` (a monotonic marker giving replay order). Created atomically via temp file + rename + fsync + directory fsync. The envelope format is unversioned: a change to it is not backward-compatible, and an upgrade across one requires starting from an empty spool (a fresh install). A leftover envelope in an older format drains as `CorruptEnvelope` and halts replay rather than being silently dropped.
 - `.json.proc` marker: Empty file indicating a worker is processing this delivery. Created atomically. If present without `.done`, the processing was interrupted.
 - `.json.done` marker: Empty file indicating the delivery's state effects are durably persisted. Created atomically after fsync of the event log.
 
@@ -1120,7 +1120,7 @@ Deliveries are written to a per-repo spool directory keyed by `X-GitHub-Delivery
 The HTTP handler:
 1. Validates the webhook signature
 2. Extracts the repository ID and `X-GitHub-Delivery` ID
-3. Writes the delivery (headers + body) to the per-repo disk spool:
+3. Writes the delivery envelope (event type, signature, signed body, arrival marker) to the per-repo disk spool:
    a. Write to a temp file in the spool directory
    b. fsync the temp file
    c. Rename to `<delivery-id>.json` (atomic on POSIX)

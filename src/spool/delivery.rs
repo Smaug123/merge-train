@@ -170,6 +170,15 @@ impl WebhookEnvelope {
 /// Wire format for [`WebhookEnvelope`]; deserialization funnels through
 /// [`WebhookEnvelope::new`] so the non-empty `event_type` invariant also holds
 /// for envelopes read back from disk.
+///
+/// This format is **unversioned and not backward-compatible**. All four
+/// fields are required, so an envelope written by a build with a different
+/// shape fails to deserialize and surfaces as
+/// [`SpoolError::CorruptEnvelope`], halting replay. We control both writer
+/// and reader and deploy a clean cutover, so upgrading across a format
+/// change requires starting from an empty spool rather than a migration
+/// path (see DESIGN.md, "File semantics"). If that ever stops being
+/// acceptable, add an explicit version tag and a v1->v2 read path here.
 #[derive(Deserialize)]
 struct WebhookEnvelopeWire {
     event_type: String,
@@ -206,8 +215,11 @@ pub enum SpoolError {
 
     /// A spooled payload exists but is not a valid [`WebhookEnvelope`].
     ///
-    /// This is an uncharacterizable state (the spool only ever writes
-    /// envelopes), so it is surfaced loudly rather than skipped.
+    /// This is an uncharacterizable state (a running spool only ever writes
+    /// envelopes), so it is surfaced loudly rather than skipped. An envelope
+    /// left by a build with a different, incompatible wire format also lands
+    /// here: the format is unversioned, so upgrading across a change to it
+    /// requires an empty spool (see [`WebhookEnvelopeWire`]).
     #[error("corrupt spool envelope for delivery {delivery_id}: {source}")]
     CorruptEnvelope {
         delivery_id: DeliveryId,
