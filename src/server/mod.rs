@@ -139,11 +139,19 @@ impl AppState {
 }
 
 /// Builds the axum Router with all endpoints.
+///
+/// The webhook route carries an explicit body limit of
+/// [`webhook::WEBHOOK_BODY_LIMIT_BYTES`] (GitHub's 25MB payload cap): axum's
+/// 2MB default would silently 413 legitimate large deliveries.
 pub fn build_router(app_state: AppState) -> axum::Router {
+    use axum::extract::DefaultBodyLimit;
     use axum::routing::{get, post};
 
     axum::Router::new()
-        .route("/webhook", post(webhook_handler))
+        .route(
+            "/webhook",
+            post(webhook_handler).layer(DefaultBodyLimit::max(webhook::WEBHOOK_BODY_LIMIT_BYTES)),
+        )
         .route("/api/v1/repos/{owner}/{repo}/state", get(state_handler))
         .route("/health", get(health_handler))
         .with_state(app_state)
@@ -152,31 +160,6 @@ pub fn build_router(app_state: AppState) -> axum::Router {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
-
-    #[test]
-    fn app_state_accessors_work() {
-        let spool_dir = tempdir().unwrap();
-        let state_dir = tempdir().unwrap();
-        let secret = b"test-secret";
-
-        let state = AppState::new(spool_dir.path(), state_dir.path(), secret.to_vec());
-
-        assert_eq!(state.spool_dir(), spool_dir.path());
-        assert_eq!(state.state_dir(), state_dir.path());
-        assert_eq!(state.webhook_secret(), secret);
-    }
-
-    #[test]
-    fn app_state_is_clone() {
-        let spool_dir = tempdir().unwrap();
-        let state_dir = tempdir().unwrap();
-
-        let state = AppState::new(spool_dir.path(), state_dir.path(), b"secret".to_vec());
-        let cloned = state.clone();
-
-        assert_eq!(state.spool_dir(), cloned.spool_dir());
-    }
 
     #[test]
     fn validate_path_component_accepts_valid() {
@@ -274,14 +257,13 @@ mod integration_tests {
         (state, spool_dir, state_dir)
     }
 
-    /// Creates a valid webhook request with proper signature.
-    fn create_webhook_request(
+    /// Creates a valid webhook request with proper signature from raw body bytes.
+    fn create_webhook_request_raw(
         secret: &[u8],
         event_type: &str,
         delivery_id: &str,
-        body: &serde_json::Value,
+        body_bytes: Vec<u8>,
     ) -> Request<Body> {
-        let body_bytes = serde_json::to_vec(body).unwrap();
         let signature = compute_signature(&body_bytes, secret);
         let signature_header = format_signature_header(&signature);
 
@@ -294,6 +276,17 @@ mod integration_tests {
             .header("x-hub-signature-256", signature_header)
             .body(Body::from(body_bytes))
             .unwrap()
+    }
+
+    /// Creates a valid webhook request with proper signature.
+    fn create_webhook_request(
+        secret: &[u8],
+        event_type: &str,
+        delivery_id: &str,
+        body: &serde_json::Value,
+    ) -> Request<Body> {
+        let body_bytes = serde_json::to_vec(body).unwrap();
+        create_webhook_request_raw(secret, event_type, delivery_id, body_bytes)
     }
 
     // ─── Health endpoint tests ───
@@ -468,6 +461,207 @@ mod integration_tests {
 
         // Should still return 202 (idempotent)
         assert_eq!(response2.status(), StatusCode::ACCEPTED);
+    }
+
+    /// GitHub sends webhook payloads up to 25MB. The default axum body limit
+    /// (2MB) would reject these with 413, and GitHub does not retry 413s
+    /// indefinitely - the delivery would be lost forever.
+    #[tokio::test]
+    async fn webhook_large_body_within_25mb_accepted() {
+        let secret = b"test-secret";
+        let (state, _spool, _state_dir) = test_app_state(secret);
+        let app = build_router(state);
+
+        // 3MB payload: above the 2MB axum default, below the 25MB GitHub max.
+        let padding = "x".repeat(3 * 1024 * 1024);
+        let body = serde_json::json!({
+            "action": "opened",
+            "padding": padding,
+            "repository": {
+                "name": "hello-world",
+                "owner": { "login": "octocat" }
+            }
+        });
+
+        let request = create_webhook_request(
+            secret,
+            "pull_request",
+            "550e8400-e29b-41d4-a716-446655440020",
+            &body,
+        );
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    /// Bodies over the documented 25MB GitHub maximum are rejected.
+    #[tokio::test]
+    async fn webhook_body_over_25mb_rejected() {
+        let secret = b"test-secret";
+        let (state, _spool, _state_dir) = test_app_state(secret);
+        let app = build_router(state);
+
+        let padding = "x".repeat(26 * 1024 * 1024);
+        let body = serde_json::json!({
+            "padding": padding,
+            "repository": {
+                "name": "hello-world",
+                "owner": { "login": "octocat" }
+            }
+        });
+
+        let request = create_webhook_request(
+            secret,
+            "pull_request",
+            "550e8400-e29b-41d4-a716-446655440021",
+            &body,
+        );
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// An empty X-GitHub-Event header is malformed client input: 400, not 500.
+    /// (500 invites pointless retries of a permanently-bad request.)
+    #[tokio::test]
+    async fn webhook_empty_event_header_returns_400() {
+        let secret = b"test-secret";
+        let (state, _spool, _state_dir) = test_app_state(secret);
+        let app = build_router(state);
+
+        let body = serde_json::json!({
+            "repository": {
+                "name": "hello-world",
+                "owner": { "login": "octocat" }
+            }
+        });
+        let body_bytes = serde_json::to_vec(&body).unwrap();
+        let signature = compute_signature(&body_bytes, secret);
+        let signature_header = format_signature_header(&signature);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/webhook")
+            .header("content-type", "application/json")
+            .header("x-github-event", "")
+            .header("x-github-delivery", "550e8400-e29b-41d4-a716-446655440022")
+            .header("x-hub-signature-256", signature_header)
+            .body(Body::from(body_bytes))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// An invalid delivery id (e.g. leading dot) is malformed client input:
+    /// 400, not 500.
+    #[tokio::test]
+    async fn webhook_invalid_delivery_id_returns_400() {
+        let secret = b"test-secret";
+        let (state, spool_dir, _state_dir) = test_app_state(secret);
+        let app = build_router(state);
+
+        let body = serde_json::json!({
+            "action": "opened",
+            "repository": {
+                "name": "hello-world",
+                "owner": { "login": "octocat" }
+            }
+        });
+
+        // Leading dot: passes naive path checks but is rejected by the spool
+        // (hidden files conflict with marker handling).
+        let request = create_webhook_request(secret, "pull_request", ".hidden-delivery", &body);
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let entries: Vec<_> = std::fs::read_dir(spool_dir.path())
+            .unwrap()
+            .map(|e| e.unwrap())
+            .collect();
+        assert!(
+            entries.is_empty(),
+            "Spool directory should be empty after rejected request"
+        );
+    }
+
+    /// A missing X-Hub-Signature-256 header is an authentication failure (401),
+    /// just like an invalid signature - not a 400.
+    #[tokio::test]
+    async fn webhook_missing_signature_returns_401() {
+        let secret = b"test-secret";
+        let (state, _spool, _state_dir) = test_app_state(secret);
+        let app = build_router(state);
+
+        let body = serde_json::json!({
+            "repository": {
+                "name": "hello-world",
+                "owner": { "login": "octocat" }
+            }
+        });
+        let body_bytes = serde_json::to_vec(&body).unwrap();
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/webhook")
+            .header("content-type", "application/json")
+            .header("x-github-event", "pull_request")
+            .header("x-github-delivery", "550e8400-e29b-41d4-a716-446655440023")
+            .body(Body::from(body_bytes))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// The spooled envelope must store the raw signed body bytes so the stored
+    /// X-Hub-Signature-256 can be re-verified against the stored body.
+    ///
+    /// A re-serialized `serde_json::Value` silently collapses duplicate JSON
+    /// keys and changes formatting, making the stored signature useless.
+    #[tokio::test]
+    async fn webhook_spools_raw_signed_body_bytes() {
+        let secret = b"test-secret";
+        let (state, spool_dir, _state_dir) = test_app_state(secret);
+        let app = build_router(state);
+
+        // Duplicate "action" keys and unusual whitespace: any re-serialization
+        // would not be byte-identical.
+        let raw_body: &[u8] = br#"{ "action": "opened",  "action": "closed",
+            "repository": { "name": "hello-world", "owner": { "login": "octocat" } } }"#;
+
+        let delivery_id = "550e8400-e29b-41d4-a716-446655440024";
+        let request =
+            create_webhook_request_raw(secret, "pull_request", delivery_id, raw_body.to_vec());
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let payload_path = spool_dir
+            .path()
+            .join("octocat")
+            .join("hello-world")
+            .join(format!("{delivery_id}.json"));
+        let stored = std::fs::read(&payload_path).unwrap();
+        let envelope: serde_json::Value = serde_json::from_slice(&stored).unwrap();
+
+        let stored_body = envelope["body"]
+            .as_str()
+            .expect("envelope body must be the raw signed bytes, stored as a string");
+        assert_eq!(
+            stored_body.as_bytes(),
+            raw_body,
+            "stored body must be byte-identical to the signed request body"
+        );
+
+        let stored_signature = envelope["signature"]
+            .as_str()
+            .expect("envelope must store the X-Hub-Signature-256 header");
+        assert!(
+            crate::webhooks::verify_signature(stored_body.as_bytes(), stored_signature, secret),
+            "stored signature must re-verify against the stored body"
+        );
     }
 
     // ─── State endpoint tests ───

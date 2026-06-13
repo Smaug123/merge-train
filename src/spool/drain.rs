@@ -2,6 +2,12 @@
 //!
 //! On startup or during normal processing, the spool is drained to find
 //! deliveries that need processing.
+//!
+//! Deliveries are returned in `(arrival, delivery_id)` order: the arrival
+//! marker recorded at intake, with the delivery ID breaking ties (which can
+//! occur across process restarts). Event-priority ordering
+//! (`crate::webhooks::priority`) is the engine's concern, applied after
+//! parsing; the spool replays in arrival order only.
 
 use std::path::Path;
 
@@ -9,10 +15,12 @@ use crate::types::DeliveryId;
 
 use super::delivery::{Result, SpooledDelivery};
 
-/// Drains the spool directory, returning all pending deliveries.
+/// Drains the spool directory, returning all pending deliveries in
+/// `(arrival, delivery_id)` order.
 ///
-/// Returns all pending deliveries (`.json` files without `.done` markers)
-/// in deterministic order (sorted by delivery ID) for reproducible behavior.
+/// Reads each pending payload's envelope to obtain its arrival marker:
+/// GitHub delivery IDs are UUIDs, so sorting by ID alone would replay in
+/// effectively random order.
 ///
 /// **Important**: This function does NOT clean up interrupted processing markers.
 /// Call [`cleanup_interrupted_processing`] once at startup before starting any
@@ -22,14 +30,16 @@ use super::delivery::{Result, SpooledDelivery};
 ///
 /// # Errors
 ///
-/// Returns an error if the spool directory cannot be read.
+/// Returns an error if the spool directory cannot be read, or
+/// [`super::delivery::SpoolError::CorruptEnvelope`] if a pending payload is
+/// not a valid envelope: the spool only ever writes envelopes, so a corrupt
+/// payload is an uncharacterizable state and is surfaced rather than skipped.
 pub fn drain_pending(spool_dir: &Path) -> Result<Vec<SpooledDelivery>> {
     // If spool directory doesn't exist, return empty (no pending deliveries)
     if !spool_dir.exists() {
         return Ok(Vec::new());
     }
 
-    // Find all pending deliveries
     let mut pending = Vec::new();
 
     for entry in std::fs::read_dir(spool_dir)? {
@@ -37,35 +47,45 @@ pub fn drain_pending(spool_dir: &Path) -> Result<Vec<SpooledDelivery>> {
         let path = entry.path();
 
         // Only look at .json files (payload files)
-        if path.extension().is_some_and(|e| e == "json") {
-            // Extract delivery ID from filename
-            if let Some(delivery_id) = extract_delivery_id(&path) {
-                let delivery = SpooledDelivery::new(spool_dir, delivery_id);
+        if path.extension().is_some_and(|e| e == "json")
+            && let Some(delivery_id) = extract_delivery_id(&path)
+        {
+            let delivery = SpooledDelivery::new(spool_dir, delivery_id);
 
-                // Include if pending (has payload, no done marker)
-                if delivery.is_pending() {
-                    pending.push(delivery);
-                }
+            // Include if pending (has payload, no proc/done marker)
+            if delivery.is_pending() {
+                let arrival = delivery.read_webhook()?.arrival();
+                pending.push((arrival, delivery));
             }
         }
     }
 
-    // Sort by delivery ID for deterministic order
-    pending.sort_by(|a, b| a.delivery_id.as_str().cmp(b.delivery_id.as_str()));
+    pending.sort_by(|(arrival_a, a), (arrival_b, b)| {
+        arrival_a
+            .cmp(arrival_b)
+            .then_with(|| a.delivery_id.as_str().cmp(b.delivery_id.as_str()))
+    });
 
-    Ok(pending)
+    Ok(pending.into_iter().map(|(_, delivery)| delivery).collect())
 }
 
-/// Cleans up interrupted processing by removing orphaned `.proc` markers.
+/// Cleans up interrupted work left by a crashed run: orphaned `.proc`
+/// markers and orphaned spool temp files.
 ///
 /// If a crash occurred during processing, we'll have a `.proc` marker
 /// but no `.done` marker. The delivery needs to be reprocessed, so we
 /// remove the `.proc` marker to put it back in the pending state.
 ///
+/// If a crash occurred during spooling (between the temp-file write and the
+/// hard_link), an orphaned `<id>.json.tmp.<pid>.<counter>` file remains; it
+/// is removed here. This is only safe at startup: during normal operation a
+/// temp file may belong to an intake write that is about to hard_link it.
+///
 /// **Critical**: This function MUST only be called at startup, before any
-/// workers begin processing deliveries. Calling it while workers are active
-/// would delete their in-progress markers, causing the same delivery to be
-/// picked up and processed again (double-processing).
+/// workers begin processing deliveries and before the server accepts
+/// webhooks. Calling it while workers are active would delete their
+/// in-progress markers, causing the same delivery to be picked up and
+/// processed again (double-processing).
 ///
 /// # Safety Guarantee
 ///
@@ -76,10 +96,10 @@ pub fn drain_pending(spool_dir: &Path) -> Result<Vec<SpooledDelivery>> {
 ///
 /// # Durability
 ///
-/// After removing all orphaned `.proc` markers, this function fsyncs the
-/// directory to ensure the deletions are durable. Without this, a power
-/// loss could "resurrect" the deleted markers (see DESIGN.md: "All directory
-/// fsyncs are mandatory, not best-effort").
+/// After removing files, this function fsyncs the directory to ensure the
+/// deletions are durable. Without this, a power loss could "resurrect" the
+/// deleted markers (see DESIGN.md: "All directory fsyncs are mandatory, not
+/// best-effort").
 pub fn cleanup_interrupted_processing(spool_dir: &Path) -> Result<()> {
     use crate::persistence::fsync::fsync_dir;
 
@@ -94,29 +114,31 @@ pub fn cleanup_interrupted_processing(spool_dir: &Path) -> Result<()> {
         let entry = entry?;
         let path = entry.path();
 
-        // Look for .proc files
-        if path.extension().is_some_and(|e| e == "proc") {
-            // Check if there's a corresponding .done marker
-            let done_path = path.with_extension("done");
-            if !done_path.exists() {
-                // No .done marker means processing was interrupted.
-                // Remove the .proc marker so it can be reprocessed.
-                //
-                // We propagate errors here because a failed removal leaves the
-                // .proc marker stuck, preventing the delivery from ever becoming
-                // pending again. This is a critical failure that should not be
-                // silently ignored.
-                match std::fs::remove_file(&path) {
-                    Ok(()) => {
-                        removed_any = true;
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        // File was already removed (race with another cleanup),
-                        // this is fine - the goal is achieved.
-                    }
-                    Err(e) => {
-                        return Err(e.into());
-                    }
+        // An interrupted .proc marker (no corresponding .done) must be
+        // removed so the delivery becomes pending again.
+        let interrupted_proc =
+            path.extension().is_some_and(|e| e == "proc") && !path.with_extension("done").exists();
+
+        let orphaned_temp = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(is_orphaned_spool_temp);
+
+        if interrupted_proc || orphaned_temp {
+            // We propagate errors here because a failed removal leaves the
+            // .proc marker stuck, preventing the delivery from ever becoming
+            // pending again. This is a critical failure that should not be
+            // silently ignored.
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    removed_any = true;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // File was already removed (race with another cleanup),
+                    // this is fine - the goal is achieved.
+                }
+                Err(e) => {
+                    return Err(e.into());
                 }
             }
         }
@@ -131,39 +153,27 @@ pub fn cleanup_interrupted_processing(spool_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Extracts the delivery ID from a payload file path.
+/// True for spool temp files (`<stem>.json.tmp.<pid>.<counter>`).
 ///
-/// The path should be `<spool_dir>/<delivery-id>.json`.
-fn extract_delivery_id(path: &Path) -> Option<DeliveryId> {
-    let file_name = path.file_stem()?.to_str()?;
-    Some(DeliveryId::new(file_name))
+/// Payload (`.json`) and marker (`.proc`/`.done`) files never match: the temp
+/// suffix ends in numeric segments, and a delivery ID that itself contains
+/// `.json.tmp.` still produces filenames ending in one of the excluded
+/// suffixes.
+fn is_orphaned_spool_temp(name: &str) -> bool {
+    name.contains(".json.tmp.")
+        && !name.ends_with(".json")
+        && !name.ends_with(".proc")
+        && !name.ends_with(".done")
 }
 
-/// Returns the number of pending deliveries in the spool.
+/// Extracts the delivery ID from a payload file path (`<id>.json`).
 ///
-/// This is a lightweight check that doesn't load payload data.
-pub fn count_pending(spool_dir: &Path) -> Result<usize> {
-    if !spool_dir.exists() {
-        return Ok(0);
-    }
-
-    let mut count = 0;
-
-    for entry in std::fs::read_dir(spool_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-
-        if path.extension().is_some_and(|e| e == "json")
-            && let Some(delivery_id) = extract_delivery_id(&path)
-        {
-            let delivery = SpooledDelivery::new(spool_dir, delivery_id);
-            if delivery.is_pending() {
-                count += 1;
-            }
-        }
-    }
-
-    Ok(count)
+/// Returns `None` for stems that are not valid delivery IDs: the spool only
+/// creates payloads for validated IDs, so such files are foreign and are
+/// ignored like any other unrelated file in the directory.
+fn extract_delivery_id(path: &Path) -> Option<DeliveryId> {
+    let file_name = path.file_stem()?.to_str()?;
+    DeliveryId::parse(file_name).ok()
 }
 
 /// Cleans up done deliveries that are older than the grace period.
@@ -201,9 +211,10 @@ pub fn cleanup_done_deliveries(
             && let Some(json_path) = path.file_stem()
             && let Some(delivery_id) = Path::new(json_path).file_stem()
             && let Some(id_str) = delivery_id.to_str()
+            && let Ok(delivery_id) = DeliveryId::parse(id_str)
         {
             // The path is <id>.json.done, we want <id>
-            let delivery = SpooledDelivery::new(spool_dir, DeliveryId::new(id_str));
+            let delivery = SpooledDelivery::new(spool_dir, delivery_id);
             super::delivery::remove_delivery(&delivery)?;
             removed += 1;
         }
@@ -215,17 +226,46 @@ pub fn cleanup_done_deliveries(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spool::delivery::{mark_done, mark_processing, spool_delivery};
+    use crate::spool::delivery::{
+        ArrivalMarker, SpoolError, WebhookEnvelope, mark_done, mark_processing, spool_delivery,
+        spool_webhook,
+    };
     use proptest::prelude::*;
     use std::time::Duration;
     use tempfile::tempdir;
 
     fn arb_delivery_id() -> impl Strategy<Value = DeliveryId> {
-        "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}".prop_map(DeliveryId::new)
+        "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+            .prop_map(|s| DeliveryId::parse(s).unwrap())
     }
 
-    fn arb_payload() -> impl Strategy<Value = Vec<u8>> {
-        prop::collection::vec(any::<u8>(), 0..100)
+    /// Spools a minimal valid envelope with an explicit arrival marker.
+    fn spool_envelope_with_arrival(
+        spool_dir: &Path,
+        id: &DeliveryId,
+        arrival: ArrivalMarker,
+    ) -> SpooledDelivery {
+        let envelope = WebhookEnvelope::new(
+            "pull_request",
+            "sha256=0000",
+            r#"{"action":"opened"}"#,
+            arrival,
+        )
+        .unwrap();
+        spool_webhook(spool_dir, id, &envelope).unwrap()
+    }
+
+    /// Spools a minimal valid envelope; arrival order follows call order.
+    fn spool_test_envelope(spool_dir: &Path, id: &DeliveryId) -> SpooledDelivery {
+        spool_envelope_with_arrival(spool_dir, id, ArrivalMarker::now())
+    }
+
+    /// Dedupes delivery IDs, preserving first-seen order.
+    fn dedupe_preserving_order(ids: Vec<DeliveryId>) -> Vec<DeliveryId> {
+        let mut seen = std::collections::HashSet::new();
+        ids.into_iter()
+            .filter(|id| seen.insert(id.as_str().to_string()))
+            .collect()
     }
 
     proptest! {
@@ -233,68 +273,65 @@ mod tests {
         #[test]
         fn drain_returns_pending(
             ids in prop::collection::vec(arb_delivery_id(), 1..10),
-            payloads in prop::collection::vec(arb_payload(), 1..10),
         ) {
             let dir = tempdir().unwrap();
             let spool_dir = dir.path();
 
-            // Ensure we have the same number of IDs and payloads
-            let count = ids.len().min(payloads.len());
-            let ids = &ids[..count];
-            let payloads = &payloads[..count];
-
-            // Dedupe IDs (in case proptest generates duplicates)
-            let mut unique_ids: Vec<_> = ids.to_vec();
-            unique_ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-            unique_ids.dedup_by(|a, b| a.as_str() == b.as_str());
-
-            // Spool deliveries
-            for (id, payload) in unique_ids.iter().zip(payloads.iter()) {
-                let _ = spool_delivery(spool_dir, id, payload);
+            let unique_ids = dedupe_preserving_order(ids);
+            for id in &unique_ids {
+                spool_test_envelope(spool_dir, id);
             }
 
-            // Drain pending
             let pending = drain_pending(spool_dir).unwrap();
-
-            // All spooled deliveries should be pending
             prop_assert_eq!(pending.len(), unique_ids.len());
         }
 
-        /// Drain returns deliveries in deterministic order.
+        /// Drain replays in arrival order, not delivery-ID order.
+        ///
+        /// GitHub delivery IDs are UUIDs: sorting by ID would replay in
+        /// effectively random order. The arrival marker recorded at intake
+        /// determines replay order.
         #[test]
-        fn drain_returns_deterministic_order(
-            ids in prop::collection::vec(arb_delivery_id(), 2..5),
-            payloads in prop::collection::vec(arb_payload(), 2..5),
+        fn drain_orders_by_arrival_not_id(
+            ids in prop::collection::vec(arb_delivery_id(), 2..6),
         ) {
             let dir = tempdir().unwrap();
             let spool_dir = dir.path();
 
-            let count = ids.len().min(payloads.len());
-            let ids = &ids[..count];
-            let payloads = &payloads[..count];
-
-            // Dedupe
-            let mut unique_ids: Vec<_> = ids.to_vec();
-            unique_ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-            unique_ids.dedup_by(|a, b| a.as_str() == b.as_str());
-
-            for (id, payload) in unique_ids.iter().zip(payloads.iter()) {
-                let _ = spool_delivery(spool_dir, id, payload);
+            // Spool in generated order; ArrivalMarker::now() is monotonic
+            // in-process, so arrival order == spool order.
+            let unique_ids = dedupe_preserving_order(ids);
+            for id in &unique_ids {
+                spool_test_envelope(spool_dir, id);
             }
 
-            // Drain twice
+            let drained = drain_pending(spool_dir).unwrap();
+            let drained_ids: Vec<&str> =
+                drained.iter().map(|d| d.delivery_id.as_str()).collect();
+            let spooled_ids: Vec<&str> = unique_ids.iter().map(|id| id.as_str()).collect();
+            prop_assert_eq!(drained_ids, spooled_ids,
+                "drain must replay in arrival order");
+        }
+
+        /// Repeated drains return the same order (deterministic).
+        #[test]
+        fn drain_returns_deterministic_order(
+            ids in prop::collection::vec(arb_delivery_id(), 2..5),
+        ) {
+            let dir = tempdir().unwrap();
+            let spool_dir = dir.path();
+
+            let unique_ids = dedupe_preserving_order(ids);
+            for id in &unique_ids {
+                spool_test_envelope(spool_dir, id);
+            }
+
             let pending1 = drain_pending(spool_dir).unwrap();
             let pending2 = drain_pending(spool_dir).unwrap();
 
-            // Order should be identical
             prop_assert_eq!(pending1.len(), pending2.len());
             for (p1, p2) in pending1.iter().zip(pending2.iter()) {
                 prop_assert_eq!(p1.delivery_id.as_str(), p2.delivery_id.as_str());
-            }
-
-            // Order should be sorted by delivery ID
-            for window in pending1.windows(2) {
-                prop_assert!(window[0].delivery_id.as_str() <= window[1].delivery_id.as_str());
             }
         }
 
@@ -306,7 +343,6 @@ mod tests {
         fn drain_never_returns_in_progress_deliveries(
             pending_ids in prop::collection::vec(arb_delivery_id(), 1..5),
             processing_ids in prop::collection::vec(arb_delivery_id(), 1..5),
-            payload in arb_payload(),
         ) {
             use std::collections::HashSet;
 
@@ -315,18 +351,20 @@ mod tests {
             let processing_set: HashSet<_> = processing_ids.iter().map(|id| id.as_str()).collect();
             let overlap = pending_set.intersection(&processing_set).count();
             prop_assume!(overlap == 0);
+            prop_assume!(pending_set.len() == pending_ids.len());
+            prop_assume!(processing_set.len() == processing_ids.len());
 
             let dir = tempdir().unwrap();
             let spool_dir = dir.path();
 
             // Create pending deliveries (no .proc marker)
             for id in &pending_ids {
-                let _ = spool_delivery(spool_dir, id, &payload);
+                spool_test_envelope(spool_dir, id);
             }
 
             // Create in-progress deliveries (with .proc marker)
             for id in &processing_ids {
-                let delivery = spool_delivery(spool_dir, id, &payload).unwrap();
+                let delivery = spool_test_envelope(spool_dir, id);
                 mark_processing(&delivery).unwrap();
             }
 
@@ -352,7 +390,6 @@ mod tests {
         fn drain_excludes_done(
             id1 in arb_delivery_id(),
             id2 in arb_delivery_id(),
-            payload in arb_payload(),
         ) {
             prop_assume!(id1.as_str() != id2.as_str());
 
@@ -360,8 +397,8 @@ mod tests {
             let spool_dir = dir.path();
 
             // Spool two deliveries
-            let delivery1 = spool_delivery(spool_dir, &id1, &payload).unwrap();
-            let _ = spool_delivery(spool_dir, &id2, &payload).unwrap();
+            let delivery1 = spool_test_envelope(spool_dir, &id1);
+            let _ = spool_test_envelope(spool_dir, &id2);
 
             // Mark first as done
             mark_done(&delivery1).unwrap();
@@ -376,13 +413,12 @@ mod tests {
         #[test]
         fn cleanup_removes_interrupted_proc_markers(
             id in arb_delivery_id(),
-            payload in arb_payload(),
         ) {
             let dir = tempdir().unwrap();
             let spool_dir = dir.path();
 
             // Spool and mark processing
-            let delivery = spool_delivery(spool_dir, &id, &payload).unwrap();
+            let delivery = spool_test_envelope(spool_dir, &id);
             mark_processing(&delivery).unwrap();
 
             // Simulate crash: proc marker exists but not done
@@ -409,17 +445,16 @@ mod tests {
         /// Startup recovery with mixed states.
         ///
         /// Simulates a crash leaving the spool in a mixed state with:
-        /// - Orphaned temp files (crash during spool)
-        /// - Pending deliveries (crash after spool)
-        /// - Interrupted processing (crash during processing)
-        /// - Completed deliveries (crash after done marker)
+        /// - Orphaned temp files (crash during spool) - removed by cleanup
+        /// - Pending deliveries (crash after spool) - drained
+        /// - Interrupted processing (crash during processing) - drained
+        /// - Completed deliveries (crash after done marker) - not drained
         #[test]
         fn startup_recovery_mixed_states(
             pending_ids in prop::collection::vec(arb_delivery_id(), 1..3),
             interrupted_ids in prop::collection::vec(arb_delivery_id(), 1..3),
             done_ids in prop::collection::vec(arb_delivery_id(), 1..3),
             temp_ids in prop::collection::vec(arb_delivery_id(), 1..3),
-            payload in arb_payload(),
         ) {
             let dir = tempdir().unwrap();
             let spool_dir = dir.path();
@@ -440,24 +475,27 @@ mod tests {
 
             // Set up each state
             for id in &pending_ids {
-                spool_delivery(spool_dir, id, &payload).unwrap();
+                spool_test_envelope(spool_dir, id);
             }
 
             for id in &interrupted_ids {
-                let d = spool_delivery(spool_dir, id, &payload).unwrap();
+                let d = spool_test_envelope(spool_dir, id);
                 mark_processing(&d).unwrap();
             }
 
             for id in &done_ids {
-                let d = spool_delivery(spool_dir, id, &payload).unwrap();
+                let d = spool_test_envelope(spool_dir, id);
                 mark_processing(&d).unwrap();
                 mark_done(&d).unwrap();
             }
 
-            for id in &temp_ids {
-                use crate::spool::delivery::SpooledDelivery;
-                let d = SpooledDelivery::new(spool_dir, id.clone());
-                std::fs::write(d.temp_path(), &payload).unwrap();
+            // Orphaned temp files use the real spool pattern:
+            // <id>.json.tmp.<pid>.<counter>
+            let mut temp_paths = Vec::new();
+            for (i, id) in temp_ids.iter().enumerate() {
+                let temp = spool_dir.join(format!("{}.json.tmp.4242.{}", id.as_str(), i));
+                std::fs::write(&temp, b"partial payload").unwrap();
+                temp_paths.push(temp);
             }
 
             // Run startup recovery
@@ -482,6 +520,12 @@ mod tests {
             for id in &temp_ids {
                 prop_assert!(!pending_set.contains(id.as_str()));
             }
+
+            // Orphaned temp files are removed at startup
+            for temp in &temp_paths {
+                prop_assert!(!temp.exists(),
+                    "orphaned temp file {:?} should be removed by startup cleanup", temp);
+            }
         }
 
         /// Repeated drain calls return consistent results.
@@ -491,22 +535,13 @@ mod tests {
         #[test]
         fn drain_is_idempotent(
             ids in prop::collection::vec(arb_delivery_id(), 2..5),
-            payloads in prop::collection::vec(arb_payload(), 2..5),
         ) {
             let dir = tempdir().unwrap();
             let spool_dir = dir.path();
 
-            let count = ids.len().min(payloads.len());
-            let ids = &ids[..count];
-            let payloads = &payloads[..count];
-
-            // Dedupe IDs
-            let mut unique_ids: Vec<_> = ids.to_vec();
-            unique_ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-            unique_ids.dedup_by(|a, b| a.as_str() == b.as_str());
-
-            for (id, payload) in unique_ids.iter().zip(payloads.iter()) {
-                let _ = spool_delivery(spool_dir, id, payload);
+            let unique_ids = dedupe_preserving_order(ids);
+            for id in &unique_ids {
+                spool_test_envelope(spool_dir, id);
             }
 
             // Drain multiple times
@@ -542,28 +577,45 @@ mod tests {
         assert!(pending.is_empty());
     }
 
+    /// Equal arrival markers (possible across process restarts, where only
+    /// the wall clock orders arrivals) break ties by delivery ID.
     #[test]
-    fn count_pending_matches_drain() {
+    fn drain_breaks_arrival_ties_by_delivery_id() {
         let dir = tempdir().unwrap();
         let spool_dir = dir.path();
 
-        // Spool some deliveries
-        let id1 = DeliveryId::new("delivery-1");
-        let id2 = DeliveryId::new("delivery-2");
-        let id3 = DeliveryId::new("delivery-3");
+        let tied = ArrivalMarker::from_parts(1_000, 0);
+        let id_b = DeliveryId::parse("bbbbbbbb-0000-0000-0000-000000000000").unwrap();
+        let id_a = DeliveryId::parse("aaaaaaaa-0000-0000-0000-000000000000").unwrap();
 
-        spool_delivery(spool_dir, &id1, b"p1").unwrap();
-        spool_delivery(spool_dir, &id2, b"p2").unwrap();
-        let delivery3 = spool_delivery(spool_dir, &id3, b"p3").unwrap();
+        // Spool b first: with tied arrivals, ID order must win regardless.
+        spool_envelope_with_arrival(spool_dir, &id_b, tied);
+        spool_envelope_with_arrival(spool_dir, &id_a, tied);
 
-        // Mark one as done
-        mark_done(&delivery3).unwrap();
+        let drained = drain_pending(spool_dir).unwrap();
+        let drained_ids: Vec<&str> = drained.iter().map(|d| d.delivery_id.as_str()).collect();
+        assert_eq!(drained_ids, vec![id_a.as_str(), id_b.as_str()]);
+    }
 
-        // Count should match drain
-        let count = count_pending(spool_dir).unwrap();
-        let pending = drain_pending(spool_dir).unwrap();
-        assert_eq!(count, pending.len());
-        assert_eq!(count, 2);
+    /// A pending payload that is not a valid envelope fails the drain loudly.
+    ///
+    /// The spool only ever writes envelopes, so a corrupt payload is an
+    /// uncharacterizable state: surfacing it beats silently skipping (or
+    /// reordering) a delivery GitHub believes we accepted.
+    #[test]
+    fn drain_fails_loudly_on_corrupt_envelope() {
+        let dir = tempdir().unwrap();
+        let spool_dir = dir.path();
+
+        let id = DeliveryId::parse("corrupt-delivery").unwrap();
+        spool_delivery(spool_dir, &id, b"not an envelope").unwrap();
+
+        let result = drain_pending(spool_dir);
+        assert!(
+            matches!(result, Err(SpoolError::CorruptEnvelope { .. })),
+            "expected CorruptEnvelope, got {:?}",
+            result.map(|v| v.len())
+        );
     }
 
     #[test]
@@ -571,8 +623,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let spool_dir = dir.path();
 
-        let id = DeliveryId::new("delivery-to-clean");
-        let delivery = spool_delivery(spool_dir, &id, b"payload").unwrap();
+        let id = DeliveryId::parse("delivery-to-clean").unwrap();
+        let delivery = spool_test_envelope(spool_dir, &id);
         mark_done(&delivery).unwrap();
 
         // With a very long grace period, nothing should be cleaned
@@ -594,10 +646,65 @@ mod tests {
         assert_eq!(id.as_str(), "abc-123");
     }
 
+    /// Files whose stem is not a valid delivery ID are foreign and ignored.
+    #[test]
+    fn extract_delivery_id_rejects_invalid_stem() {
+        assert!(extract_delivery_id(Path::new("/spool/.hidden.json")).is_none());
+    }
+
+    /// Startup cleanup removes orphaned spool temp files.
+    ///
+    /// A crash between the temp-file write and the hard_link leaves an
+    /// orphaned `<id>.json.tmp.<pid>.<counter>` file that nothing else
+    /// reclaims (remove_delivery only sees temps for IDs it is removing).
+    #[test]
+    fn cleanup_removes_orphaned_spool_temp_files() {
+        let dir = tempdir().unwrap();
+        let spool_dir = dir.path();
+        std::fs::create_dir_all(spool_dir).unwrap();
+
+        let orphan = spool_dir.join("dead-beef.json.tmp.12345.0");
+        std::fs::write(&orphan, b"partial payload").unwrap();
+
+        let id = DeliveryId::parse("real-delivery").unwrap();
+        let delivery = spool_test_envelope(spool_dir, &id);
+
+        cleanup_interrupted_processing(spool_dir).unwrap();
+
+        assert!(
+            !orphan.exists(),
+            "orphaned temp file should be removed at startup"
+        );
+        assert!(delivery.payload_path.exists(), "payload must survive");
+    }
+
+    /// A delivery ID may legally contain dots, so a payload filename can
+    /// contain the temp pattern; cleanup must only remove true temp files.
+    #[test]
+    fn cleanup_spares_payload_whose_name_contains_temp_pattern() {
+        let dir = tempdir().unwrap();
+        let spool_dir = dir.path();
+
+        // Payload file is "a.json.tmp.5.json": contains ".json.tmp." but is
+        // a durably spooled delivery, not a temp file.
+        let id = DeliveryId::parse("a.json.tmp.5").unwrap();
+        let delivery = spool_test_envelope(spool_dir, &id);
+
+        cleanup_interrupted_processing(spool_dir).unwrap();
+
+        assert!(
+            delivery.payload_path.exists(),
+            "spooled payload must survive startup cleanup"
+        );
+        let pending = drain_pending(spool_dir).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].delivery_id.as_str(), id.as_str());
+    }
+
     /// Temp files from interrupted spooling are ignored by drain.
     ///
     /// If a crash occurs during spool_delivery (after writing the temp file
-    /// but before the atomic rename), the orphaned .json.tmp file should not
+    /// but before the atomic hard_link), the orphaned temp file should not
     /// be picked up as a pending delivery.
     #[test]
     fn drain_ignores_temp_files() {
@@ -605,16 +712,17 @@ mod tests {
         let spool_dir = dir.path();
 
         // Simulate an orphaned temp file from an interrupted spool operation
+        // (real pattern: <id>.json.tmp.<pid>.<counter>)
         std::fs::create_dir_all(spool_dir).unwrap();
         std::fs::write(
-            spool_dir.join("orphan-delivery.json.tmp"),
+            spool_dir.join("orphan-delivery.json.tmp.999.7"),
             b"partial payload",
         )
         .unwrap();
 
         // Also add a real delivery to ensure drain still works
-        let id = DeliveryId::new("real-delivery");
-        spool_delivery(spool_dir, &id, b"real payload").unwrap();
+        let id = DeliveryId::parse("real-delivery").unwrap();
+        spool_test_envelope(spool_dir, &id);
 
         let pending = drain_pending(spool_dir).unwrap();
 
@@ -639,8 +747,8 @@ mod tests {
         std::fs::write(spool_dir.join("debug.log"), b"log data").unwrap();
 
         // Add a real delivery
-        let id = DeliveryId::new("actual-delivery");
-        spool_delivery(spool_dir, &id, b"payload").unwrap();
+        let id = DeliveryId::parse("actual-delivery").unwrap();
+        spool_test_envelope(spool_dir, &id);
 
         let pending = drain_pending(spool_dir).unwrap();
 
@@ -665,8 +773,8 @@ mod tests {
         std::fs::write(spool_dir.join("another.json.done"), b"").unwrap();
 
         // Add a real delivery
-        let id = DeliveryId::new("valid-delivery");
-        spool_delivery(spool_dir, &id, b"payload").unwrap();
+        let id = DeliveryId::parse("valid-delivery").unwrap();
+        spool_test_envelope(spool_dir, &id);
 
         // Call cleanup first (simulating startup)
         cleanup_interrupted_processing(spool_dir).unwrap();
@@ -693,8 +801,8 @@ mod tests {
         let spool_dir = dir.path();
 
         // Spool and mark processing (simulating an active worker)
-        let id = DeliveryId::new("in-progress-delivery");
-        let delivery = spool_delivery(spool_dir, &id, b"payload").unwrap();
+        let id = DeliveryId::parse("in-progress-delivery").unwrap();
+        let delivery = spool_test_envelope(spool_dir, &id);
         mark_processing(&delivery).unwrap();
 
         // Drain WITHOUT calling cleanup_interrupted_processing

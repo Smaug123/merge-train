@@ -346,6 +346,12 @@ mod tests {
     use crate::webhooks::events::{CommentAction, IssueCommentEvent, PrAction, PullRequestEvent};
     use proptest::prelude::*;
 
+    /// Builds a [`DeliveryId`] from a known-good test literal, panicking on
+    /// the invalid inputs `parse` rejects (none of the test IDs are).
+    fn delivery_id(s: impl Into<String>) -> DeliveryId {
+        DeliveryId::parse(s).expect("test delivery id must be valid")
+    }
+
     fn make_stop_comment() -> GitHubEvent {
         GitHubEvent::IssueComment(IssueCommentEvent {
             repo: RepoId::new("owner", "repo"),
@@ -385,11 +391,7 @@ mod tests {
     #[test]
     fn push_increases_length() {
         let mut queue = EventQueue::new();
-        queue.push(
-            make_pr_event(1),
-            DeliveryId::new("d1"),
-            EventPriority::Normal,
-        );
+        queue.push(make_pr_event(1), delivery_id("d1"), EventPriority::Normal);
         assert_eq!(queue.len(), 1);
         assert!(!queue.is_empty());
     }
@@ -397,11 +399,7 @@ mod tests {
     #[test]
     fn pop_decreases_length() {
         let mut queue = EventQueue::new();
-        queue.push(
-            make_pr_event(1),
-            DeliveryId::new("d1"),
-            EventPriority::Normal,
-        );
+        queue.push(make_pr_event(1), delivery_id("d1"), EventPriority::Normal);
         queue.pop();
         assert!(queue.is_empty());
     }
@@ -415,16 +413,8 @@ mod tests {
     #[test]
     fn peek_returns_highest_priority() {
         let mut queue = EventQueue::new();
-        queue.push(
-            make_pr_event(1),
-            DeliveryId::new("d1"),
-            EventPriority::Normal,
-        );
-        queue.push(
-            make_stop_comment(),
-            DeliveryId::new("d2"),
-            EventPriority::High,
-        );
+        queue.push(make_pr_event(1), delivery_id("d1"), EventPriority::Normal);
+        queue.push(make_stop_comment(), delivery_id("d2"), EventPriority::High);
 
         let peeked = queue.peek().unwrap();
         assert_eq!(peeked.priority, EventPriority::High);
@@ -443,13 +433,13 @@ mod tests {
         // Push normal priority first
         queue.push(
             make_pr_event(1),
-            DeliveryId::new("normal"),
+            delivery_id("normal"),
             EventPriority::Normal,
         );
         // Push high priority second
         queue.push(
             make_stop_comment(),
-            DeliveryId::new("high"),
+            delivery_id("high"),
             EventPriority::High,
         );
 
@@ -470,17 +460,17 @@ mod tests {
         // Push multiple high priority events
         queue.push(
             make_stop_comment(),
-            DeliveryId::new("stop1"),
+            delivery_id("stop1"),
             EventPriority::High,
         );
         queue.push(
             make_stop_comment(),
-            DeliveryId::new("stop2"),
+            delivery_id("stop2"),
             EventPriority::High,
         );
         queue.push(
             make_stop_comment(),
-            DeliveryId::new("stop3"),
+            delivery_id("stop3"),
             EventPriority::High,
         );
 
@@ -494,21 +484,9 @@ mod tests {
     fn fifo_within_same_priority() {
         let mut queue = EventQueue::new();
 
-        queue.push(
-            make_pr_event(1),
-            DeliveryId::new("pr1"),
-            EventPriority::Normal,
-        );
-        queue.push(
-            make_pr_event(2),
-            DeliveryId::new("pr2"),
-            EventPriority::Normal,
-        );
-        queue.push(
-            make_pr_event(3),
-            DeliveryId::new("pr3"),
-            EventPriority::Normal,
-        );
+        queue.push(make_pr_event(1), delivery_id("pr1"), EventPriority::Normal);
+        queue.push(make_pr_event(2), delivery_id("pr2"), EventPriority::Normal);
+        queue.push(make_pr_event(3), delivery_id("pr3"), EventPriority::Normal);
 
         // FIFO order
         assert_eq!(queue.pop().unwrap().delivery_id.as_str(), "pr1");
@@ -521,31 +499,11 @@ mod tests {
         let mut queue = EventQueue::new();
 
         // Interleave normal and high priority events
-        queue.push(
-            make_pr_event(1),
-            DeliveryId::new("n1"),
-            EventPriority::Normal,
-        );
-        queue.push(
-            make_stop_comment(),
-            DeliveryId::new("h1"),
-            EventPriority::High,
-        );
-        queue.push(
-            make_pr_event(2),
-            DeliveryId::new("n2"),
-            EventPriority::Normal,
-        );
-        queue.push(
-            make_stop_comment(),
-            DeliveryId::new("h2"),
-            EventPriority::High,
-        );
-        queue.push(
-            make_pr_event(3),
-            DeliveryId::new("n3"),
-            EventPriority::Normal,
-        );
+        queue.push(make_pr_event(1), delivery_id("n1"), EventPriority::Normal);
+        queue.push(make_stop_comment(), delivery_id("h1"), EventPriority::High);
+        queue.push(make_pr_event(2), delivery_id("n2"), EventPriority::Normal);
+        queue.push(make_stop_comment(), delivery_id("h2"), EventPriority::High);
+        queue.push(make_pr_event(3), delivery_id("n3"), EventPriority::Normal);
 
         // All high priority first (in FIFO order), then normal (in FIFO order)
         assert_eq!(queue.pop().unwrap().delivery_id.as_str(), "h1");
@@ -561,21 +519,9 @@ mod tests {
     fn drain_returns_all_in_order() {
         let mut queue = EventQueue::new();
 
-        queue.push(
-            make_pr_event(1),
-            DeliveryId::new("n1"),
-            EventPriority::Normal,
-        );
-        queue.push(
-            make_stop_comment(),
-            DeliveryId::new("h1"),
-            EventPriority::High,
-        );
-        queue.push(
-            make_pr_event(2),
-            DeliveryId::new("n2"),
-            EventPriority::Normal,
-        );
+        queue.push(make_pr_event(1), delivery_id("n1"), EventPriority::Normal);
+        queue.push(make_stop_comment(), delivery_id("h1"), EventPriority::High);
+        queue.push(make_pr_event(2), delivery_id("n2"), EventPriority::Normal);
 
         let events = queue.drain();
 
@@ -606,7 +552,7 @@ mod tests {
             for i in 0..normal_count {
                 queue.push(
                     make_pr_event(i as u64),
-                    DeliveryId::new(format!("n{}", i)),
+                    delivery_id(format!("n{}", i)),
                     EventPriority::Normal,
                 );
             }
@@ -615,7 +561,7 @@ mod tests {
             for i in 0..high_count {
                 queue.push(
                     make_stop_comment(),
-                    DeliveryId::new(format!("h{}", i)),
+                    delivery_id(format!("h{}", i)),
                     EventPriority::High,
                 );
             }
@@ -646,7 +592,7 @@ mod tests {
             for i in 0..count {
                 queue.push(
                     make_pr_event(i as u64),
-                    DeliveryId::new(format!("d{}", i)),
+                    delivery_id(format!("d{}", i)),
                     priority,
                 );
             }
@@ -670,7 +616,7 @@ mod tests {
             for i in 0..push_count {
                 queue.push(
                     make_pr_event(i as u64),
-                    DeliveryId::new(format!("d{}", i)),
+                    delivery_id(format!("d{}", i)),
                     EventPriority::Normal,
                 );
             }

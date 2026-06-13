@@ -106,14 +106,80 @@ impl fmt::Display for RepoId {
     }
 }
 
-/// A GitHub webhook delivery ID.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Error returned when parsing an invalid delivery ID.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("invalid delivery ID: {reason}")]
+pub struct InvalidDeliveryId {
+    reason: &'static str,
+}
+
+/// Maximum length of a delivery ID in bytes.
+///
+/// The delivery ID is the stem of every spool filename, and most filesystems
+/// cap a single filename component at 255 bytes. The longest derived name is
+/// the payload temp written during spooling (see [`crate::spool`]),
+/// `<id>.json.tmp.<pid>.<counter>`: a `.json.tmp.` infix, a `u32` PID (at
+/// most 10 digits), a dot, and a `u64` counter (at most 20 digits) — 41 bytes
+/// at worst. Reserving that headroom keeps every spool filename, temps
+/// included, within 255 bytes, so `parse` rejects an un-spoolable ID up front
+/// instead of letting it fail with an I/O error at spool time. GitHub
+/// delivery IDs are 36-character UUIDs, so this is still generous.
+///
+/// The coupling to the actual suffixes is machine-checked by
+/// `spool::delivery`'s `max_length_delivery_id_yields_spoolable_filenames`.
+pub(crate) const MAX_DELIVERY_ID_LEN: usize = {
+    const FS_NAME_LIMIT: usize = 255;
+    // Digits in the largest value each integer can print.
+    const PID_DIGITS: usize = u32::MAX.ilog10() as usize + 1; // 10
+    const COUNTER_DIGITS: usize = u64::MAX.ilog10() as usize + 1; // 20
+    // Longest derived spool name: "<id>.json.tmp.<pid>.<counter>".
+    const MAX_SUFFIX: usize = ".json.tmp.".len() + PID_DIGITS + ".".len() + COUNTER_DIGITS;
+    FS_NAME_LIMIT - MAX_SUFFIX
+};
+
+/// A GitHub webhook delivery ID (the `X-GitHub-Delivery` header value).
+///
+/// This type guarantees that the contained string is safe to use as a
+/// filesystem path component: non-empty, bounded length, no path separators
+/// or null bytes, and no leading dot. Construction is only possible via
+/// [`DeliveryId::parse`], which validates the input; deserialization runs
+/// the same validation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
-pub struct DeliveryId(pub String);
+pub struct DeliveryId(String);
 
 impl DeliveryId {
-    pub fn new(s: impl Into<String>) -> Self {
-        DeliveryId(s.into())
+    /// Parses a string as a delivery ID, validating path safety.
+    ///
+    /// Rejects:
+    /// - Empty strings
+    /// - Strings too long to spool safely (see [`MAX_DELIVERY_ID_LEN`], which
+    ///   reserves room for the longest derived spool filename)
+    /// - Strings containing `/`, `\`, or null bytes (path traversal)
+    /// - Strings starting with `.` (hidden files; also covers `.` and `..`)
+    pub fn parse(s: impl Into<String>) -> Result<Self, InvalidDeliveryId> {
+        let s = s.into();
+        if s.is_empty() {
+            return Err(InvalidDeliveryId {
+                reason: "empty string",
+            });
+        }
+        if s.len() > MAX_DELIVERY_ID_LEN {
+            return Err(InvalidDeliveryId {
+                reason: "too long to spool safely",
+            });
+        }
+        if s.contains('/') || s.contains('\\') || s.contains('\0') {
+            return Err(InvalidDeliveryId {
+                reason: "contains path separator or null byte",
+            });
+        }
+        if s.starts_with('.') {
+            return Err(InvalidDeliveryId {
+                reason: "starts with a dot",
+            });
+        }
+        Ok(DeliveryId(s))
     }
 
     pub fn as_str(&self) -> &str {
@@ -127,9 +193,13 @@ impl fmt::Display for DeliveryId {
     }
 }
 
-impl From<String> for DeliveryId {
-    fn from(s: String) -> Self {
-        DeliveryId(s)
+impl<'de> Deserialize<'de> for DeliveryId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        DeliveryId::parse(s).map_err(serde::de::Error::custom)
     }
 }
 
@@ -268,11 +338,60 @@ mod tests {
         proptest! {
             #[test]
             fn serde_roundtrip(s in "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}") {
-                let id = DeliveryId::new(&s);
+                let id = DeliveryId::parse(&s).unwrap();
                 let json = serde_json::to_string(&id).unwrap();
                 let parsed: DeliveryId = serde_json::from_str(&json).unwrap();
                 prop_assert_eq!(id, parsed);
             }
+
+            /// Any string containing a path separator is rejected.
+            #[test]
+            fn rejects_path_separators(
+                prefix in "[a-zA-Z0-9-]{0,10}",
+                suffix in "[a-zA-Z0-9-]{0,10}",
+                separator in prop::sample::select(vec!['/', '\\']),
+            ) {
+                let s = format!("{}{}{}", prefix, separator, suffix);
+                prop_assert!(DeliveryId::parse(&s).is_err());
+            }
+
+            /// Any string starting with a dot is rejected.
+            #[test]
+            fn rejects_leading_dot(suffix in "[a-zA-Z0-9-]{0,20}") {
+                let s = format!(".{}", suffix);
+                prop_assert!(DeliveryId::parse(&s).is_err());
+            }
+
+            /// Valid UUID-format delivery IDs are always accepted.
+            #[test]
+            fn accepts_uuids(s in "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}") {
+                let id = DeliveryId::parse(&s).unwrap();
+                prop_assert_eq!(id.as_str(), s);
+            }
+        }
+
+        #[test]
+        fn rejects_malformed_ids() {
+            assert!(DeliveryId::parse("").is_err());
+            assert!(DeliveryId::parse(".").is_err());
+            assert!(DeliveryId::parse("..").is_err());
+            assert!(DeliveryId::parse(".hidden").is_err());
+            assert!(DeliveryId::parse("/etc/passwd").is_err());
+            assert!(DeliveryId::parse("../../../etc/passwd").is_err());
+            assert!(DeliveryId::parse("..\\..\\windows").is_err());
+            assert!(DeliveryId::parse("id\0null").is_err());
+            assert!(DeliveryId::parse("x".repeat(super::super::MAX_DELIVERY_ID_LEN + 1)).is_err());
+        }
+
+        #[test]
+        fn accepts_boundary_length() {
+            assert!(DeliveryId::parse("x".repeat(super::super::MAX_DELIVERY_ID_LEN)).is_ok());
+        }
+
+        #[test]
+        fn deserialize_rejects_invalid() {
+            let result: Result<DeliveryId, _> = serde_json::from_str(r#""../escape""#);
+            assert!(result.is_err());
         }
     }
 

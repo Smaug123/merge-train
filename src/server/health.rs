@@ -23,15 +23,3 @@ use axum::http::StatusCode;
 pub async fn health_handler() -> (StatusCode, &'static str) {
     (StatusCode::OK, "OK")
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn health_returns_200_ok() {
-        let (status, body) = health_handler().await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body, "OK");
-    }
-}
