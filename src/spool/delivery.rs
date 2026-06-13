@@ -20,6 +20,14 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Counter for ordering arrivals within a process (ties in wall-clock time).
 static ARRIVAL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Highest arrival timestamp (ms since the Unix epoch) this process has
+/// emitted. The system clock can move backwards while the process runs (NTP
+/// steps, VM migration, manual adjustment); without this floor a webhook
+/// accepted *after* such a step would get a smaller `unix_ms` and replay
+/// before earlier deliveries. Clamping every marker up to this floor keeps
+/// emitted timestamps non-decreasing within the process.
+static LAST_ARRIVAL_MS: AtomicU64 = AtomicU64::new(0);
+
 /// Generates a unique temp file path for atomic writes.
 ///
 /// Uses PID + monotonic counter to ensure uniqueness across concurrent operations.
@@ -40,6 +48,15 @@ fn unique_temp_path(base_path: &Path) -> PathBuf {
     base_path.with_extension(new_extension)
 }
 
+/// Reads the system clock as milliseconds since the Unix epoch, saturating
+/// rather than failing on a pre-epoch clock or an out-of-range value.
+fn raw_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
 /// A monotonic arrival marker recorded when a webhook is accepted at intake.
 ///
 /// Drains replay deliveries in `(arrival, delivery_id)` order, so this marker
@@ -48,9 +65,11 @@ fn unique_temp_path(base_path: &Path) -> PathBuf {
 /// random.
 ///
 /// The marker is a wall-clock timestamp (milliseconds since the Unix epoch)
-/// plus a process-local atomic counter that breaks ties within a process.
-/// Within a single process the ordering is strictly monotonic; across process
-/// restarts it is as accurate as the system clock.
+/// plus a process-local atomic counter that breaks ties within a process. The
+/// timestamp is clamped up to the highest value the process has emitted (see
+/// [`LAST_ARRIVAL_MS`]), so within a single process the `(unix_ms, seq)`
+/// ordering is strictly monotonic even if the system clock steps backwards;
+/// across process restarts it is as accurate as the system clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ArrivalMarker {
     /// Milliseconds since the Unix epoch at arrival time.
@@ -62,14 +81,25 @@ pub struct ArrivalMarker {
 impl ArrivalMarker {
     /// Captures the current arrival marker.
     pub fn now() -> Self {
-        let unix_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-            .unwrap_or(0);
         ArrivalMarker {
-            unix_ms,
+            unix_ms: Self::monotonic_unix_ms(raw_unix_ms(), &LAST_ARRIVAL_MS),
             seq: ARRIVAL_COUNTER.fetch_add(1, Ordering::Relaxed),
         }
+    }
+
+    /// Clamps `raw` up to the highest value `floor` has seen and records the
+    /// result, returning a timestamp that never falls below an earlier one
+    /// even when the underlying clock moves backwards.
+    ///
+    /// Factored out (with `floor` injected) so the monotonicity guarantee can
+    /// be tested against a backward-jumping clock without touching the global
+    /// floor or the real system clock.
+    fn monotonic_unix_ms(raw: u64, floor: &AtomicU64) -> u64 {
+        // fetch_max stores max(prev, raw) and returns prev; the emitted value
+        // is max(raw, prev), so `floor` only ever rises and equals the
+        // highest timestamp emitted so far.
+        let prev = floor.fetch_max(raw, Ordering::Relaxed);
+        raw.max(prev)
     }
 
     /// Constructs a marker from raw parts. Test-only: production code must
@@ -664,6 +694,7 @@ pub fn remove_delivery(delivery: &SpooledDelivery) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ids::MAX_DELIVERY_ID_LEN;
     use proptest::prelude::*;
     use tempfile::tempdir;
 
@@ -671,6 +702,44 @@ mod tests {
     fn arb_delivery_id() -> impl Strategy<Value = DeliveryId> {
         "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
             .prop_map(|s| DeliveryId::parse(s).unwrap())
+    }
+
+    /// The longest filename `DeliveryId::parse` admits must still fit a
+    /// single filesystem name component (255 bytes) after every suffix this
+    /// module appends — including the worst-case payload temp with a maximal
+    /// `u32` PID and `u64` counter. This machine-checks the coupling between
+    /// `MAX_DELIVERY_ID_LEN` (which reserves the headroom) and the suffixes
+    /// defined here: adding a longer suffix without widening the reservation
+    /// fails here rather than as a runtime I/O error at spool time.
+    #[test]
+    fn max_length_delivery_id_yields_spoolable_filenames() {
+        const FS_NAME_LIMIT: usize = 255;
+        let dir = Path::new("/spool");
+        let max_id = "x".repeat(MAX_DELIVERY_ID_LEN);
+        let delivery = SpooledDelivery::new(dir, DeliveryId::parse(&max_id).unwrap());
+
+        let mut names = vec![
+            delivery.payload_path.clone(),
+            delivery.proc_marker_path(),
+            delivery.done_marker_path(),
+            // Marker temp written by create_marker_file: `<id>.json.done.tmp`.
+            delivery.done_marker_path().with_extension("done.tmp"),
+            delivery.proc_marker_path().with_extension("proc.tmp"),
+            // A concrete payload temp with this process's real PID/counter.
+            unique_temp_path(&delivery.payload_path),
+        ];
+        // The worst case unique_temp_path can ever produce: maximal-width
+        // PID and counter. Pinned explicitly so the bound does not rely on
+        // the small PID/counter this test run happens to have.
+        names.push(dir.join(format!("{max_id}.json.tmp.{}.{}", u32::MAX, u64::MAX)));
+
+        for path in names {
+            let len = path.file_name().unwrap().len();
+            assert!(
+                len <= FS_NAME_LIMIT,
+                "derived spool filename is {len} bytes (> {FS_NAME_LIMIT}): {path:?}",
+            );
+        }
     }
 
     /// Generate arbitrary payload bytes.
@@ -812,6 +881,50 @@ mod tests {
             let a = ArrivalMarker::now();
             let b = ArrivalMarker::now();
             prop_assert!(a < b, "arrival markers must be strictly monotonic in-process");
+        }
+
+        /// The clamped timestamp never falls below an earlier one, however the
+        /// raw clock readings move — including backwards.
+        #[test]
+        fn clamped_timestamps_never_decrease(
+            raws in prop::collection::vec(0u64..1_000_000, 1..64)
+        ) {
+            let floor = AtomicU64::new(0);
+            let mut last = 0u64;
+            for raw in raws {
+                let out = ArrivalMarker::monotonic_unix_ms(raw, &floor);
+                prop_assert!(out >= last, "emitted {out} < previous {last}");
+                prop_assert!(out >= raw, "emitted {out} below raw reading {raw}");
+                last = out;
+            }
+        }
+
+        /// The whole-marker guarantee: markers built from a backward-jumping
+        /// clock plus the strictly increasing sequence counter are still
+        /// strictly monotonic, so `drain_pending` replays them in arrival order
+        /// regardless of clock steps. (Sequential construction here mirrors a
+        /// single intake thread; concurrent intake has no required order.)
+        #[test]
+        fn markers_strictly_monotonic_under_clock_rollback(
+            raws in prop::collection::vec(0u64..1_000, 2..64)
+        ) {
+            let floor = AtomicU64::new(0);
+            let seq = AtomicU64::new(0);
+            let markers: Vec<ArrivalMarker> = raws
+                .iter()
+                .map(|&raw| {
+                    let unix_ms = ArrivalMarker::monotonic_unix_ms(raw, &floor);
+                    ArrivalMarker::from_parts(unix_ms, seq.fetch_add(1, Ordering::Relaxed))
+                })
+                .collect();
+            for pair in markers.windows(2) {
+                prop_assert!(
+                    pair[0] < pair[1],
+                    "markers not strictly increasing: {:?} !< {:?}",
+                    pair[0],
+                    pair[1]
+                );
+            }
         }
     }
 

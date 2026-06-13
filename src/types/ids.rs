@@ -115,10 +115,27 @@ pub struct InvalidDeliveryId {
 
 /// Maximum length of a delivery ID in bytes.
 ///
-/// The delivery ID is used as a filename stem (`<id>.json.proc` is the longest
-/// derived name), and most filesystems cap filenames at 255 bytes. GitHub
-/// delivery IDs are 36-character UUIDs, so this limit is generous.
-const MAX_DELIVERY_ID_LEN: usize = 245;
+/// The delivery ID is the stem of every spool filename, and most filesystems
+/// cap a single filename component at 255 bytes. The longest derived name is
+/// the payload temp written during spooling (see [`crate::spool`]),
+/// `<id>.json.tmp.<pid>.<counter>`: a `.json.tmp.` infix, a `u32` PID (at
+/// most 10 digits), a dot, and a `u64` counter (at most 20 digits) — 41 bytes
+/// at worst. Reserving that headroom keeps every spool filename, temps
+/// included, within 255 bytes, so `parse` rejects an un-spoolable ID up front
+/// instead of letting it fail with an I/O error at spool time. GitHub
+/// delivery IDs are 36-character UUIDs, so this is still generous.
+///
+/// The coupling to the actual suffixes is machine-checked by
+/// `spool::delivery`'s `max_length_delivery_id_yields_spoolable_filenames`.
+pub(crate) const MAX_DELIVERY_ID_LEN: usize = {
+    const FS_NAME_LIMIT: usize = 255;
+    // Digits in the largest value each integer can print.
+    const PID_DIGITS: usize = u32::MAX.ilog10() as usize + 1; // 10
+    const COUNTER_DIGITS: usize = u64::MAX.ilog10() as usize + 1; // 20
+    // Longest derived spool name: "<id>.json.tmp.<pid>.<counter>".
+    const MAX_SUFFIX: usize = ".json.tmp.".len() + PID_DIGITS + ".".len() + COUNTER_DIGITS;
+    FS_NAME_LIMIT - MAX_SUFFIX
+};
 
 /// A GitHub webhook delivery ID (the `X-GitHub-Delivery` header value).
 ///
@@ -136,7 +153,8 @@ impl DeliveryId {
     ///
     /// Rejects:
     /// - Empty strings
-    /// - Strings longer than 245 bytes (filename length safety)
+    /// - Strings too long to spool safely (see [`MAX_DELIVERY_ID_LEN`], which
+    ///   reserves room for the longest derived spool filename)
     /// - Strings containing `/`, `\`, or null bytes (path traversal)
     /// - Strings starting with `.` (hidden files; also covers `.` and `..`)
     pub fn parse(s: impl Into<String>) -> Result<Self, InvalidDeliveryId> {
@@ -148,7 +166,7 @@ impl DeliveryId {
         }
         if s.len() > MAX_DELIVERY_ID_LEN {
             return Err(InvalidDeliveryId {
-                reason: "longer than 245 bytes",
+                reason: "too long to spool safely",
             });
         }
         if s.contains('/') || s.contains('\\') || s.contains('\0') {
@@ -362,12 +380,12 @@ mod tests {
             assert!(DeliveryId::parse("../../../etc/passwd").is_err());
             assert!(DeliveryId::parse("..\\..\\windows").is_err());
             assert!(DeliveryId::parse("id\0null").is_err());
-            assert!(DeliveryId::parse("x".repeat(246)).is_err());
+            assert!(DeliveryId::parse("x".repeat(super::super::MAX_DELIVERY_ID_LEN + 1)).is_err());
         }
 
         #[test]
         fn accepts_boundary_length() {
-            assert!(DeliveryId::parse("x".repeat(245)).is_ok());
+            assert!(DeliveryId::parse("x".repeat(super::super::MAX_DELIVERY_ID_LEN)).is_ok());
         }
 
         #[test]
