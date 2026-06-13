@@ -28,7 +28,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::fsync::{fsync_dir, fsync_file};
+use super::fsync::{fsync_dir, fsync_file, rename};
 use crate::types::{CachedPr, PrNumber, TrainRecord};
 
 /// Current schema version. Increment when making breaking changes.
@@ -149,7 +149,7 @@ pub fn save_snapshot_atomic(path: &Path, snapshot: &PersistedRepoSnapshot) -> Re
     }
 
     // Atomic rename
-    std::fs::rename(&tmp_path, path)?;
+    rename(&tmp_path, path)?;
 
     // fsync directory to ensure rename is durable
     if let Some(parent) = path.parent() {
@@ -196,7 +196,7 @@ pub fn try_load_snapshot(path: &Path) -> Result<Option<PersistedRepoSnapshot>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{MergeStateStatus, PrState, Sha};
+    use crate::types::{CommentId, MergeStateStatus, PrState, Sha};
     use proptest::prelude::*;
     use tempfile::tempdir;
 
@@ -251,6 +251,10 @@ mod tests {
         "[a-zA-Z][a-zA-Z0-9_-]{0,20}".prop_map(String::from)
     }
 
+    fn arb_comment_id() -> impl Strategy<Value = CommentId> {
+        any::<u64>().prop_map(CommentId)
+    }
+
     fn arb_cached_pr() -> impl Strategy<Value = CachedPr> {
         (
             arb_pr_number(),
@@ -258,6 +262,7 @@ mod tests {
             arb_branch_name(),
             arb_branch_name(),
             prop::option::of(arb_pr_number()),
+            prop::option::of(arb_comment_id()),
             arb_pr_state(),
             arb_merge_state_and_draft(),
             prop::option::of(arb_datetime()),
@@ -270,6 +275,7 @@ mod tests {
                     head_ref,
                     base_ref,
                     predecessor,
+                    predecessor_comment_id,
                     state,
                     (merge_state_status, is_draft),
                     closed_at,
@@ -285,6 +291,7 @@ mod tests {
                         merge_state_status,
                         is_draft,
                     );
+                    pr.predecessor_comment_id = predecessor_comment_id;
                     pr.closed_at = closed_at;
                     pr.predecessor_squash_reconciled = predecessor_squash_reconciled;
                     pr
