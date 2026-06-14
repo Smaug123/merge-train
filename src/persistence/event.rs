@@ -93,6 +93,7 @@ pub enum StateEventPayload {
     /// - current_pr: which PR the train is currently processing
     /// - predecessor_pr: for fetching via refs/pull/<n>/head during recovery
     /// - last_squash_sha: for reconciliation recovery
+    /// - last_squash_parent: `$SQUASH_SHA^`, the ancestry proof MergeReconcile needs
     /// - phase: the CascadePhase including completed descendant lists
     #[serde(rename = "phase_transition")]
     PhaseTransition {
@@ -104,6 +105,13 @@ pub enum StateEventPayload {
         predecessor_pr: Option<PrNumber>,
         /// The SHA of the last squash commit (for reconciliation recovery).
         last_squash_sha: Option<Sha>,
+        /// The parent of the squash commit (`$SQUASH_SHA^`), captured at squash
+        /// observation time (seam e). Recovery reads it from the latest
+        /// `PhaseTransition` to restore `TrainRecord.last_squash_parent_sha`,
+        /// which `MergeReconcile` needs as `expected_squash_parent`. `#[serde(default)]`
+        /// so events written before this field existed still deserialize.
+        #[serde(default)]
+        last_squash_parent: Option<Sha>,
         /// The new cascade phase with descendant tracking.
         phase: CascadePhase,
     },
@@ -183,6 +191,20 @@ pub enum StateEventPayload {
         branch: String,
     },
 
+    /// A descendant was reconciled against the squash commit (seam c).
+    ///
+    /// `apply_event` sets `prs[pr].predecessor_squash_reconciled = Some(squash_sha)`,
+    /// which is what lets `is_root` later recognize the descendant as a valid
+    /// new train root. Equality with the predecessor's `merge_commit_sha` holds
+    /// by construction: both flow from the single squash observation.
+    #[serde(rename = "reconciliation_recorded")]
+    ReconciliationRecorded {
+        /// The descendant PR that was reconciled.
+        pr: PrNumber,
+        /// The squash commit SHA it was reconciled against.
+        squash_sha: Sha,
+    },
+
     /// Intent: about to push catch-up merge to a descendant branch.
     #[serde(rename = "intent_push_catchup")]
     IntentPushCatchup {
@@ -223,6 +245,12 @@ pub enum StateEventPayload {
         train_root: PrNumber,
         /// The PR that was retargeted.
         pr: PrNumber,
+        /// The branch the PR was retargeted onto. `apply_event` sets
+        /// `prs[pr].base_ref = new_base` so the materialized state matches the
+        /// retarget the interpreter performed. `#[serde(default)]` so events
+        /// written before this field existed still deserialize.
+        #[serde(default)]
+        new_base: String,
     },
 
     // ─── Fan-out (atomic update of train records) ───
@@ -413,7 +441,9 @@ impl StateEventPayload {
 
             // Phase transitions
             StateEventPayload::PhaseTransition { .. }
-            | StateEventPayload::SquashCommitted { .. } => true,
+            | StateEventPayload::SquashCommitted { .. }
+            // Reconciliation marker (is_root-by-construction depends on it)
+            | StateEventPayload::ReconciliationRecorded { .. } => true,
 
             // Intent events (must be durable before performing operation)
             StateEventPayload::IntentPushPrep { .. }
@@ -502,12 +532,17 @@ mod tests {
                 current_pr: PrNumber(1),
                 predecessor_pr: None,
                 last_squash_sha: None,
+                last_squash_parent: None,
                 phase: CascadePhase::Idle,
             },
             StateEventPayload::SquashCommitted {
                 train_root: PrNumber(1),
                 pr: PrNumber(1),
                 sha: Sha::parse("0".repeat(40)).unwrap(),
+            },
+            StateEventPayload::ReconciliationRecorded {
+                pr: PrNumber(1),
+                squash_sha: Sha::parse("0".repeat(40)).unwrap(),
             },
             StateEventPayload::IntentPushPrep {
                 train_root: PrNumber(1),
@@ -551,6 +586,7 @@ mod tests {
             StateEventPayload::DoneRetarget {
                 train_root: PrNumber(1),
                 pr: PrNumber(1),
+                new_base: "main".to_string(),
             },
             StateEventPayload::FanOutCompleted {
                 old_root: PrNumber(1),

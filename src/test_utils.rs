@@ -73,6 +73,7 @@ pub fn arb_train_record() -> impl Strategy<Value = TrainRecord> {
         arb_cascade_phase(),
         prop::option::of(arb_pr_number()),
         prop::option::of(arb_sha()),
+        prop::option::of(arb_sha()),
         any::<u64>(),
         arb_datetime(),
         prop::option::of(any::<u64>().prop_map(CommentId)),
@@ -85,6 +86,7 @@ pub fn arb_train_record() -> impl Strategy<Value = TrainRecord> {
                 cascade_phase,
                 predecessor_pr,
                 predecessor_head_sha,
+                last_squash_parent_sha,
                 recovery_seq,
                 started_at,
                 status_comment_id,
@@ -98,6 +100,7 @@ pub fn arb_train_record() -> impl Strategy<Value = TrainRecord> {
                     cascade_phase,
                     predecessor_pr,
                     predecessor_head_sha,
+                    last_squash_parent_sha,
                     started_at,
                     status_comment_id,
                 }
@@ -192,21 +195,28 @@ pub fn arb_state_event_payload() -> impl Strategy<Value = StateEventPayload> {
             arb_pr_number(),
             prop::option::of(arb_pr_number()),
             prop::option::of(arb_sha()),
+            prop::option::of(arb_sha()),
             arb_cascade_phase()
         )
-            .prop_map(|(tr, cp, pp, ls, ph)| StateEventPayload::PhaseTransition {
-                train_root: tr,
-                current_pr: cp,
-                predecessor_pr: pp,
-                last_squash_sha: ls,
-                phase: ph
-            }),
+            .prop_map(
+                |(tr, cp, pp, ls, lp, ph)| StateEventPayload::PhaseTransition {
+                    train_root: tr,
+                    current_pr: cp,
+                    predecessor_pr: pp,
+                    last_squash_sha: ls,
+                    last_squash_parent: lp,
+                    phase: ph
+                }
+            ),
         (arb_pr_number(), arb_pr_number(), arb_sha()).prop_map(|(tr, pr, sh)| {
             StateEventPayload::SquashCommitted {
                 train_root: tr,
                 pr,
                 sha: sh,
             }
+        }),
+        (arb_pr_number(), arb_sha()).prop_map(|(pr, sh)| {
+            StateEventPayload::ReconciliationRecorded { pr, squash_sha: sh }
         }),
         // Intent/done - prep
         (arb_pr_number(), arb_branch_name(), arb_sha(), arb_sha()).prop_map(
@@ -264,8 +274,13 @@ pub fn arb_state_event_payload() -> impl Strategy<Value = StateEventPayload> {
                 new_base: nb,
             }
         }),
-        (arb_pr_number(), arb_pr_number())
-            .prop_map(|(tr, pr)| StateEventPayload::DoneRetarget { train_root: tr, pr }),
+        (arb_pr_number(), arb_pr_number(), arb_branch_name()).prop_map(|(tr, pr, nb)| {
+            StateEventPayload::DoneRetarget {
+                train_root: tr,
+                pr,
+                new_base: nb,
+            }
+        }),
         // Fan-out
         (
             arb_pr_number(),

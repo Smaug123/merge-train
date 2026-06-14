@@ -561,6 +561,15 @@ pub struct TrainRecord {
     /// Head SHA of predecessor at preparation time (for verifying preparation during recovery).
     pub predecessor_head_sha: Option<Sha>,
 
+    /// Parent of the squash commit (`$SQUASH_SHA^`), captured at the moment the
+    /// squash is observed (M1 seam e). Threaded into `GitEffect::MergeReconcile`
+    /// as `expected_squash_parent` so `reconcile_descendant` can refuse without
+    /// an ancestry proof. `None` until a squash has been committed this train;
+    /// `#[serde(default)]` so snapshots/status comments written before this
+    /// field existed still deserialize.
+    #[serde(default)]
+    pub last_squash_parent_sha: Option<Sha>,
+
     /// ISO 8601 timestamp when started.
     pub started_at: DateTime<Utc>,
 
@@ -590,6 +599,7 @@ impl TrainRecord {
             cascade_phase: CascadePhase::Idle,
             predecessor_pr: None,
             predecessor_head_sha: None,
+            last_squash_parent_sha: None,
             started_at,
             status_comment_id: None,
         }
