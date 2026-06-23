@@ -53,6 +53,8 @@ crash-safety; we stop testing storage durability and test only our logic.
 ```sql
 PRAGMA journal_mode = WAL;        -- crash-safe; concurrent read for status/health
 PRAGMA synchronous = FULL;        -- durability over speed (correctness > availability)
+-- user_version is SET only when creating a fresh DB (see Store::open); it is
+-- READ first on every open so a mismatch fails loud instead of being clobbered.
 PRAGMA user_version = 1;          -- schema version; bump on breaking change
 
 CREATE TABLE events (
@@ -89,33 +91,52 @@ can be added later if cold-start replay is ever slow; pure replay is the simple
 default and keeps one source of truth.)
 
 Store API (sync; called from the per-repo worker thread):
-- `Store::open(path) -> Store` — open/create, apply PRAGMAs, run schema DDL if
-  fresh, check `user_version` (fail loud on mismatch — the explicit break), and
-  **reset any `status='processing'` delivery back to `'pending'`**. With one
-  writer per repo, a `processing` row at open time is abandoned by a dead
-  worker — this is the SQLite equivalent of the old
-  `cleanup_interrupted_processing`. Without it, a delivery interrupted between
-  claim and the closing commit is stuck forever, since the drain only takes
-  `pending` (Codex plan-review P1-A).
+- `Store::open(path) -> Store` — in order:
+  1. **Acquire an exclusive per-repo process lock** (an `flock`/lockfile beside
+     the DB — the role the current `StateDirLock` plays). SQLite/WAL only
+     serializes individual *writes*; it does **not** stop two bot processes
+     (rollout overlap, double supervisor start, a stray dev instance) from each
+     opening the repo DB, claiming different deliveries, and running concurrent
+     git/GitHub effects. This lock preserves single-writer-per-repo *across
+     processes* and must outlive the worker; **do not delete `StateDirLock`'s
+     role when deleting `recovery.rs`** (Codex plan-review P1-D).
+  2. Apply connection PRAGMAs (`journal_mode`/`synchronous`).
+  3. **Read `user_version`**: `0`/absent ⇒ fresh DB, run the schema DDL and
+     *set* `user_version`; equal ⇒ proceed; mismatch ⇒ **fail loud** (the
+     explicit break — never overwrite it) (Codex plan-review P2-F).
+  4. **Reset any `status='processing'` delivery back to `'pending'`** — with the
+     per-repo lock held, a `processing` row at open is abandoned by a dead
+     worker (the SQLite equivalent of `cleanup_interrupted_processing`); without
+     it an interrupted delivery is stuck, since the drain only takes `pending`
+     (Codex plan-review P1-A).
 - `load(&self) -> RepoState` — replay all `events` through `apply_event`.
 - `claim_next_delivery(&mut self) -> Option<Delivery>` — txn: pick lowest
   `arrival` with `status='pending'`, set `'processing'`, return it.
 - `append(&mut self, events: &[StateEventPayload])` — append state events in
   their own txn (assigning `seq` from `meta`); used for the outbox
   `Intent*`/`Done*`/observation commits during a saga.
-- `commit_delivery(&mut self, id, events, dedupe)` — the **closing
-  transaction**: append any remaining state events, INSERT-OR-IGNORE the dedupe
-  key, set the delivery `'done'`. For an effect-free delivery this is the whole
-  processing step; effectful deliveries commit intent/result txns first (see the
-  flow below).
+- `commit_delivery(&mut self, id, final_events, dedupe)` — the **closing
+  transaction**, atomically: append the delivery's **final** state event(s)
+  (for an effectful delivery, the last `Done*`/observation that advances state),
+  INSERT-OR-IGNORE the dedupe key, set the delivery `'done'`. The final result
+  and the close are the *same* txn, so there is no window where state has
+  advanced but the delivery is still open and un-deduped — closing this window
+  is Codex plan-review P1-C. For an effect-free delivery this is the whole
+  processing step.
 - `is_duplicate(&self, key) -> bool`, `prune_dedupe(&mut self, ttl)`.
 - `enqueue(&mut self, envelope)` — INSERT a `pending` delivery (intake).
 
 ### Concurrency
-Per-repo single writer = the worker thread owns its `Store` connection. The
-async server (axum) hands raw deliveries to the repo's worker (enqueue) and
-**never** writes state. Read-only endpoints (`/health`, `/state`) use a
-separate read-only connection; WAL lets them read without blocking the writer.
+Two levels of mutual exclusion:
+- **Across processes:** the exclusive per-repo lock taken in `Store::open`
+  (above). SQLite/WAL serializes *writes* but would happily let two processes
+  each claim different deliveries and run git/GitHub effects concurrently — the
+  lock (inheriting `StateDirLock`'s role) is what actually enforces one driver
+  per repo. Held for the worker's lifetime.
+- **Within the process:** the worker thread owns its `Store` write connection;
+  the async server (axum) only `enqueue`s and never writes state. Read-only
+  endpoints (`/health`, `/state`) use a separate read-only connection; WAL lets
+  them read without blocking the writer.
 
 ## The per-delivery flow (replaces the marker dance)
 
@@ -146,26 +167,35 @@ marked before processing ⇒ dropped event) structurally impossible.
 cannot join a SQLite txn, the **outbox** discipline — *intent committed before
 the effect, result after, done last* (Codex plan-review P1-B):
 
-1. txn **I** — append the `IntentPush*` event(s): the durable "about to do X",
+1. txn **I** — append the `Intent*` event(s): the durable "about to do X",
    carrying the fencing token (`expected_sha`). **Committed before the effect.**
 2. the relay performs the **idempotent** effect, guarded by the fencing token.
-3. txn **R** — append the `Done*` / observation event(s) and advance state.
-4. `commit_delivery` — closing txn: dedupe key seen + delivery `'done'`.
+3. txn **R** — append the `Done*` / observation event(s) and advance state. For
+   an *intermediate* step this is a plain `append`; for the delivery's **last**
+   step it is the `commit_delivery` closing txn, so the final result event, the
+   dedupe key, and delivery `'done'` commit **together** — there is no window
+   where state advanced but the delivery is still open (Codex plan-review P1-C).
 
 On a crash mid-saga, replay finds an `Intent*` without its `Done*` and re-runs
 the idempotent effect (the existing pre-action checks — already merged? ref
-already at the expected tree? — make the retry a safe no-op or redo). This is
-the corrected ordering that also resolves `CASCADE_ENGINE_PLAN.md`:
-- **Finding #2:** the fencing token (`expected_sha`) is in txn **I**, durable
-  *before* the squash — no in-memory gap.
+already at the expected tree? — make the retry a safe no-op or redo). The
+saga-resume logic (re-running `handle_event`/the engine over a partly-logged
+delivery without double-emitting) is the **M5 worker's** responsibility and is
+specified there; this plan only fixes the *substrate* ordering. The corrected
+ordering also resolves `CASCADE_ENGINE_PLAN.md`:
+- **Finding #2:** the fencing token must be durable in txn **I** — which
+  requires the one targeted vocabulary extension this migration makes:
+  `IntentSquash` (today `{ train_root, pr }`) gains `expected_sha: Sha`, since
+  there is otherwise nowhere to replay the token from after a crash (Codex
+  plan-review P2-E). This is the sole exception to "keep the vocabulary."
 - **Finding #3:** the external cleanup (worktree removal, final status comment)
   runs as the effect in steps 1–2; the terminal `TrainStopped`/`TrainAborted`
   is the txn-**R** state event *after* cleanup — never before.
 
 The key correction over the first draft: effects never run before their intent
-is durable, and the delivery is marked `done` only after every effect's result
-is committed — so no crash window repeats an irreversible effect or strands a
-claimed delivery.
+is durable, the delivery is closed atomically with its final result, and a
+per-repo process lock keeps a second process from driving the same repo — so no
+crash or overlap window repeats an irreversible effect or strands a delivery.
 
 ## Testing
 
@@ -181,7 +211,13 @@ claimed delivery.
     an `Intent*`-without-`Done*` and the idempotent re-run yields the same final
     `RepoState` as the no-crash run (P1-B);
   - dedupe + done commit atomically: a crash before the closing txn re-drains
-    and reprocesses with no dropped event (finding #1).
+    and reprocesses with no dropped event (finding #1);
+  - a crash after the final result txn does **not** re-enter `handle_event`,
+    because that result and the close are one txn (P1-C);
+  - a second `Store::open` on the same repo path fails/blocks while the first
+    holds the lock (P1-D);
+  - `Store::open` on a DB with a mismatched `user_version` fails loud and leaves
+    the stored version untouched (P2-F).
 
 ## Stages — each a green, reviewable PR
 
