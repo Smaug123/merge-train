@@ -32,7 +32,13 @@ use super::fsync::{fsync_dir, fsync_file, rename};
 use crate::types::{CachedPr, PrNumber, TrainRecord};
 
 /// Current schema version. Increment when making breaking changes.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// Bumped to 2 by the machine-enforced core: `TrainState::Stopped`/`Aborted`
+/// moved from string tags with top-level `ended_at`/`error` to nested struct
+/// variants, so v1 `TrainRecord`s no longer deserialize. Backward compatibility
+/// is intentionally dropped; the version bump makes recovery reject a v1
+/// snapshot with a clear `SchemaMismatch` rather than a cryptic serde error.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Errors that can occur during snapshot operations.
 #[derive(Debug, Error)]
@@ -171,7 +177,6 @@ pub fn load_snapshot(path: &Path) -> Result<PersistedRepoSnapshot> {
     let bytes = std::fs::read(path)?;
     let snapshot: PersistedRepoSnapshot = serde_json::from_slice(&bytes)?;
 
-    // Check schema version
     if snapshot.schema_version != SCHEMA_VERSION {
         return Err(SnapshotError::SchemaMismatch {
             expected: SCHEMA_VERSION,
@@ -196,23 +201,18 @@ pub fn try_load_snapshot(path: &Path) -> Result<Option<PersistedRepoSnapshot>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{CommentId, MergeStateStatus, PrState, Sha};
+    use crate::types::{CommentId, MergeStateStatus, PrState};
     use proptest::prelude::*;
     use tempfile::tempdir;
 
     // ─── Arbitrary implementations ───
+    // (arb_sha/arb_datetime come from crate::test_utils; arb_pr_number stays
+    // local because it deliberately uses a small range for readable failures.)
+
+    use crate::test_utils::{arb_datetime, arb_sha};
 
     fn arb_pr_number() -> impl Strategy<Value = PrNumber> {
         (1u64..100000).prop_map(PrNumber)
-    }
-
-    fn arb_sha() -> impl Strategy<Value = Sha> {
-        "[0-9a-f]{40}".prop_map(|s| Sha::parse(s).unwrap())
-    }
-
-    fn arb_datetime() -> impl Strategy<Value = DateTime<Utc>> {
-        // Generate timestamps in a reasonable range (year 2000-2100)
-        (946684800i64..4102444800i64).prop_map(|secs| DateTime::from_timestamp(secs, 0).unwrap())
     }
 
     fn arb_pr_state() -> impl Strategy<Value = PrState> {
@@ -300,7 +300,7 @@ mod tests {
     }
 
     fn arb_train_record() -> impl Strategy<Value = TrainRecord> {
-        arb_pr_number().prop_map(TrainRecord::new)
+        (arb_pr_number(), arb_datetime()).prop_map(|(pr, t)| TrainRecord::new(pr, t))
     }
 
     fn arb_dedupe_key() -> impl Strategy<Value = String> {
@@ -438,13 +438,13 @@ mod tests {
         std::fs::write(&path, json).unwrap();
 
         let result = load_snapshot(&path);
-        assert!(matches!(
-            result,
-            Err(SnapshotError::SchemaMismatch {
-                expected: 1,
-                got: 2
-            })
-        ));
+        match result {
+            Err(SnapshotError::SchemaMismatch { expected, got }) => {
+                assert_eq!(expected, SCHEMA_VERSION);
+                assert_eq!(got, SCHEMA_VERSION + 1);
+            }
+            other => panic!("expected SchemaMismatch, got {other:?}"),
+        }
     }
 
     #[test]

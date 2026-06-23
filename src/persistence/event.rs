@@ -495,7 +495,7 @@ mod tests {
             },
             StateEventPayload::TrainAborted {
                 root_pr: PrNumber(1),
-                error: TrainError::new("test", "test"),
+                error: TrainError::new(crate::types::TrainErrorKind::ApiError, "test"),
             },
             StateEventPayload::PhaseTransition {
                 train_root: PrNumber(1),

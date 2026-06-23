@@ -43,16 +43,6 @@ pub fn remaining_descendants(phase: &CascadePhase) -> Vec<PrNumber> {
     }
 }
 
-/// Returns all frozen descendants for a phase, regardless of completion status.
-///
-/// Returns an empty vector for phases that don't track descendants (e.g., Idle).
-pub fn frozen_descendants(phase: &CascadePhase) -> Vec<PrNumber> {
-    match phase.progress() {
-        Some(progress) => progress.frozen_descendants.clone(),
-        None => Vec::new(),
-    }
-}
-
 /// Collects all descendants of a PR (direct and transitive).
 ///
 /// Uses the descendants index to walk the tree and collect all PRs
@@ -240,7 +230,7 @@ mod tests {
         fn preparing_with_some_completed_returns_remaining() {
             let frozen = vec![PrNumber(2), PrNumber(3), PrNumber(4)];
             let mut progress = DescendantProgress::new(frozen);
-            progress.mark_completed(PrNumber(2));
+            progress.mark_completed(PrNumber(2)).unwrap();
 
             let phase = CascadePhase::Preparing { progress };
             let remaining = remaining_descendants(&phase);
@@ -255,7 +245,7 @@ mod tests {
         fn preparing_with_some_skipped_excludes_skipped() {
             let frozen = vec![PrNumber(2), PrNumber(3)];
             let mut progress = DescendantProgress::new(frozen);
-            progress.mark_skipped(PrNumber(3));
+            progress.mark_skipped(PrNumber(3)).unwrap();
 
             let phase = CascadePhase::Preparing { progress };
             let remaining = remaining_descendants(&phase);
@@ -269,8 +259,8 @@ mod tests {
         fn all_completed_or_skipped_returns_empty() {
             let frozen = vec![PrNumber(2), PrNumber(3)];
             let mut progress = DescendantProgress::new(frozen);
-            progress.mark_completed(PrNumber(2));
-            progress.mark_skipped(PrNumber(3));
+            progress.mark_completed(PrNumber(2)).unwrap();
+            progress.mark_skipped(PrNumber(3)).unwrap();
 
             let phase = CascadePhase::Preparing { progress };
             let remaining = remaining_descendants(&phase);
@@ -404,14 +394,14 @@ mod tests {
                 // Mark some as completed (avoiding overflow)
                 for i in 0..completed_count.min(frozen_count) {
                     if i < frozen.len() {
-                        progress.mark_completed(frozen[i]);
+                        progress.mark_completed(frozen[i]).unwrap();
                     }
                 }
 
                 // Mark some as skipped (different from completed)
                 for i in completed_count..(completed_count + skipped_count).min(frozen_count) {
                     if i < frozen.len() {
-                        progress.mark_skipped(frozen[i]);
+                        progress.mark_skipped(frozen[i]).unwrap();
                     }
                 }
 
@@ -423,13 +413,13 @@ mod tests {
                 // All returned elements are valid (in frozen, not in completed/skipped)
                 for pr in &remaining {
                     prop_assert!(frozen.contains(pr));
-                    prop_assert!(!progress.completed.contains(pr));
-                    prop_assert!(!progress.skipped.contains(pr));
+                    prop_assert!(!progress.completed().contains(pr));
+                    prop_assert!(!progress.skipped().contains(pr));
                 }
 
                 // All expected elements are returned (completeness)
                 let expected: HashSet<_> = frozen.iter()
-                    .filter(|pr| !progress.completed.contains(pr) && !progress.skipped.contains(pr))
+                    .filter(|pr| !progress.completed().contains(pr) && !progress.skipped().contains(pr))
                     .copied()
                     .collect();
                 let actual: HashSet<_> = remaining.iter().copied().collect();

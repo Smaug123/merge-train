@@ -475,11 +475,11 @@ This comment includes:
     "Reconciling": {
       "completed": [125],
       "skipped": [],
-      "frozen_descendants": [125, 126]
+      "frozen_descendants": [125, 126],
+      "squash_sha": "abc123def4561234567890abcdef123456789012"
     }
   },
   "predecessor_pr": 123,
-  "last_squash_sha": "abc123def456",
   "started_at": "2024-01-15T09:00:00Z"
 }
 -->
@@ -488,7 +488,17 @@ This comment includes:
 Train running — reconciling PR #124 after squash (1/2 descendants complete)
 ```
 
-**JSON fields:** Same as the `TrainRecord` fields documented in "Local train state" above, **except** `status_comment_id` (which is only known locally after the comment is created): `version`, `recovery_seq`, `state`, `original_root_pr`, `current_pr`, `cascade_phase` (as full `CascadePhase` object), `predecessor_pr`, `predecessor_head_sha`, `last_squash_sha`, `started_at`, `stopped_at`, `error`. The `recovery_seq` is a monotonic counter incremented on each state change, used to determine which record is "ahead" during recovery. Deserialization must tolerate a missing `status_comment_id` field.
+**JSON fields:** Same as the `TrainRecord` fields documented in "Local train state" above, **except** `status_comment_id` (which is only known locally after the comment is created): `version`, `recovery_seq`, `state`, `original_root_pr`, `current_pr`, `cascade_phase` (as full `CascadePhase` object), `predecessor_pr`, `predecessor_head_sha`, `started_at`. The `recovery_seq` is a monotonic counter incremented on each state change, used to determine which record is "ahead" during recovery. Deserialization must tolerate a missing `status_comment_id` field.
+
+> **Implementation divergence (2026-06):** the implemented `TrainRecord` has no
+> top-level `last_squash_sha`, `stopped_at`/`ended_at`, or `error` fields. The
+> squash SHA lives inside the `cascade_phase` object (Reconciling/CatchingUp/
+> Retargeting carry a mandatory `squash_sha`, so "Reconciling with a missing
+> squash SHA" is unrepresentable rather than a recovery scenario), and the
+> end timestamp and error live inside the `state` value
+> (`{"stopped": {"ended_at": ...}}` /
+> `{"aborted": {"ended_at": ..., "error": {...}}}`), so an aborted train
+> without an error is likewise unrepresentable.
 
 **Critical for recovery:** The `cascade_phase` MUST include `completed`, `skipped`, AND `frozen_descendants`. See "Descendant set freezing" for why this is essential.
 

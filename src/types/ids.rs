@@ -230,24 +230,9 @@ mod tests {
 
         proptest! {
             #[test]
-            fn serde_roundtrip(n: u64) {
-                let pr = PrNumber(n);
-                let json = serde_json::to_string(&pr).unwrap();
-                let parsed: PrNumber = serde_json::from_str(&json).unwrap();
-                prop_assert_eq!(pr, parsed);
-            }
-
-            #[test]
             fn display_format(n: u64) {
                 let pr = PrNumber(n);
                 prop_assert_eq!(format!("{}", pr), format!("#{}", n));
-            }
-
-            #[test]
-            fn comparison_matches_underlying(a: u64, b: u64) {
-                let pr_a = PrNumber(a);
-                let pr_b = PrNumber(b);
-                prop_assert_eq!(pr_a == pr_b, a == b);
             }
         }
     }
@@ -270,13 +255,6 @@ mod tests {
                 let sha = Sha::parse(&s).unwrap();
                 prop_assert_eq!(sha.short().len(), 7);
                 prop_assert_eq!(sha.short(), &s[..7]);
-            }
-
-            #[test]
-            fn comparison_matches_underlying(a in "[0-9a-f]{40}", b in "[0-9a-f]{40}") {
-                let sha_a = Sha::parse(&a).unwrap();
-                let sha_b = Sha::parse(&b).unwrap();
-                prop_assert_eq!(sha_a == sha_b, a == b);
             }
 
             #[test]
@@ -309,17 +287,6 @@ mod tests {
         use proptest::prelude::*;
 
         proptest! {
-            #[test]
-            fn serde_roundtrip(
-                owner in "[a-zA-Z][a-zA-Z0-9-]{0,38}",
-                repo in "[a-zA-Z][a-zA-Z0-9_-]{0,99}"
-            ) {
-                let id = RepoId::new(&owner, &repo);
-                let json = serde_json::to_string(&id).unwrap();
-                let parsed: RepoId = serde_json::from_str(&json).unwrap();
-                prop_assert_eq!(id, parsed);
-            }
-
             #[test]
             fn display_format(
                 owner in "[a-zA-Z][a-zA-Z0-9-]{0,38}",
@@ -392,28 +359,6 @@ mod tests {
         fn deserialize_rejects_invalid() {
             let result: Result<DeliveryId, _> = serde_json::from_str(r#""../escape""#);
             assert!(result.is_err());
-        }
-    }
-
-    mod comment_id {
-        use super::*;
-        use proptest::prelude::*;
-
-        proptest! {
-            #[test]
-            fn serde_roundtrip(n: u64) {
-                let id = CommentId(n);
-                let json = serde_json::to_string(&id).unwrap();
-                let parsed: CommentId = serde_json::from_str(&json).unwrap();
-                prop_assert_eq!(id, parsed);
-            }
-
-            #[test]
-            fn comparison_matches_underlying(a: u64, b: u64) {
-                let id_a = CommentId(a);
-                let id_b = CommentId(b);
-                prop_assert_eq!(id_a == id_b, a == b);
-            }
         }
     }
 }

@@ -3,7 +3,7 @@
 //! Pure functions for computing the next phase based on the current phase
 //! and the outcome of operations.
 
-use crate::types::{CascadePhase, DescendantProgress, PrNumber, Sha};
+use crate::types::{CascadePhase, DescendantProgress, PhaseKind, PrNumber, ProgressError, Sha};
 
 /// The outcome of completing a phase operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +39,14 @@ pub enum TransitionError {
         phase: &'static str,
         remaining_count: usize,
     },
+
+    /// A descendant was marked in a way the progress invariants forbid
+    /// (not in the frozen set, or completing a skipped PR / skipping a
+    /// completed one). Indicates a bug in the caller.
+    InvalidDescendant {
+        phase: &'static str,
+        error: ProgressError,
+    },
 }
 
 impl std::fmt::Display for TransitionError {
@@ -70,6 +78,13 @@ impl std::fmt::Display for TransitionError {
                     phase, remaining_count
                 )
             }
+            TransitionError::InvalidDescendant { phase, error } => {
+                write!(
+                    f,
+                    "invalid descendant marking in {} phase: {}",
+                    phase, error
+                )
+            }
         }
     }
 }
@@ -78,327 +93,65 @@ impl std::error::Error for TransitionError {}
 
 /// Computes the next phase based on the current phase and outcome.
 ///
-/// This is the core state machine transition logic. It ensures:
-/// - Phases proceed in order: Idle -> Preparing -> SquashPending -> Reconciling -> CatchingUp -> Retargeting -> Idle
-/// - frozen_descendants is preserved through all phases after Preparing
-/// - skipped set is preserved and only grows across phases
-/// - completed set is reset at phase boundaries (tracks per-phase progress)
+/// This is the core state machine transition logic. The phase order is
+/// defined once, in [`PhaseKind::ORDER`]; this function only knows the
+/// per-phase rules:
+/// - Descendant-processing phases (Preparing, Reconciling, CatchingUp,
+///   Retargeting) accept `DescendantCompleted`/`DescendantSkipped` for PRs in
+///   the frozen set, and `AllComplete` as an assertion that nothing remains.
+/// - `SquashPending` exits only via `SquashComplete`, which supplies the
+///   squash SHA. Even with no descendants, the squash must actually happen.
+/// - `Idle` accepts no outcomes; cascades start via [`start_preparing`].
+/// - A phase whose work is already complete is never parked in: the cascade
+///   settles forward (possibly several phases, possibly to Idle).
 ///
-/// Returns the new phase, or an error if the transition is invalid.
+/// Invariants maintained: `frozen_descendants` is preserved verbatim through
+/// every transition; `skipped` only grows; `completed` is cleared when
+/// entering each post-squash processing phase (it tracks per-phase progress).
 pub fn next_phase(
     current: &CascadePhase,
     outcome: PhaseOutcome,
 ) -> Result<CascadePhase, TransitionError> {
     match (current, outcome) {
-        // === Idle transitions ===
-
-        // Starting a cascade with descendants to prepare
-        (CascadePhase::Idle, PhaseOutcome::AllComplete) => {
-            // This represents "start with empty descendants" - go directly to SquashPending
-            Ok(CascadePhase::SquashPending {
-                progress: DescendantProgress::new(vec![]),
-            })
-        }
-
-        // === Preparing transitions ===
-
-        // A descendant completed preparation
-        (CascadePhase::Preparing { progress }, PhaseOutcome::DescendantCompleted { pr }) => {
-            let mut new_progress = progress.clone();
-            new_progress.mark_completed(pr);
-
-            if new_progress.is_complete() {
-                Ok(CascadePhase::SquashPending {
-                    progress: new_progress,
-                })
-            } else {
-                Ok(CascadePhase::Preparing {
-                    progress: new_progress,
-                })
-            }
-        }
-
-        // A descendant was skipped during preparation
-        (CascadePhase::Preparing { progress }, PhaseOutcome::DescendantSkipped { pr }) => {
-            let mut new_progress = progress.clone();
-            new_progress.mark_skipped(pr);
-
-            if new_progress.is_complete() {
-                Ok(CascadePhase::SquashPending {
-                    progress: new_progress,
-                })
-            } else {
-                Ok(CascadePhase::Preparing {
-                    progress: new_progress,
-                })
-            }
-        }
-
-        // All descendants prepared (explicit signal)
-        // Guard: verify that progress.is_complete() is actually true
-        (CascadePhase::Preparing { progress }, PhaseOutcome::AllComplete) => {
-            if !progress.is_complete() {
-                return Err(TransitionError::IncompleteProgress {
-                    phase: "Preparing",
-                    remaining_count: progress.remaining().count(),
-                });
-            }
-            Ok(CascadePhase::SquashPending {
-                progress: progress.clone(),
-            })
-        }
-
-        // === SquashPending transitions ===
-
-        // Squash completed, move to Reconciling
         (CascadePhase::SquashPending { progress }, PhaseOutcome::SquashComplete { squash_sha }) => {
-            // Reset completed for reconciliation phase while preserving frozen and skipped
-            let mut new_progress = DescendantProgress::new(progress.frozen_descendants.clone());
-            new_progress.skipped = progress.skipped.clone();
-
-            if new_progress.is_complete() {
-                // No descendants to reconcile, go to CatchingUp
-                Ok(CascadePhase::CatchingUp {
-                    progress: new_progress,
-                    squash_sha,
-                })
-            } else {
-                Ok(CascadePhase::Reconciling {
-                    progress: new_progress,
-                    squash_sha,
-                })
-            }
+            enter(PhaseKind::Reconciling, progress.clone(), Some(&squash_sha))
         }
 
-        // NOTE: SquashPending does NOT accept AllComplete. The only valid exit
-        // is via SquashComplete, which provides the squash_sha. Even with empty
-        // frozen_descendants, the squash must actually happen before transitioning.
-        // The SquashComplete arm handles empty descendants by going to CatchingUp
-        // (which will immediately complete and proceed to Retargeting -> Idle).
-
-        // === Reconciling transitions ===
-
-        // A descendant completed reconciliation
-        (
-            CascadePhase::Reconciling {
-                progress,
-                squash_sha,
-            },
-            PhaseOutcome::DescendantCompleted { pr },
-        ) => {
-            let mut new_progress = progress.clone();
-            new_progress.mark_completed(pr);
-
-            if new_progress.is_complete() {
-                // Reset completed for catch-up phase
-                let mut catchup_progress =
-                    DescendantProgress::new(progress.frozen_descendants.clone());
-                catchup_progress.skipped = new_progress.skipped.clone();
-
-                Ok(CascadePhase::CatchingUp {
-                    progress: catchup_progress,
-                    squash_sha: squash_sha.clone(),
-                })
-            } else {
-                Ok(CascadePhase::Reconciling {
-                    progress: new_progress,
-                    squash_sha: squash_sha.clone(),
-                })
-            }
+        (phase, PhaseOutcome::DescendantCompleted { pr })
+            if phase.kind().processes_descendants() =>
+        {
+            let mut progress = expect_progress(phase).clone();
+            progress
+                .mark_completed(pr)
+                .map_err(|error| TransitionError::InvalidDescendant {
+                    phase: phase.name(),
+                    error,
+                })?;
+            settle(phase.kind(), progress, phase.squash_sha())
         }
 
-        // A descendant was skipped during reconciliation
-        (
-            CascadePhase::Reconciling {
-                progress,
-                squash_sha,
-            },
-            PhaseOutcome::DescendantSkipped { pr },
-        ) => {
-            let mut new_progress = progress.clone();
-            new_progress.mark_skipped(pr);
-
-            if new_progress.is_complete() {
-                let mut catchup_progress =
-                    DescendantProgress::new(progress.frozen_descendants.clone());
-                catchup_progress.skipped = new_progress.skipped.clone();
-
-                Ok(CascadePhase::CatchingUp {
-                    progress: catchup_progress,
-                    squash_sha: squash_sha.clone(),
-                })
-            } else {
-                Ok(CascadePhase::Reconciling {
-                    progress: new_progress,
-                    squash_sha: squash_sha.clone(),
-                })
-            }
+        (phase, PhaseOutcome::DescendantSkipped { pr }) if phase.kind().processes_descendants() => {
+            let mut progress = expect_progress(phase).clone();
+            progress
+                .mark_skipped(pr)
+                .map_err(|error| TransitionError::InvalidDescendant {
+                    phase: phase.name(),
+                    error,
+                })?;
+            settle(phase.kind(), progress, phase.squash_sha())
         }
 
-        // All descendants reconciled (explicit signal)
-        // Guard: verify that progress.is_complete() is actually true
-        (
-            CascadePhase::Reconciling {
-                progress,
-                squash_sha,
-            },
-            PhaseOutcome::AllComplete,
-        ) => {
+        (phase, PhaseOutcome::AllComplete) if phase.kind().processes_descendants() => {
+            let progress = expect_progress(phase);
             if !progress.is_complete() {
                 return Err(TransitionError::IncompleteProgress {
-                    phase: "Reconciling",
+                    phase: phase.name(),
                     remaining_count: progress.remaining().count(),
                 });
             }
-            let mut catchup_progress = DescendantProgress::new(progress.frozen_descendants.clone());
-            catchup_progress.skipped = progress.skipped.clone();
-
-            Ok(CascadePhase::CatchingUp {
-                progress: catchup_progress,
-                squash_sha: squash_sha.clone(),
-            })
+            settle(phase.kind(), progress.clone(), phase.squash_sha())
         }
 
-        // === CatchingUp transitions ===
-
-        // A descendant completed catch-up
-        (
-            CascadePhase::CatchingUp {
-                progress,
-                squash_sha,
-            },
-            PhaseOutcome::DescendantCompleted { pr },
-        ) => {
-            let mut new_progress = progress.clone();
-            new_progress.mark_completed(pr);
-
-            if new_progress.is_complete() {
-                let mut retarget_progress =
-                    DescendantProgress::new(progress.frozen_descendants.clone());
-                retarget_progress.skipped = new_progress.skipped.clone();
-
-                Ok(CascadePhase::Retargeting {
-                    progress: retarget_progress,
-                    squash_sha: squash_sha.clone(),
-                })
-            } else {
-                Ok(CascadePhase::CatchingUp {
-                    progress: new_progress,
-                    squash_sha: squash_sha.clone(),
-                })
-            }
-        }
-
-        // A descendant was skipped during catch-up
-        (
-            CascadePhase::CatchingUp {
-                progress,
-                squash_sha,
-            },
-            PhaseOutcome::DescendantSkipped { pr },
-        ) => {
-            let mut new_progress = progress.clone();
-            new_progress.mark_skipped(pr);
-
-            if new_progress.is_complete() {
-                let mut retarget_progress =
-                    DescendantProgress::new(progress.frozen_descendants.clone());
-                retarget_progress.skipped = new_progress.skipped.clone();
-
-                Ok(CascadePhase::Retargeting {
-                    progress: retarget_progress,
-                    squash_sha: squash_sha.clone(),
-                })
-            } else {
-                Ok(CascadePhase::CatchingUp {
-                    progress: new_progress,
-                    squash_sha: squash_sha.clone(),
-                })
-            }
-        }
-
-        // All descendants caught up (explicit signal)
-        // Guard: verify that progress.is_complete() is actually true
-        (
-            CascadePhase::CatchingUp {
-                progress,
-                squash_sha,
-            },
-            PhaseOutcome::AllComplete,
-        ) => {
-            if !progress.is_complete() {
-                return Err(TransitionError::IncompleteProgress {
-                    phase: "CatchingUp",
-                    remaining_count: progress.remaining().count(),
-                });
-            }
-            let mut retarget_progress =
-                DescendantProgress::new(progress.frozen_descendants.clone());
-            retarget_progress.skipped = progress.skipped.clone();
-
-            Ok(CascadePhase::Retargeting {
-                progress: retarget_progress,
-                squash_sha: squash_sha.clone(),
-            })
-        }
-
-        // === Retargeting transitions ===
-
-        // A descendant completed retargeting
-        (
-            CascadePhase::Retargeting {
-                progress,
-                squash_sha,
-            },
-            PhaseOutcome::DescendantCompleted { pr },
-        ) => {
-            let mut new_progress = progress.clone();
-            new_progress.mark_completed(pr);
-
-            if new_progress.is_complete() {
-                Ok(CascadePhase::Idle)
-            } else {
-                Ok(CascadePhase::Retargeting {
-                    progress: new_progress,
-                    squash_sha: squash_sha.clone(),
-                })
-            }
-        }
-
-        // A descendant was skipped during retargeting
-        (
-            CascadePhase::Retargeting {
-                progress,
-                squash_sha,
-            },
-            PhaseOutcome::DescendantSkipped { pr },
-        ) => {
-            let mut new_progress = progress.clone();
-            new_progress.mark_skipped(pr);
-
-            if new_progress.is_complete() {
-                Ok(CascadePhase::Idle)
-            } else {
-                Ok(CascadePhase::Retargeting {
-                    progress: new_progress,
-                    squash_sha: squash_sha.clone(),
-                })
-            }
-        }
-
-        // All descendants retargeted (explicit signal)
-        // Guard: verify that progress.is_complete() is actually true
-        (CascadePhase::Retargeting { progress, .. }, PhaseOutcome::AllComplete) => {
-            if !progress.is_complete() {
-                return Err(TransitionError::IncompleteProgress {
-                    phase: "Retargeting",
-                    remaining_count: progress.remaining().count(),
-                });
-            }
-            Ok(CascadePhase::Idle)
-        }
-
-        // === Invalid transitions ===
         (phase, outcome) => Err(TransitionError::InvalidTransition {
             from: phase.name(),
             outcome: format!("{:?}", outcome),
@@ -406,20 +159,89 @@ pub fn next_phase(
     }
 }
 
-/// Creates a new Preparing phase with the given descendants.
-///
-/// This is the entry point for starting a cascade. The frozen_descendants
-/// list is captured here and carried through all subsequent phases.
-pub fn start_preparing(descendants: Vec<PrNumber>) -> CascadePhase {
-    if descendants.is_empty() {
-        CascadePhase::SquashPending {
-            progress: DescendantProgress::new(vec![]),
-        }
+fn expect_progress(phase: &CascadePhase) -> &DescendantProgress {
+    phase
+        .progress()
+        .expect("descendant-processing phases carry progress")
+}
+
+/// Wraps `progress` back into `kind` if work remains; otherwise advances to
+/// the successor phase via [`enter`].
+fn settle(
+    kind: PhaseKind,
+    progress: DescendantProgress,
+    squash_sha: Option<&Sha>,
+) -> Result<CascadePhase, TransitionError> {
+    if progress.is_complete() {
+        let next = kind
+            .successor()
+            .expect("settle is only called for active phases");
+        enter(next, progress, squash_sha)
     } else {
-        CascadePhase::Preparing {
-            progress: DescendantProgress::new(descendants),
+        make_phase(kind, progress, squash_sha)
+    }
+}
+
+/// Enters `kind` afresh. Post-squash processing phases start with a cleared
+/// per-phase completion ledger; a phase entered with no remaining work is
+/// settled straight through to its successor. `SquashPending` always parks
+/// (its exit is the squash itself, not descendant bookkeeping); `Idle` is
+/// terminal.
+fn enter(
+    kind: PhaseKind,
+    progress: DescendantProgress,
+    squash_sha: Option<&Sha>,
+) -> Result<CascadePhase, TransitionError> {
+    match kind {
+        PhaseKind::Idle | PhaseKind::SquashPending => make_phase(kind, progress, squash_sha),
+        PhaseKind::Preparing => settle(kind, progress, squash_sha),
+        PhaseKind::Reconciling | PhaseKind::CatchingUp | PhaseKind::Retargeting => {
+            settle(kind, progress.with_completed_reset(), squash_sha)
         }
     }
+}
+
+fn make_phase(
+    kind: PhaseKind,
+    progress: DescendantProgress,
+    squash_sha: Option<&Sha>,
+) -> Result<CascadePhase, TransitionError> {
+    let require_sha = || {
+        squash_sha.cloned().ok_or(TransitionError::MissingData {
+            field: "squash_sha",
+        })
+    };
+    match kind {
+        PhaseKind::Idle => Ok(CascadePhase::Idle),
+        PhaseKind::Preparing => Ok(CascadePhase::Preparing { progress }),
+        PhaseKind::SquashPending => Ok(CascadePhase::SquashPending { progress }),
+        PhaseKind::Reconciling => Ok(CascadePhase::Reconciling {
+            progress,
+            squash_sha: require_sha()?,
+        }),
+        PhaseKind::CatchingUp => Ok(CascadePhase::CatchingUp {
+            progress,
+            squash_sha: require_sha()?,
+        }),
+        PhaseKind::Retargeting => Ok(CascadePhase::Retargeting {
+            progress,
+            squash_sha: require_sha()?,
+        }),
+    }
+}
+
+/// Creates the starting phase for a cascade with the given descendants.
+///
+/// The frozen_descendants list is captured here and carried through all
+/// subsequent phases. With no descendants there is no preparation work, so
+/// the cascade starts at SquashPending.
+pub fn start_preparing(descendants: Vec<PrNumber>) -> CascadePhase {
+    enter(
+        PhaseKind::Preparing,
+        DescendantProgress::new(descendants),
+        None,
+    )
+    .expect("no path from Preparing to a squash-sha-bearing phase")
 }
 
 /// Verifies that a phase transition maintains invariants.
@@ -433,34 +255,14 @@ pub fn verify_transition_invariants(
     from: &CascadePhase,
     to: &CascadePhase,
 ) -> Result<(), TransitionError> {
-    // Get progress from both phases (if they have progress)
-    let from_progress = from.progress();
-    let to_progress = to.progress();
-
-    match (from_progress, to_progress) {
-        (Some(from_p), Some(to_p)) => {
-            // Frozen descendants must be identical
-            if from_p.frozen_descendants != to_p.frozen_descendants {
-                return Err(TransitionError::FrozenDescendantsModified);
-            }
-
-            // Note: We don't check that completed/skipped only grow here because
-            // between phases (e.g., Preparing -> SquashPending -> Reconciling),
-            // the completed set is reset. The growth invariant only applies
-            // within a single phase.
-        }
-        (None, Some(to_p)) => {
-            // Transitioning from Idle to a phase with progress is valid
-            // (this is start_preparing)
-            let _ = to_p;
-        }
-        (Some(_from_p), None) => {
-            // Transitioning from a phase with progress to Idle is valid
-            // (this is completing a cascade step)
-        }
-        (None, None) => {
-            // Both Idle, nothing to check
-        }
+    // Entering from Idle and returning to Idle are unconstrained; between two
+    // progress-bearing phases the frozen set must be byte-identical.
+    // (completed resets at phase boundaries by design, so growth is only an
+    // intra-phase invariant and is not checked here.)
+    if let (Some(from_p), Some(to_p)) = (from.progress(), to.progress())
+        && from_p.frozen_descendants() != to_p.frozen_descendants()
+    {
+        return Err(TransitionError::FrozenDescendantsModified);
     }
 
     Ok(())
@@ -485,21 +287,12 @@ mod tests {
         use super::*;
 
         #[test]
-        fn idle_to_squash_pending_with_empty_descendants() {
-            let result = next_phase(&CascadePhase::Idle, PhaseOutcome::AllComplete);
-            assert!(result.is_ok());
-
-            let phase = result.unwrap();
-            assert!(matches!(phase, CascadePhase::SquashPending { .. }));
-        }
-
-        #[test]
         fn preparing_to_squash_pending_when_all_complete() {
             let progress = make_progress(&[1, 2, 3]);
             let mut complete_progress = progress.clone();
-            complete_progress.mark_completed(PrNumber(1));
-            complete_progress.mark_completed(PrNumber(2));
-            complete_progress.mark_completed(PrNumber(3));
+            complete_progress.mark_completed(PrNumber(1)).unwrap();
+            complete_progress.mark_completed(PrNumber(2)).unwrap();
+            complete_progress.mark_completed(PrNumber(3)).unwrap();
 
             let phase = CascadePhase::Preparing {
                 progress: complete_progress,
@@ -528,7 +321,7 @@ mod tests {
             assert!(matches!(new_phase, CascadePhase::Preparing { .. }));
 
             if let CascadePhase::Preparing { progress: p } = new_phase {
-                assert!(p.completed.contains(&PrNumber(1)));
+                assert!(p.completed().contains(&PrNumber(1)));
                 assert!(!p.is_complete());
             }
         }
@@ -556,14 +349,14 @@ mod tests {
             } = new_phase
             {
                 assert_eq!(squash_sha, sha);
-                assert_eq!(progress.frozen_descendants.len(), 2);
+                assert_eq!(progress.frozen_descendants().len(), 2);
             }
         }
 
         #[test]
         fn reconciling_to_catching_up_when_all_complete() {
             let mut progress = make_progress(&[1]);
-            progress.mark_completed(PrNumber(1));
+            progress.mark_completed(PrNumber(1)).unwrap();
             let sha = make_sha("abc123");
 
             let phase = CascadePhase::Reconciling {
@@ -580,7 +373,7 @@ mod tests {
         #[test]
         fn catching_up_to_retargeting_when_all_complete() {
             let mut progress = make_progress(&[1]);
-            progress.mark_completed(PrNumber(1));
+            progress.mark_completed(PrNumber(1)).unwrap();
             let sha = make_sha("abc123");
 
             let phase = CascadePhase::CatchingUp {
@@ -597,7 +390,7 @@ mod tests {
         #[test]
         fn retargeting_to_idle_when_all_complete() {
             let mut progress = make_progress(&[1]);
-            progress.mark_completed(PrNumber(1));
+            progress.mark_completed(PrNumber(1)).unwrap();
             let sha = make_sha("abc123");
 
             let phase = CascadePhase::Retargeting {
@@ -609,6 +402,35 @@ mod tests {
 
             assert!(result.is_ok());
             assert!(matches!(result.unwrap(), CascadePhase::Idle));
+        }
+
+        #[test]
+        fn idle_accepts_no_outcomes() {
+            // Cascade entry goes through start_preparing, never through next_phase.
+            // (Idle, AllComplete) used to be a back door meaning "start with empty
+            // descendants"; that is start_preparing(vec![])'s job.
+            let result = next_phase(&CascadePhase::Idle, PhaseOutcome::AllComplete);
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn squash_complete_with_nothing_left_advances_to_idle() {
+            // All frozen descendants were skipped during Preparing: after the
+            // squash there is no reconcile/catch-up/retarget work, so the train
+            // settles straight back to Idle rather than parking in a
+            // trivially-complete intermediate phase.
+            let mut progress = make_progress(&[1]);
+            progress.mark_skipped(PrNumber(1)).unwrap();
+            let phase = CascadePhase::SquashPending { progress };
+
+            let result = next_phase(
+                &phase,
+                PhaseOutcome::SquashComplete {
+                    squash_sha: make_sha("abc123"),
+                },
+            );
+
+            assert!(matches!(result, Ok(CascadePhase::Idle)));
         }
 
         #[test]
@@ -639,15 +461,15 @@ mod tests {
         #[test]
         fn skipped_descendants_are_preserved_across_phases() {
             let mut progress = make_progress(&[1, 2]);
-            progress.mark_skipped(PrNumber(1));
-            progress.mark_completed(PrNumber(2));
+            progress.mark_skipped(PrNumber(1)).unwrap();
+            progress.mark_completed(PrNumber(2)).unwrap();
 
             let phase = CascadePhase::Preparing { progress };
             let result = next_phase(&phase, PhaseOutcome::AllComplete);
 
             assert!(result.is_ok());
             if let CascadePhase::SquashPending { progress: p } = result.unwrap() {
-                assert!(p.skipped.contains(&PrNumber(1)));
+                assert!(p.skipped().contains(&PrNumber(1)));
             }
         }
 
@@ -664,7 +486,7 @@ mod tests {
             assert!(matches!(
                 result,
                 Err(TransitionError::IncompleteProgress {
-                    phase: "Preparing",
+                    phase: "preparing",
                     remaining_count: 3,
                 })
             ));
@@ -684,7 +506,7 @@ mod tests {
             assert!(matches!(
                 result,
                 Err(TransitionError::IncompleteProgress {
-                    phase: "Reconciling",
+                    phase: "reconciling",
                     remaining_count: 2,
                 })
             ));
@@ -693,7 +515,7 @@ mod tests {
         #[test]
         fn catching_up_all_complete_fails_when_not_complete() {
             let mut progress = make_progress(&[1, 2, 3]);
-            progress.mark_completed(PrNumber(1)); // Only 1 of 3 completed
+            progress.mark_completed(PrNumber(1)).unwrap(); // Only 1 of 3 completed
             let sha = make_sha("abc123");
             let phase = CascadePhase::CatchingUp {
                 progress,
@@ -705,7 +527,7 @@ mod tests {
             assert!(matches!(
                 result,
                 Err(TransitionError::IncompleteProgress {
-                    phase: "CatchingUp",
+                    phase: "catching_up",
                     remaining_count: 2,
                 })
             ));
@@ -725,7 +547,7 @@ mod tests {
             assert!(matches!(
                 result,
                 Err(TransitionError::IncompleteProgress {
-                    phase: "Retargeting",
+                    phase: "retargeting",
                     remaining_count: 1,
                 })
             ));
@@ -772,7 +594,7 @@ mod tests {
 
             assert!(matches!(phase, CascadePhase::Preparing { .. }));
             if let CascadePhase::Preparing { progress: p } = phase {
-                assert_eq!(p.frozen_descendants.len(), 2);
+                assert_eq!(p.frozen_descendants().len(), 2);
             }
         }
 
@@ -871,8 +693,8 @@ mod tests {
                 // start_preparing with non-empty descendants will create Preparing phase
                 let initial = start_preparing(descendants.clone());
                 let frozen = match &initial {
-                    CascadePhase::Preparing { progress: p } => p.frozen_descendants.clone(),
-                    CascadePhase::SquashPending { progress } => progress.frozen_descendants.clone(),
+                    CascadePhase::Preparing { progress: p } => p.frozen_descendants().to_vec(),
+                    CascadePhase::SquashPending { progress } => progress.frozen_descendants().to_vec(),
                     _ => Vec::new(),
                 };
 
@@ -891,7 +713,7 @@ mod tests {
 
                 // Verify frozen_descendants preserved after Preparing
                 if let Some(progress) = phase.progress() {
-                    prop_assert_eq!(&progress.frozen_descendants, &frozen, "frozen_descendants changed after Preparing");
+                    prop_assert_eq!(progress.frozen_descendants(), &frozen[..], "frozen_descendants changed after Preparing");
                 }
 
                 // === Phase 2: SquashPending → Reconciling ===
@@ -904,7 +726,7 @@ mod tests {
 
                 // Verify frozen_descendants preserved after SquashPending
                 if let Some(progress) = phase.progress() {
-                    prop_assert_eq!(&progress.frozen_descendants, &frozen, "frozen_descendants changed after SquashPending");
+                    prop_assert_eq!(progress.frozen_descendants(), &frozen[..], "frozen_descendants changed after SquashPending");
                 }
 
                 // === Phase 3: Reconciling → CatchingUp ===
@@ -921,7 +743,7 @@ mod tests {
 
                 // Verify frozen_descendants preserved after Reconciling
                 if let Some(progress) = phase.progress() {
-                    prop_assert_eq!(&progress.frozen_descendants, &frozen, "frozen_descendants changed after Reconciling");
+                    prop_assert_eq!(progress.frozen_descendants(), &frozen[..], "frozen_descendants changed after Reconciling");
                 }
 
                 // === Phase 4: CatchingUp → Retargeting ===
@@ -938,7 +760,7 @@ mod tests {
 
                 // Verify frozen_descendants preserved after CatchingUp
                 if let Some(progress) = phase.progress() {
-                    prop_assert_eq!(&progress.frozen_descendants, &frozen, "frozen_descendants changed after CatchingUp");
+                    prop_assert_eq!(progress.frozen_descendants(), &frozen[..], "frozen_descendants changed after CatchingUp");
                 }
 
                 // === Phase 5: Retargeting → Idle ===
@@ -987,7 +809,63 @@ mod tests {
 
                 // Check skipped is preserved
                 if let Some(progress) = phase.progress() {
-                    prop_assert!(progress.skipped.contains(&to_skip));
+                    prop_assert!(progress.skipped().contains(&to_skip));
+                }
+            }
+
+            /// Driving a cascade with arbitrary complete/skip decisions:
+            /// every observable transition moves forward in the phase order
+            /// (and satisfies can_transition_to), the frozen set is preserved
+            /// verbatim, skipped only grows, and the cascade terminates Idle.
+            ///
+            /// This also exercises the never-parked-complete invariant: in any
+            /// non-Idle, non-SquashPending phase there is always at least one
+            /// remaining descendant (the `.expect` below would panic otherwise).
+            #[test]
+            fn cascade_walk_is_forward_only(
+                descendants in arb_unique_descendants(1, 8),
+                skip_mask in any::<u8>(),
+                sha in arb_sha()
+            ) {
+                let mut phase = start_preparing(descendants.clone());
+                let mut steps = 0;
+                while !matches!(phase, CascadePhase::Idle) {
+                    steps += 1;
+                    prop_assert!(steps < 100, "cascade did not terminate");
+
+                    let outcome = match &phase {
+                        CascadePhase::SquashPending { .. } => PhaseOutcome::SquashComplete {
+                            squash_sha: sha.clone(),
+                        },
+                        p => {
+                            let progress = p.progress().expect("active phases carry progress");
+                            let pr = *progress
+                                .remaining()
+                                .next()
+                                .expect("non-SquashPending active phases always have work");
+                            if skip_mask & (1 << (pr.0 % 8)) != 0 {
+                                PhaseOutcome::DescendantSkipped { pr }
+                            } else {
+                                PhaseOutcome::DescendantCompleted { pr }
+                            }
+                        }
+                    };
+
+                    let next = next_phase(&phase, outcome).expect("valid outcome");
+
+                    if next.kind() != phase.kind() {
+                        prop_assert!(
+                            phase.can_transition_to(&next),
+                            "{} -> {} violates the phase order",
+                            phase.name(),
+                            next.name()
+                        );
+                    }
+                    if let (Some(a), Some(b)) = (phase.progress(), next.progress()) {
+                        prop_assert_eq!(a.frozen_descendants(), b.frozen_descendants());
+                        prop_assert!(a.skipped().is_subset(b.skipped()));
+                    }
+                    phase = next;
                 }
             }
 

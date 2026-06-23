@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::ids::{PrNumber, Sha};
+use super::train::TrainErrorKind;
 
 /// Reason why a cascade step is blocked and waiting.
 ///
@@ -181,27 +182,33 @@ pub enum AbortReason {
 }
 
 impl AbortReason {
-    /// Returns the error type string for logging/serialization.
-    pub fn error_type(&self) -> &'static str {
+    /// Returns the error category for this abort reason.
+    ///
+    /// This is the structured counterpart of [`Self::description`]: the kind
+    /// goes in `TrainError.kind` (serialized as snake_case `error_type` in
+    /// status comments), the description in `TrainError.message`.
+    pub fn error_type(&self) -> TrainErrorKind {
         match self {
-            AbortReason::MergeConflict { .. } => "merge_conflict",
-            AbortReason::PushRejected { .. } => "push_rejected",
-            AbortReason::PrClosed => "pr_closed",
-            AbortReason::CiFailed => "ci_failed",
-            AbortReason::CycleDetected => "cycle_detected",
-            AbortReason::ReviewDismissed => "review_dismissed",
-            AbortReason::ApprovalWithdrawn => "approval_withdrawn",
-            AbortReason::ApiError { .. } => "api_error",
-            AbortReason::BranchDeleted => "branch_deleted",
-            AbortReason::NonSquashMerge { .. } => "non_squash_merge",
-            AbortReason::StatusCommentTooLarge => "status_comment_too_large",
-            AbortReason::TrainTooLarge { .. } => "train_too_large",
-            AbortReason::PreparationMissing { .. } => "preparation_missing",
-            AbortReason::MergeHooksEnabled => "merge_hooks_enabled",
-            AbortReason::PreparationIncomplete { .. } => "preparation_incomplete",
-            AbortReason::BaseBranchMismatch { .. } => "base_branch_mismatch",
-            AbortReason::HeadShaChanged { .. } => "head_sha_changed",
-            AbortReason::InternalInvariantViolation { .. } => "internal_invariant_violation",
+            AbortReason::MergeConflict { .. } => TrainErrorKind::MergeConflict,
+            AbortReason::PushRejected { .. } => TrainErrorKind::PushRejected,
+            AbortReason::PrClosed => TrainErrorKind::PrClosed,
+            AbortReason::CiFailed => TrainErrorKind::CiFailed,
+            AbortReason::CycleDetected => TrainErrorKind::CycleDetected,
+            AbortReason::ReviewDismissed => TrainErrorKind::ReviewDismissed,
+            AbortReason::ApprovalWithdrawn => TrainErrorKind::ApprovalWithdrawn,
+            AbortReason::ApiError { .. } => TrainErrorKind::ApiError,
+            AbortReason::BranchDeleted => TrainErrorKind::BranchDeleted,
+            AbortReason::NonSquashMerge { .. } => TrainErrorKind::NonSquashMerge,
+            AbortReason::StatusCommentTooLarge => TrainErrorKind::StatusCommentTooLarge,
+            AbortReason::TrainTooLarge { .. } => TrainErrorKind::TrainTooLarge,
+            AbortReason::PreparationMissing { .. } => TrainErrorKind::PreparationMissing,
+            AbortReason::MergeHooksEnabled => TrainErrorKind::MergeHooksEnabled,
+            AbortReason::PreparationIncomplete { .. } => TrainErrorKind::PreparationIncomplete,
+            AbortReason::BaseBranchMismatch { .. } => TrainErrorKind::BaseBranchMismatch,
+            AbortReason::HeadShaChanged { .. } => TrainErrorKind::HeadShaChanged,
+            AbortReason::InternalInvariantViolation { .. } => {
+                TrainErrorKind::InternalInvariantViolation
+            }
         }
     }
 
@@ -253,11 +260,16 @@ impl AbortReason {
             AbortReason::PreparationIncomplete {
                 unprepared_descendants,
             } => {
+                let listed = unprepared_descendants
+                    .iter()
+                    .map(|pr| pr.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 format!(
-                    "External merge before preparation completed: {} descendant(s) unprepared: {:?}. \
+                    "External merge before preparation completed: {} descendant(s) unprepared: {}. \
                      Manual intervention required.",
                     unprepared_descendants.len(),
-                    unprepared_descendants
+                    listed
                 )
             }
             AbortReason::BaseBranchMismatch {
@@ -266,7 +278,7 @@ impl AbortReason {
                 actual_base,
             } => {
                 format!(
-                    "PR #{} base branch '{}' doesn't match predecessor's head branch '{}' (was PR retargeted?)",
+                    "PR {} base branch '{}' doesn't match predecessor's head branch '{}' (was PR retargeted?)",
                     pr, actual_base, expected_base
                 )
             }
@@ -380,6 +392,34 @@ mod tests {
 
     fn arb_pr_number() -> impl Strategy<Value = PrNumber> {
         any::<u64>().prop_map(PrNumber)
+    }
+
+    #[test]
+    fn descriptions_render_pr_numbers_for_humans() {
+        // PrNumber's Display already includes the '#'.
+        let reason = AbortReason::BaseBranchMismatch {
+            pr: PrNumber(5),
+            expected_base: "feature-a".to_string(),
+            actual_base: "main".to_string(),
+        };
+        let description = reason.description();
+        assert!(description.contains("PR #5"), "got: {description}");
+        assert!(
+            !description.contains("##"),
+            "doubled '#' in user-facing text: {description}"
+        );
+
+        // Debug formatting (PrNumber(3)) must not leak into user-facing text.
+        let reason = AbortReason::PreparationIncomplete {
+            unprepared_descendants: vec![PrNumber(3), PrNumber(4)],
+        };
+        let description = reason.description();
+        assert!(
+            !description.contains("PrNumber"),
+            "Debug output in user-facing text: {description}"
+        );
+        assert!(description.contains("#3"), "got: {description}");
+        assert!(description.contains("#4"), "got: {description}");
     }
 
     fn arb_sha() -> impl Strategy<Value = Sha> {
@@ -530,66 +570,6 @@ mod tests {
                 let json = serde_json::to_string(&reason).unwrap();
                 let parsed: AbortReason = serde_json::from_str(&json).unwrap();
                 prop_assert_eq!(reason, parsed);
-            }
-        }
-
-        #[test]
-        fn error_type_is_lowercase_snake_case() {
-            let reasons = [
-                AbortReason::MergeConflict {
-                    details: "test".into(),
-                },
-                AbortReason::PushRejected {
-                    details: "test".into(),
-                },
-                AbortReason::PrClosed,
-                AbortReason::CiFailed,
-                AbortReason::CycleDetected,
-                AbortReason::ReviewDismissed,
-                AbortReason::ApprovalWithdrawn,
-                AbortReason::ApiError {
-                    details: "test".into(),
-                },
-                AbortReason::BranchDeleted,
-                AbortReason::NonSquashMerge {
-                    predecessor: PrNumber(1),
-                    details: "test".into(),
-                },
-                AbortReason::StatusCommentTooLarge,
-                AbortReason::TrainTooLarge {
-                    pr_count: 51,
-                    max_allowed: 50,
-                },
-                AbortReason::PreparationMissing {
-                    descendant: PrNumber(2),
-                },
-                AbortReason::MergeHooksEnabled,
-                AbortReason::PreparationIncomplete {
-                    unprepared_descendants: vec![PrNumber(3), PrNumber(4)],
-                },
-                AbortReason::BaseBranchMismatch {
-                    pr: PrNumber(5),
-                    expected_base: "feature".into(),
-                    actual_base: "main".into(),
-                },
-                AbortReason::HeadShaChanged {
-                    expected: Sha::parse("0000000000000000000000000000000000000000").unwrap(),
-                    actual: Sha::parse("1111111111111111111111111111111111111111").unwrap(),
-                },
-                AbortReason::InternalInvariantViolation {
-                    details: "test".into(),
-                },
-            ];
-
-            for reason in &reasons {
-                let error_type = reason.error_type();
-                assert!(
-                    error_type
-                        .chars()
-                        .all(|c| c.is_ascii_lowercase() || c == '_'),
-                    "error_type '{}' should be lowercase snake_case",
-                    error_type
-                );
             }
         }
     }

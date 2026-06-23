@@ -58,9 +58,13 @@ impl MergeStack {
 /// IMPORTANT: We always require base_ref == default_branch. A PR whose
 /// predecessor merged but which hasn't been retargeted yet is NOT a root.
 ///
-/// CRITICAL: For the merged-predecessor case, we require `predecessor_squash_reconciled`
-/// to be set. This prevents races where someone manually retargets a late descendant
-/// to main before the bot's reconciliation runs.
+/// CRITICAL: For the merged-predecessor case, we require
+/// `predecessor_squash_reconciled` to equal the predecessor's actual squash
+/// commit — not merely to be set. A marker recorded against a different
+/// commit (e.g. the predecessor declaration was repointed at another merged
+/// PR after an earlier reconciliation) means THIS predecessor's squash has
+/// not been reconciled, and treating the PR as a root would bypass the
+/// ours-merge protection.
 pub fn is_root(pr: &CachedPr, default_branch: &str, prs: &HashMap<PrNumber, CachedPr>) -> bool {
     // Must target the default branch to be a root
     if pr.base_ref != default_branch {
@@ -72,9 +76,13 @@ pub fn is_root(pr: &CachedPr, default_branch: &str, prs: &HashMap<PrNumber, Cach
         None => true,
         Some(pred) => {
             match prs.get(&pred) {
-                // Predecessor merged — but ONLY a root if reconciliation completed.
-                // This prevents manually-retargeted PRs from bypassing ours-merge.
-                Some(p) if p.state.is_merged() => pr.predecessor_squash_reconciled.is_some(),
+                // Predecessor merged — a root only if reconciliation completed
+                // against that predecessor's actual squash commit. (A merged
+                // PR always has a merge_commit_sha, so an unset marker can
+                // never equal it.)
+                Some(p) if p.state.is_merged() => {
+                    pr.predecessor_squash_reconciled.as_ref() == p.state.merge_commit_sha()
+                }
                 // Predecessor exists but not merged = not a root (still stacked)
                 Some(_) => false,
                 // Predecessor missing from cache = NOT a root (data integrity issue)
@@ -108,7 +116,7 @@ pub fn compute_stacks(
     // Build stack for each root
     roots
         .into_iter()
-        .filter_map(|root| build_stack(root, prs, descendants_index))
+        .map(|root| build_stack(root, prs, descendants_index))
         .collect()
 }
 
@@ -117,7 +125,7 @@ fn build_stack(
     root: PrNumber,
     prs: &HashMap<PrNumber, CachedPr>,
     descendants_index: &HashMap<PrNumber, HashSet<PrNumber>>,
-) -> Option<MergeStack> {
+) -> MergeStack {
     let mut stack_prs = vec![root];
     let mut visited = HashSet::new();
     visited.insert(root);
@@ -150,7 +158,7 @@ fn build_stack(
         current = next;
     }
 
-    Some(MergeStack::new(stack_prs))
+    MergeStack::new(stack_prs)
 }
 
 /// Detects cycles in the predecessor graph.
@@ -173,7 +181,6 @@ pub fn detect_cycle(prs: &HashMap<PrNumber, CachedPr>) -> Option<Vec<PrNumber>> 
     }
 
     let mut colors: HashMap<PrNumber, Color> = prs.keys().map(|&pr| (pr, Color::White)).collect();
-    let mut parent: HashMap<PrNumber, Option<PrNumber>> = HashMap::new();
 
     // Build the forward edge map (pr -> its predecessor)
     // For cycle detection, we traverse predecessor edges
@@ -186,7 +193,6 @@ pub fn detect_cycle(prs: &HashMap<PrNumber, CachedPr>) -> Option<Vec<PrNumber>> 
         node: PrNumber,
         predecessor_of: &HashMap<PrNumber, PrNumber>,
         colors: &mut HashMap<PrNumber, Color>,
-        parent: &mut HashMap<PrNumber, Option<PrNumber>>,
         path: &mut Vec<PrNumber>,
     ) -> Option<Vec<PrNumber>> {
         colors.insert(node, Color::Gray);
@@ -202,8 +208,7 @@ pub fn detect_cycle(prs: &HashMap<PrNumber, CachedPr>) -> Option<Vec<PrNumber>> 
                     }
                 }
                 Some(Color::White) => {
-                    parent.insert(pred, Some(node));
-                    if let Some(cycle) = dfs(pred, predecessor_of, colors, parent, path) {
+                    if let Some(cycle) = dfs(pred, predecessor_of, colors, path) {
                         return Some(cycle);
                     }
                 }
@@ -222,7 +227,7 @@ pub fn detect_cycle(prs: &HashMap<PrNumber, CachedPr>) -> Option<Vec<PrNumber>> 
     for &pr in prs.keys() {
         if colors.get(&pr) == Some(&Color::White) {
             let mut path = Vec::new();
-            if let Some(cycle) = dfs(pr, &predecessor_of, &mut colors, &mut parent, &mut path) {
+            if let Some(cycle) = dfs(pr, &predecessor_of, &mut colors, &mut path) {
                 return Some(cycle);
             }
         }
@@ -315,6 +320,23 @@ mod tests {
             let prs = HashMap::from([(PrNumber(1), pred), (PrNumber(2), pr.clone())]);
 
             assert!(is_root(&pr, "main", &prs));
+        }
+
+        #[test]
+        fn pr_with_stale_reconciliation_marker_is_not_root() {
+            // The marker records WHICH squash commit was reconciled. If the
+            // predecessor declaration was later repointed at a different
+            // merged PR, the old marker must not bypass the ours-merge
+            // protection: the descendant has not been reconciled against
+            // THIS predecessor's squash.
+            let pred = make_merged_pr(1, "abc123def456789012345678901234567890abcd");
+            let mut pr = make_open_pr(2, "main", Some(1));
+            pr.predecessor_squash_reconciled =
+                Some(Sha::parse("ffff23def456789012345678901234567890abcd").unwrap());
+
+            let prs = HashMap::from([(PrNumber(1), pred), (PrNumber(2), pr.clone())]);
+
+            assert!(!is_root(&pr, "main", &prs));
         }
 
         #[test]
