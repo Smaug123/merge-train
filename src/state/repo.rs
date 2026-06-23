@@ -35,7 +35,7 @@ use chrono::{DateTime, Utc};
 
 use crate::persistence::event::{StateEvent, StateEventPayload};
 use crate::persistence::snapshot::{PersistedRepoSnapshot, SCHEMA_VERSION};
-use crate::types::{CachedPr, PrNumber, PrState, TrainRecord, TrainState};
+use crate::types::{CachedPr, MergeStateStatus, PrNumber, PrState, TrainRecord, TrainState};
 
 use super::descendants::build_descendants_index;
 
@@ -188,10 +188,10 @@ impl RepoState {
             }
 
             // ─── Observational PR updates ───
-            StateEventPayload::PrMerged { pr, sha } => {
+            StateEventPayload::PrMerged { pr, merge_sha } => {
                 if let Some(p) = self.prs.get_mut(pr) {
                     p.state = PrState::Merged {
-                        merge_commit_sha: sha.clone(),
+                        merge_commit_sha: merge_sha.clone(),
                     };
                     prs_mutated = true;
                 }
@@ -215,9 +215,92 @@ impl RepoState {
                 }
             }
 
-            StateEventPayload::PredecessorDeclared { pr, predecessor } => {
+            StateEventPayload::PredecessorDeclared {
+                pr,
+                predecessor,
+                comment_id,
+            } => {
                 if let Some(p) = self.prs.get_mut(pr) {
                     p.predecessor = Some(*predecessor);
+                    p.predecessor_comment_id = Some(*comment_id);
+                    prs_mutated = true;
+                }
+            }
+
+            // The authoritative predecessor comment was deleted/edited away;
+            // clear the link so the descendants index no longer reflects it.
+            StateEventPayload::PredecessorRemoved { pr, comment_id: _ } => {
+                if let Some(p) = self.prs.get_mut(pr) {
+                    p.predecessor = None;
+                    p.predecessor_comment_id = None;
+                    prs_mutated = true;
+                }
+            }
+
+            // ─── PR lifecycle: keep the PR cache current ───
+            StateEventPayload::PrOpened {
+                pr,
+                head_sha,
+                head_ref,
+                base_ref,
+                is_draft,
+            } => {
+                self.prs.insert(
+                    *pr,
+                    CachedPr::new(
+                        *pr,
+                        head_sha.clone(),
+                        head_ref.clone(),
+                        base_ref.clone(),
+                        None,
+                        PrState::Open,
+                        MergeStateStatus::Unknown,
+                        *is_draft,
+                    ),
+                );
+                prs_mutated = true;
+            }
+
+            StateEventPayload::PrClosed { pr } => {
+                if let Some(p) = self.prs.get_mut(pr) {
+                    p.state = PrState::Closed;
+                    p.closed_at = Some(event.ts);
+                    prs_mutated = true;
+                }
+            }
+
+            StateEventPayload::PrReopened { pr } => {
+                if let Some(p) = self.prs.get_mut(pr) {
+                    p.state = PrState::Open;
+                    p.closed_at = None;
+                    prs_mutated = true;
+                }
+            }
+
+            StateEventPayload::PrBaseChanged { pr, new_base, .. } => {
+                if let Some(p) = self.prs.get_mut(pr) {
+                    p.base_ref = new_base.clone();
+                    prs_mutated = true;
+                }
+            }
+
+            StateEventPayload::PrSynchronized { pr, new_head_sha } => {
+                if let Some(p) = self.prs.get_mut(pr) {
+                    p.head_sha = new_head_sha.clone();
+                    prs_mutated = true;
+                }
+            }
+
+            StateEventPayload::PrConvertedToDraft { pr } => {
+                if let Some(p) = self.prs.get_mut(pr) {
+                    p.is_draft = true;
+                    prs_mutated = true;
+                }
+            }
+
+            StateEventPayload::PrReadyForReview { pr } => {
+                if let Some(p) = self.prs.get_mut(pr) {
+                    p.is_draft = false;
                     prs_mutated = true;
                 }
             }
@@ -246,6 +329,16 @@ impl RepoState {
             | StateEventPayload::IntentPushCatchup { .. }
             | StateEventPayload::DonePushCatchup { .. }
             | StateEventPayload::IntentRetarget { .. } => {}
+
+            // ─── Engine observations: CI / review / descendant-skip events
+            // drive the planner's decisions (M2+) and the train's progress
+            // (carried wholesale on `PhaseTransition`), not the materialized PR
+            // cache. M1 replay-materialization is best-effort for these. ───
+            StateEventPayload::DescendantSkipped { .. }
+            | StateEventPayload::CheckSuiteCompleted { .. }
+            | StateEventPayload::StatusReceived { .. }
+            | StateEventPayload::ReviewSubmitted { .. }
+            | StateEventPayload::ReviewDismissed { .. } => {}
         }
 
         if prs_mutated {
@@ -259,7 +352,7 @@ mod tests {
     use super::*;
     use crate::persistence::event::StateEvent;
     use crate::test_utils::{arb_datetime, arb_sha};
-    use crate::types::{MergeStateStatus, Sha, TrainError};
+    use crate::types::{CommentId, MergeStateStatus, Sha, TrainError};
     use proptest::prelude::*;
 
     // ─── Generators ───
@@ -412,13 +505,14 @@ mod tests {
                 }
             }),
             (arb_small_pr(), arb_sha())
-                .prop_map(|(pr, sha)| StateEventPayload::PrMerged { pr, sha }),
+                .prop_map(|(pr, sha)| StateEventPayload::PrMerged { pr, merge_sha: sha }),
             (arb_small_pr(), arb_pr_state_string())
                 .prop_map(|(pr, state)| StateEventPayload::PrStateChanged { pr, state }),
             (arb_small_pr(), arb_small_pr()).prop_map(|(pr, pred)| {
                 StateEventPayload::PredecessorDeclared {
                     pr,
                     predecessor: pred,
+                    comment_id: CommentId(1),
                 }
             }),
             (
@@ -431,6 +525,41 @@ mod tests {
                     new_roots: new,
                     original_root_pr: orig,
                 }),
+            // PR-lifecycle arms — exercise the cache/index materialization.
+            arb_small_pr().prop_map(|pr| StateEventPayload::PredecessorRemoved {
+                pr,
+                comment_id: CommentId(1),
+            }),
+            (
+                arb_small_pr(),
+                arb_sha(),
+                arb_small_branch(),
+                arb_small_branch(),
+                any::<bool>(),
+            )
+                .prop_map(|(pr, head_sha, head_ref, base_ref, is_draft)| {
+                    StateEventPayload::PrOpened {
+                        pr,
+                        head_sha,
+                        head_ref,
+                        base_ref,
+                        is_draft,
+                    }
+                }),
+            arb_small_pr().prop_map(|pr| StateEventPayload::PrClosed { pr }),
+            arb_small_pr().prop_map(|pr| StateEventPayload::PrReopened { pr }),
+            (arb_small_pr(), arb_small_branch(), arb_small_branch()).prop_map(
+                |(pr, old_base, new_base)| StateEventPayload::PrBaseChanged {
+                    pr,
+                    old_base,
+                    new_base,
+                },
+            ),
+            (arb_small_pr(), arb_sha()).prop_map(|(pr, new_head_sha)| {
+                StateEventPayload::PrSynchronized { pr, new_head_sha }
+            }),
+            arb_small_pr().prop_map(|pr| StateEventPayload::PrConvertedToDraft { pr }),
+            arb_small_pr().prop_map(|pr| StateEventPayload::PrReadyForReview { pr }),
         ]
     }
 
@@ -562,6 +691,7 @@ mod tests {
             payload: StateEventPayload::PredecessorDeclared {
                 pr: PrNumber(2),
                 predecessor: PrNumber(1),
+                comment_id: CommentId(1),
             },
         });
 
