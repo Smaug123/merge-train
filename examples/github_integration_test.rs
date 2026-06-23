@@ -30,7 +30,7 @@
 
 use std::env;
 
-use merge_train::effects::{GitHubEffect, GitHubInterpreter, GitHubResponse};
+use merge_train::effects::{GitHubEffect, GitHubResponse};
 use merge_train::github::OctocrabClient;
 use merge_train::types::{PrNumber, RepoId};
 

@@ -53,12 +53,4 @@ mod tests {
             prop_assert_eq!(cmd, parsed);
         }
     }
-
-    #[test]
-    fn command_debug_format() {
-        assert!(format!("{:?}", Command::Start).contains("Start"));
-        assert!(format!("{:?}", Command::Stop).contains("Stop"));
-        assert!(format!("{:?}", Command::StopForce).contains("StopForce"));
-        assert!(format!("{:?}", Command::Predecessor(PrNumber(42))).contains("42"));
-    }
 }

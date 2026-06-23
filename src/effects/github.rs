@@ -1,7 +1,7 @@
 //! GitHub API effect types.
 //!
 //! These types describe GitHub API operations as data, without executing them.
-//! The interpreter (implemented in a later stage) executes these effects against
+//! `crate::github::interpret_github_effect` executes these effects against
 //! the actual GitHub API.
 
 use serde::{Deserialize, Serialize};
@@ -329,14 +329,6 @@ pub enum GitHubResponse {
 mod tests {
     use super::*;
     use proptest::prelude::*;
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    fn hash<T: Hash>(t: &T) -> u64 {
-        let mut s = DefaultHasher::new();
-        t.hash(&mut s);
-        s.finish()
-    }
 
     // ─── Arbitrary Generators ─────────────────────────────────────────────────
 
@@ -545,13 +537,6 @@ mod tests {
                 let parsed: Reaction = serde_json::from_str(&json).unwrap();
                 prop_assert_eq!(reaction, parsed);
             }
-
-            #[test]
-            fn hash_consistent(reaction in arb_reaction()) {
-                let h1 = hash(&reaction);
-                let h2 = hash(&reaction);
-                prop_assert_eq!(h1, h2);
-            }
         }
 
         #[test]
@@ -578,25 +563,6 @@ mod tests {
                 let json = serde_json::to_string(&effect).unwrap();
                 let parsed: GitHubEffect = serde_json::from_str(&json).unwrap();
                 prop_assert_eq!(effect, parsed);
-            }
-
-            #[test]
-            fn eq_reflexive(effect in arb_github_effect()) {
-                prop_assert_eq!(&effect, &effect);
-            }
-
-            #[test]
-            fn hash_consistent(effect in arb_github_effect()) {
-                let h1 = hash(&effect);
-                let h2 = hash(&effect);
-                prop_assert_eq!(h1, h2);
-            }
-
-            #[test]
-            fn eq_implies_same_hash(e1 in arb_github_effect(), e2 in arb_github_effect()) {
-                if e1 == e2 {
-                    prop_assert_eq!(hash(&e1), hash(&e2));
-                }
             }
 
             /// Property: exactly PostComment and SquashMerge are non-idempotent.

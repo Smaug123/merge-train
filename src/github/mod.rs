@@ -1,7 +1,7 @@
 //! GitHub API client and effect interpreter.
 //!
 //! This module provides the implementation for executing GitHub effects via the octocrab
-//! library. It implements the `GitHubInterpreter` trait defined in the effects module.
+//! library (`OctocrabClient::interpret` and `interpret_github_effect`).
 //!
 //! Key features:
 //! - Exponential backoff retry for transient failures
