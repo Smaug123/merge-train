@@ -90,13 +90,24 @@ default and keeps one source of truth.)
 
 Store API (sync; called from the per-repo worker thread):
 - `Store::open(path) -> Store` — open/create, apply PRAGMAs, run schema DDL if
-  fresh, check `user_version` (fail loud on mismatch — the explicit break).
+  fresh, check `user_version` (fail loud on mismatch — the explicit break), and
+  **reset any `status='processing'` delivery back to `'pending'`**. With one
+  writer per repo, a `processing` row at open time is abandoned by a dead
+  worker — this is the SQLite equivalent of the old
+  `cleanup_interrupted_processing`. Without it, a delivery interrupted between
+  claim and the closing commit is stuck forever, since the drain only takes
+  `pending` (Codex plan-review P1-A).
 - `load(&self) -> RepoState` — replay all `events` through `apply_event`.
 - `claim_next_delivery(&mut self) -> Option<Delivery>` — txn: pick lowest
   `arrival` with `status='pending'`, set `'processing'`, return it.
-- `commit_delivery(&mut self, id, events: &[StateEventPayload], dedupe: Option<&DedupeKey>)`
-  — **one transaction**: INSERT the state events (assigning `seq` from `meta`),
-  INSERT-OR-IGNORE the dedupe key, set the delivery `'done'`. (See below.)
+- `append(&mut self, events: &[StateEventPayload])` — append state events in
+  their own txn (assigning `seq` from `meta`); used for the outbox
+  `Intent*`/`Done*`/observation commits during a saga.
+- `commit_delivery(&mut self, id, events, dedupe)` — the **closing
+  transaction**: append any remaining state events, INSERT-OR-IGNORE the dedupe
+  key, set the delivery `'done'`. For an effect-free delivery this is the whole
+  processing step; effectful deliveries commit intent/result txns first (see the
+  flow below).
 - `is_duplicate(&self, key) -> bool`, `prune_dedupe(&mut self, ttl)`.
 - `enqueue(&mut self, envelope)` — INSERT a `pending` delivery (intake).
 
@@ -106,41 +117,55 @@ async server (axum) hands raw deliveries to the repo's worker (enqueue) and
 **never** writes state. Read-only endpoints (`/health`, `/state`) use a
 separate read-only connection; WAL lets them read without blocking the writer.
 
-## The per-delivery transaction (replaces the marker dance)
+## The per-delivery flow (replaces the marker dance)
+
+Intake and processing are separate; the spool is the `deliveries` table.
+
+- **Intake (server):** INSERT a `pending` delivery in its own txn, then notify
+  the repo's worker.
+- **Startup recovery:** `Store::open` resets `processing` → `pending` (above),
+  so a delivery interrupted mid-processing is re-drained, never stuck.
+
+The worker loop, for one delivery:
 
 ```
--- intake (server): INSERT delivery (status='pending')   [own txn]
--- worker loop:
-claim_next_delivery()                                    -- txn: pending -> processing
-parse_webhook(body)
-if is_duplicate(key) { mark done; continue }             -- dedupe is a fast-path only
-let events = handle_event(...)                            -- pure
-run external effects via the outbox (see below)
-commit_delivery(id, &events, Some(&key))                 -- ONE txn:
-    INSERT events...; UPDATE meta.next_seq;
-    INSERT OR IGNORE dedupe_keys(key, now);
-    UPDATE deliveries SET status='done' WHERE id=?;
-COMMIT
+claim_next_delivery()                 -- txn: pending -> processing
+parse_webhook(body); key = DedupeKey::for_event(event)
+if is_duplicate(key) { commit_delivery(id, [], None); continue }  -- txn: mark 'done'
+events, plan = handle_event(...)      -- pure: state events + effect intents (triggers)
 ```
 
-`mark_seen` lives **inside** the commit with the state events and the done
-marker. A crash anywhere before COMMIT leaves all three un-applied, so the
-delivery re-drains and reprocesses (idempotent). This makes
-`CASCADE_ENGINE_PLAN.md` finding #1 (dedupe marked before processing ⇒ dropped
-event) structurally impossible.
+**Effect-free delivery** (a pure state/cache change — most events): a single
+closing txn — `commit_delivery` — `{ append events; INSERT OR IGNORE dedupe
+key; set delivery 'done' }`. The dedupe mark lives *with* the events and the
+done marker, so a crash before COMMIT leaves all three un-applied and the
+delivery re-drains. This makes `CASCADE_ENGINE_PLAN.md` finding #1 (dedupe
+marked before processing ⇒ dropped event) structurally impossible.
 
-## External effects — the irreducible part (findings #2/#3)
+**Effectful delivery** (the cascade saga): because a `git push` / GitHub merge
+cannot join a SQLite txn, the **outbox** discipline — *intent committed before
+the effect, result after, done last* (Codex plan-review P1-B):
 
-A `git push` / GitHub merge cannot join a SQLite transaction, so the **outbox**
-pattern stays — just expressed cleanly:
-- Intent rows (the existing `IntentPush*`/`Done*` events) are written in the
-  same txn as the state change; a relay performs the effect and records the
-  result. At-least-once + idempotent effects (the existing pre-action checks).
-- **Finding #2:** persist the fencing token (`expected_sha`) in the same txn
-  *before* the external squash — now a trivial column/event, no in-memory gap.
-- **Finding #3:** run the external cleanup (worktree removal, final status
-  comment) *before* writing the terminal `TrainStopped`/`TrainAborted` row —
-  saga discipline, unchanged by the substrate.
+1. txn **I** — append the `IntentPush*` event(s): the durable "about to do X",
+   carrying the fencing token (`expected_sha`). **Committed before the effect.**
+2. the relay performs the **idempotent** effect, guarded by the fencing token.
+3. txn **R** — append the `Done*` / observation event(s) and advance state.
+4. `commit_delivery` — closing txn: dedupe key seen + delivery `'done'`.
+
+On a crash mid-saga, replay finds an `Intent*` without its `Done*` and re-runs
+the idempotent effect (the existing pre-action checks — already merged? ref
+already at the expected tree? — make the retry a safe no-op or redo). This is
+the corrected ordering that also resolves `CASCADE_ENGINE_PLAN.md`:
+- **Finding #2:** the fencing token (`expected_sha`) is in txn **I**, durable
+  *before* the squash — no in-memory gap.
+- **Finding #3:** the external cleanup (worktree removal, final status comment)
+  runs as the effect in steps 1–2; the terminal `TrainStopped`/`TrainAborted`
+  is the txn-**R** state event *after* cleanup — never before.
+
+The key correction over the first draft: effects never run before their intent
+is durable, and the delivery is marked `done` only after every effect's result
+is committed — so no crash window repeats an irreversible effect or strands a
+claimed delivery.
 
 ## Testing
 
@@ -148,10 +173,15 @@ pattern stays — just expressed cleanly:
   orphan / settlement tests.
 - **Keep / add:** `apply_event`/replay properties (`replay(events) == state`,
   the compaction-equivalence property restated as replay-vs-replay), event-
-  vocab serde round-trips, `DedupeKey` properties, and one integration test:
-  `kill -9` mid-transaction ⇒ on restart SQLite recovers, the worker re-drains,
-  and final `RepoState` equals the no-crash run. (We test *our* redrain, not
-  SQLite's durability.)
+  vocab serde round-trips, `DedupeKey` properties, and crash-recovery
+  integration tests (we test *our* recovery, not SQLite's durability):
+  - a `processing` row left by a dead worker is requeued to `pending` on
+    `Store::open` and re-drained (P1-A);
+  - a delivery interrupted after an effect but before its `Done*` txn replays as
+    an `Intent*`-without-`Done*` and the idempotent re-run yields the same final
+    `RepoState` as the no-crash run (P1-B);
+  - dedupe + done commit atomically: a crash before the closing txn re-drains
+    and reprocesses with no dropped event (finding #1).
 
 ## Stages — each a green, reviewable PR
 
