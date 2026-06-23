@@ -166,13 +166,7 @@ impl RepoState {
             // ─── is-root-by-construction (seam c) ───
             StateEventPayload::SquashCommitted { pr, sha, .. } => {
                 if let Some(p) = self.prs.get_mut(pr) {
-                    p.state = PrState::Merged {
-                        merge_commit_sha: sha.clone(),
-                    };
-                    // Stamp the merge time so the PR ages out under the
-                    // retention policy; `prune_snapshot` keeps merged/closed PRs
-                    // with no `closed_at` forever as "legacy" (Codex review #49).
-                    p.closed_at = Some(event.ts);
+                    p.mark_merged(sha.clone(), event.ts);
                     prs_mutated = true;
                 }
             }
@@ -193,7 +187,7 @@ impl RepoState {
                 if !new_base.is_empty()
                     && let Some(p) = self.prs.get_mut(pr)
                 {
-                    p.base_ref = new_base.clone();
+                    p.record_new_base(new_base.clone());
                     prs_mutated = true;
                 }
             }
@@ -201,10 +195,7 @@ impl RepoState {
             // ─── Observational PR updates ───
             StateEventPayload::PrMerged { pr, merge_sha } => {
                 if let Some(p) = self.prs.get_mut(pr) {
-                    p.state = PrState::Merged {
-                        merge_commit_sha: merge_sha.clone(),
-                    };
-                    p.closed_at = Some(event.ts);
+                    p.mark_merged(merge_sha.clone(), event.ts);
                     prs_mutated = true;
                 }
             }
@@ -215,11 +206,11 @@ impl RepoState {
                     // carry; merges arrive via `PrMerged`/`SquashCommitted`.
                     match state.as_str() {
                         "open" => {
-                            p.state = PrState::Open;
+                            p.mark_open();
                             prs_mutated = true;
                         }
                         "closed" => {
-                            p.state = PrState::Closed;
+                            p.mark_closed(event.ts);
                             prs_mutated = true;
                         }
                         _ => {}
@@ -264,14 +255,20 @@ impl RepoState {
             } => {
                 match self.prs.get_mut(pr) {
                     // Duplicate / delayed open for a PR we already track: refresh
-                    // only the fields this event carries; preserve metadata
-                    // learned later (predecessor, reconciliation, terminal state)
-                    // rather than rebuilding from scratch (Codex review #49).
+                    // the fields this event carries (routing head/base/draft
+                    // through the invalidating mutators so stale CI/reconciliation
+                    // facts don't survive a changed head/base) while preserving
+                    // metadata learned later — predecessor, reconciliation,
+                    // terminal state (Codex review #49).
                     Some(p) => {
-                        p.head_sha = head_sha.clone();
                         p.head_ref = head_ref.clone();
-                        p.base_ref = base_ref.clone();
-                        p.is_draft = *is_draft;
+                        p.record_new_head(head_sha.clone());
+                        p.record_new_base(base_ref.clone());
+                        if *is_draft {
+                            p.mark_draft();
+                        } else {
+                            p.mark_ready_for_review();
+                        }
                     }
                     None => {
                         self.prs.insert(
@@ -294,60 +291,45 @@ impl RepoState {
 
             StateEventPayload::PrClosed { pr } => {
                 if let Some(p) = self.prs.get_mut(pr) {
-                    p.state = PrState::Closed;
-                    p.closed_at = Some(event.ts);
+                    p.mark_closed(event.ts);
                     prs_mutated = true;
                 }
             }
 
             StateEventPayload::PrReopened { pr } => {
                 if let Some(p) = self.prs.get_mut(pr) {
-                    p.state = PrState::Open;
-                    p.closed_at = None;
+                    p.mark_open();
                     prs_mutated = true;
                 }
             }
 
             StateEventPayload::PrBaseChanged { pr, new_base, .. } => {
                 if let Some(p) = self.prs.get_mut(pr) {
-                    p.base_ref = new_base.clone();
+                    p.record_new_base(new_base.clone());
                     prs_mutated = true;
                 }
             }
 
             StateEventPayload::PrSynchronized { pr, new_head_sha } => {
                 if let Some(p) = self.prs.get_mut(pr) {
-                    p.head_sha = new_head_sha.clone();
-                    // A new head invalidates everything derived from the old
-                    // one: cached mergeability is stale (CI hasn't run on the
-                    // new head) and any predecessor-squash reconciliation done
-                    // against the old head no longer holds. Clear both so
-                    // is_root / mergeability decisions force a refetch and
-                    // re-reconciliation — the force-push race guard (Codex
-                    // review #49 [P1]).
-                    p.merge_state_status = MergeStateStatus::Unknown;
-                    p.predecessor_squash_reconciled = None;
+                    // The force-push race guard: a new head invalidates the
+                    // cached mergeability and predecessor-squash reconciliation
+                    // (both verified against the old head).
+                    p.record_new_head(new_head_sha.clone());
                     prs_mutated = true;
                 }
             }
 
             StateEventPayload::PrConvertedToDraft { pr } => {
                 if let Some(p) = self.prs.get_mut(pr) {
-                    p.is_draft = true;
-                    // A draft is never mergeable; keep the cached status
-                    // consistent so `is_mergeable()` consumers don't see it as
-                    // ready (Codex review #49 [P2]).
-                    p.merge_state_status = MergeStateStatus::Draft;
+                    p.mark_draft();
                     prs_mutated = true;
                 }
             }
 
             StateEventPayload::PrReadyForReview { pr } => {
                 if let Some(p) = self.prs.get_mut(pr) {
-                    p.is_draft = false;
-                    // The real mergeability is unknown until a refetch; don't
-                    // leave the stale `Draft` status looking authoritative.
-                    p.merge_state_status = MergeStateStatus::Unknown;
+                    p.mark_ready_for_review();
                     prs_mutated = true;
                 }
             }
@@ -865,11 +847,12 @@ mod tests {
         assert_eq!(state.prs[&PrNumber(2)].predecessor_comment_id, None);
     }
 
-    /// A duplicate/delayed `PrOpened` for a tracked PR must refresh only the
-    /// event's fields and preserve metadata learned later (predecessor,
-    /// reconciliation), not rebuild the record from scratch.
+    /// A duplicate/delayed `PrOpened` for a tracked PR preserves the learned
+    /// *topology* (predecessor link + comment id) rather than rebuilding from
+    /// scratch — but, because it carries a new head, must still invalidate the
+    /// *head-derived* facts (mergeability + predecessor-squash reconciliation).
     #[test]
-    fn pr_opened_upsert_preserves_learned_metadata() {
+    fn pr_opened_upsert_keeps_topology_but_invalidates_head_state() {
         let mut pr = CachedPr::new(
             PrNumber(2),
             Sha::parse("a".repeat(40)).unwrap(),
@@ -897,12 +880,46 @@ mod tests {
         assert_eq!(p.head_sha, new_head, "event fields refreshed");
         assert_eq!(p.base_ref, "new-base");
         assert!(p.is_draft);
+        // Topology learned later survives a duplicate open.
         assert_eq!(p.predecessor, Some(PrNumber(1)), "learned predecessor kept");
         assert_eq!(p.predecessor_comment_id, Some(CommentId(5)));
+        // Head-derived facts do not: the new head invalidates the old
+        // reconciliation, and a draft is never mergeable.
         assert_eq!(
-            p.predecessor_squash_reconciled,
-            Some(Sha::parse("c".repeat(40)).unwrap()),
-            "learned reconciliation kept"
+            p.predecessor_squash_reconciled, None,
+            "reconciliation against the old head must be cleared"
+        );
+        assert_eq!(p.merge_state_status, MergeStateStatus::Draft);
+    }
+
+    /// Changing a PR's base (`PrBaseChanged`, and likewise a cascade retarget)
+    /// resets cached mergeability — GitHub recomputes it against the new base.
+    #[test]
+    fn base_change_resets_mergeability() {
+        let pr = CachedPr::new(
+            PrNumber(1),
+            Sha::parse("a".repeat(40)).unwrap(),
+            "feature".to_string(),
+            "main".to_string(),
+            None,
+            PrState::Open,
+            MergeStateStatus::Clean,
+            false,
+        );
+        let mut state = state_with_pr(pr);
+
+        state.apply_event(&event(StateEventPayload::PrBaseChanged {
+            pr: PrNumber(1),
+            old_base: "main".to_string(),
+            new_base: "release".to_string(),
+        }));
+
+        let p = &state.prs[&PrNumber(1)];
+        assert_eq!(p.base_ref, "release");
+        assert_eq!(
+            p.merge_state_status,
+            MergeStateStatus::Unknown,
+            "mergeability computed against the old base must be reset"
         );
     }
 

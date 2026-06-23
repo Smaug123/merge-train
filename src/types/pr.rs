@@ -195,6 +195,62 @@ impl CachedPr {
             predecessor_squash_reconciled: None,
         }
     }
+
+    // ─── Mutators that carry the cache-invalidation invariants ───
+    //
+    // Derived facts (`merge_state_status`, `predecessor_squash_reconciled`,
+    // `closed_at`) are computed against a specific head/base/state. Routing
+    // every head/base/state change through these keeps the stale facts from
+    // surviving the change — the force-push race guard and the retention policy
+    // depend on it, and scattering the invalidation across call sites is how it
+    // gets forgotten.
+
+    /// Records a new head SHA, invalidating everything derived from the old
+    /// head: cached mergeability (CI has not run on the new head) and any
+    /// predecessor-squash reconciliation (verified against the old head).
+    pub fn record_new_head(&mut self, head_sha: Sha) {
+        self.head_sha = head_sha;
+        self.merge_state_status = MergeStateStatus::Unknown;
+        self.predecessor_squash_reconciled = None;
+    }
+
+    /// Records a new base branch, resetting cached mergeability (GitHub
+    /// recomputes it against the new base).
+    pub fn record_new_base(&mut self, base_ref: String) {
+        self.base_ref = base_ref;
+        self.merge_state_status = MergeStateStatus::Unknown;
+    }
+
+    /// Marks the PR merged, stamping `closed_at` so it ages out of retention.
+    pub fn mark_merged(&mut self, merge_commit_sha: Sha, at: DateTime<Utc>) {
+        self.state = PrState::Merged { merge_commit_sha };
+        self.closed_at = Some(at);
+    }
+
+    /// Marks the PR closed (not merged), stamping `closed_at`.
+    pub fn mark_closed(&mut self, at: DateTime<Utc>) {
+        self.state = PrState::Closed;
+        self.closed_at = Some(at);
+    }
+
+    /// Marks the PR open (opened or reopened), clearing any close timestamp.
+    pub fn mark_open(&mut self) {
+        self.state = PrState::Open;
+        self.closed_at = None;
+    }
+
+    /// Marks the PR a draft; a draft is never mergeable.
+    pub fn mark_draft(&mut self) {
+        self.is_draft = true;
+        self.merge_state_status = MergeStateStatus::Draft;
+    }
+
+    /// Marks the PR ready for review; real mergeability is unknown until a
+    /// refetch.
+    pub fn mark_ready_for_review(&mut self) {
+        self.is_draft = false;
+        self.merge_state_status = MergeStateStatus::Unknown;
+    }
 }
 
 #[cfg(test)]
