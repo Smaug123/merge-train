@@ -169,6 +169,10 @@ impl RepoState {
                     p.state = PrState::Merged {
                         merge_commit_sha: sha.clone(),
                     };
+                    // Stamp the merge time so the PR ages out under the
+                    // retention policy; `prune_snapshot` keeps merged/closed PRs
+                    // with no `closed_at` forever as "legacy" (Codex review #49).
+                    p.closed_at = Some(event.ts);
                     prs_mutated = true;
                 }
             }
@@ -200,6 +204,7 @@ impl RepoState {
                     p.state = PrState::Merged {
                         merge_commit_sha: merge_sha.clone(),
                     };
+                    p.closed_at = Some(event.ts);
                     prs_mutated = true;
                 }
             }
@@ -234,10 +239,15 @@ impl RepoState {
                 }
             }
 
-            // The authoritative predecessor comment was deleted/edited away;
-            // clear the link so the descendants index no longer reflects it.
-            StateEventPayload::PredecessorRemoved { pr, comment_id: _ } => {
-                if let Some(p) = self.prs.get_mut(pr) {
+            // The authoritative predecessor comment was deleted/edited away.
+            // Only clear when the event names the *current* authoritative
+            // comment: a delayed/redelivered removal for an older comment must
+            // not wipe a newer declaration (that's what `predecessor_comment_id`
+            // is for — Codex review #49).
+            StateEventPayload::PredecessorRemoved { pr, comment_id } => {
+                if let Some(p) = self.prs.get_mut(pr)
+                    && p.predecessor_comment_id == Some(*comment_id)
+                {
                     p.predecessor = None;
                     p.predecessor_comment_id = None;
                     prs_mutated = true;
@@ -252,19 +262,33 @@ impl RepoState {
                 base_ref,
                 is_draft,
             } => {
-                self.prs.insert(
-                    *pr,
-                    CachedPr::new(
-                        *pr,
-                        head_sha.clone(),
-                        head_ref.clone(),
-                        base_ref.clone(),
-                        None,
-                        PrState::Open,
-                        MergeStateStatus::Unknown,
-                        *is_draft,
-                    ),
-                );
+                match self.prs.get_mut(pr) {
+                    // Duplicate / delayed open for a PR we already track: refresh
+                    // only the fields this event carries; preserve metadata
+                    // learned later (predecessor, reconciliation, terminal state)
+                    // rather than rebuilding from scratch (Codex review #49).
+                    Some(p) => {
+                        p.head_sha = head_sha.clone();
+                        p.head_ref = head_ref.clone();
+                        p.base_ref = base_ref.clone();
+                        p.is_draft = *is_draft;
+                    }
+                    None => {
+                        self.prs.insert(
+                            *pr,
+                            CachedPr::new(
+                                *pr,
+                                head_sha.clone(),
+                                head_ref.clone(),
+                                base_ref.clone(),
+                                None,
+                                PrState::Open,
+                                MergeStateStatus::Unknown,
+                                *is_draft,
+                            ),
+                        );
+                    }
+                }
                 prs_mutated = true;
             }
 
@@ -777,6 +801,108 @@ mod tests {
         assert_eq!(
             p.predecessor_squash_reconciled, None,
             "reconciliation against the old head must be cleared"
+        );
+    }
+
+    /// Builds a one-PR state for the edge-case tests below.
+    fn state_with_pr(pr: CachedPr) -> RepoState {
+        RepoState::from_snapshot(PersistedRepoSnapshot {
+            schema_version: SCHEMA_VERSION,
+            snapshot_at: crate::test_utils::test_timestamp(),
+            log_generation: 0,
+            log_position: 0,
+            next_seq: 0,
+            default_branch: "main".to_string(),
+            prs: HashMap::from([(pr.number, pr)]),
+            active_trains: HashMap::new(),
+            seen_dedupe_keys: HashMap::new(),
+        })
+    }
+
+    fn event(payload: StateEventPayload) -> StateEvent {
+        StateEvent {
+            seq: 0,
+            ts: crate::test_utils::test_timestamp(),
+            payload,
+        }
+    }
+
+    /// `PredecessorRemoved` must only clear the link when it names the current
+    /// authoritative comment — a stale/redelivered removal for an older comment
+    /// must not wipe a newer declaration.
+    #[test]
+    fn predecessor_removed_only_clears_matching_comment() {
+        let mut pr = CachedPr::new(
+            PrNumber(2),
+            Sha::parse("a".repeat(40)).unwrap(),
+            "feature".to_string(),
+            "main".to_string(),
+            Some(PrNumber(1)),
+            PrState::Open,
+            MergeStateStatus::Unknown,
+            false,
+        );
+        pr.predecessor_comment_id = Some(CommentId(5));
+        let mut state = state_with_pr(pr);
+
+        // Stale removal for an older comment id: ignored.
+        state.apply_event(&event(StateEventPayload::PredecessorRemoved {
+            pr: PrNumber(2),
+            comment_id: CommentId(4),
+        }));
+        assert_eq!(
+            state.prs[&PrNumber(2)].predecessor,
+            Some(PrNumber(1)),
+            "stale removal must not clear a newer declaration"
+        );
+
+        // Removal naming the current comment: clears.
+        state.apply_event(&event(StateEventPayload::PredecessorRemoved {
+            pr: PrNumber(2),
+            comment_id: CommentId(5),
+        }));
+        assert_eq!(state.prs[&PrNumber(2)].predecessor, None);
+        assert_eq!(state.prs[&PrNumber(2)].predecessor_comment_id, None);
+    }
+
+    /// A duplicate/delayed `PrOpened` for a tracked PR must refresh only the
+    /// event's fields and preserve metadata learned later (predecessor,
+    /// reconciliation), not rebuild the record from scratch.
+    #[test]
+    fn pr_opened_upsert_preserves_learned_metadata() {
+        let mut pr = CachedPr::new(
+            PrNumber(2),
+            Sha::parse("a".repeat(40)).unwrap(),
+            "feature".to_string(),
+            "old-base".to_string(),
+            Some(PrNumber(1)),
+            PrState::Open,
+            MergeStateStatus::Unknown,
+            false,
+        );
+        pr.predecessor_comment_id = Some(CommentId(5));
+        pr.predecessor_squash_reconciled = Some(Sha::parse("c".repeat(40)).unwrap());
+        let mut state = state_with_pr(pr);
+
+        let new_head = Sha::parse("b".repeat(40)).unwrap();
+        state.apply_event(&event(StateEventPayload::PrOpened {
+            pr: PrNumber(2),
+            head_sha: new_head.clone(),
+            head_ref: "feature".to_string(),
+            base_ref: "new-base".to_string(),
+            is_draft: true,
+        }));
+
+        let p = &state.prs[&PrNumber(2)];
+        assert_eq!(p.head_sha, new_head, "event fields refreshed");
+        assert_eq!(p.base_ref, "new-base");
+        assert!(p.is_draft);
+        assert_eq!(p.predecessor, Some(PrNumber(1)), "learned predecessor kept");
+        assert_eq!(p.predecessor_comment_id, Some(CommentId(5)));
+        assert_eq!(
+            p.predecessor_squash_reconciled,
+            Some(Sha::parse("c".repeat(40)).unwrap()),
+            "learned reconciliation kept"
         );
     }
 
