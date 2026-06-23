@@ -181,7 +181,14 @@ impl RepoState {
             }
 
             StateEventPayload::DoneRetarget { pr, new_base, .. } => {
-                if let Some(p) = self.prs.get_mut(pr) {
+                // A legacy `done_retarget` written before `new_base` existed
+                // deserializes (via `#[serde(default)]`) to an empty string;
+                // that means "base unrecorded", not "retarget to no branch", so
+                // leave the cached base untouched rather than blanking it
+                // (Codex review #49 [P2]).
+                if !new_base.is_empty()
+                    && let Some(p) = self.prs.get_mut(pr)
+                {
                     p.base_ref = new_base.clone();
                     prs_mutated = true;
                 }
@@ -287,6 +294,15 @@ impl RepoState {
             StateEventPayload::PrSynchronized { pr, new_head_sha } => {
                 if let Some(p) = self.prs.get_mut(pr) {
                     p.head_sha = new_head_sha.clone();
+                    // A new head invalidates everything derived from the old
+                    // one: cached mergeability is stale (CI hasn't run on the
+                    // new head) and any predecessor-squash reconciliation done
+                    // against the old head no longer holds. Clear both so
+                    // is_root / mergeability decisions force a refetch and
+                    // re-reconciliation — the force-push race guard (Codex
+                    // review #49 [P1]).
+                    p.merge_state_status = MergeStateStatus::Unknown;
+                    p.predecessor_squash_reconciled = None;
                     prs_mutated = true;
                 }
             }
@@ -294,6 +310,10 @@ impl RepoState {
             StateEventPayload::PrConvertedToDraft { pr } => {
                 if let Some(p) = self.prs.get_mut(pr) {
                     p.is_draft = true;
+                    // A draft is never mergeable; keep the cached status
+                    // consistent so `is_mergeable()` consumers don't see it as
+                    // ready (Codex review #49 [P2]).
+                    p.merge_state_status = MergeStateStatus::Draft;
                     prs_mutated = true;
                 }
             }
@@ -301,6 +321,9 @@ impl RepoState {
             StateEventPayload::PrReadyForReview { pr } => {
                 if let Some(p) = self.prs.get_mut(pr) {
                     p.is_draft = false;
+                    // The real mergeability is unknown until a refetch; don't
+                    // leave the stale `Draft` status looking authoritative.
+                    p.merge_state_status = MergeStateStatus::Unknown;
                     prs_mutated = true;
                 }
             }
@@ -701,6 +724,60 @@ mod tests {
             "PredecessorDeclared must rebuild the descendants index"
         );
         assert_eq!(state.descendants, build_descendants_index(&state.prs));
+    }
+
+    /// A `PrSynchronized` (force-)push invalidates everything derived from the
+    /// old head: the cached mergeability and the predecessor-squash
+    /// reconciliation marker. Leaving either would let a new head look CI-clean
+    /// and already-reconciled, bypassing the force-push race guard (Codex #49).
+    #[test]
+    fn synchronize_invalidates_old_head_derived_state() {
+        let new_head = Sha::parse("b".repeat(40)).unwrap();
+        let mut pr = CachedPr::new(
+            PrNumber(1),
+            Sha::parse("a".repeat(40)).unwrap(),
+            "feature".to_string(),
+            "main".to_string(),
+            None,
+            PrState::Open,
+            MergeStateStatus::Clean,
+            false,
+        );
+        pr.predecessor_squash_reconciled = Some(Sha::parse("c".repeat(40)).unwrap());
+
+        let snapshot = PersistedRepoSnapshot {
+            schema_version: SCHEMA_VERSION,
+            snapshot_at: crate::test_utils::test_timestamp(),
+            log_generation: 0,
+            log_position: 0,
+            next_seq: 0,
+            default_branch: "main".to_string(),
+            prs: HashMap::from([(PrNumber(1), pr)]),
+            active_trains: HashMap::new(),
+            seen_dedupe_keys: HashMap::new(),
+        };
+        let mut state = RepoState::from_snapshot(snapshot);
+
+        state.apply_event(&StateEvent {
+            seq: 0,
+            ts: crate::test_utils::test_timestamp(),
+            payload: StateEventPayload::PrSynchronized {
+                pr: PrNumber(1),
+                new_head_sha: new_head.clone(),
+            },
+        });
+
+        let p = &state.prs[&PrNumber(1)];
+        assert_eq!(p.head_sha, new_head, "head SHA must update");
+        assert_eq!(
+            p.merge_state_status,
+            MergeStateStatus::Unknown,
+            "stale mergeability must be cleared on a new head"
+        );
+        assert_eq!(
+            p.predecessor_squash_reconciled, None,
+            "reconciliation against the old head must be cleared"
+        );
     }
 
     /// is-root-by-construction (seam c): a reconciled, retargeted descendant of
