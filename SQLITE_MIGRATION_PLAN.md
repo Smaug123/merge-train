@@ -85,10 +85,17 @@ CREATE TABLE meta (               -- next_seq, default_branch cache, etc.
 );
 ```
 
-Active trains / cached PRs are **not** stored as tables in M1: `RepoState` is
-reconstructed by replaying `events`. (An optional single-row cached-state blob
-can be added later if cold-start replay is ever slow; pure replay is the simple
-default and keeps one source of truth.)
+A `repo_state` row/table holds the **materialized `RepoState`** (the snapshot
+equivalent) and is **required**, not a perf tweak (Codex plan-review P1-G):
+bootstrap-from-GitHub-crawl and status-comment recovery materialize state —
+`default_branch`, `CachedPr.merge_state_status`, an active `TrainRecord` — that
+the `StateEventPayload` vocabulary does **not** express, so a replay-only `load`
+would lose open PRs / active trains on the next restart. `apply_event` updates
+the in-memory state and upserts this row **in the same txn** as the event. This
+is the existing snapshot+log model, minus generations/compaction/orphan-rollback
+— in SQLite the "snapshot" is just an upserted row. Replay-from-`events` stays
+as the recovery/equivalence oracle (`replay == cached state`), not the hot
+`load` path.
 
 Store API (sync; called from the per-repo worker thread):
 - `Store::open(path) -> Store` — in order:
@@ -102,8 +109,10 @@ Store API (sync; called from the per-repo worker thread):
      role when deleting `recovery.rs`** (Codex plan-review P1-D).
   2. Apply connection PRAGMAs (`journal_mode`/`synchronous`).
   3. **Read `user_version`**: `0`/absent ⇒ fresh DB, run the schema DDL and
-     *set* `user_version`; equal ⇒ proceed; mismatch ⇒ **fail loud** (the
-     explicit break — never overwrite it) (Codex plan-review P2-F).
+     *set* `user_version` **in one transaction** (atomic — a crash mid-DDL must
+     not leave a partial schema still at version 0, Codex plan-review P2-K);
+     equal ⇒ proceed; mismatch ⇒ **fail loud** (the explicit break — never
+     overwrite it) (Codex plan-review P2-F).
   4. **Reset any `status='processing'` delivery back to `'pending'`** — with the
      per-repo lock held, a `processing` row at open is abandoned by a dead
      worker (the SQLite equivalent of `cleanup_interrupted_processing`); without
@@ -124,7 +133,14 @@ Store API (sync; called from the per-repo worker thread):
   is Codex plan-review P1-C. For an effect-free delivery this is the whole
   processing step.
 - `is_duplicate(&self, key) -> bool`, `prune_dedupe(&mut self, ttl)`.
-- `enqueue(&mut self, envelope)` — INSERT a `pending` delivery (intake).
+- `prune_deliveries(&mut self, grace)` — delete `done` deliveries older than the
+  grace period (frees the raw-body BLOBs; keeps delivery-id idempotency during
+  the grace). Replaces `cleanup_done_deliveries` — without it the per-repo DB
+  grows unbounded as `done` rows retain ≤25 MB payloads forever (Codex
+  plan-review P2-I).
+- `enqueue(&mut self, envelope)` — INSERT a `pending` delivery. Called **by the
+  worker thread** (which owns the write connection and holds the lock), never by
+  the server (Codex plan-review P1-H — see Intake).
 
 ### Concurrency
 Two levels of mutual exclusion:
@@ -133,17 +149,23 @@ Two levels of mutual exclusion:
   each claim different deliveries and run git/GitHub effects concurrently — the
   lock (inheriting `StateDirLock`'s role) is what actually enforces one driver
   per repo. Held for the worker's lifetime.
-- **Within the process:** the worker thread owns its `Store` write connection;
-  the async server (axum) only `enqueue`s and never writes state. Read-only
-  endpoints (`/health`, `/state`) use a separate read-only connection; WAL lets
-  them read without blocking the writer.
+- **Within the process:** the worker thread owns its `Store` write connection
+  and is the *only* writer. The async server **never opens the Store**; it hands
+  raw deliveries to the repo's worker over an in-process channel and awaits the
+  worker's durable-INSERT ack before replying 200 (a second `Store::open` from
+  the handler would deadlock on the worker-held lock — Codex plan-review P1-H).
+  Read-only endpoints (`/health`, `/state`) use a separate read-only connection;
+  WAL lets them read without blocking the writer.
 
 ## The per-delivery flow (replaces the marker dance)
 
 Intake and processing are separate; the spool is the `deliveries` table.
 
-- **Intake (server):** INSERT a `pending` delivery in its own txn, then notify
-  the repo's worker.
+- **Intake:** the axum handler sends the raw delivery (headers + body) to the
+  repo's worker over an in-process channel; the worker `enqueue`s the `pending`
+  row (it holds the lock + connection) and acks; the handler returns 200 only
+  after that durable INSERT. A crash before the INSERT means no 200, so GitHub
+  redelivers — at-least-once intake (Codex plan-review P1-H).
 - **Startup recovery:** `Store::open` resets `processing` → `pending` (above),
   so a delivery interrupted mid-processing is re-drained, never stuck.
 
@@ -151,9 +173,14 @@ The worker loop, for one delivery:
 
 ```
 claim_next_delivery()                 -- txn: pending -> processing
-parse_webhook(body); key = DedupeKey::for_event(event)
-if is_duplicate(key) { commit_delivery(id, [], None); continue }  -- txn: mark 'done'
-events, plan = handle_event(...)      -- pure: state events + effect intents (triggers)
+event = match parse_webhook(type, body) {
+    Ok(None)        => { commit_delivery(id, [], None); continue }  -- ignored event type
+    Err(_malformed) => { commit_delivery(id, [], None); continue }  -- log + close; never re-loop
+    Ok(Some(e))     => e,
+}
+key = DedupeKey::for_event(&event)    -- Option: a non-PR comment has no key
+if key.as_ref().is_some_and(is_duplicate) { commit_delivery(id, [], None); continue }
+events, plan = handle_event(&event, ...)   -- pure: state events + effect intents (triggers)
 ```
 
 **Effect-free delivery** (a pure state/cache change — most events): a single
