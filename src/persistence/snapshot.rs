@@ -32,7 +32,13 @@ use super::fsync::{fsync_dir, fsync_file, rename};
 use crate::types::{CachedPr, PrNumber, TrainRecord};
 
 /// Current schema version. Increment when making breaking changes.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// Bumped to 2 by the machine-enforced core: `TrainState::Stopped`/`Aborted`
+/// moved from string tags with top-level `ended_at`/`error` to nested struct
+/// variants, so v1 `TrainRecord`s no longer deserialize. Backward compatibility
+/// is intentionally dropped; the version bump makes recovery reject a v1
+/// snapshot with a clear `SchemaMismatch` rather than a cryptic serde error.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Errors that can occur during snapshot operations.
 #[derive(Debug, Error)]
@@ -195,7 +201,7 @@ pub fn try_load_snapshot(path: &Path) -> Result<Option<PersistedRepoSnapshot>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{CommentId, MergeStateStatus, PrState, Sha};
+    use crate::types::{CommentId, MergeStateStatus, PrState};
     use proptest::prelude::*;
     use tempfile::tempdir;
 
@@ -432,13 +438,13 @@ mod tests {
         std::fs::write(&path, json).unwrap();
 
         let result = load_snapshot(&path);
-        assert!(matches!(
-            result,
-            Err(SnapshotError::SchemaMismatch {
-                expected: 1,
-                got: 2
-            })
-        ));
+        match result {
+            Err(SnapshotError::SchemaMismatch { expected, got }) => {
+                assert_eq!(expected, SCHEMA_VERSION);
+                assert_eq!(got, SCHEMA_VERSION + 1);
+            }
+            other => panic!("expected SchemaMismatch, got {other:?}"),
+        }
     }
 
     #[test]
