@@ -216,6 +216,16 @@ impl Store {
     }
 }
 
+impl Drop for Store {
+    fn drop(&mut self) {
+        // Release the advisory lock explicitly rather than relying on the file
+        // descriptor close alone: under load the implicit release can leave a
+        // brief window where an immediate reopen in the same process still
+        // observes the lock as held (Codex review #50 [P1]).
+        let _ = fs2::FileExt::unlock(&self._lock);
+    }
+}
+
 /// Creates the schema and stamps the version, atomically.
 fn init_schema(conn: &Connection) -> Result<(), StoreError> {
     let tx = conn.unchecked_transaction()?;
