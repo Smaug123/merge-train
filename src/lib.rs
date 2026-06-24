@@ -18,3 +18,4 @@ pub mod status;
 pub mod store;
 pub mod types;
 pub mod webhooks;
+pub mod worker;
