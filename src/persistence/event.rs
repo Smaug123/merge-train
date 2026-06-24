@@ -247,9 +247,10 @@ pub enum StateEventPayload {
         pr: PrNumber,
         /// The branch the PR was retargeted onto. `apply_event` sets
         /// `prs[pr].base_ref = new_base` so the materialized state matches the
-        /// retarget the interpreter performed. `#[serde(default)]` so events
-        /// written before this field existed still deserialize.
-        #[serde(default)]
+        /// retarget the interpreter performed. Required: `done_retarget` is only
+        /// emitted by the cascade (M2+), so no field-less legacy events exist —
+        /// representing the target as missing-or-empty would lose a successful
+        /// retarget on replay (Codex review #49).
         new_base: String,
     },
 

@@ -179,14 +179,7 @@ impl RepoState {
             }
 
             StateEventPayload::DoneRetarget { pr, new_base, .. } => {
-                // A legacy `done_retarget` written before `new_base` existed
-                // deserializes (via `#[serde(default)]`) to an empty string;
-                // that means "base unrecorded", not "retarget to no branch", so
-                // leave the cached base untouched rather than blanking it
-                // (Codex review #49 [P2]).
-                if !new_base.is_empty()
-                    && let Some(p) = self.prs.get_mut(pr)
-                {
+                if let Some(p) = self.prs.get_mut(pr) {
                     p.record_new_base(new_base.clone());
                     prs_mutated = true;
                 }
