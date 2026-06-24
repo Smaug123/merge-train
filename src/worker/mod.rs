@@ -173,50 +173,77 @@ impl WorkerRegistry {
     }
 }
 
-/// The worker thread body: drain anything left pending by a previous run, then
-/// serve the mailbox, draining fully after each enqueue. Returns when every
-/// sender has dropped (process shutdown), releasing the `Store` (and its lock).
+/// The worker thread body. Returns when every sender has dropped (process
+/// shutdown), releasing the `Store` (and its lock).
+///
+/// Intake is prioritized over processing: each iteration first durably enqueues
+/// and acks **every** delivery already waiting in the mailbox, then processes at
+/// most **one** backlog delivery before looking again. So a webhook's 200 waits
+/// at most one `process_one`, never the whole backlog — without this, a delivery
+/// arriving during a long drain could exceed GitHub's redelivery timeout even
+/// though its enqueue was trivial. (With the M5 engine a single saga may still
+/// be slow; running effects off-thread so intake never waits is M5's concern.)
 fn run(mut store: Store, mut rx: mpsc::Receiver<WorkerMsg>) {
-    drain(&mut store);
-    while let Some(msg) = rx.blocking_recv() {
-        match msg {
-            WorkerMsg::Enqueue { delivery, ack } => {
-                let outcome = store
-                    .enqueue(
-                        &delivery.delivery_id,
-                        &delivery.event_type,
-                        &delivery.headers,
-                        &delivery.body,
-                        Utc::now(),
-                    )
-                    .map(|inserted| {
-                        if inserted {
-                            EnqueueOutcome::Enqueued
-                        } else {
-                            EnqueueOutcome::Duplicate
-                        }
-                    });
-                // The handler may have timed out and dropped the receiver; the
-                // delivery is durable regardless, so ignore a send failure.
-                let _ = ack.send(outcome);
+    loop {
+        // Service all waiting intake first. The mailbox is bounded, so this
+        // burst is bounded too.
+        loop {
+            match rx.try_recv() {
+                Ok(msg) => handle_msg(&mut store, msg),
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => return,
             }
         }
-        drain(&mut store);
+        // Process one unit of backlog, then loop back to re-check intake. With
+        // nothing to process, block until the next message (or shutdown).
+        if !process_next(&mut store) {
+            match rx.blocking_recv() {
+                Some(msg) => handle_msg(&mut store, msg),
+                None => return,
+            }
+        }
     }
 }
 
-/// Claims and processes every pending delivery, oldest first, until the queue
-/// drains. A claim error stops this round (the worker retries on the next
-/// message or restart) rather than spinning.
-fn drain(store: &mut Store) {
-    loop {
-        match store.claim_next_delivery() {
-            Ok(Some(delivery)) => process_one(store, delivery),
-            Ok(None) => return,
-            Err(e) => {
-                error!(error = %e, "claim_next_delivery failed; pausing drain");
-                return;
-            }
+/// Durably enqueues a delivery and acks the outcome to the handler.
+fn handle_msg(store: &mut Store, msg: WorkerMsg) {
+    match msg {
+        WorkerMsg::Enqueue { delivery, ack } => {
+            let outcome = store
+                .enqueue(
+                    &delivery.delivery_id,
+                    &delivery.event_type,
+                    &delivery.headers,
+                    &delivery.body,
+                    Utc::now(),
+                )
+                .map(|inserted| {
+                    if inserted {
+                        EnqueueOutcome::Enqueued
+                    } else {
+                        EnqueueOutcome::Duplicate
+                    }
+                });
+            // The handler may have timed out and dropped the receiver; the
+            // delivery is durable regardless, so ignore a send failure.
+            let _ = ack.send(outcome);
+        }
+    }
+}
+
+/// Claims and processes one pending delivery (oldest first); returns whether it
+/// did work. A claim error pauses processing (the worker retries on the next
+/// message) rather than spinning.
+fn process_next(store: &mut Store) -> bool {
+    match store.claim_next_delivery() {
+        Ok(Some(delivery)) => {
+            process_one(store, delivery);
+            true
+        }
+        Ok(None) => false,
+        Err(e) => {
+            error!(error = %e, "claim_next_delivery failed; pausing processing");
+            false
         }
     }
 }
@@ -296,17 +323,17 @@ mod tests {
             .enqueue("d-bad", "pull_request", "{}", b"not json", ts)
             .unwrap();
 
-        drain(&mut store);
+        while process_next(&mut store) {}
 
         // All three are closed: nothing remains claimable.
         assert!(store.claim_next_delivery().unwrap().is_none());
     }
 
     #[test]
-    fn drain_is_a_noop_on_empty_queue() {
+    fn process_next_is_false_on_empty_queue() {
         let dir = tempdir().unwrap();
         let mut store = open_store(dir.path());
-        drain(&mut store);
+        assert!(!process_next(&mut store));
         assert!(store.claim_next_delivery().unwrap().is_none());
     }
 
@@ -363,6 +390,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ack_rx.await.unwrap().unwrap(), EnqueueOutcome::Duplicate);
+    }
+
+    #[tokio::test]
+    async fn services_new_intake_with_backlog_present() {
+        let dir = tempdir().unwrap();
+        let db_dir = dir.path().join("o").join("r");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        // Pre-seed a backlog of pending deliveries, then release the lock so the
+        // worker can open the DB and find them waiting.
+        {
+            let mut store = Store::open(&db_dir.join("state.db")).unwrap();
+            for i in 0..50 {
+                store
+                    .enqueue(
+                        &format!("backlog-{i}"),
+                        "pull_request",
+                        "{}",
+                        &pull_request_body(),
+                        Utc::now(),
+                    )
+                    .unwrap();
+            }
+        }
+
+        let registry = WorkerRegistry::new(dir.path());
+        let sender = registry.sender_for("o", "r").await.unwrap();
+
+        // A fresh delivery is still durably enqueued and acked despite the
+        // backlog: intake is serviced ahead of backlog draining, so this ack
+        // does not wait for all 50 to process.
+        let (ack_tx, ack_rx) = oneshot::channel();
+        sender
+            .send(WorkerMsg::Enqueue {
+                delivery: IntakeDelivery {
+                    delivery_id: "fresh".into(),
+                    event_type: "pull_request".into(),
+                    headers: "{}".into(),
+                    body: pull_request_body(),
+                },
+                ack: ack_tx,
+            })
+            .await
+            .unwrap();
+        assert_eq!(ack_rx.await.unwrap().unwrap(), EnqueueOutcome::Enqueued);
     }
 
     #[tokio::test]
