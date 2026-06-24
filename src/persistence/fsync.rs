@@ -1,23 +1,10 @@
 //! Low-level durable filesystem operations.
 //!
 //! These functions ensure data is persisted to disk before returning.
-//! Both file and directory fsyncs are required for crash safety.
-//!
-//! # Why Directory fsync?
-//!
-//! On POSIX systems, creating or renaming a file updates the directory entry.
-//! Without fsync on the directory, this entry may not survive a power loss
-//! even if the file contents were synced. This is a common source of data loss.
-//!
-//! # Fault injection
-//!
-//! Every function here is an instrumented seam: under `cfg(test)`, the
-//! `fault` module can fail the k-th operation on the current thread (or
-//! every operation from the k-th on, modelling a dead disk). Crash-safety
-//! tests use this to sweep "what if the disk failed exactly here?" across
-//! whole multi-step procedures like compaction, instead of hand-simulating
-//! a few chosen crash points. In non-test builds the wrappers compile down
-//! to the bare `std::fs` calls.
+//! Both file and directory fsyncs are required for crash safety. They are the
+//! filesystem primitives the webhook intake spool and the snapshot/generation
+//! file-layout helpers share; the SQLite [`crate::store::Store`] owns its own
+//! durability (WAL) and does not go through here.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -28,8 +15,6 @@ use std::path::Path;
 /// This is equivalent to calling `fsync(2)` on the file descriptor.
 /// After this returns, the file's contents are guaranteed to be on disk.
 pub fn fsync_file(file: &File) -> io::Result<()> {
-    #[cfg(test)]
-    fault::check(fault::OpKind::FsyncFile, Path::new(""))?;
     file.sync_all()
 }
 
@@ -50,169 +35,22 @@ pub fn fsync_file(file: &File) -> io::Result<()> {
 /// on regular files too. However, it's semantically intended for directories
 /// and should only be called with directory paths.
 pub fn fsync_dir(dir_path: &Path) -> io::Result<()> {
-    #[cfg(test)]
-    fault::check(fault::OpKind::FsyncDir, dir_path)?;
     // Open the directory as a file (read-only is sufficient for fsync)
     let dir = OpenOptions::new().read(true).open(dir_path)?;
     dir.sync_all()
 }
 
-/// Renames `from` to `to`.
-///
-/// Identical to [`std::fs::rename`] in non-test builds; exists so that
-/// crash-safety tests can inject a failure at exactly this operation.
-/// Callers in the persistence layer must use this instead of `std::fs`
-/// directly, or the fault-injection sweep silently loses coverage of them.
+/// Renames `from` to `to`. A thin wrapper over [`std::fs::rename`] kept as the
+/// persistence layer's single rename primitive (it had an instrumentation seam
+/// for the now-deleted crash-safety sweep).
 pub fn rename(from: &Path, to: &Path) -> io::Result<()> {
-    #[cfg(test)]
-    fault::check(fault::OpKind::Rename, to)?;
     std::fs::rename(from, to)
 }
 
-/// Removes the file at `path`.
-///
-/// Identical to [`std::fs::remove_file`] in non-test builds; exists so that
-/// crash-safety tests can inject a failure at exactly this operation.
-/// Callers in the persistence layer must use this instead of `std::fs`
-/// directly, or the fault-injection sweep silently loses coverage of them.
+/// Removes the file at `path`. A thin wrapper over [`std::fs::remove_file`],
+/// the persistence layer's single unlink primitive.
 pub fn remove_file(path: &Path) -> io::Result<()> {
-    #[cfg(test)]
-    fault::check(fault::OpKind::RemoveFile, path)?;
     std::fs::remove_file(path)
-}
-
-/// Test-only fault injection for the instrumented operations above.
-///
-/// A thread-local *plan* counts every instrumented operation on the current
-/// thread and decides which ones fail. An injected failure happens **before**
-/// the underlying syscall, so a "failed" rename/unlink leaves the filesystem
-/// untouched — modelling an I/O layer that rejected the request.
-///
-/// # Usage discipline
-///
-/// The plan sees *every* instrumented op on the thread, not just the ones a
-/// test cares about: critical-event appends fsync, `recover` performs many
-/// ops, and the spool module (`spool::delivery`, `spool::drain`) shares
-/// `fsync_file`/`fsync_dir`. Arm immediately before the operation under test
-/// and let the [`ArmedGuard`] disarm immediately after — never hold a plan
-/// across appends, drops, or `recover`. Indices shift whenever the code under
-/// test changes, so locate them with [`FaultMode::Record`] on an identical
-/// setup rather than hardcoding.
-#[cfg(test)]
-pub(crate) mod fault {
-    use std::cell::RefCell;
-    use std::io;
-    use std::path::{Path, PathBuf};
-
-    /// The kind of an instrumented operation.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum OpKind {
-        FsyncFile,
-        FsyncDir,
-        Rename,
-        RemoveFile,
-    }
-
-    /// What an armed plan does to instrumented operations.
-    #[derive(Debug, Clone, Copy)]
-    pub enum FaultMode {
-        /// Fail exactly the op with this 0-based index; all others succeed.
-        FailOnly(usize),
-        /// Fail every op from this 0-based index on (a dead disk).
-        FailFrom(usize),
-        /// Fail nothing; useful purely for the recording.
-        Record,
-    }
-
-    /// One instrumented operation, as recorded by an armed plan.
-    #[derive(Debug, Clone)]
-    pub struct RecordedOp {
-        pub kind: OpKind,
-        /// The operation's primary path: the destination for renames, the
-        /// file or directory path otherwise. Empty for [`OpKind::FsyncFile`],
-        /// where only a file handle is available.
-        pub path: PathBuf,
-    }
-
-    struct Plan {
-        mode: FaultMode,
-        counter: usize,
-        recording: Vec<RecordedOp>,
-    }
-
-    thread_local! {
-        static PLAN: RefCell<Option<Plan>> = const { RefCell::new(None) };
-    }
-
-    /// Arms the thread-local plan. The returned guard disarms it on drop,
-    /// so a panicking test cannot leak an armed plan into the next test on
-    /// the same thread.
-    #[must_use]
-    pub fn arm(mode: FaultMode) -> ArmedGuard {
-        PLAN.with(|p| {
-            let prev = p.borrow_mut().replace(Plan {
-                mode,
-                counter: 0,
-                recording: Vec::new(),
-            });
-            assert!(prev.is_none(), "fault plan armed while already armed");
-        });
-        ArmedGuard { _private: () }
-    }
-
-    /// Disarms the plan on drop; see [`arm`].
-    pub struct ArmedGuard {
-        _private: (),
-    }
-
-    impl ArmedGuard {
-        /// Disarms the plan and returns every operation it observed.
-        pub fn take_recording(self) -> Vec<RecordedOp> {
-            PLAN.with(|p| p.borrow_mut().take())
-                .map(|plan| plan.recording)
-                .unwrap_or_default()
-        }
-    }
-
-    impl Drop for ArmedGuard {
-        fn drop(&mut self) {
-            PLAN.with(|p| p.borrow_mut().take());
-        }
-    }
-
-    /// Called by each instrumented operation before executing. Returns an
-    /// error (and suppresses the operation) if the plan says this op fails.
-    ///
-    /// Injected errors are `ErrorKind::Other`, never `NotFound`: several
-    /// callers deliberately tolerate `NotFound` (idempotent deletes), and an
-    /// injected failure must not be swallowed by those paths.
-    pub(super) fn check(kind: OpKind, path: &Path) -> io::Result<()> {
-        PLAN.with(|p| {
-            let mut p = p.borrow_mut();
-            let Some(plan) = p.as_mut() else {
-                return Ok(());
-            };
-            let index = plan.counter;
-            plan.counter += 1;
-            plan.recording.push(RecordedOp {
-                kind,
-                path: path.to_path_buf(),
-            });
-            let fail = match plan.mode {
-                FaultMode::FailOnly(k) => index == k,
-                FaultMode::FailFrom(k) => index >= k,
-                FaultMode::Record => false,
-            };
-            if fail {
-                Err(io::Error::other(format!(
-                    "injected fault: op {index} ({kind:?}) on {}",
-                    path.display()
-                )))
-            } else {
-                Ok(())
-            }
-        })
-    }
 }
 
 #[cfg(test)]
@@ -265,30 +103,15 @@ mod tests {
     }
 
     #[test]
-    fn fault_fail_only_fails_exactly_that_op_and_suppresses_it() {
+    fn rename_then_remove_round_trips() {
         let dir = tempdir().unwrap();
         let a = dir.path().join("a");
         let b = dir.path().join("b");
         File::create(&a).unwrap();
 
-        let guard = fault::arm(fault::FaultMode::FailOnly(1));
-        // Op 0 succeeds.
         rename(&a, &b).unwrap();
-        // Op 1 fails, and the underlying operation must not be performed.
-        let err = remove_file(&b).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::Other, "never NotFound: {err}");
-        assert!(b.exists(), "an injected failure must suppress the op");
-        // Op 2 succeeds again.
+        assert!(b.exists() && !a.exists());
         remove_file(&b).unwrap();
-
-        let ops = guard.take_recording();
-        assert_eq!(ops.len(), 3, "every instrumented op is recorded");
-        assert_eq!(ops[0].kind, fault::OpKind::Rename);
-        assert_eq!(ops[0].path, b, "renames record their destination");
-        assert_eq!(ops[1].kind, fault::OpKind::RemoveFile);
-
-        // The guard disarmed the plan: ops run bare again.
-        File::create(&a).unwrap();
-        remove_file(&a).unwrap();
+        assert!(!b.exists());
     }
 }
