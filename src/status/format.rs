@@ -254,6 +254,7 @@ mod tests {
                         cascade_phase,
                         predecessor_pr: None,
                         predecessor_head_sha: None,
+                        last_squash_parent_sha: None,
                         started_at,
                         status_comment_id: None,
                     }

@@ -1268,6 +1268,7 @@ mod tests {
             current_pr: PrNumber(200),
             predecessor_pr: Some(PrNumber(99)),
             last_squash_sha: Some(sha.clone()),
+            last_squash_parent: Some(sha.clone()),
             phase: CascadePhase::Reconciling {
                 progress: DescendantProgress::new(vec![PrNumber(201), PrNumber(202)]),
                 squash_sha: sha,
