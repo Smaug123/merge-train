@@ -29,6 +29,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use chrono::Utc;
 use thiserror::Error;
@@ -92,6 +93,11 @@ pub enum WorkerError {
     Unavailable,
 }
 
+/// `(owner, repo)`.
+type RepoKey = (String, String);
+/// Per-repo creation guards (an async lock per repo); see [`WorkerRegistry`].
+type CreationGuards = HashMap<RepoKey, Arc<Mutex<()>>>;
+
 /// The set of live per-repo workers, keyed by `(owner, repo)`.
 ///
 /// Workers are spawned lazily on the first delivery for a repo and live for the
@@ -99,10 +105,15 @@ pub enum WorkerError {
 /// sender; it never holds a `Store`.
 pub struct WorkerRegistry {
     state_dir: PathBuf,
-    /// An async mutex so worker *creation* (which awaits the worker thread's
-    /// `Store::open`) is serialized without two concurrent first-deliveries for
-    /// the same new repo racing two `Store::open`s into a spurious lock conflict.
-    workers: Mutex<HashMap<(String, String), mpsc::Sender<WorkerMsg>>>,
+    /// Live per-repo mailbox senders. Guarded by a *sync* mutex held only for the
+    /// brief get/insert — never across an `.await` — so a slow worker startup for
+    /// one repo can't block routing to another (Codex review #53).
+    workers: std::sync::Mutex<HashMap<RepoKey, mpsc::Sender<WorkerMsg>>>,
+    /// Per-repo creation guards. Holding a repo's guard across its `Store::open`
+    /// single-flights that repo's worker creation (so two concurrent
+    /// first-deliveries can't race two opens into a spurious lock conflict)
+    /// *without* serializing creation across different repos.
+    creating: std::sync::Mutex<CreationGuards>,
 }
 
 impl WorkerRegistry {
@@ -111,7 +122,8 @@ impl WorkerRegistry {
     pub fn new(state_dir: impl Into<PathBuf>) -> Self {
         WorkerRegistry {
             state_dir: state_dir.into(),
-            workers: Mutex::new(HashMap::new()),
+            workers: std::sync::Mutex::new(HashMap::new()),
+            creating: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -129,24 +141,62 @@ impl WorkerRegistry {
         repo: &str,
     ) -> Result<mpsc::Sender<WorkerMsg>, WorkerError> {
         let key = (owner.to_owned(), repo.to_owned());
-        let mut workers = self.workers.lock().await;
 
-        // A live worker already owns this repo.
-        if let Some(tx) = workers.get(&key) {
-            if !tx.is_closed() {
-                return Ok(tx.clone());
-            }
-            // The worker died; drop the stale sender and respawn below (its
-            // `Store` was dropped, so the lock is free again).
-            workers.remove(&key);
+        // Fast path: a live worker already owns this repo.
+        if let Some(tx) = self.live_sender(&key) {
+            return Ok(tx);
         }
 
-        let db_path = self.state_dir.join(owner).join(repo).join("state.db");
+        // Slow path: single-flight creation under *this repo's* guard (an async
+        // lock, safe to hold across the `Store::open` await). Different repos use
+        // different guards, so a slow open never blocks routing to another repo.
+        let guard = self.creation_guard(&key);
+        let _creating = guard.lock().await;
+
+        // Re-check: another task may have finished creating it while we waited.
+        if let Some(tx) = self.live_sender(&key) {
+            return Ok(tx);
+        }
+
+        let tx = self.spawn_worker(&key).await?;
+        self.workers.lock().unwrap().insert(key, tx.clone());
+        Ok(tx)
+    }
+
+    /// Returns a live sender for `key`, evicting a stale (dead-worker) entry.
+    fn live_sender(&self, key: &RepoKey) -> Option<mpsc::Sender<WorkerMsg>> {
+        let mut workers = self.workers.lock().unwrap();
+        match workers.get(key) {
+            Some(tx) if !tx.is_closed() => Some(tx.clone()),
+            // The worker died; drop the stale sender (its `Store` was dropped, so
+            // the lock is free) and let the caller respawn.
+            Some(_) => {
+                workers.remove(key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// The per-repo creation guard, created on first need.
+    fn creation_guard(&self, key: &RepoKey) -> Arc<Mutex<()>> {
+        self.creating
+            .lock()
+            .unwrap()
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    /// Spawns a worker thread that opens the repo's `Store` (acquiring the lock)
+    /// on its own thread and reports readiness; returns its mailbox sender.
+    async fn spawn_worker(&self, key: &RepoKey) -> Result<mpsc::Sender<WorkerMsg>, WorkerError> {
+        let db_path = self.state_dir.join(&key.0).join(&key.1).join("state.db");
         let (tx, rx) = mpsc::channel(MAILBOX_CAPACITY);
         let (ready_tx, ready_rx) = oneshot::channel();
 
         std::thread::Builder::new()
-            .name(format!("worker-{owner}-{repo}"))
+            .name(format!("worker-{}-{}", key.0, key.1))
             .spawn(move || match Store::open(&db_path) {
                 Ok(store) => {
                     // Tell the registrar we're live before we start draining.
@@ -162,10 +212,7 @@ impl WorkerRegistry {
             .map_err(|_| WorkerError::Unavailable)?;
 
         match ready_rx.await {
-            Ok(Ok(())) => {
-                workers.insert(key, tx.clone());
-                Ok(tx)
-            }
+            Ok(Ok(())) => Ok(tx),
             Ok(Err(e)) => Err(WorkerError::Open(e)),
             // The thread vanished before reporting (e.g. it panicked in open).
             Err(_) => Err(WorkerError::Unavailable),
@@ -194,12 +241,26 @@ fn run(mut store: Store, mut rx: mpsc::Receiver<WorkerMsg>) {
                 Err(mpsc::error::TryRecvError::Disconnected) => return,
             }
         }
-        // Process one unit of backlog, then loop back to re-check intake. With
-        // nothing to process, block until the next message (or shutdown).
-        if !process_next(&mut store) {
-            match rx.blocking_recv() {
+        // Process one unit of backlog, then loop back to re-check intake.
+        match process_next(&mut store) {
+            // Did work: re-check intake, then process the next.
+            Ok(true) => {}
+            // Nothing to process: block until the next message (or shutdown).
+            Ok(false) => match rx.blocking_recv() {
                 Some(msg) => handle_msg(&mut store, msg),
                 None => return,
+            },
+            // A Store error means we can no longer characterize this repo's
+            // state. Stop the worker: dropping the `Store` releases the lock, and
+            // the next delivery respawns a worker whose `Store::open` re-runs the
+            // `processing`->`pending` recovery, requeueing whatever was claimed
+            // (Codex review #53). Failing fast beats holding a wedged Store open
+            // for the process lifetime — which would strand the claimed delivery,
+            // since open-recovery never re-runs while this worker lives — and
+            // beats hot-looping a retry against a persistently broken store.
+            Err(e) => {
+                error!(error = %e, "fatal store error; stopping worker (it will respawn and recover)");
+                return;
             }
         }
     }
@@ -231,20 +292,16 @@ fn handle_msg(store: &mut Store, msg: WorkerMsg) {
     }
 }
 
-/// Claims and processes one pending delivery (oldest first); returns whether it
-/// did work. A claim error pauses processing (the worker retries on the next
-/// message) rather than spinning.
-fn process_next(store: &mut Store) -> bool {
-    match store.claim_next_delivery() {
-        Ok(Some(delivery)) => {
-            process_one(store, delivery);
-            true
+/// Claims and processes one pending delivery (oldest first). Returns `Ok(true)`
+/// if it did work, `Ok(false)` if the queue was empty, or `Err` if the Store
+/// failed (fatal — see [`run`]).
+fn process_next(store: &mut Store) -> Result<bool, StoreError> {
+    match store.claim_next_delivery()? {
+        Some(delivery) => {
+            process_one(store, delivery)?;
+            Ok(true)
         }
-        Ok(None) => false,
-        Err(e) => {
-            error!(error = %e, "claim_next_delivery failed; pausing processing");
-            false
-        }
+        None => Ok(false),
     }
 }
 
@@ -256,28 +313,26 @@ fn process_next(store: &mut Store) -> bool {
 /// becomes: compute the [`crate::spool::DedupeKey`]; skip if `store.is_duplicate`;
 /// else `handle_event` → `commit_delivery(id, events, Some(key))`. The other two
 /// arms (ignored type / malformed) stay as effect-free closes.
-fn process_one(store: &mut Store, delivery: Delivery) {
+fn process_one(store: &mut Store, delivery: Delivery) -> Result<(), StoreError> {
     let id = delivery.delivery_id.clone();
     match parse_webhook(&delivery.event_type, &delivery.body) {
-        Ok(Some(_event)) => {
-            // ENGINE SEAM: no events, no dedupe key yet — just close.
-            close(store, &id, "parsed");
-        }
+        // ENGINE SEAM: no events, no dedupe key yet — just close.
+        Ok(Some(_event)) => close(store, &id, "parsed"),
         Ok(None) => close(store, &id, "ignored event type"),
         Err(e) => {
             warn!(delivery_id = %id, error = %e, "malformed webhook; closing");
-            close(store, &id, "malformed");
+            close(store, &id, "malformed")
         }
     }
 }
 
-/// Closes a delivery with no state events (the effect-free path).
-fn close(store: &mut Store, delivery_id: &str, reason: &str) {
-    match store.commit_delivery(delivery_id, &[], None, Utc::now()) {
-        Ok(()) => info!(delivery_id, reason, "delivery closed"),
-        // The delivery stays `processing`; the next `Store::open` requeues it.
-        Err(e) => error!(delivery_id, error = %e, "commit_delivery failed"),
-    }
+/// Closes a delivery with no state events (the effect-free path). A failure here
+/// is fatal to the worker (see [`run`]): on respawn, `Store::open` requeues the
+/// still-`processing` row.
+fn close(store: &mut Store, delivery_id: &str, reason: &str) -> Result<(), StoreError> {
+    store.commit_delivery(delivery_id, &[], None, Utc::now())?;
+    info!(delivery_id, reason, "delivery closed");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -323,7 +378,7 @@ mod tests {
             .enqueue("d-bad", "pull_request", "{}", b"not json", ts)
             .unwrap();
 
-        while process_next(&mut store) {}
+        while process_next(&mut store).unwrap() {}
 
         // All three are closed: nothing remains claimable.
         assert!(store.claim_next_delivery().unwrap().is_none());
@@ -333,8 +388,33 @@ mod tests {
     fn process_next_is_false_on_empty_queue() {
         let dir = tempdir().unwrap();
         let mut store = open_store(dir.path());
-        assert!(!process_next(&mut store));
+        assert!(!process_next(&mut store).unwrap());
         assert!(store.claim_next_delivery().unwrap().is_none());
+    }
+
+    #[test]
+    fn delivery_left_processing_is_recovered_on_reopen() {
+        // The recovery the fatal-error path relies on (Codex review #53): a
+        // delivery claimed but never closed (a worker that stopped mid-process)
+        // is requeued by the next `Store::open` and then drained.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        {
+            let mut store = Store::open(&path).unwrap();
+            store
+                .enqueue("d1", "pull_request", "{}", &pull_request_body(), Utc::now())
+                .unwrap();
+            // Claim (-> processing), then drop without closing (the worker died).
+            assert!(store.claim_next_delivery().unwrap().is_some());
+        }
+
+        // A fresh worker: open requeues the stranded row, the loop drains it.
+        let mut store = Store::open(&path).unwrap();
+        while process_next(&mut store).unwrap() {}
+        assert!(
+            store.claim_next_delivery().unwrap().is_none(),
+            "the stranded delivery was recovered and closed"
+        );
     }
 
     #[test]
