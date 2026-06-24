@@ -190,8 +190,9 @@ impl Store {
     /// later stage's bootstrap introduces non-event state), `replay() ==
     /// state()`.
     pub fn replay(&self) -> Result<RepoState, StoreError> {
-        let mut state =
-            RepoState::from_snapshot(PersistedRepoSnapshot::new(self.state.default_branch.clone()));
+        let mut state = RepoState::from_snapshot(PersistedRepoSnapshot::new(
+            self.state.default_branch.clone(),
+        ));
         let mut stmt = self
             .conn
             .prepare("SELECT seq, ts, payload FROM events ORDER BY seq")?;
