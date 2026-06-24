@@ -26,6 +26,9 @@ chrono = { version = "0.4", features = ["serde"] }
 # File locking
 fs2 = "0.4"
 
+# SQLite storage (bundled = vendored SQLite compiled from source, no system dep)
+rusqlite = { version = "0.32", features = ["bundled"] }
+
 # Error handling
 thiserror = "2"
 anyhow = "1"
