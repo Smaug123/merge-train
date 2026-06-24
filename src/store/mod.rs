@@ -29,7 +29,7 @@ use rusqlite::{Connection, OptionalExtension};
 use thiserror::Error;
 
 use crate::persistence::event::{StateEvent, StateEventPayload};
-use crate::persistence::snapshot::PersistedRepoSnapshot;
+use crate::persistence::snapshot::{PersistedRepoSnapshot, SCHEMA_VERSION};
 use crate::state::RepoState;
 
 /// Schema version for the SQLite store. Bump on a breaking schema change; a DB
@@ -51,13 +51,22 @@ pub enum StoreError {
     /// Another process holds the per-repo lock.
     #[error("another process holds the lock for {0}")]
     Locked(PathBuf),
-    /// The DB was written by an incompatible schema version.
+    /// The DB was written by an incompatible store schema version.
     #[error("schema version mismatch: store is v{found}, this build expects v{expected}")]
     SchemaMismatch {
         /// The version this build understands.
         expected: i64,
         /// The version found in the DB.
         found: i64,
+    },
+    /// The cached `repo_state` row was written by an incompatible snapshot
+    /// schema version (separate from the SQLite store schema above).
+    #[error("cached state schema mismatch: snapshot is v{found}, this build expects v{expected}")]
+    CachedStateSchemaMismatch {
+        /// The snapshot schema version this build understands.
+        expected: u32,
+        /// The version found in the cached row.
+        found: u32,
     },
 }
 
@@ -238,6 +247,15 @@ fn load_cached(conn: &Connection) -> Result<(RepoState, u64), StoreError> {
     match cached {
         Some(json) => {
             let snapshot: PersistedRepoSnapshot = serde_json::from_str(&json)?;
+            // Validate the snapshot format version too — a row written by an
+            // incompatible build that still happens to deserialize must fail
+            // loud, not be silently materialized (Codex review #50).
+            if snapshot.schema_version != SCHEMA_VERSION {
+                return Err(StoreError::CachedStateSchemaMismatch {
+                    expected: SCHEMA_VERSION,
+                    found: snapshot.schema_version,
+                });
+            }
             let next_seq = snapshot.next_seq;
             Ok((RepoState::from_snapshot(snapshot), next_seq))
         }
@@ -348,6 +366,51 @@ mod tests {
             }
             Ok(_) => panic!("expected SchemaMismatch, got a store"),
             Err(e) => panic!("expected SchemaMismatch, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn cached_state_schema_mismatch_fails_loud() {
+        use crate::types::PrNumber;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        {
+            let mut store = Store::open(&path).unwrap();
+            store
+                .append(
+                    StateEventPayload::TrainStarted {
+                        root_pr: PrNumber(1),
+                        current_pr: PrNumber(1),
+                    },
+                    test_timestamp(),
+                )
+                .unwrap();
+        }
+
+        // Rewrite the cached row with an incompatible snapshot schema version
+        // that still deserializes.
+        {
+            let conn = Connection::open(&path).unwrap();
+            let json: String = conn
+                .query_row("SELECT snapshot FROM repo_state WHERE id = 0", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            let mut snap: PersistedRepoSnapshot = serde_json::from_str(&json).unwrap();
+            snap.schema_version = SCHEMA_VERSION + 1;
+            let bad = serde_json::to_string(&snap).unwrap();
+            conn.execute("UPDATE repo_state SET snapshot = ?1 WHERE id = 0", [bad])
+                .unwrap();
+        }
+
+        match Store::open(&path) {
+            Err(StoreError::CachedStateSchemaMismatch { expected, found }) => {
+                assert_eq!(expected, SCHEMA_VERSION);
+                assert_eq!(found, SCHEMA_VERSION + 1);
+            }
+            Ok(_) => panic!("expected CachedStateSchemaMismatch, got a store"),
+            Err(e) => panic!("expected CachedStateSchemaMismatch, got {e:?}"),
         }
     }
 }
