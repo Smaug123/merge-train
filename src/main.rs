@@ -14,10 +14,7 @@ struct Config {
     /// Address to bind the HTTP server to.
     listen_addr: SocketAddr,
 
-    /// Directory for spooling webhook deliveries.
-    spool_dir: PathBuf,
-
-    /// Directory for persisted repository state.
+    /// Root for per-repo state DBs (`<state_dir>/<owner>/<repo>/state.db`).
     state_dir: PathBuf,
 
     /// Secret for verifying webhook signatures. Non-empty.
@@ -42,17 +39,13 @@ fn webhook_secret_from(value: Option<String>) -> Result<Vec<u8>, &'static str> {
 impl Config {
     /// Loads configuration from environment variables.
     ///
-    /// `LISTEN_ADDR`, `SPOOL_DIR`, and `STATE_DIR` have defaults;
-    /// `WEBHOOK_SECRET` is required (see [`webhook_secret_from`]).
+    /// `LISTEN_ADDR` and `STATE_DIR` have defaults; `WEBHOOK_SECRET` is
+    /// required (see [`webhook_secret_from`]).
     fn from_env() -> Result<Self, &'static str> {
         let listen_addr = std::env::var("LISTEN_ADDR")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 3000)));
-
-        let spool_dir = std::env::var("SPOOL_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("./data/spool"));
 
         let state_dir = std::env::var("STATE_DIR")
             .map(PathBuf::from)
@@ -62,7 +55,6 @@ impl Config {
 
         Ok(Config {
             listen_addr,
-            spool_dir,
             state_dir,
             webhook_secret,
         })
@@ -89,13 +81,12 @@ async fn main() {
     };
 
     tracing::info!(
-        spool_dir = %config.spool_dir.display(),
         state_dir = %config.state_dir.display(),
         "Starting merge train bot"
     );
 
     // Create application state
-    let app_state = AppState::new(config.spool_dir, config.state_dir, config.webhook_secret);
+    let app_state = AppState::new(config.state_dir, config.webhook_secret);
 
     // Build router
     let app = build_router(app_state);

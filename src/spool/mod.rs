@@ -1,43 +1,17 @@
-//! Webhook delivery spool for crash-safe event processing.
+//! Deduplication keys for webhook deliveries.
 //!
-//! This module provides a durable queue for webhook deliveries using the filesystem.
-//! Each delivery progresses through states using marker files:
+//! GitHub may redeliver the same logical event under new delivery IDs. A
+//! [`DedupeKey`] identifies the *logical* event (e.g. a comment id, a PR head
+//! sha) so a redelivery can be recognized and skipped.
 //!
-//! ```text
-//! <delivery-id>.json       - pending (contains payload)
-//! <delivery-id>.json.proc  - processing (empty marker: worker claimed it)
-//! <delivery-id>.json.done  - processed (empty marker: state effects persisted)
-//! ```
-//!
-//! # Crash Safety
-//!
-//! - Payload files are written atomically using temp file + hard_link + fsync + dir fsync.
-//!   The hard_link operation fails atomically with EEXIST if the target already exists,
-//!   providing both atomicity and duplicate detection in a single syscall.
-//! - Marker files use temp file + rename + fsync + dir fsync (empty files, creation atomic).
-//! - On recovery, deliveries with `.proc` but no `.done` are reprocessed.
-//!
-//! # Ordering
-//!
-//! Each envelope records a monotonic arrival marker at intake; drains replay
-//! in `(arrival, delivery_id)` order. Event-priority ordering is applied by
-//! the engine after parsing, not by the spool.
-//!
-//! # Deduplication
-//!
-//! GitHub may redeliver webhooks with new delivery IDs for the same logical event.
-//! The dedupe module provides keys that identify logical events for deduplication.
+//! The durable queue itself now lives in the SQLite [`crate::store::Store`]
+//! (the `deliveries` and `dedupe_keys` tables); the per-repo worker
+//! ([`crate::worker`]) drains it. The filesystem marker-spool that used to live
+//! here has been deleted.
 
 pub mod dedupe;
-pub mod delivery;
-pub mod drain;
 
 pub use dedupe::{
     DEFAULT_DEDUPE_TTL_HOURS, DedupeKey, extract_dedupe_key, is_duplicate, mark_seen,
     prune_expired_keys, prune_expired_keys_default,
 };
-pub use delivery::{
-    ArrivalMarker, ClaimOutcome, EmptyEventType, SpoolError, SpooledDelivery, WebhookEnvelope,
-    mark_done, mark_processing, spool_webhook,
-};
-pub use drain::{cleanup_interrupted_processing, drain_pending};

@@ -1,6 +1,12 @@
 //! State inspection endpoint for observability.
 //!
 //! Provides a read-only view of repository state for debugging and monitoring.
+//!
+//! NOTE (migration): this still reads the legacy filesystem snapshot
+//! (`snapshot.N.json`), which the live system no longer writes now that intake
+//! goes to the SQLite `Store`. So in production it currently 404s. Repointing
+//! it at the `Store` (via a read-only connection — WAL lets it read without
+//! blocking the worker's writer) is a tracked follow-up.
 
 use axum::Json;
 use axum::extract::{Path, State};

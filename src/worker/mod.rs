@@ -310,6 +310,22 @@ mod tests {
         assert!(store.claim_next_delivery().unwrap().is_none());
     }
 
+    #[test]
+    fn enqueued_body_is_stored_verbatim() {
+        // The exact signed bytes must survive for the worker's `parse_webhook`:
+        // no serde round-trip that would collapse duplicate keys or whitespace.
+        let dir = tempdir().unwrap();
+        let mut store = open_store(dir.path());
+        let raw: &[u8] = br#"{ "action": "opened",  "action": "closed",
+            "repository": { "name": "r", "owner": { "login": "o" } } }"#;
+
+        store
+            .enqueue("d1", "pull_request", "{}", raw, Utc::now())
+            .unwrap();
+        let claimed = store.claim_next_delivery().unwrap().unwrap();
+        assert_eq!(claimed.body, raw, "stored body must be byte-identical");
+    }
+
     #[tokio::test]
     async fn registry_routes_enqueue_and_processes() {
         let dir = tempdir().unwrap();

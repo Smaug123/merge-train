@@ -1,13 +1,15 @@
 //! HTTP server for the merge train bot.
 //!
 //! This module implements the HTTP server that:
-//! - Accepts webhooks from GitHub, validates signatures, and spools them durably
+//! - Accepts webhooks from GitHub, validates signatures, and hands each to the
+//!   repo's worker, which durably enqueues it before the handler replies
 //! - Provides state inspection endpoints for observability
 //! - Provides health checks for liveness probes
 //!
 //! # Endpoints
 //!
-//! - `POST /webhook` - Accepts GitHub webhook deliveries (returns 202 Accepted)
+//! - `POST /webhook` - Accepts GitHub webhook deliveries (returns 200 once the
+//!   delivery is durably enqueued on the repo's worker)
 //! - `GET /api/v1/repos/{owner}/{repo}/state` - Returns repository state as JSON
 //! - `GET /health` - Returns 200 if server is running
 //!
@@ -25,6 +27,8 @@ use std::sync::Arc;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use thiserror::Error;
+
+use crate::worker::WorkerRegistry;
 
 pub mod health;
 pub mod state;
@@ -80,56 +84,47 @@ pub fn validate_path_component(s: &str) -> Result<(), InvalidPathComponent> {
 
 /// Shared application state.
 ///
-/// This is passed to all handlers via Axum's `State` extractor.
-/// It contains the configuration needed for webhook processing
-/// and state inspection.
+/// Passed to every handler via Axum's `State` extractor. It owns the
+/// [`WorkerRegistry`] (the per-repo workers the webhook handler routes
+/// deliveries to) and the webhook signing secret. The async server never
+/// touches a `Store` directly — only the workers do (plan P1-H).
 #[derive(Clone)]
 pub struct AppState {
     inner: Arc<AppStateInner>,
 }
 
 struct AppStateInner {
-    /// Directory where webhook deliveries are spooled.
-    spool_dir: PathBuf,
-
-    /// Directory where repository state is persisted.
-    /// Structure: `<state_dir>/<owner>/<repo>/snapshot.<gen>.json`
-    state_dir: PathBuf,
+    /// The per-repo worker registry; owns the repos' DBs (under `state_dir`).
+    workers: WorkerRegistry,
 
     /// Webhook secret for HMAC-SHA256 signature verification.
     webhook_secret: Vec<u8>,
 }
 
 impl AppState {
-    /// Creates a new `AppState` with the given configuration.
+    /// Creates a new `AppState`.
     ///
     /// # Arguments
     ///
-    /// * `spool_dir` - Directory for spooling webhook deliveries
-    /// * `state_dir` - Directory for persisted repository state
+    /// * `state_dir` - Root for per-repo state DBs (`<state_dir>/<owner>/<repo>/state.db`)
     /// * `webhook_secret` - Secret for verifying webhook signatures
-    pub fn new(
-        spool_dir: impl Into<PathBuf>,
-        state_dir: impl Into<PathBuf>,
-        webhook_secret: impl Into<Vec<u8>>,
-    ) -> Self {
+    pub fn new(state_dir: impl Into<PathBuf>, webhook_secret: impl Into<Vec<u8>>) -> Self {
         AppState {
             inner: Arc::new(AppStateInner {
-                spool_dir: spool_dir.into(),
-                state_dir: state_dir.into(),
+                workers: WorkerRegistry::new(state_dir),
                 webhook_secret: webhook_secret.into(),
             }),
         }
     }
 
-    /// Returns the spool directory path.
-    pub fn spool_dir(&self) -> &PathBuf {
-        &self.inner.spool_dir
+    /// Returns the per-repo worker registry.
+    pub fn workers(&self) -> &WorkerRegistry {
+        &self.inner.workers
     }
 
     /// Returns the state directory path.
     pub fn state_dir(&self) -> &PathBuf {
-        &self.inner.state_dir
+        self.inner.workers.state_dir()
     }
 
     /// Returns the webhook secret.
@@ -249,12 +244,11 @@ mod integration_tests {
     use crate::persistence::snapshot::{PersistedRepoSnapshot, save_snapshot_atomic};
     use crate::webhooks::{compute_signature, format_signature_header};
 
-    /// Creates a test app state with temporary directories.
-    fn test_app_state(secret: &[u8]) -> (AppState, tempfile::TempDir, tempfile::TempDir) {
-        let spool_dir = tempdir().unwrap();
+    /// Creates a test app state rooted at a temporary state directory.
+    fn test_app_state(secret: &[u8]) -> (AppState, tempfile::TempDir) {
         let state_dir = tempdir().unwrap();
-        let state = AppState::new(spool_dir.path(), state_dir.path(), secret.to_vec());
-        (state, spool_dir, state_dir)
+        let state = AppState::new(state_dir.path(), secret.to_vec());
+        (state, state_dir)
     }
 
     /// Creates a valid webhook request with proper signature from raw body bytes.
@@ -293,7 +287,7 @@ mod integration_tests {
 
     #[tokio::test]
     async fn health_returns_200() {
-        let (state, _spool, _state_dir) = test_app_state(b"secret");
+        let (state, _state_dir) = test_app_state(b"secret");
         let app = build_router(state);
 
         let request = Request::builder()
@@ -312,9 +306,9 @@ mod integration_tests {
     // ─── Webhook endpoint tests ───
 
     #[tokio::test]
-    async fn webhook_valid_returns_202() {
+    async fn webhook_valid_returns_200() {
         let secret = b"test-secret";
-        let (state, spool_dir, _state_dir) = test_app_state(secret);
+        let (state, _state_dir) = test_app_state(secret);
         let app = build_router(state);
 
         let body = serde_json::json!({
@@ -336,17 +330,16 @@ mod integration_tests {
 
         let response = app.oneshot(request).await.unwrap();
 
-        assert_eq!(response.status(), StatusCode::ACCEPTED);
-
-        // Verify file appears in spool directory
-        let repo_spool = spool_dir.path().join("octocat").join("hello-world");
-        let payload_file = repo_spool.join("550e8400-e29b-41d4-a716-446655440000.json");
-        assert!(payload_file.exists(), "Webhook should be spooled to disk");
+        // 200 means the worker durably enqueued the delivery (it acked before
+        // the handler replied). The durable-INSERT itself is covered by the
+        // worker/Store tests; here we can't open the Store (the worker holds
+        // its lock), so we assert the contract at the HTTP boundary.
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
     async fn webhook_invalid_signature_returns_401() {
-        let (state, spool_dir, _state_dir) = test_app_state(b"correct-secret");
+        let (state, state_dir) = test_app_state(b"correct-secret");
         let app = build_router(state);
 
         // Sign with wrong secret
@@ -371,18 +364,19 @@ mod integration_tests {
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
-        // Verify no file in spool directory
-        let repo_spool = spool_dir.path().join("octocat").join("hello-world");
+        // Rejection happens before routing, so no worker is spawned and no DB
+        // is created for the repo.
+        let repo_db = state_dir.path().join("octocat").join("hello-world");
         assert!(
-            !repo_spool.exists(),
-            "No spool directory should be created for invalid signature"
+            !repo_db.exists(),
+            "no per-repo state should be created for an unauthenticated request"
         );
     }
 
     #[tokio::test]
     async fn webhook_missing_event_header_returns_400() {
         let secret = b"test-secret";
-        let (state, _spool, _state_dir) = test_app_state(secret);
+        let (state, _state_dir) = test_app_state(secret);
         let app = build_router(state);
 
         let body = serde_json::json!({
@@ -413,7 +407,7 @@ mod integration_tests {
     #[tokio::test]
     async fn webhook_missing_repository_returns_400() {
         let secret = b"test-secret";
-        let (state, _spool, _state_dir) = test_app_state(secret);
+        let (state, _state_dir) = test_app_state(secret);
         let app = build_router(state);
 
         // Body without repository field
@@ -434,9 +428,11 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn webhook_duplicate_delivery_returns_202() {
+    async fn webhook_duplicate_delivery_returns_200() {
         let secret = b"test-secret";
-        let (state, _spool, _state_dir) = test_app_state(secret);
+        let (state, _state_dir) = test_app_state(secret);
+        // Both requests share one AppState (hence one worker), so the second
+        // hits the same Store and is recognised as a redelivery.
         let app = build_router(state.clone());
 
         let body = serde_json::json!({
@@ -449,18 +445,15 @@ mod integration_tests {
 
         let delivery_id = "550e8400-e29b-41d4-a716-446655440004";
 
-        // First request
         let request = create_webhook_request(secret, "pull_request", delivery_id, &body);
         let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(response.status(), StatusCode::OK);
 
-        // Second request with same delivery ID (duplicate)
+        // Same delivery id again: idempotent, still 200.
         let app2 = build_router(state);
         let request2 = create_webhook_request(secret, "pull_request", delivery_id, &body);
         let response2 = app2.oneshot(request2).await.unwrap();
-
-        // Should still return 202 (idempotent)
-        assert_eq!(response2.status(), StatusCode::ACCEPTED);
+        assert_eq!(response2.status(), StatusCode::OK);
     }
 
     /// GitHub sends webhook payloads up to 25MB. The default axum body limit
@@ -469,7 +462,7 @@ mod integration_tests {
     #[tokio::test]
     async fn webhook_large_body_within_25mb_accepted() {
         let secret = b"test-secret";
-        let (state, _spool, _state_dir) = test_app_state(secret);
+        let (state, _state_dir) = test_app_state(secret);
         let app = build_router(state);
 
         // 3MB payload: above the 2MB axum default, below the 25MB GitHub max.
@@ -491,14 +484,14 @@ mod integration_tests {
         );
 
         let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     /// Bodies over the documented 25MB GitHub maximum are rejected.
     #[tokio::test]
     async fn webhook_body_over_25mb_rejected() {
         let secret = b"test-secret";
-        let (state, _spool, _state_dir) = test_app_state(secret);
+        let (state, _state_dir) = test_app_state(secret);
         let app = build_router(state);
 
         let padding = "x".repeat(26 * 1024 * 1024);
@@ -526,7 +519,7 @@ mod integration_tests {
     #[tokio::test]
     async fn webhook_empty_event_header_returns_400() {
         let secret = b"test-secret";
-        let (state, _spool, _state_dir) = test_app_state(secret);
+        let (state, _state_dir) = test_app_state(secret);
         let app = build_router(state);
 
         let body = serde_json::json!({
@@ -558,7 +551,7 @@ mod integration_tests {
     #[tokio::test]
     async fn webhook_invalid_delivery_id_returns_400() {
         let secret = b"test-secret";
-        let (state, spool_dir, _state_dir) = test_app_state(secret);
+        let (state, _state_dir) = test_app_state(secret);
         let app = build_router(state);
 
         let body = serde_json::json!({
@@ -569,21 +562,11 @@ mod integration_tests {
             }
         });
 
-        // Leading dot: passes naive path checks but is rejected by the spool
-        // (hidden files conflict with marker handling).
+        // Leading dot is rejected by `DeliveryId::parse`.
         let request = create_webhook_request(secret, "pull_request", ".hidden-delivery", &body);
 
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-
-        let entries: Vec<_> = std::fs::read_dir(spool_dir.path())
-            .unwrap()
-            .map(|e| e.unwrap())
-            .collect();
-        assert!(
-            entries.is_empty(),
-            "Spool directory should be empty after rejected request"
-        );
     }
 
     /// A missing X-Hub-Signature-256 header is an authentication failure (401),
@@ -591,7 +574,7 @@ mod integration_tests {
     #[tokio::test]
     async fn webhook_missing_signature_returns_401() {
         let secret = b"test-secret";
-        let (state, _spool, _state_dir) = test_app_state(secret);
+        let (state, _state_dir) = test_app_state(secret);
         let app = build_router(state);
 
         let body = serde_json::json!({
@@ -615,60 +598,16 @@ mod integration_tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
-    /// The spooled envelope must store the raw signed body bytes so the stored
-    /// X-Hub-Signature-256 can be re-verified against the stored body.
-    ///
-    /// A re-serialized `serde_json::Value` silently collapses duplicate JSON
-    /// keys and changes formatting, making the stored signature useless.
-    #[tokio::test]
-    async fn webhook_spools_raw_signed_body_bytes() {
-        let secret = b"test-secret";
-        let (state, spool_dir, _state_dir) = test_app_state(secret);
-        let app = build_router(state);
-
-        // Duplicate "action" keys and unusual whitespace: any re-serialization
-        // would not be byte-identical.
-        let raw_body: &[u8] = br#"{ "action": "opened",  "action": "closed",
-            "repository": { "name": "hello-world", "owner": { "login": "octocat" } } }"#;
-
-        let delivery_id = "550e8400-e29b-41d4-a716-446655440024";
-        let request =
-            create_webhook_request_raw(secret, "pull_request", delivery_id, raw_body.to_vec());
-
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::ACCEPTED);
-
-        let payload_path = spool_dir
-            .path()
-            .join("octocat")
-            .join("hello-world")
-            .join(format!("{delivery_id}.json"));
-        let stored = std::fs::read(&payload_path).unwrap();
-        let envelope: serde_json::Value = serde_json::from_slice(&stored).unwrap();
-
-        let stored_body = envelope["body"]
-            .as_str()
-            .expect("envelope body must be the raw signed bytes, stored as a string");
-        assert_eq!(
-            stored_body.as_bytes(),
-            raw_body,
-            "stored body must be byte-identical to the signed request body"
-        );
-
-        let stored_signature = envelope["signature"]
-            .as_str()
-            .expect("envelope must store the X-Hub-Signature-256 header");
-        assert!(
-            crate::webhooks::verify_signature(stored_body.as_bytes(), stored_signature, secret),
-            "stored signature must re-verify against the stored body"
-        );
-    }
+    // (Raw-body byte fidelity — that the exact signed bytes survive for the
+    // worker's `parse_webhook` — is now a Store/worker concern, covered by
+    // `worker::tests::enqueued_body_is_stored_verbatim`. The signature is
+    // verified once at intake and never re-verified at drain.)
 
     // ─── State endpoint tests ───
 
     #[tokio::test]
     async fn state_returns_json_for_existing_repo() {
-        let (state, _spool, state_dir) = test_app_state(b"secret");
+        let (state, state_dir) = test_app_state(b"secret");
         let app = build_router(state);
 
         // Create a snapshot for the test repository
@@ -695,7 +634,7 @@ mod integration_tests {
 
     #[tokio::test]
     async fn state_returns_404_for_nonexistent_repo() {
-        let (state, _spool, _state_dir) = test_app_state(b"secret");
+        let (state, _state_dir) = test_app_state(b"secret");
         let app = build_router(state);
 
         let request = Request::builder()
@@ -710,7 +649,7 @@ mod integration_tests {
 
     #[tokio::test]
     async fn state_returns_latest_generation() {
-        let (state, _spool, state_dir) = test_app_state(b"secret");
+        let (state, state_dir) = test_app_state(b"secret");
         let app = build_router(state);
 
         // Create snapshots for multiple generations
@@ -747,7 +686,7 @@ mod integration_tests {
 
     #[tokio::test]
     async fn state_rejects_path_traversal_in_owner() {
-        let (state, _spool, _state_dir) = test_app_state(b"secret");
+        let (state, _state_dir) = test_app_state(b"secret");
         let app = build_router(state);
 
         // Attempt path traversal in owner segment
@@ -763,7 +702,7 @@ mod integration_tests {
 
     #[tokio::test]
     async fn state_rejects_path_traversal_in_repo() {
-        let (state, _spool, _state_dir) = test_app_state(b"secret");
+        let (state, _state_dir) = test_app_state(b"secret");
         let app = build_router(state);
 
         // Attempt path traversal in repo segment
@@ -780,7 +719,7 @@ mod integration_tests {
     #[tokio::test]
     async fn webhook_rejects_path_traversal_in_owner() {
         let secret = b"test-secret";
-        let (state, spool_dir, _state_dir) = test_app_state(secret);
+        let (state, _state_dir) = test_app_state(secret);
         let app = build_router(state);
 
         // Payload with path traversal in owner
@@ -804,23 +743,12 @@ mod integration_tests {
         let response = app.oneshot(request).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-
-        // Verify nothing was created in the spool directory
-        let entries: Vec<_> = std::fs::read_dir(spool_dir.path())
-            .unwrap()
-            .map(|e| e.unwrap())
-            .collect();
-        assert!(
-            entries.is_empty(),
-            "Spool directory should be empty after rejected request, but found: {:?}",
-            entries
-        );
     }
 
     #[tokio::test]
     async fn webhook_rejects_path_traversal_in_repo() {
         let secret = b"test-secret";
-        let (state, spool_dir, _state_dir) = test_app_state(secret);
+        let (state, _state_dir) = test_app_state(secret);
         let app = build_router(state);
 
         // Payload with path traversal in repo name
@@ -844,23 +772,12 @@ mod integration_tests {
         let response = app.oneshot(request).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-
-        // Verify nothing was created in the spool directory
-        let entries: Vec<_> = std::fs::read_dir(spool_dir.path())
-            .unwrap()
-            .map(|e| e.unwrap())
-            .collect();
-        assert!(
-            entries.is_empty(),
-            "Spool directory should be empty after rejected request, but found: {:?}",
-            entries
-        );
     }
 
     #[tokio::test]
     async fn webhook_rejects_path_traversal_in_delivery_id() {
         let secret = b"test-secret";
-        let (state, spool_dir, _state_dir) = test_app_state(secret);
+        let (state, _state_dir) = test_app_state(secret);
         let app = build_router(state);
 
         // Valid owner/repo but path traversal in delivery ID header
@@ -884,16 +801,5 @@ mod integration_tests {
         let response = app.oneshot(request).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-
-        // Verify nothing was created in the spool directory
-        let entries: Vec<_> = std::fs::read_dir(spool_dir.path())
-            .unwrap()
-            .map(|e| e.unwrap())
-            .collect();
-        assert!(
-            entries.is_empty(),
-            "Spool directory should be empty after rejected request, but found: {:?}",
-            entries
-        );
     }
 }
