@@ -30,11 +30,14 @@ use thiserror::Error;
 
 use crate::persistence::event::{StateEvent, StateEventPayload};
 use crate::persistence::snapshot::{PersistedRepoSnapshot, SCHEMA_VERSION};
+use crate::spool::DedupeKey;
 use crate::state::RepoState;
 
 /// Schema version for the SQLite store. Bump on a breaking schema change; a DB
 /// at a different version is rejected loudly rather than mis-read.
-const STORE_SCHEMA_VERSION: i64 = 1;
+///
+/// v2 added the `deliveries` and `dedupe_keys` tables (the webhook queue).
+const STORE_SCHEMA_VERSION: i64 = 2;
 
 /// Errors from the store.
 #[derive(Debug, Error)]
@@ -81,6 +84,23 @@ pub struct Store {
     next_seq: u64,
 }
 
+/// A claimed webhook delivery, as returned by [`Store::claim_next_delivery`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Delivery {
+    /// Monotonic arrival order (the drain key).
+    pub arrival: i64,
+    /// The `X-GitHub-Delivery` id (unique; the intake idempotency key).
+    pub delivery_id: String,
+    /// The `X-GitHub-Event` header.
+    pub event_type: String,
+    /// Captured headers, as JSON.
+    pub headers: String,
+    /// The raw webhook payload bytes.
+    pub body: Vec<u8>,
+    /// When the delivery was received.
+    pub received_at: DateTime<Utc>,
+}
+
 impl Store {
     /// Opens (or creates) the per-repo store at `db_path`.
     ///
@@ -123,7 +143,16 @@ impl Store {
             });
         }
 
-        // (4) Load the cached materialized state (empty on a fresh DB).
+        // (4) Requeue any delivery left `processing` by a dead worker. With the
+        // per-repo lock held, a `processing` row at open time is abandoned, so
+        // resetting it to `pending` re-drains it (without this, the drain — which
+        // only takes `pending` — would strand it forever).
+        conn.execute(
+            "UPDATE deliveries SET status = 'pending' WHERE status = 'processing'",
+            [],
+        )?;
+
+        // (5) Load the cached materialized state (empty on a fresh DB).
         let (state, next_seq) = load_cached(&conn)?;
 
         Ok(Store {
@@ -153,36 +182,153 @@ impl Store {
         payload: StateEventPayload,
         ts: DateTime<Utc>,
     ) -> Result<StateEvent, StoreError> {
-        let event = StateEvent {
-            seq: self.next_seq,
-            ts,
-            payload,
-        };
+        let seq = self.next_seq;
+        let event = StateEvent { seq, ts, payload };
 
-        // Apply to a scratch copy and serialize everything *before* opening the
-        // transaction, so a serialization error can't leave the in-memory state
-        // ahead of the durable log.
-        let payload_json = serde_json::to_string(&event.payload)?;
         let mut next_state = self.state.clone();
-        next_state.apply_event(&event);
-        let cache_json =
-            serde_json::to_string(&next_state.to_snapshot(0, 0, self.next_seq + 1, ts))?;
-
         let tx = self.conn.transaction()?;
-        tx.execute(
-            "INSERT INTO events (seq, ts, payload) VALUES (?1, ?2, ?3)",
-            rusqlite::params![event.seq as i64, ts.to_rfc3339(), payload_json],
-        )?;
-        tx.execute(
-            "INSERT INTO repo_state (id, snapshot) VALUES (0, ?1)
-             ON CONFLICT(id) DO UPDATE SET snapshot = excluded.snapshot",
-            rusqlite::params![cache_json],
-        )?;
+        insert_and_apply(&tx, &mut next_state, &event)?;
+        upsert_cache(&tx, &next_state, seq + 1, ts)?;
         tx.commit()?;
 
         self.state = next_state;
         self.next_seq += 1;
         Ok(event)
+    }
+
+    /// Enqueues a pending webhook delivery. Returns `false` if a delivery with
+    /// the same id is already present (idempotent intake — GitHub redelivers).
+    pub fn enqueue(
+        &mut self,
+        delivery_id: &str,
+        event_type: &str,
+        headers: &str,
+        body: &[u8],
+        received_at: DateTime<Utc>,
+    ) -> Result<bool, StoreError> {
+        let n = self.conn.execute(
+            "INSERT OR IGNORE INTO deliveries
+                 (delivery_id, event_type, headers, body, status, received_at)
+             VALUES (?1, ?2, ?3, ?4, 'pending', ?5)",
+            rusqlite::params![
+                delivery_id,
+                event_type,
+                headers,
+                body,
+                received_at.to_rfc3339()
+            ],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Claims the lowest-`arrival` pending delivery, marking it `processing`.
+    pub fn claim_next_delivery(&mut self) -> Result<Option<Delivery>, StoreError> {
+        let tx = self.conn.transaction()?;
+        let row = tx
+            .query_row(
+                "SELECT arrival, delivery_id, event_type, headers, body, received_at
+                 FROM deliveries WHERE status = 'pending' ORDER BY arrival LIMIT 1",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, Vec<u8>>(4)?,
+                        r.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let delivery = match row {
+            Some((arrival, delivery_id, event_type, headers, body, received_at)) => {
+                tx.execute(
+                    "UPDATE deliveries SET status = 'processing' WHERE arrival = ?1",
+                    rusqlite::params![arrival],
+                )?;
+                Some(Delivery {
+                    arrival,
+                    delivery_id,
+                    event_type,
+                    headers,
+                    body,
+                    received_at: parse_ts(&received_at)?,
+                })
+            }
+            None => None,
+        };
+        tx.commit()?;
+        Ok(delivery)
+    }
+
+    /// Closes a delivery: appends its final state events, records the dedupe key
+    /// (if any), and marks it `done` — all in one transaction, so the result and
+    /// the close commit together (no window where state advanced but the
+    /// delivery is still open). See `SQLITE_MIGRATION_PLAN.md`.
+    pub fn commit_delivery(
+        &mut self,
+        delivery_id: &str,
+        events: &[StateEventPayload],
+        dedupe: Option<&DedupeKey>,
+        ts: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        let mut next_state = self.state.clone();
+        let mut seq = self.next_seq;
+
+        let tx = self.conn.transaction()?;
+        for payload in events {
+            let event = StateEvent {
+                seq,
+                ts,
+                payload: payload.clone(),
+            };
+            insert_and_apply(&tx, &mut next_state, &event)?;
+            seq += 1;
+        }
+        upsert_cache(&tx, &next_state, seq, ts)?;
+        if let Some(key) = dedupe {
+            tx.execute(
+                "INSERT OR IGNORE INTO dedupe_keys (key, seen_at) VALUES (?1, ?2)",
+                rusqlite::params![key.as_str(), ts.to_rfc3339()],
+            )?;
+        }
+        tx.execute(
+            "UPDATE deliveries SET status = 'done' WHERE delivery_id = ?1",
+            rusqlite::params![delivery_id],
+        )?;
+        tx.commit()?;
+
+        self.state = next_state;
+        self.next_seq = seq;
+        Ok(())
+    }
+
+    /// Whether `key` has already been seen (a duplicate to skip).
+    pub fn is_duplicate(&self, key: &DedupeKey) -> Result<bool, StoreError> {
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM dedupe_keys WHERE key = ?1)",
+            rusqlite::params![key.as_str()],
+            |r| r.get(0),
+        )?;
+        Ok(exists)
+    }
+
+    /// Prunes dedupe keys first seen before `cutoff`. Returns the count removed.
+    pub fn prune_dedupe(&mut self, cutoff: DateTime<Utc>) -> Result<usize, StoreError> {
+        Ok(self.conn.execute(
+            "DELETE FROM dedupe_keys WHERE seen_at < ?1",
+            rusqlite::params![cutoff.to_rfc3339()],
+        )?)
+    }
+
+    /// Prunes `done` deliveries received before `cutoff` (frees the body BLOBs
+    /// once past the idempotency grace period). Returns the count removed.
+    pub fn prune_deliveries(&mut self, cutoff: DateTime<Utc>) -> Result<usize, StoreError> {
+        Ok(self.conn.execute(
+            "DELETE FROM deliveries WHERE status = 'done' AND received_at < ?1",
+            rusqlite::params![cutoff.to_rfc3339()],
+        )?)
     }
 
     /// Replays the entire `events` log from an empty state — the equivalence
@@ -227,6 +373,40 @@ impl Drop for Store {
     }
 }
 
+/// Inserts `event` into the log and applies it to `state`, within `tx`.
+fn insert_and_apply(
+    tx: &rusqlite::Transaction,
+    state: &mut RepoState,
+    event: &StateEvent,
+) -> Result<(), StoreError> {
+    state.apply_event(event);
+    tx.execute(
+        "INSERT INTO events (seq, ts, payload) VALUES (?1, ?2, ?3)",
+        rusqlite::params![
+            event.seq as i64,
+            event.ts.to_rfc3339(),
+            serde_json::to_string(&event.payload)?
+        ],
+    )?;
+    Ok(())
+}
+
+/// Upserts the single-row materialized cache from `state`, within `tx`.
+fn upsert_cache(
+    tx: &rusqlite::Transaction,
+    state: &RepoState,
+    next_seq: u64,
+    ts: DateTime<Utc>,
+) -> Result<(), StoreError> {
+    let cache_json = serde_json::to_string(&state.to_snapshot(0, 0, next_seq, ts))?;
+    tx.execute(
+        "INSERT INTO repo_state (id, snapshot) VALUES (0, ?1)
+         ON CONFLICT(id) DO UPDATE SET snapshot = excluded.snapshot",
+        rusqlite::params![cache_json],
+    )?;
+    Ok(())
+}
+
 /// Creates the schema and stamps the version, atomically.
 fn init_schema(conn: &Connection) -> Result<(), StoreError> {
     let tx = conn.unchecked_transaction()?;
@@ -239,6 +419,24 @@ fn init_schema(conn: &Connection) -> Result<(), StoreError> {
         CREATE TABLE repo_state (
             id       INTEGER PRIMARY KEY CHECK (id = 0),
             snapshot TEXT NOT NULL
+        );
+        -- The webhook queue. `arrival` (AUTOINCREMENT) is the monotonic
+        -- drain order; `delivery_id` (X-GitHub-Delivery) is unique for
+        -- idempotent intake.
+        CREATE TABLE deliveries (
+            arrival     INTEGER PRIMARY KEY AUTOINCREMENT,
+            delivery_id TEXT NOT NULL UNIQUE,
+            event_type  TEXT NOT NULL,
+            headers     TEXT NOT NULL,
+            body        BLOB NOT NULL,
+            status      TEXT NOT NULL,
+            received_at TEXT NOT NULL
+        );
+        CREATE INDEX deliveries_drain ON deliveries (status, arrival);
+        -- Seen dedupe keys with the time first seen, for TTL pruning.
+        CREATE TABLE dedupe_keys (
+            key     TEXT PRIMARY KEY,
+            seen_at TEXT NOT NULL
         );",
     )?;
     // `user_version` is a transactional header write, so the DDL above and this
@@ -423,5 +621,110 @@ mod tests {
             Ok(_) => panic!("expected CachedStateSchemaMismatch, got a store"),
             Err(e) => panic!("expected CachedStateSchemaMismatch, got {e:?}"),
         }
+    }
+
+    #[test]
+    fn enqueue_claim_commit_flow() {
+        use crate::spool::DedupeKey;
+        use crate::types::{CommentId, PrNumber};
+
+        let dir = tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("state.db")).unwrap();
+        let ts = test_timestamp();
+
+        assert!(
+            store
+                .enqueue("d1", "issue_comment", "{}", b"body", ts)
+                .unwrap()
+        );
+        // Idempotent: the same delivery id again is a no-op.
+        assert!(
+            !store
+                .enqueue("d1", "issue_comment", "{}", b"body", ts)
+                .unwrap()
+        );
+
+        let claimed = store.claim_next_delivery().unwrap().expect("a delivery");
+        assert_eq!(claimed.delivery_id, "d1");
+        assert_eq!(claimed.event_type, "issue_comment");
+        assert_eq!(claimed.body, b"body");
+
+        let key = DedupeKey::issue_comment_created(PrNumber(7), CommentId(1));
+        assert!(!store.is_duplicate(&key).unwrap());
+        store
+            .commit_delivery(
+                "d1",
+                &[StateEventPayload::TrainStarted {
+                    root_pr: PrNumber(7),
+                    current_pr: PrNumber(7),
+                }],
+                Some(&key),
+                ts,
+            )
+            .unwrap();
+
+        // State advanced, dedupe recorded, delivery done (no longer claimable).
+        assert!(store.state().active_trains.contains_key(&PrNumber(7)));
+        assert!(store.is_duplicate(&key).unwrap());
+        assert!(store.claim_next_delivery().unwrap().is_none());
+    }
+
+    #[test]
+    fn claim_orders_by_arrival() {
+        let dir = tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("state.db")).unwrap();
+        let ts = test_timestamp();
+        for id in ["a", "b", "c"] {
+            store.enqueue(id, "status", "{}", b"x", ts).unwrap();
+        }
+        let mut order = vec![];
+        while let Some(d) = store.claim_next_delivery().unwrap() {
+            order.push(d.delivery_id);
+        }
+        assert_eq!(order, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn processing_is_requeued_on_open() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let ts = test_timestamp();
+        {
+            let mut store = Store::open(&path).unwrap();
+            store.enqueue("d1", "status", "{}", b"x", ts).unwrap();
+            // Claim (→ processing), then "crash" by dropping before commit.
+            assert!(store.claim_next_delivery().unwrap().is_some());
+        }
+        // Reopen requeues the abandoned `processing` delivery to `pending`.
+        let mut reopened = Store::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .claim_next_delivery()
+                .unwrap()
+                .map(|d| d.delivery_id),
+            Some("d1".to_string())
+        );
+    }
+
+    #[test]
+    fn prune_drops_old_dedupe_and_done_deliveries() {
+        use crate::spool::DedupeKey;
+        use crate::types::{CommentId, PrNumber};
+
+        let dir = tempdir().unwrap();
+        let mut store = Store::open(&dir.path().join("state.db")).unwrap();
+        let old = test_timestamp();
+        let cutoff = old + chrono::Duration::hours(1);
+
+        store.enqueue("d1", "status", "{}", b"x", old).unwrap();
+        store.claim_next_delivery().unwrap();
+        let key = DedupeKey::issue_comment_created(PrNumber(1), CommentId(1));
+        store.commit_delivery("d1", &[], Some(&key), old).unwrap();
+
+        assert!(store.is_duplicate(&key).unwrap());
+        assert_eq!(store.prune_dedupe(cutoff).unwrap(), 1);
+        assert!(!store.is_duplicate(&key).unwrap());
+        assert_eq!(store.prune_deliveries(cutoff).unwrap(), 1);
+        assert!(store.claim_next_delivery().unwrap().is_none());
     }
 }
