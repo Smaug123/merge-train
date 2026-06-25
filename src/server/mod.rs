@@ -241,7 +241,7 @@ mod integration_tests {
     use tempfile::tempdir;
     use tower::ServiceExt;
 
-    use crate::persistence::snapshot::{PersistedRepoSnapshot, save_snapshot_atomic};
+    use crate::persistence::snapshot::PersistedRepoSnapshot;
     use crate::webhooks::{compute_signature, format_signature_header};
 
     /// Creates a test app state rooted at a temporary state directory.
@@ -607,16 +607,32 @@ mod integration_tests {
 
     #[tokio::test]
     async fn state_returns_json_for_existing_repo() {
+        use crate::persistence::event::StateEventPayload;
+        use crate::store::Store;
+        use crate::types::PrNumber;
+
         let (state, state_dir) = test_app_state(b"secret");
         let app = build_router(state);
 
-        // Create a snapshot for the test repository
-        let repo_state_dir = state_dir.path().join("octocat").join("hello-world");
-        std::fs::create_dir_all(&repo_state_dir).unwrap();
-
-        let snapshot = PersistedRepoSnapshot::new("main");
-        let snapshot_path = repo_state_dir.join("snapshot.0.json");
-        save_snapshot_atomic(&snapshot_path, &snapshot).unwrap();
+        // Materialize state by appending an event to the repo's Store (this also
+        // creates `<state_dir>/octocat/hello-world/state.db`), then release it.
+        let db_path = state_dir
+            .path()
+            .join("octocat")
+            .join("hello-world")
+            .join("state.db");
+        {
+            let mut store = Store::open(&db_path).unwrap();
+            store
+                .append(
+                    StateEventPayload::TrainStarted {
+                        root_pr: PrNumber(42),
+                        current_pr: PrNumber(42),
+                    },
+                    chrono::Utc::now(),
+                )
+                .unwrap();
+        }
 
         let request = Request::builder()
             .uri("/api/v1/repos/octocat/hello-world/state")
@@ -629,7 +645,7 @@ mod integration_tests {
 
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let parsed: PersistedRepoSnapshot = serde_json::from_slice(&body).unwrap();
-        assert_eq!(parsed.default_branch, "main");
+        assert!(parsed.active_trains.contains_key(&PrNumber(42)));
     }
 
     #[tokio::test]
@@ -645,41 +661,6 @@ mod integration_tests {
         let response = app.oneshot(request).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn state_returns_latest_generation() {
-        let (state, state_dir) = test_app_state(b"secret");
-        let app = build_router(state);
-
-        // Create snapshots for multiple generations
-        let repo_state_dir = state_dir.path().join("octocat").join("hello-world");
-        std::fs::create_dir_all(&repo_state_dir).unwrap();
-
-        // Create generation 0 with "develop" branch
-        let mut snapshot0 = PersistedRepoSnapshot::new("develop");
-        snapshot0.log_generation = 0;
-        save_snapshot_atomic(&repo_state_dir.join("snapshot.0.json"), &snapshot0).unwrap();
-
-        // Create generation 1 with "main" branch (this should be returned)
-        let mut snapshot1 = PersistedRepoSnapshot::new("main");
-        snapshot1.log_generation = 1;
-        save_snapshot_atomic(&repo_state_dir.join("snapshot.1.json"), &snapshot1).unwrap();
-
-        let request = Request::builder()
-            .uri("/api/v1/repos/octocat/hello-world/state")
-            .body(Body::empty())
-            .unwrap();
-
-        let response = app.oneshot(request).await.unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let parsed: PersistedRepoSnapshot = serde_json::from_slice(&body).unwrap();
-        // Should return the latest generation (1) with "main" branch
-        assert_eq!(parsed.default_branch, "main");
-        assert_eq!(parsed.log_generation, 1);
     }
 
     // ─── Path traversal protection tests ───

@@ -1,34 +1,16 @@
-//! Snapshot persistence for the merge train bot.
+//! The materialized-state snapshot type.
 //!
-//! Snapshots capture the complete state at a point in time, enabling fast
-//! recovery without replaying the entire event log.
-//!
-//! # File Format
-//!
-//! Snapshots are stored as `snapshot.<gen>.json` where `<gen>` is the
-//! generation number. The generation-based naming enables crash-safe
-//! compaction (see `compaction.rs`).
-//!
-//! # Atomic Writes
-//!
-//! Snapshots are written atomically using a write-to-temp-then-rename pattern:
-//! 1. Write to `snapshot.<gen>.json.tmp`
-//! 2. fsync the file
-//! 3. Rename to `snapshot.<gen>.json`
-//! 4. fsync the directory
-//!
-//! This ensures that readers always see either the old or new snapshot,
-//! never a partial write.
+//! [`PersistedRepoSnapshot`] is the serialized form of a [`crate::state::RepoState`]:
+//! the SQLite [`crate::store::Store`] keeps it (as JSON) in its single
+//! `repo_state` row, the `/state` endpoint returns it, and the status-comment
+//! backup embeds it. Durability is the Store's job; this module is just the
+//! shared data type and its serde.
 
 use std::collections::HashMap;
-use std::io;
-use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 
-use super::fsync::{fsync_dir, fsync_file, rename};
 use crate::types::{CachedPr, PrNumber, TrainRecord};
 
 /// Current schema version. Increment when making breaking changes.
@@ -36,33 +18,11 @@ use crate::types::{CachedPr, PrNumber, TrainRecord};
 /// Bumped to 2 by the machine-enforced core: `TrainState::Stopped`/`Aborted`
 /// moved from string tags with top-level `ended_at`/`error` to nested struct
 /// variants, so v1 `TrainRecord`s no longer deserialize. Backward compatibility
-/// is intentionally dropped; the version bump makes recovery reject a v1
-/// snapshot with a clear `SchemaMismatch` rather than a cryptic serde error.
+/// is intentionally dropped; the version bump makes a stale snapshot reject with
+/// a clear mismatch rather than a cryptic serde error.
 pub const SCHEMA_VERSION: u32 = 2;
 
-/// Errors that can occur during snapshot operations.
-#[derive(Debug, Error)]
-pub enum SnapshotError {
-    /// IO error during file operations.
-    #[error("IO error: {0}")]
-    Io(#[from] io::Error),
-
-    /// JSON serialization/deserialization error.
-    #[error("JSON error: {0}")]
-    Json(#[from] serde_json::Error),
-
-    /// Schema version mismatch.
-    #[error("schema version mismatch: expected {expected}, got {got}")]
-    SchemaMismatch { expected: u32, got: u32 },
-}
-
-/// Result type for snapshot operations.
-pub type Result<T> = std::result::Result<T, SnapshotError>;
-
-/// Persisted state snapshot.
-///
-/// This is the JSON structure stored at `<state_dir>/<owner>/<repo>/snapshot.<gen>.json`.
-/// The `<gen>` suffix is the current generation number (see compaction).
+/// Persisted state snapshot — the serialized `RepoState` the Store caches.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedRepoSnapshot {
     /// Schema version for forward-compatible migrations.
@@ -71,17 +31,15 @@ pub struct PersistedRepoSnapshot {
     /// When this snapshot was last updated (ISO 8601).
     pub snapshot_at: DateTime<Utc>,
 
-    /// The generation number this snapshot belongs to (matches filename suffix).
+    /// Legacy log generation (always 0 under SQLite; retained for format
+    /// stability with the status-comment backup).
     pub log_generation: u64,
 
-    /// Byte offset in `events.<log_generation>.log` at which this snapshot was taken.
-    /// On replay, seek to this offset and read forward.
+    /// Legacy log position (always 0 under SQLite; retained for format
+    /// stability).
     pub log_position: u64,
 
     /// Next sequence number to assign (globally monotonic).
-    /// This value is preserved across generations during compaction.
-    /// Events written to any generation's log file use this as their
-    /// starting sequence number, ensuring global uniqueness.
     pub next_seq: u64,
 
     /// Cached default branch name.
@@ -120,90 +78,11 @@ impl PersistedRepoSnapshot {
     }
 }
 
-/// Saves a snapshot atomically to disk.
-///
-/// Uses the write-to-temp-then-rename pattern for crash safety:
-/// 1. Write to `<path>.tmp`
-/// 2. fsync the temp file
-/// 3. Rename to `<path>`
-/// 4. fsync the parent directory
-///
-/// # Errors
-///
-/// Returns an error if any IO operation fails.
-pub fn save_snapshot_atomic(path: &Path, snapshot: &PersistedRepoSnapshot) -> Result<()> {
-    use std::fs::OpenOptions;
-    use std::io::Write;
-
-    // Ensure parent directory exists
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    // Write to temp file
-    let tmp_path = path.with_extension("json.tmp");
-    let bytes = serde_json::to_vec_pretty(snapshot)?;
-
-    {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp_path)?;
-        file.write_all(&bytes)?;
-        fsync_file(&file)?;
-    }
-
-    // Atomic rename
-    rename(&tmp_path, path)?;
-
-    // fsync directory to ensure rename is durable
-    if let Some(parent) = path.parent() {
-        fsync_dir(parent)?;
-    }
-
-    Ok(())
-}
-
-/// Loads a snapshot from disk.
-///
-/// # Errors
-///
-/// Returns an error if:
-/// - The file doesn't exist or can't be read
-/// - The JSON is malformed
-/// - The schema version is incompatible
-pub fn load_snapshot(path: &Path) -> Result<PersistedRepoSnapshot> {
-    let bytes = std::fs::read(path)?;
-    let snapshot: PersistedRepoSnapshot = serde_json::from_slice(&bytes)?;
-
-    if snapshot.schema_version != SCHEMA_VERSION {
-        return Err(SnapshotError::SchemaMismatch {
-            expected: SCHEMA_VERSION,
-            got: snapshot.schema_version,
-        });
-    }
-
-    Ok(snapshot)
-}
-
-/// Attempts to load a snapshot, returning None if the file doesn't exist.
-///
-/// Other errors (malformed JSON, schema mismatch) are propagated.
-pub fn try_load_snapshot(path: &Path) -> Result<Option<PersistedRepoSnapshot>> {
-    match load_snapshot(path) {
-        Ok(snapshot) => Ok(Some(snapshot)),
-        Err(SnapshotError::Io(e)) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::{CommentId, MergeStateStatus, PrState};
     use proptest::prelude::*;
-    use tempfile::tempdir;
 
     // ─── Arbitrary implementations ───
     // (arb_sha/arb_datetime come from crate::test_utils; arb_pr_number stays
@@ -344,44 +223,16 @@ mod tests {
             )
     }
 
-    // ─── Property tests ───
-
     proptest! {
-        /// Snapshot serialization roundtrip preserves all data.
+        /// Snapshot serialization roundtrip preserves all data — the property the
+        /// Store relies on to cache and restore `RepoState`.
         #[test]
         fn snapshot_serde_roundtrip(snapshot in arb_snapshot()) {
             let json = serde_json::to_string(&snapshot).unwrap();
             let parsed: PersistedRepoSnapshot = serde_json::from_str(&json).unwrap();
             prop_assert_eq!(snapshot, parsed);
         }
-
-        /// Atomic save and load roundtrip preserves all data.
-        #[test]
-        fn atomic_save_load_roundtrip(snapshot in arb_snapshot()) {
-            let dir = tempdir().unwrap();
-            let path = dir.path().join("snapshot.0.json");
-
-            save_snapshot_atomic(&path, &snapshot).unwrap();
-            let loaded = load_snapshot(&path).unwrap();
-
-            prop_assert_eq!(snapshot, loaded);
-        }
-
-        /// Temp file is cleaned up after successful save.
-        #[test]
-        fn temp_file_cleaned_up(snapshot in arb_snapshot()) {
-            let dir = tempdir().unwrap();
-            let path = dir.path().join("snapshot.0.json");
-            let tmp_path = path.with_extension("json.tmp");
-
-            save_snapshot_atomic(&path, &snapshot).unwrap();
-
-            prop_assert!(path.exists(), "Snapshot file should exist");
-            prop_assert!(!tmp_path.exists(), "Temp file should be cleaned up");
-        }
     }
-
-    // ─── Unit tests ───
 
     #[test]
     fn new_snapshot_has_correct_defaults() {
@@ -395,66 +246,5 @@ mod tests {
         assert!(snapshot.prs.is_empty());
         assert!(snapshot.active_trains.is_empty());
         assert!(snapshot.seen_dedupe_keys.is_empty());
-    }
-
-    #[test]
-    fn load_nonexistent_returns_error() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("nonexistent.json");
-
-        let result = load_snapshot(&path);
-        assert!(matches!(result, Err(SnapshotError::Io(_))));
-    }
-
-    #[test]
-    fn try_load_nonexistent_returns_none() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("nonexistent.json");
-
-        let result = try_load_snapshot(&path).unwrap();
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn load_invalid_json_returns_error() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("invalid.json");
-        std::fs::write(&path, "not valid json").unwrap();
-
-        let result = load_snapshot(&path);
-        assert!(matches!(result, Err(SnapshotError::Json(_))));
-    }
-
-    #[test]
-    fn load_wrong_schema_version_returns_error() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("wrong_version.json");
-
-        let mut snapshot = PersistedRepoSnapshot::new("main");
-        snapshot.schema_version = SCHEMA_VERSION + 1;
-
-        // Write directly to avoid the schema check on save
-        let json = serde_json::to_string(&snapshot).unwrap();
-        std::fs::write(&path, json).unwrap();
-
-        let result = load_snapshot(&path);
-        match result {
-            Err(SnapshotError::SchemaMismatch { expected, got }) => {
-                assert_eq!(expected, SCHEMA_VERSION);
-                assert_eq!(got, SCHEMA_VERSION + 1);
-            }
-            other => panic!("expected SchemaMismatch, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn save_creates_parent_directories() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("nested/dir/snapshot.0.json");
-
-        let snapshot = PersistedRepoSnapshot::new("main");
-        save_snapshot_atomic(&path, &snapshot).unwrap();
-
-        assert!(path.exists());
     }
 }
