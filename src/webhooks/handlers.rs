@@ -18,11 +18,12 @@ use crate::commands::{Command, parse_command};
 use crate::effects::Effect;
 use crate::effects::github::{GitHubEffect, Reaction};
 use crate::persistence::event::StateEventPayload;
+use crate::state::validation::validate_predecessor_update;
 use crate::state::{PredecessorValidationError, RepoState, validate_predecessor_declaration};
-use crate::types::{CommentId, PrNumber, TrainError, TrainErrorKind};
+use crate::types::{CommentId, PrNumber, PrState, TrainError, TrainErrorKind};
 use crate::webhooks::events::{
-    CommentAction, GitHubEvent, IssueCommentEvent, MergeStatus, PrAction, PullRequestEvent,
-    PullRequestReviewEvent, ReviewAction,
+    CheckSuiteAction, CommentAction, GitHubEvent, IssueCommentEvent, MergeStatus, PrAction,
+    PullRequestEvent, PullRequestReviewEvent, ReviewAction,
 };
 
 /// Ambient context a handler needs but the event doesn't carry.
@@ -71,16 +72,22 @@ pub fn handle_event(event: &GitHubEvent, state: &RepoState, ctx: &HandlerCtx) ->
     match event {
         GitHubEvent::IssueComment(e) => handle_issue_comment(e, state, ctx),
         GitHubEvent::PullRequest(e) => handle_pull_request(e, state),
-        GitHubEvent::CheckSuite(e) => {
-            HandlerOutput::event(StateEventPayload::CheckSuiteCompleted {
-                sha: e.head_sha.clone(),
-                conclusion: e
-                    .conclusion
-                    .as_ref()
-                    .map(|c| format!("{c:?}"))
-                    .unwrap_or_else(|| "none".to_owned()),
-            })
-        }
+        // Only a *completed* suite carries a conclusion the engine can act on;
+        // created/(re)requested suites are not "completed" and must not be
+        // recorded as such (that would falsely re-trigger CI re-evaluation).
+        GitHubEvent::CheckSuite(e) => match e.action {
+            CheckSuiteAction::Completed => {
+                HandlerOutput::event(StateEventPayload::CheckSuiteCompleted {
+                    sha: e.head_sha.clone(),
+                    conclusion: e
+                        .conclusion
+                        .as_ref()
+                        .map(|c| format!("{c:?}"))
+                        .unwrap_or_else(|| "none".to_owned()),
+                })
+            }
+            _ => HandlerOutput::default(),
+        },
         GitHubEvent::Status(e) => HandlerOutput::event(StateEventPayload::StatusReceived {
             sha: e.sha.clone(),
             context: e.context.clone(),
@@ -116,45 +123,68 @@ fn handle_issue_comment(
             }),
             None => HandlerOutput::default(),
         },
-        // Created or edited: (re-)parse the body as a command.
+        // Created or edited: re-interpret the body, honoring a predecessor
+        // declaration this very comment may already own (Codex review #55).
         CommentAction::Created | CommentAction::Edited => {
-            match parse_command(&event.body, &ctx.bot_name) {
-                Some(command) => dispatch_command(command, pr, event.comment_id, state),
-                None => HandlerOutput::default(),
-            }
+            handle_comment_command(pr, event.comment_id, &event.body, state, &ctx.bot_name)
         }
     }
 }
 
-fn dispatch_command(
-    command: Command,
+/// Interprets a created/edited comment's body as a command. An *edit* to the
+/// comment that currently owns `pr`'s predecessor declaration is handled
+/// specially: editing the declaration away retracts it, and editing it to a
+/// different predecessor updates it (rather than rejecting as already-declared).
+fn handle_comment_command(
     pr: PrNumber,
     comment_id: CommentId,
+    body: &str,
     state: &RepoState,
+    bot_name: &str,
 ) -> HandlerOutput {
-    match command {
-        Command::Start => acked_trigger(comment_id, Trigger::StartTrain { pr }),
-        Command::Stop => acked_trigger(comment_id, Trigger::StopTrain { pr, force: false }),
-        Command::StopForce => acked_trigger(comment_id, Trigger::StopTrain { pr, force: true }),
-        Command::Predecessor(predecessor) => {
-            handle_predecessor_command(pr, predecessor, comment_id, state)
-        }
-    }
-}
+    // Does this comment currently own pr's predecessor declaration?
+    let declared = state
+        .prs
+        .get(&pr)
+        .is_some_and(|c| c.predecessor_comment_id == Some(comment_id));
 
-/// Acknowledge a command with a 👍 and emit its engine trigger.
-fn acked_trigger(comment_id: CommentId, trigger: Trigger) -> HandlerOutput {
-    HandlerOutput {
-        events: vec![],
-        effects: vec![ack(comment_id)],
-        triggers: vec![trigger],
+    let command = parse_command(body, bot_name);
+
+    if let Some(Command::Predecessor(predecessor)) = command {
+        return handle_predecessor_command(pr, predecessor, comment_id, declared, state);
     }
+
+    // Any non-predecessor outcome: if this comment had declared a predecessor,
+    // the edit no longer does, so retract it first.
+    let mut out = if declared {
+        HandlerOutput::event(StateEventPayload::PredecessorRemoved { pr, comment_id })
+    } else {
+        HandlerOutput::default()
+    };
+    match command {
+        Some(Command::Start) => {
+            out.effects.push(ack(comment_id));
+            out.triggers.push(Trigger::StartTrain { pr });
+        }
+        Some(Command::Stop) => {
+            out.effects.push(ack(comment_id));
+            out.triggers.push(Trigger::StopTrain { pr, force: false });
+        }
+        Some(Command::StopForce) => {
+            out.effects.push(ack(comment_id));
+            out.triggers.push(Trigger::StopTrain { pr, force: true });
+        }
+        Some(Command::Predecessor(_)) => unreachable!("handled above"),
+        None => {}
+    }
+    out
 }
 
 fn handle_predecessor_command(
     pr: PrNumber,
     predecessor: PrNumber,
     comment_id: CommentId,
+    declared_by_this_comment: bool,
     state: &RepoState,
 ) -> HandlerOutput {
     // We can only validate a predecessor declaration once the PR is cached. If
@@ -167,7 +197,22 @@ fn handle_predecessor_command(
         };
     };
 
-    match validate_predecessor_declaration(cached, predecessor, &state.prs, &state.default_branch) {
+    // Idempotent re-statement of the same declaration.
+    if declared_by_this_comment && cached.predecessor == Some(predecessor) {
+        return HandlerOutput::default();
+    }
+
+    // If this comment already owns the declaration, an edit *updates* it (the
+    // update validator tolerates an existing predecessor). Otherwise it's a
+    // fresh declaration, which rejects if a predecessor already exists — first
+    // declaration wins.
+    let validation = if declared_by_this_comment {
+        validate_predecessor_update(cached, predecessor, &state.prs, &state.default_branch)
+    } else {
+        validate_predecessor_declaration(cached, predecessor, &state.prs, &state.default_branch)
+    };
+
+    match validation {
         Ok(()) => HandlerOutput {
             events: vec![StateEventPayload::PredecessorDeclared {
                 pr,
@@ -189,46 +234,74 @@ fn handle_predecessor_command(
 
 fn handle_pull_request(event: &PullRequestEvent, state: &RepoState) -> HandlerOutput {
     let pr = event.pr_number;
+    // An edit can also break a stack (a retarget away from the predecessor's
+    // head), so it produces an effect as well as an event — handled separately.
+    if let PrAction::Edited = event.action {
+        return handle_pr_edited(pr, &event.base_branch, state);
+    }
+
     let payload = match event.action {
-        PrAction::Opened => Some(StateEventPayload::PrOpened {
+        PrAction::Opened => StateEventPayload::PrOpened {
             pr,
             head_sha: event.head_sha.clone(),
             head_ref: event.head_branch.clone(),
             base_ref: event.base_branch.clone(),
             is_draft: event.is_draft,
-        }),
-        PrAction::Closed => Some(match &event.merge_status {
+        },
+        PrAction::Closed => match &event.merge_status {
             MergeStatus::Merged { merge_commit_sha } => StateEventPayload::PrMerged {
                 pr,
                 merge_sha: merge_commit_sha.clone(),
             },
             MergeStatus::NotMerged => StateEventPayload::PrClosed { pr },
-        }),
-        PrAction::Reopened => Some(StateEventPayload::PrReopened { pr }),
-        PrAction::Synchronize => Some(StateEventPayload::PrSynchronized {
+        },
+        PrAction::Reopened => StateEventPayload::PrReopened { pr },
+        PrAction::Synchronize => StateEventPayload::PrSynchronized {
             pr,
             new_head_sha: event.head_sha.clone(),
-        }),
-        PrAction::ConvertedToDraft => Some(StateEventPayload::PrConvertedToDraft { pr }),
-        PrAction::ReadyForReview => Some(StateEventPayload::PrReadyForReview { pr }),
-        // An edit only matters when it changes the base branch, and only then if
-        // we know the previous base (apply_event would skip an unknown PR anyway).
-        PrAction::Edited => match state.prs.get(&pr) {
-            Some(cached) if cached.base_ref != event.base_branch => {
-                Some(StateEventPayload::PrBaseChanged {
-                    pr,
-                    old_base: cached.base_ref.clone(),
-                    new_base: event.base_branch.clone(),
-                })
-            }
-            _ => None,
         },
+        PrAction::ConvertedToDraft => StateEventPayload::PrConvertedToDraft { pr },
+        PrAction::ReadyForReview => StateEventPayload::PrReadyForReview { pr },
+        PrAction::Edited => unreachable!("handled above"),
     };
+    HandlerOutput::event(payload)
+}
 
-    match payload {
-        Some(p) => HandlerOutput::event(p),
-        None => HandlerOutput::default(),
+/// A PR edit matters only when it changes the base branch (and we know the old
+/// base — `apply_event` would skip an unknown PR anyway). A retarget that breaks
+/// the stack (the new base no longer matches an *open* predecessor's head) also
+/// gets a loud warning comment so it's fixed before a cascade trips on it
+/// (Codex review #55).
+fn handle_pr_edited(pr: PrNumber, new_base: &str, state: &RepoState) -> HandlerOutput {
+    let Some(cached) = state.prs.get(&pr) else {
+        return HandlerOutput::default();
+    };
+    if cached.base_ref == new_base {
+        return HandlerOutput::default();
     }
+
+    let mut out = HandlerOutput::event(StateEventPayload::PrBaseChanged {
+        pr,
+        old_base: cached.base_ref.clone(),
+        new_base: new_base.to_owned(),
+    });
+
+    if let Some(pred_num) = cached.predecessor
+        && let Some(pred) = state.prs.get(&pred_num)
+        && pred.state == PrState::Open
+        && pred.head_ref != new_base
+    {
+        out.effects.push(reject(
+            pr,
+            &format!(
+                "Heads up: retargeting PR #{pr} to `{new_base}` no longer matches its \
+                 predecessor #{pred_num}'s head `{}`, so they are no longer stacked. \
+                 Re-declare the predecessor or restart the train.",
+                pred.head_ref
+            ),
+        ));
+    }
+    out
 }
 
 // ─── pull_request_review ───
@@ -293,13 +366,22 @@ fn find_pr_by_predecessor_comment(state: &RepoState, comment_id: CommentId) -> O
         .map(|pr| pr.number)
 }
 
-/// The root of an active train that `pr` participates in (as the current PR or
-/// a frozen descendant), if any.
+/// The root of an *active* train that `pr` participates in — as the root, the
+/// current PR, or a frozen descendant being cascaded — if any. Terminal trains
+/// (stopped/aborted) still linger in `active_trains` but are excluded, so a late
+/// review dismissal can't re-abort one (Codex review #55).
 fn active_train_root_for(state: &RepoState, pr: PrNumber) -> Option<PrNumber> {
     state
         .active_trains
         .values()
-        .find(|t| t.current_pr == pr || t.original_root_pr == pr)
+        .find(|t| {
+            t.state.is_active()
+                && (t.original_root_pr == pr
+                    || t.current_pr == pr
+                    || t.cascade_phase
+                        .progress()
+                        .is_some_and(|p| p.frozen_descendants().contains(&pr)))
+        })
         .map(|t| t.original_root_pr)
 }
 
@@ -822,5 +904,146 @@ mod tests {
         assert_eq!(a.events, b.events);
         assert_eq!(a.triggers, b.triggers);
         assert_eq!(effects_debug(&a), effects_debug(&b));
+    }
+
+    // ─── Codex review #55 fixes ───
+
+    #[test]
+    fn editing_a_predecessor_comment_retracts_or_updates() {
+        // PR #2 already declares predecessor #1 via comment 7; its base matches
+        // #3's head so an update to #3 is valid.
+        let mut pr2 = open_pr(2, "feature-3", Some(1));
+        pr2.predecessor_comment_id = Some(CommentId(7));
+        let state = state_with(vec![
+            open_pr(1, "main", None),
+            open_pr(3, "main", None),
+            pr2,
+        ]);
+
+        // Edit drops the command → retract the declaration.
+        let retract = handle_event(
+            &comment(CommentAction::Edited, Some(2), "oops, never mind", 1),
+            &state,
+            &ctx(),
+        );
+        assert_eq!(
+            retract.events,
+            vec![StateEventPayload::PredecessorRemoved {
+                pr: PrNumber(2),
+                comment_id: CommentId(7),
+            }]
+        );
+
+        // Edit changes the predecessor → update (not an AlreadyHasPredecessor reject).
+        let updated = handle_event(
+            &comment(
+                CommentAction::Edited,
+                Some(2),
+                "@merge-train predecessor #3",
+                1,
+            ),
+            &state,
+            &ctx(),
+        );
+        assert_eq!(
+            updated.events,
+            vec![StateEventPayload::PredecessorDeclared {
+                pr: PrNumber(2),
+                predecessor: PrNumber(3),
+                comment_id: CommentId(7),
+            }]
+        );
+    }
+
+    #[test]
+    fn check_suite_only_records_completed() {
+        use crate::webhooks::events::{CheckSuiteConclusion, CheckSuiteEvent};
+        let state = state_with(vec![]);
+        let mk = |action| {
+            GitHubEvent::CheckSuite(CheckSuiteEvent {
+                repo: repo(),
+                action,
+                head_sha: sha(),
+                conclusion: Some(CheckSuiteConclusion::Success),
+                pull_requests: vec![],
+            })
+        };
+        assert!(
+            handle_event(&mk(CheckSuiteAction::Created), &state, &ctx())
+                .events
+                .is_empty()
+        );
+        assert!(matches!(
+            handle_event(&mk(CheckSuiteAction::Completed), &state, &ctx())
+                .events
+                .as_slice(),
+            [StateEventPayload::CheckSuiteCompleted { .. }]
+        ));
+    }
+
+    #[test]
+    fn review_dismissed_on_frozen_descendant_aborts() {
+        use crate::types::{CascadePhase, DescendantProgress, TrainState};
+        let mut train = TrainRecord::new(PrNumber(1), ts());
+        train.state = TrainState::Running;
+        train.cascade_phase = CascadePhase::Preparing {
+            progress: DescendantProgress::new(vec![PrNumber(2)]),
+        };
+        let mut snap = PersistedRepoSnapshot::new("main");
+        snap.prs.insert(PrNumber(1), open_pr(1, "main", None));
+        snap.prs.insert(PrNumber(2), open_pr(2, "main", Some(1)));
+        snap.active_trains.insert(PrNumber(1), train);
+        let state = RepoState::from_snapshot(snap);
+
+        let out = handle_event(&review(ReviewAction::Dismissed, 2), &state, &ctx());
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            StateEventPayload::TrainAborted {
+                root_pr: PrNumber(1),
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn review_dismissed_on_terminal_train_does_not_abort() {
+        use crate::types::TrainState;
+        let mut train = TrainRecord::new(PrNumber(1), ts());
+        train.state = TrainState::Stopped { ended_at: ts() };
+        let mut snap = PersistedRepoSnapshot::new("main");
+        snap.prs.insert(PrNumber(1), open_pr(1, "main", None));
+        snap.active_trains.insert(PrNumber(1), train);
+        let state = RepoState::from_snapshot(snap);
+
+        let out = handle_event(&review(ReviewAction::Dismissed, 1), &state, &ctx());
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, StateEventPayload::TrainAborted { .. }))
+        );
+    }
+
+    #[test]
+    fn retarget_breaking_the_stack_warns() {
+        // PR #2 is stacked on #1 (base = #1's head); retargeting it to main breaks
+        // the stack, so a warning comment accompanies the base-change event.
+        let pr2 = open_pr(2, "feature-1", Some(1));
+        let state = state_with(vec![open_pr(1, "main", None), pr2]);
+        let out = handle_event(
+            &pr_event(PrAction::Edited, 2, "main", MergeStatus::NotMerged),
+            &state,
+            &ctx(),
+        );
+        assert!(matches!(
+            out.events.as_slice(),
+            [StateEventPayload::PrBaseChanged { .. }]
+        ));
+        assert!(matches!(
+            out.effects.as_slice(),
+            [Effect::GitHub(GitHubEffect::PostComment {
+                pr: PrNumber(2),
+                ..
+            })]
+        ));
     }
 }
