@@ -10,7 +10,21 @@
 //! What's deferred to later stages: the `EvaluateTrain`/`LateAddition` triggers
 //! that re-drive a *parked* train on CI/review/merge events need M2's parking
 //! model, so the observation handlers here emit their record events but not yet
-//! those triggers. Dedupe is the worker's job (M5); handlers assume deduped input.
+//! those triggers.
+//!
+//! # Preconditions the worker (M5) establishes — not these pure handlers
+//!
+//! - **Dedupe**: handlers assume deduped input.
+//! - **Command authorization**: a command reaching command handling is assumed
+//!   already authorized. DESIGN §Command authorization gates commands on the
+//!   commenter's identity — `predecessor`/`start` require the PR author,
+//!   `stop` the author or a repo admin/maintainer, `stop --force` an admin —
+//!   which needs a GitHub `…/collaborators/{user}/permission` query and the PR
+//!   author's id, i.e. **effects a pure function cannot perform**. So M5
+//!   authorizes a parsed command (rejecting an unauthorized commenter with a
+//!   comment) *before* invoking the command path here. The one purely-checkable
+//!   rule — the comment must be on a PR, not an issue — *is* enforced here
+//!   (a non-PR comment yields no output).
 
 use chrono::{DateTime, Utc};
 
@@ -136,10 +150,12 @@ fn handle_issue_comment(
     }
 }
 
-/// Interprets a created/edited comment's body as a command. An *edit* to the
-/// comment that currently owns `pr`'s predecessor declaration is handled
-/// specially: editing the declaration away retracts it, and editing it to a
-/// different predecessor updates it (rather than rejecting as already-declared).
+/// Interprets a created/edited comment's body as a command. **Assumes the
+/// command (if any) is already authorized** — see the module docs: M5 enforces
+/// DESIGN §Command authorization before calling here. An *edit* to the comment
+/// that currently owns `pr`'s predecessor declaration is handled specially:
+/// editing the declaration away retracts it, and editing it to a different
+/// predecessor updates it (rather than rejecting as already-declared).
 fn handle_comment_command(
     pr: PrNumber,
     comment_id: CommentId,
