@@ -132,6 +132,48 @@ impl WorkerRegistry {
         &self.state_dir
     }
 
+    /// Spawns a worker for every repo that already has a state DB under
+    /// `state_dir`, draining whatever a previous run left queued.
+    ///
+    /// Call once at startup. Without it, a delivery that was acked (200) but not
+    /// yet processed before a crash would sit unprocessed — its `processing`/
+    /// `pending` row is only requeued/drained when a worker opens the DB, and
+    /// workers otherwise spawn lazily on the *next* webhook for that repo, which
+    /// may never come (Codex review #53). The repo's own worker lock still
+    /// guarantees one writer.
+    pub async fn recover_existing(&self) {
+        let Ok(owners) = std::fs::read_dir(&self.state_dir) else {
+            return; // no state dir yet: nothing to recover
+        };
+        let mut recovered = 0u64;
+        for owner in owners.flatten().filter(is_dir) {
+            let Ok(owner_name) = owner.file_name().into_string() else {
+                continue;
+            };
+            let Ok(repos) = std::fs::read_dir(owner.path()) else {
+                continue;
+            };
+            for repo in repos.flatten().filter(is_dir) {
+                if !repo.path().join("state.db").is_file() {
+                    continue;
+                }
+                let Ok(repo_name) = repo.file_name().into_string() else {
+                    continue;
+                };
+                match self.sender_for(&owner_name, &repo_name).await {
+                    Ok(_) => recovered += 1,
+                    Err(e) => {
+                        warn!(owner = %owner_name, repo = %repo_name, error = %e,
+                            "failed to recover worker at startup")
+                    }
+                }
+            }
+        }
+        if recovered > 0 {
+            info!(recovered, "spawned workers for repos with existing state");
+        }
+    }
+
     /// Returns the mailbox sender for `(owner, repo)`, spawning the worker on
     /// first use. Opening the `Store` (and acquiring the per-repo lock) happens
     /// on the new worker thread; a failure there surfaces as [`WorkerError::Open`].
@@ -232,9 +274,14 @@ impl WorkerRegistry {
 /// be slow; running effects off-thread so intake never waits is M5's concern.)
 fn run(mut store: Store, mut rx: mpsc::Receiver<WorkerMsg>) {
     loop {
-        // Service all waiting intake first. The mailbox is bounded, so this
-        // burst is bounded too.
-        loop {
+        // Service waiting intake first, but cap the batch at one mailbox's
+        // worth. The mailbox can be refilled faster than it drains, so an
+        // uncapped inner loop could keep accepting messages and never reach
+        // `process_next`, starving backlog processing under sustained intake
+        // (Codex review #53). The cap keeps intake prioritized — a normal burst
+        // (< capacity) still drains fully before processing — while guaranteeing
+        // processing gets a turn.
+        for _ in 0..MAILBOX_CAPACITY {
             match rx.try_recv() {
                 Ok(msg) => handle_msg(&mut store, msg),
                 Err(mpsc::error::TryRecvError::Empty) => break,
@@ -333,6 +380,12 @@ fn close(store: &mut Store, delivery_id: &str, reason: &str) -> Result<(), Store
     store.commit_delivery(delivery_id, &[], None, Utc::now())?;
     info!(delivery_id, reason, "delivery closed");
     Ok(())
+}
+
+/// Whether a directory entry is itself a directory (used to walk
+/// `state_dir/<owner>/<repo>`).
+fn is_dir(entry: &std::fs::DirEntry) -> bool {
+    entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -514,6 +567,51 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ack_rx.await.unwrap().unwrap(), EnqueueOutcome::Enqueued);
+    }
+
+    #[tokio::test]
+    async fn recover_existing_spawns_workers_for_queued_repos() {
+        // A delivery enqueued by a previous run, then the process "crashes".
+        let dir = tempdir().unwrap();
+        let db_dir = dir.path().join("o").join("r");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        {
+            let mut store = Store::open(&db_dir.join("state.db")).unwrap();
+            store
+                .enqueue("d1", "pull_request", "{}", &pull_request_body(), Utc::now())
+                .unwrap();
+        }
+
+        // Startup recovery spawns a worker for the existing repo DB (no webhook
+        // for it has arrived this run).
+        let registry = WorkerRegistry::new(dir.path());
+        registry.recover_existing().await;
+
+        // That worker now owns the repo's Store: re-enqueuing the same id is seen
+        // as a duplicate (proving the recovered worker opened the pre-existing
+        // DB), and sender_for returns the already-spawned worker.
+        let sender = registry.sender_for("o", "r").await.unwrap();
+        let (ack_tx, ack_rx) = oneshot::channel();
+        sender
+            .send(WorkerMsg::Enqueue {
+                delivery: IntakeDelivery {
+                    delivery_id: "d1".into(),
+                    event_type: "pull_request".into(),
+                    headers: "{}".into(),
+                    body: pull_request_body(),
+                },
+                ack: ack_tx,
+            })
+            .await
+            .unwrap();
+        assert_eq!(ack_rx.await.unwrap().unwrap(), EnqueueOutcome::Duplicate);
+    }
+
+    #[tokio::test]
+    async fn recover_existing_is_a_noop_without_state_dir() {
+        let dir = tempdir().unwrap();
+        let registry = WorkerRegistry::new(dir.path().join("does-not-exist"));
+        registry.recover_existing().await; // must not panic
     }
 
     #[tokio::test]

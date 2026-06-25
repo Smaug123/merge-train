@@ -88,6 +88,11 @@ async fn main() {
     // Create application state
     let app_state = AppState::new(config.state_dir, config.webhook_secret);
 
+    // Spawn workers for repos with deliveries left queued by a previous run, so
+    // an acked-but-unprocessed delivery is drained at startup rather than
+    // waiting for the next webhook to that repo.
+    app_state.workers().recover_existing().await;
+
     // Build router
     let app = build_router(app_state);
 
