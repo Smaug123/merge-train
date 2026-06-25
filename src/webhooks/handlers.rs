@@ -82,7 +82,7 @@ pub fn handle_event(event: &GitHubEvent, state: &RepoState, ctx: &HandlerCtx) ->
                     conclusion: e
                         .conclusion
                         .as_ref()
-                        .map(|c| format!("{c:?}"))
+                        .map(canonical)
                         .unwrap_or_else(|| "none".to_owned()),
                 })
             }
@@ -91,7 +91,7 @@ pub fn handle_event(event: &GitHubEvent, state: &RepoState, ctx: &HandlerCtx) ->
         GitHubEvent::Status(e) => HandlerOutput::event(StateEventPayload::StatusReceived {
             sha: e.sha.clone(),
             context: e.context.clone(),
-            state: format!("{:?}", e.state),
+            state: canonical(&e.state),
         }),
         GitHubEvent::PullRequestReview(e) => handle_review(e, state),
     }
@@ -117,10 +117,15 @@ fn handle_issue_comment(
     match event.action {
         // A deleted comment that declared a predecessor retracts the declaration.
         CommentAction::Deleted => match find_pr_by_predecessor_comment(state, event.comment_id) {
-            Some(declaring_pr) => HandlerOutput::event(StateEventPayload::PredecessorRemoved {
-                pr: declaring_pr,
-                comment_id: event.comment_id,
-            }),
+            Some(declaring_pr) => {
+                let mut out = HandlerOutput::event(StateEventPayload::PredecessorRemoved {
+                    pr: declaring_pr,
+                    comment_id: event.comment_id,
+                });
+                out.events
+                    .extend(topology_change_abort(state, declaring_pr));
+                out
+            }
             None => HandlerOutput::default(),
         },
         // Created or edited: re-interpret the body, honoring a predecessor
@@ -155,9 +160,12 @@ fn handle_comment_command(
     }
 
     // Any non-predecessor outcome: if this comment had declared a predecessor,
-    // the edit no longer does, so retract it first.
+    // the edit no longer does, so retract it first (and abort any active train
+    // whose stack this changes).
     let mut out = if declared {
-        HandlerOutput::event(StateEventPayload::PredecessorRemoved { pr, comment_id })
+        let mut o = HandlerOutput::event(StateEventPayload::PredecessorRemoved { pr, comment_id });
+        o.events.extend(topology_change_abort(state, pr));
+        o
     } else {
         HandlerOutput::default()
     };
@@ -213,15 +221,20 @@ fn handle_predecessor_command(
     };
 
     match validation {
-        Ok(()) => HandlerOutput {
-            events: vec![StateEventPayload::PredecessorDeclared {
-                pr,
-                predecessor,
-                comment_id,
-            }],
-            effects: vec![ack(comment_id)],
-            triggers: vec![],
-        },
+        Ok(()) => {
+            let mut out = HandlerOutput {
+                events: vec![StateEventPayload::PredecessorDeclared {
+                    pr,
+                    predecessor,
+                    comment_id,
+                }],
+                effects: vec![ack(comment_id)],
+                triggers: vec![],
+            };
+            // Changing the stack under an active train is unsafe to cascade.
+            out.events.extend(topology_change_abort(state, pr));
+            out
+        }
         Err(e) => HandlerOutput {
             events: vec![],
             effects: vec![reject(pr, &predecessor_rejection_message(&e))],
@@ -311,7 +324,7 @@ fn handle_review(event: &PullRequestReviewEvent, state: &RepoState) -> HandlerOu
         ReviewAction::Submitted => HandlerOutput::event(StateEventPayload::ReviewSubmitted {
             pr: event.pr_number,
             reviewer: event.reviewer_login.clone(),
-            state: format!("{:?}", event.state),
+            state: canonical(&event.state),
         }),
         ReviewAction::Dismissed => {
             let mut out = HandlerOutput::event(StateEventPayload::ReviewDismissed {
@@ -342,6 +355,31 @@ fn handle_review(event: &PullRequestReviewEvent, state: &RepoState) -> HandlerOu
 }
 
 // ─── helpers ───
+
+/// The canonical (serde, snake_case) wire value of a webhook state enum, so the
+/// persisted event strings match the rest of the model rather than Rust `Debug`
+/// names like `Success` / `Other(..)` (Codex review #55). These enums always
+/// serialize to a JSON string.
+fn canonical<T: serde::Serialize>(value: &T) -> String {
+    match serde_json::to_value(value) {
+        Ok(serde_json::Value::String(s)) => s,
+        other => format!("{other:?}"),
+    }
+}
+
+/// If an active train involves `pr`, the event that aborts it because its stack
+/// topology changed. A predecessor change/removal mid-train is unsafe to
+/// cascade — the frozen descendant set no longer reflects the declared stack
+/// (DESIGN; Codex review #55).
+fn topology_change_abort(state: &RepoState, pr: PrNumber) -> Option<StateEventPayload> {
+    active_train_root_for(state, pr).map(|root| StateEventPayload::TrainAborted {
+        root_pr: root,
+        error: TrainError::new(
+            TrainErrorKind::PredecessorChanged,
+            format!("PR #{pr}'s predecessor relationship changed while a train was active"),
+        ),
+    })
+}
 
 fn ack(comment_id: CommentId) -> Effect {
     Effect::GitHub(GitHubEffect::AddReaction {
@@ -1045,5 +1083,129 @@ mod tests {
                 ..
             })]
         ));
+    }
+
+    #[test]
+    fn webhook_states_are_canonical_not_debug() {
+        use crate::webhooks::events::{
+            CheckSuiteConclusion, CheckSuiteEvent, StatusEvent, StatusState,
+        };
+        let state = state_with(vec![]);
+
+        let status = handle_event(
+            &GitHubEvent::Status(StatusEvent {
+                repo: repo(),
+                sha: sha(),
+                state: StatusState::Success,
+                context: "ci".to_owned(),
+                description: None,
+                target_url: None,
+            }),
+            &state,
+            &ctx(),
+        );
+        match status.events.as_slice() {
+            [StateEventPayload::StatusReceived { state, .. }] => {
+                assert_eq!(state.as_str(), "success")
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let cs = handle_event(
+            &GitHubEvent::CheckSuite(CheckSuiteEvent {
+                repo: repo(),
+                action: CheckSuiteAction::Completed,
+                head_sha: sha(),
+                conclusion: Some(CheckSuiteConclusion::TimedOut),
+                pull_requests: vec![],
+            }),
+            &state,
+            &ctx(),
+        );
+        match cs.events.as_slice() {
+            [StateEventPayload::CheckSuiteCompleted { conclusion, .. }] => {
+                assert_eq!(conclusion.as_str(), "timed_out")
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // review() uses ReviewState::Approved. `ReviewState` is serialized
+        // SCREAMING_SNAKE_CASE in the model, so the canonical value is "APPROVED"
+        // — the point is that it matches the model's serde, not Rust `Debug`.
+        let rev = handle_event(&review(ReviewAction::Submitted, 1), &state, &ctx());
+        match rev.events.as_slice() {
+            [StateEventPayload::ReviewSubmitted { state, .. }] => {
+                assert_eq!(state.as_str(), "APPROVED")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn changing_a_predecessor_under_an_active_train_aborts_it() {
+        use crate::types::{CascadePhase, DescendantProgress, TrainState};
+        // PR #2 declares predecessor #1 via comment 7; an active train freezes #2.
+        let mut pr2 = open_pr(2, "feature-3", Some(1));
+        pr2.predecessor_comment_id = Some(CommentId(7));
+        let mut train = TrainRecord::new(PrNumber(1), ts());
+        train.state = TrainState::Running;
+        train.cascade_phase = CascadePhase::Preparing {
+            progress: DescendantProgress::new(vec![PrNumber(2)]),
+        };
+        let mut snap = PersistedRepoSnapshot::new("main");
+        for p in [open_pr(1, "main", None), open_pr(3, "main", None), pr2] {
+            snap.prs.insert(p.number, p);
+        }
+        snap.active_trains.insert(PrNumber(1), train);
+        let state = RepoState::from_snapshot(snap);
+
+        let out = handle_event(
+            &comment(
+                CommentAction::Edited,
+                Some(2),
+                "@merge-train predecessor #3",
+                1,
+            ),
+            &state,
+            &ctx(),
+        );
+        assert!(
+            out.events
+                .iter()
+                .any(|e| matches!(e, StateEventPayload::PredecessorDeclared { .. }))
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            StateEventPayload::TrainAborted { error, .. }
+                if error.kind == TrainErrorKind::PredecessorChanged
+        )));
+    }
+
+    #[test]
+    fn removing_a_predecessor_under_an_active_train_aborts_it() {
+        let mut pr2 = open_pr(2, "main", Some(1));
+        pr2.predecessor_comment_id = Some(CommentId(7));
+        let train = TrainRecord::new(PrNumber(2), ts()); // root/current = #2
+        let mut snap = PersistedRepoSnapshot::new("main");
+        snap.prs.insert(PrNumber(1), open_pr(1, "main", None));
+        snap.prs.insert(PrNumber(2), pr2);
+        snap.active_trains.insert(PrNumber(2), train);
+        let state = RepoState::from_snapshot(snap);
+
+        let out = handle_event(
+            &comment(CommentAction::Deleted, Some(2), "", 1),
+            &state,
+            &ctx(),
+        );
+        assert!(
+            out.events
+                .iter()
+                .any(|e| matches!(e, StateEventPayload::PredecessorRemoved { .. }))
+        );
+        assert!(
+            out.events
+                .iter()
+                .any(|e| matches!(e, StateEventPayload::TrainAborted { .. }))
+        );
     }
 }
