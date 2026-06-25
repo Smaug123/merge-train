@@ -7,14 +7,20 @@
 //! validation failures become rejection-comment effects, never errors, and
 //! events for unknown PRs are tolerated by `apply_event`.
 //!
-//! What's deferred to later stages: the `EvaluateTrain`/`LateAddition` triggers
-//! that re-drive a *parked* train on CI/review/merge events need M2's parking
-//! model, so the observation handlers here emit their record events but not yet
-//! those triggers.
+//! The engine triggers ([`Trigger`]) are *emitted* here — including
+//! `EvaluateTrain` (an observation that should re-drive an active/parked train)
+//! and `LateAddition` (a predecessor declared on an already-merged PR). M2
+//! consumes them once it exists; nothing depends on them landing first.
 //!
 //! # Preconditions the worker (M5) establishes — not these pure handlers
 //!
 //! - **Dedupe**: handlers assume deduped input.
+//! - **Referenced PRs are cached**: a command/observation for a PR the bot has
+//!   never seen needs a `GetPr` crawl first. M5 bootstraps unknown PRs before
+//!   invoking the handler (and re-processes the original delivery once cached);
+//!   the `GetPr` effect a handler may emit is a cold-start fallback, not the
+//!   primary path. So a `predecessor` command is validated against a cached PR,
+//!   not silently dropped.
 //! - **Command authorization**: a command reaching command handling is assumed
 //!   already authorized. DESIGN §Command authorization gates commands on the
 //!   commenter's identity — `predecessor`/`start` require the PR author,
@@ -34,7 +40,7 @@ use crate::effects::github::{GitHubEffect, Reaction};
 use crate::persistence::event::StateEventPayload;
 use crate::state::validation::validate_predecessor_update;
 use crate::state::{PredecessorValidationError, RepoState, validate_predecessor_declaration};
-use crate::types::{CommentId, PrNumber, PrState, TrainError, TrainErrorKind};
+use crate::types::{CommentId, PrNumber, PrState, Sha, TrainError, TrainErrorKind};
 use crate::webhooks::events::{
     CheckSuiteAction, CommentAction, GitHubEvent, IssueCommentEvent, MergeStatus, PrAction,
     PullRequestEvent, PullRequestReviewEvent, ReviewAction,
@@ -59,6 +65,17 @@ pub enum Trigger {
     StartTrain { pr: PrNumber },
     /// `@bot stop[ --force]` on `pr`.
     StopTrain { pr: PrNumber, force: bool },
+    /// An observation (CI/status/review/ready/merge) arrived for a PR in this
+    /// active train; the engine should re-evaluate it (e.g. resume a `WaitingCi`
+    /// train). M2 consumes this once its parking model exists.
+    EvaluateTrain { root: PrNumber },
+    /// A `predecessor` declaration targets an **already-merged** PR — a "late
+    /// addition" that needs its own (squash-vs-rebase) flow. M3 only detects it;
+    /// M5 responds (currently: an explicit "not yet supported" comment).
+    LateAddition {
+        pr: PrNumber,
+        merged_predecessor: PrNumber,
+    },
 }
 
 /// Everything a handler produces from one event.
@@ -91,22 +108,28 @@ pub fn handle_event(event: &GitHubEvent, state: &RepoState, ctx: &HandlerCtx) ->
         // recorded as such (that would falsely re-trigger CI re-evaluation).
         GitHubEvent::CheckSuite(e) => match e.action {
             CheckSuiteAction::Completed => {
-                HandlerOutput::event(StateEventPayload::CheckSuiteCompleted {
+                let mut out = HandlerOutput::event(StateEventPayload::CheckSuiteCompleted {
                     sha: e.head_sha.clone(),
                     conclusion: e
                         .conclusion
                         .as_ref()
                         .map(canonical)
                         .unwrap_or_else(|| "none".to_owned()),
-                })
+                });
+                out.triggers = evaluate_for_sha(state, &e.head_sha);
+                out
             }
             _ => HandlerOutput::default(),
         },
-        GitHubEvent::Status(e) => HandlerOutput::event(StateEventPayload::StatusReceived {
-            sha: e.sha.clone(),
-            context: e.context.clone(),
-            state: canonical(&e.state),
-        }),
+        GitHubEvent::Status(e) => {
+            let mut out = HandlerOutput::event(StateEventPayload::StatusReceived {
+                sha: e.sha.clone(),
+                context: e.context.clone(),
+                state: canonical(&e.state),
+            });
+            out.triggers = evaluate_for_sha(state, &e.sha);
+            out
+        }
         GitHubEvent::PullRequestReview(e) => handle_review(e, state),
     }
 }
@@ -226,6 +249,22 @@ fn handle_predecessor_command(
         return HandlerOutput::default();
     }
 
+    // Late addition: declaring a predecessor that has *already merged* is a
+    // distinct (squash-vs-rebase) flow M5 handles; M3 only detects it and hands
+    // it off, so the user's command isn't silently rejected.
+    if let Some(pred) = state.prs.get(&predecessor)
+        && matches!(pred.state, PrState::Merged { .. })
+    {
+        return HandlerOutput {
+            events: vec![],
+            effects: vec![],
+            triggers: vec![Trigger::LateAddition {
+                pr,
+                merged_predecessor: predecessor,
+            }],
+        };
+    }
+
     // If this comment already owns the declaration, an edit *updates* it (the
     // update validator tolerates an existing predecessor). Otherwise it's a
     // fresh declaration, which rejects if a predecessor already exists — first
@@ -293,7 +332,18 @@ fn handle_pull_request(event: &PullRequestEvent, state: &RepoState) -> HandlerOu
         PrAction::ReadyForReview => StateEventPayload::PrReadyForReview { pr },
         PrAction::Edited => unreachable!("handled above"),
     };
-    HandlerOutput::event(payload)
+
+    let mut out = HandlerOutput::event(payload);
+    // A merge or a draft becoming ready may let an active train make progress.
+    let may_unblock = match event.action {
+        PrAction::ReadyForReview => true,
+        PrAction::Closed => matches!(event.merge_status, MergeStatus::Merged { .. }),
+        _ => false,
+    };
+    if may_unblock {
+        out.triggers.extend(evaluate_for_pr(state, pr));
+    }
+    out
 }
 
 /// A PR edit matters only when it changes the base branch (and we know the old
@@ -337,11 +387,16 @@ fn handle_pr_edited(pr: PrNumber, new_base: &str, state: &RepoState) -> HandlerO
 
 fn handle_review(event: &PullRequestReviewEvent, state: &RepoState) -> HandlerOutput {
     match event.action {
-        ReviewAction::Submitted => HandlerOutput::event(StateEventPayload::ReviewSubmitted {
-            pr: event.pr_number,
-            reviewer: event.reviewer_login.clone(),
-            state: canonical(&event.state),
-        }),
+        ReviewAction::Submitted => {
+            let mut out = HandlerOutput::event(StateEventPayload::ReviewSubmitted {
+                pr: event.pr_number,
+                reviewer: event.reviewer_login.clone(),
+                state: canonical(&event.state),
+            });
+            // An approval may unblock a parked train waiting on review.
+            out.triggers.extend(evaluate_for_pr(state, event.pr_number));
+            out
+        }
         ReviewAction::Dismissed => {
             let mut out = HandlerOutput::event(StateEventPayload::ReviewDismissed {
                 pr: event.pr_number,
@@ -395,6 +450,29 @@ fn topology_change_abort(state: &RepoState, pr: PrNumber) -> Option<StateEventPa
             format!("PR #{pr}'s predecessor relationship changed while a train was active"),
         ),
     })
+}
+
+/// An `EvaluateTrain` trigger for the active train involving `pr`, if any.
+fn evaluate_for_pr(state: &RepoState, pr: PrNumber) -> Option<Trigger> {
+    active_train_root_for(state, pr).map(|root| Trigger::EvaluateTrain { root })
+}
+
+/// `EvaluateTrain` triggers for every active train whose PR currently has head
+/// `sha` — CI/status observations land on a commit, not a PR. Roots are
+/// deduplicated and ordered for determinism.
+fn evaluate_for_sha(state: &RepoState, sha: &Sha) -> Vec<Trigger> {
+    let mut roots: Vec<PrNumber> = state
+        .prs
+        .values()
+        .filter(|pr| pr.head_sha == *sha)
+        .filter_map(|pr| active_train_root_for(state, pr.number))
+        .collect();
+    roots.sort_unstable_by_key(|p| p.0);
+    roots.dedup();
+    roots
+        .into_iter()
+        .map(|root| Trigger::EvaluateTrain { root })
+        .collect()
 }
 
 fn ack(comment_id: CommentId) -> Effect {
@@ -1223,5 +1301,85 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, StateEventPayload::TrainAborted { .. }))
         );
+    }
+
+    #[test]
+    fn observations_evaluate_the_active_train() {
+        use crate::types::TrainState;
+        use crate::webhooks::events::{CheckSuiteConclusion, CheckSuiteEvent};
+        // PR #1 is the current PR of an active (WaitingCi) train; its head is sha().
+        let mut train = TrainRecord::new(PrNumber(1), ts());
+        train.state = TrainState::WaitingCi;
+        let mut snap = PersistedRepoSnapshot::new("main");
+        snap.prs.insert(PrNumber(1), open_pr(1, "main", None));
+        snap.active_trains.insert(PrNumber(1), train);
+        let state = RepoState::from_snapshot(snap);
+
+        let want = Trigger::EvaluateTrain { root: PrNumber(1) };
+
+        // CI completion on the PR's head re-drives the train.
+        let cs = handle_event(
+            &GitHubEvent::CheckSuite(CheckSuiteEvent {
+                repo: repo(),
+                action: CheckSuiteAction::Completed,
+                head_sha: sha(),
+                conclusion: Some(CheckSuiteConclusion::Success),
+                pull_requests: vec![],
+            }),
+            &state,
+            &ctx(),
+        );
+        assert!(cs.triggers.contains(&want));
+
+        // An approval re-drives it.
+        let rev = handle_event(&review(ReviewAction::Submitted, 1), &state, &ctx());
+        assert!(rev.triggers.contains(&want));
+
+        // A merge re-drives it.
+        let merged = handle_event(
+            &pr_event(
+                PrAction::Closed,
+                1,
+                "main",
+                MergeStatus::Merged {
+                    merge_commit_sha: sha(),
+                },
+            ),
+            &state,
+            &ctx(),
+        );
+        assert!(merged.triggers.contains(&want));
+
+        // An observation for a PR in *no* train produces no trigger.
+        let idle = state_with(vec![open_pr(9, "main", None)]);
+        let none = handle_event(&review(ReviewAction::Submitted, 9), &idle, &ctx());
+        assert!(none.triggers.is_empty());
+    }
+
+    #[test]
+    fn predecessor_on_a_merged_pr_is_a_late_addition() {
+        let mut pred = open_pr(1, "main", None);
+        pred.state = PrState::Merged {
+            merge_commit_sha: sha(),
+        };
+        let state = state_with(vec![pred, open_pr(2, "feature-1", None)]);
+        let out = handle_event(
+            &comment(
+                CommentAction::Created,
+                Some(2),
+                "@merge-train predecessor #1",
+                1,
+            ),
+            &state,
+            &ctx(),
+        );
+        assert_eq!(
+            out.triggers,
+            vec![Trigger::LateAddition {
+                pr: PrNumber(2),
+                merged_predecessor: PrNumber(1),
+            }]
+        );
+        assert!(out.events.is_empty());
     }
 }
