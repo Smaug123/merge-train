@@ -177,6 +177,12 @@ pub async fn webhook_handler(
         body: body.to_vec(),
     };
 
+    // Reserve the process-wide intake-byte budget for this body before handing
+    // it off, so a burst of large payloads backpressures here rather than piling
+    // up in mailboxes. The permit travels with the delivery and is released once
+    // the worker durably enqueues it.
+    let permit = app_state.workers().reserve_intake(body.len()).await;
+
     // Route to the repo's worker and await its durable-enqueue ack before
     // replying 200 (at-least-once intake; the server never opens the Store).
     let sender = app_state.workers().sender_for(&owner, &repo).await?;
@@ -185,6 +191,7 @@ pub async fn webhook_handler(
         .send(WorkerMsg::Enqueue {
             delivery,
             ack: ack_tx,
+            permit,
         })
         .await
         .map_err(|_| WebhookError::Worker(WorkerError::Unavailable))?;

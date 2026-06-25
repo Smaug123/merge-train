@@ -33,15 +33,25 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use thiserror::Error;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tracing::{error, info, warn};
 
 use crate::store::{Delivery, Store, StoreError};
 use crate::webhooks::parse_webhook;
 
-/// Mailbox depth per repo. Backpressure: when a worker is busy and its mailbox
-/// is full, the axum handler's `send().await` waits rather than unbounded-buffering.
+/// Per-repo mailbox depth (message *count*). The byte budget
+/// ([`MAX_INFLIGHT_INTAKE_BYTES`]) — not this — bounds intake *memory*; this
+/// caps the number of queued messages and the per-turn intake batch.
 const MAILBOX_CAPACITY: usize = 1024;
+
+/// Process-wide ceiling on in-flight intake bytes: the summed body size of
+/// deliveries accepted but not yet durably enqueued. The axum handler reserves
+/// `body.len()` here before handing a delivery to a worker, so a burst of large
+/// (signature-verified) payloads applies backpressure — the handler waits —
+/// instead of accumulating in mailboxes and risking OOM (a count-only bound
+/// could hold `MAILBOX_CAPACITY` × 25 MiB per repo; Codex review #53). Must
+/// exceed the 25 MiB body limit so a single max-size body can always be admitted.
+const MAX_INFLIGHT_INTAKE_BYTES: usize = 256 * 1024 * 1024;
 
 /// A raw webhook delivery handed from the async server to a repo's worker.
 ///
@@ -74,6 +84,10 @@ pub enum WorkerMsg {
     Enqueue {
         delivery: IntakeDelivery,
         ack: oneshot::Sender<Result<EnqueueOutcome, StoreError>>,
+        /// Backpressure reservation for `delivery.body`'s bytes (see
+        /// [`WorkerRegistry::reserve_intake`]); released when this message is
+        /// dropped, i.e. after the durable enqueue.
+        permit: OwnedSemaphorePermit,
     },
 }
 
@@ -114,6 +128,8 @@ pub struct WorkerRegistry {
     /// first-deliveries can't race two opens into a spurious lock conflict)
     /// *without* serializing creation across different repos.
     creating: std::sync::Mutex<CreationGuards>,
+    /// Process-wide in-flight intake-byte budget (see `MAX_INFLIGHT_INTAKE_BYTES`).
+    intake_permits: Arc<Semaphore>,
 }
 
 impl WorkerRegistry {
@@ -124,12 +140,29 @@ impl WorkerRegistry {
             state_dir: state_dir.into(),
             workers: std::sync::Mutex::new(HashMap::new()),
             creating: std::sync::Mutex::new(HashMap::new()),
+            intake_permits: Arc::new(Semaphore::new(MAX_INFLIGHT_INTAKE_BYTES)),
         }
     }
 
     /// The state directory (the `/state` endpoint still reads from it).
     pub fn state_dir(&self) -> &PathBuf {
         &self.state_dir
+    }
+
+    /// Reserves intake budget for a `body_len`-byte delivery, waiting if the
+    /// process-wide in-flight budget ([`MAX_INFLIGHT_INTAKE_BYTES`]) is
+    /// exhausted (backpressure). The returned permit must travel with the
+    /// delivery and drop once it is durably enqueued.
+    pub async fn reserve_intake(&self, body_len: usize) -> OwnedSemaphorePermit {
+        // Clamp to [1, cap]: never request 0 (a no-op reservation) or more than
+        // the budget (which the body limit guarantees we never do, but a clamp
+        // keeps it deadlock-free regardless).
+        let permits = body_len.clamp(1, MAX_INFLIGHT_INTAKE_BYTES) as u32;
+        self.intake_permits
+            .clone()
+            .acquire_many_owned(permits)
+            .await
+            .expect("intake semaphore is never closed")
     }
 
     /// Spawns a worker for every repo that already has a state DB under
@@ -316,7 +349,14 @@ fn run(mut store: Store, mut rx: mpsc::Receiver<WorkerMsg>) {
 /// Durably enqueues a delivery and acks the outcome to the handler.
 fn handle_msg(store: &mut Store, msg: WorkerMsg) {
     match msg {
-        WorkerMsg::Enqueue { delivery, ack } => {
+        // `_permit` is held until this arm returns — i.e. until after the
+        // enqueue and the `delivery` body have been consumed — then dropped,
+        // releasing the reserved intake bytes.
+        WorkerMsg::Enqueue {
+            delivery,
+            ack,
+            permit: _permit,
+        } => {
             let outcome = store
                 .enqueue(
                     &delivery.delivery_id,
@@ -502,6 +542,7 @@ mod tests {
                     body: pull_request_body(),
                 },
                 ack: ack_tx,
+                permit: registry.reserve_intake(pull_request_body().len()).await,
             })
             .await
             .unwrap();
@@ -519,6 +560,7 @@ mod tests {
                     body: pull_request_body(),
                 },
                 ack: ack_tx,
+                permit: registry.reserve_intake(pull_request_body().len()).await,
             })
             .await
             .unwrap();
@@ -563,6 +605,7 @@ mod tests {
                     body: pull_request_body(),
                 },
                 ack: ack_tx,
+                permit: registry.reserve_intake(pull_request_body().len()).await,
             })
             .await
             .unwrap();
@@ -601,6 +644,7 @@ mod tests {
                     body: pull_request_body(),
                 },
                 ack: ack_tx,
+                permit: registry.reserve_intake(pull_request_body().len()).await,
             })
             .await
             .unwrap();
