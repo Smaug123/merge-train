@@ -116,7 +116,15 @@ pub fn handle_event(event: &GitHubEvent, state: &RepoState, ctx: &HandlerCtx) ->
                         .map(canonical)
                         .unwrap_or_else(|| "none".to_owned()),
                 });
-                out.triggers = evaluate_for_sha(state, &e.head_sha);
+                // Wake trains via the suite's head sha *and* its listed PRs: a
+                // suite can complete before `synchronize` refreshes the cached
+                // head, so the sha alone may match nothing (Codex review #55).
+                out.triggers = evaluate_trains_for(
+                    state,
+                    prs_with_head(state, &e.head_sha)
+                        .into_iter()
+                        .chain(e.pull_requests.iter().copied()),
+                );
                 out
             }
             _ => HandlerOutput::default(),
@@ -131,7 +139,7 @@ pub fn handle_event(event: &GitHubEvent, state: &RepoState, ctx: &HandlerCtx) ->
             // still report stale `CLEAN` mergeability from the old head, which
             // could advance a waiting train before CI actually finished.
             if e.state.is_terminal() {
-                out.triggers = evaluate_for_sha(state, &e.sha);
+                out.triggers = evaluate_trains_for(state, prs_with_head(state, &e.sha));
             }
             out
         }
@@ -352,6 +360,21 @@ fn handle_pull_request(event: &PullRequestEvent, state: &RepoState) -> HandlerOu
     if may_unblock {
         out.triggers.extend(evaluate_for_pr(state, pr));
     }
+
+    // A root/current PR closed *without merging* is a terminal cascade condition
+    // (Codex review #55); abort the train rather than leaving it active.
+    if matches!(event.action, PrAction::Closed)
+        && matches!(event.merge_status, MergeStatus::NotMerged)
+        && let Some(root) = active_train_with_primary(state, pr)
+    {
+        out.events.push(StateEventPayload::TrainAborted {
+            root_pr: root,
+            error: TrainError::new(
+                TrainErrorKind::PrClosed,
+                format!("PR #{pr} was closed without merging; the train cannot continue"),
+            ),
+        });
+    }
     out
 }
 
@@ -466,21 +489,40 @@ fn evaluate_for_pr(state: &RepoState, pr: PrNumber) -> Option<Trigger> {
     active_train_root_for(state, pr).map(|root| Trigger::EvaluateTrain { root })
 }
 
-/// `EvaluateTrain` triggers for every active train whose PR currently has head
-/// `sha` — CI/status observations land on a commit, not a PR. Roots are
-/// deduplicated and ordered for determinism.
-fn evaluate_for_sha(state: &RepoState, sha: &Sha) -> Vec<Trigger> {
-    let mut roots: Vec<PrNumber> = state
-        .prs
+/// The root of an active train whose **root or current** PR is `pr`. Closing one
+/// of those is terminal for the cascade; closing a frozen *descendant* is a skip
+/// the engine handles, so it is intentionally excluded here.
+fn active_train_with_primary(state: &RepoState, pr: PrNumber) -> Option<PrNumber> {
+    state
+        .active_trains
         .values()
-        .filter(|pr| pr.head_sha == *sha)
-        .filter_map(|pr| active_train_root_for(state, pr.number))
+        .find(|t| t.state.is_active() && (t.original_root_pr == pr || t.current_pr == pr))
+        .map(|t| t.original_root_pr)
+}
+
+/// `EvaluateTrain` triggers for the active trains involving any of `prs`. Roots
+/// are deduplicated and ordered for determinism.
+fn evaluate_trains_for(state: &RepoState, prs: impl IntoIterator<Item = PrNumber>) -> Vec<Trigger> {
+    let mut roots: Vec<PrNumber> = prs
+        .into_iter()
+        .filter_map(|pr| active_train_root_for(state, pr))
         .collect();
     roots.sort_unstable_by_key(|p| p.0);
     roots.dedup();
     roots
         .into_iter()
         .map(|root| Trigger::EvaluateTrain { root })
+        .collect()
+}
+
+/// PRs whose cached head currently equals `sha` (a CI/status observation lands
+/// on a commit, not a PR).
+fn prs_with_head(state: &RepoState, sha: &Sha) -> Vec<PrNumber> {
+    state
+        .prs
+        .values()
+        .filter(|pr| pr.head_sha == *sha)
+        .map(|pr| pr.number)
         .collect()
 }
 
@@ -1456,5 +1498,60 @@ mod tests {
         ));
         assert!(out.triggers.is_empty());
         assert!(out.events.is_empty());
+    }
+
+    #[test]
+    fn check_suite_wakes_train_via_listed_prs() {
+        use crate::types::TrainState;
+        use crate::webhooks::events::{CheckSuiteConclusion, CheckSuiteEvent};
+        let mut train = TrainRecord::new(PrNumber(1), ts());
+        train.state = TrainState::WaitingCi;
+        let mut snap = PersistedRepoSnapshot::new("main");
+        snap.prs.insert(PrNumber(1), open_pr(1, "main", None)); // cached head = sha()
+        snap.active_trains.insert(PrNumber(1), train);
+        let state = RepoState::from_snapshot(snap);
+
+        // The suite's head doesn't match the cached head (synchronize hasn't
+        // landed yet), but it lists PR #1 — the train must still wake.
+        let other_head = Sha::parse("b".repeat(40)).unwrap();
+        let out = handle_event(
+            &GitHubEvent::CheckSuite(CheckSuiteEvent {
+                repo: repo(),
+                action: CheckSuiteAction::Completed,
+                head_sha: other_head,
+                conclusion: Some(CheckSuiteConclusion::Success),
+                pull_requests: vec![PrNumber(1)],
+            }),
+            &state,
+            &ctx(),
+        );
+        assert!(
+            out.triggers
+                .contains(&Trigger::EvaluateTrain { root: PrNumber(1) })
+        );
+    }
+
+    #[test]
+    fn closing_root_pr_unmerged_aborts_the_train() {
+        let train = TrainRecord::new(PrNumber(1), ts()); // root/current = #1, active
+        let mut snap = PersistedRepoSnapshot::new("main");
+        snap.prs.insert(PrNumber(1), open_pr(1, "main", None));
+        snap.active_trains.insert(PrNumber(1), train);
+        let state = RepoState::from_snapshot(snap);
+
+        let out = handle_event(
+            &pr_event(PrAction::Closed, 1, "main", MergeStatus::NotMerged),
+            &state,
+            &ctx(),
+        );
+        assert!(
+            out.events
+                .iter()
+                .any(|e| matches!(e, StateEventPayload::PrClosed { .. }))
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            StateEventPayload::TrainAborted { error, .. } if error.kind == TrainErrorKind::PrClosed
+        )));
     }
 }
