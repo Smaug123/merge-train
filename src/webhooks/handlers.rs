@@ -12,6 +12,13 @@
 //! and `LateAddition` (a predecessor declared on an already-merged PR). M2
 //! consumes them once it exists; nothing depends on them landing first.
 //!
+//! One wakeup gap is **deferred to the polling fallback** (plan §Explicitly
+//! deferred): a terminal legacy `status` for a freshly-pushed head that arrives
+//! *before* `pull_request.synchronize` refreshes the cached head matches no PR
+//! — `status` webhooks, unlike check suites, carry no PR numbers — so no
+//! `EvaluateTrain` is emitted. The periodic poll re-drives such a train; there
+//! is no PR to map a bare commit status to until the cache catches up.
+//!
 //! # Preconditions the worker (M5) establishes — not these pure handlers
 //!
 //! - **Dedupe**: handlers assume deduped input.
@@ -38,6 +45,7 @@ use crate::commands::{Command, parse_command};
 use crate::effects::Effect;
 use crate::effects::github::{GitHubEffect, Reaction};
 use crate::persistence::event::StateEventPayload;
+use crate::state::descendants::collect_all_descendants;
 use crate::state::validation::validate_predecessor_update;
 use crate::state::{PredecessorValidationError, RepoState, validate_predecessor_declaration};
 use crate::types::{CommentId, PrNumber, PrState, Sha, TrainError, TrainErrorKind};
@@ -472,16 +480,39 @@ fn canonical<T: serde::Serialize>(value: &T) -> String {
 
 /// If an active train involves `pr`, the event that aborts it because its stack
 /// topology changed. A predecessor change/removal mid-train is unsafe to
-/// cascade — the frozen descendant set no longer reflects the declared stack
-/// (DESIGN; Codex review #55).
+/// cascade — the descendant set no longer reflects the declared stack (DESIGN;
+/// Codex review #55).
 fn topology_change_abort(state: &RepoState, pr: PrNumber) -> Option<StateEventPayload> {
-    active_train_root_for(state, pr).map(|root| StateEventPayload::TrainAborted {
+    topology_train_root_for(state, pr).map(|root| StateEventPayload::TrainAborted {
         root_pr: root,
         error: TrainError::new(
             TrainErrorKind::PredecessorChanged,
             format!("PR #{pr}'s predecessor relationship changed while a train was active"),
         ),
     })
+}
+
+/// The root of an active train whose stack contains `pr`, for the topology-abort
+/// rule. Broader than [`active_train_root_for`]: besides the root, current PR,
+/// and *frozen* descendants, it includes **unfrozen** descendants — a train that
+/// has started but not yet entered `Preparing` hasn't frozen its set, so a
+/// predecessor change on any PR transitively below the root must still abort it
+/// (Codex review #55).
+fn topology_train_root_for(state: &RepoState, pr: PrNumber) -> Option<PrNumber> {
+    state
+        .active_trains
+        .values()
+        .find(|t| {
+            t.state.is_active()
+                && (t.original_root_pr == pr
+                    || t.current_pr == pr
+                    || t.cascade_phase
+                        .progress()
+                        .is_some_and(|p| p.frozen_descendants().contains(&pr))
+                    || collect_all_descendants(t.original_root_pr, &state.descendants, &state.prs)
+                        .contains(&pr))
+        })
+        .map(|t| t.original_root_pr)
 }
 
 /// An `EvaluateTrain` trigger for the active train involving `pr`, if any.
@@ -1552,6 +1583,41 @@ mod tests {
         assert!(out.events.iter().any(|e| matches!(
             e,
             StateEventPayload::TrainAborted { error, .. } if error.kind == TrainErrorKind::PrClosed
+        )));
+    }
+
+    #[test]
+    fn changing_an_unfrozen_descendant_aborts_the_train() {
+        use crate::types::TrainState;
+        // Train rooted at #1, started but not yet Preparing (Idle phase → no
+        // frozen set). #2 declares #1 as predecessor, so it's an *unfrozen*
+        // descendant reachable only via the descendants index.
+        let mut train = TrainRecord::new(PrNumber(1), ts());
+        train.state = TrainState::WaitingCi;
+        let mut pr2 = open_pr(2, "feature-1", Some(1));
+        pr2.predecessor_comment_id = Some(CommentId(7));
+        let mut snap = PersistedRepoSnapshot::new("main");
+        snap.prs.insert(PrNumber(1), open_pr(1, "main", None));
+        snap.prs.insert(PrNumber(2), pr2);
+        snap.active_trains.insert(PrNumber(1), train);
+        let state = RepoState::from_snapshot(snap); // builds descendants: #1 -> {#2}
+
+        // Deleting #2's predecessor declaration must abort the train rooted at #1,
+        // even though #2 is neither the root/current nor a frozen descendant.
+        let out = handle_event(
+            &comment(CommentAction::Deleted, Some(2), "", 1),
+            &state,
+            &ctx(),
+        );
+        assert!(
+            out.events
+                .iter()
+                .any(|e| matches!(e, StateEventPayload::PredecessorRemoved { .. }))
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            StateEventPayload::TrainAborted { root_pr: PrNumber(1), error, .. }
+                if error.kind == TrainErrorKind::PredecessorChanged
         )));
     }
 }
