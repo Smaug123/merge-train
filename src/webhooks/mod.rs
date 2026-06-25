@@ -32,6 +32,7 @@
 //! ```
 
 pub mod events;
+pub mod handlers;
 pub mod parser;
 pub mod priority;
 pub mod signature;
