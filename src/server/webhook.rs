@@ -170,18 +170,19 @@ pub async fn webhook_handler(
     validate_path_component(&owner)?;
     validate_path_component(&repo)?;
 
+    // Reserve the process-wide intake-byte budget *before* copying the body into
+    // the delivery, so the budget actually bounds queued payload memory: a
+    // handler waiting here holds only axum's request `body` (bounded by HTTP
+    // concurrency), not yet a second `Vec` copy. The permit travels with the
+    // delivery and releases once the worker durably enqueues it.
+    let permit = app_state.workers().reserve_intake(body.len()).await;
+
     let delivery = IntakeDelivery {
         delivery_id: delivery_id.to_string(),
         event_type: event_type.clone(),
         headers: captured_headers(&delivery_id, &event_type, &signature_header),
         body: body.to_vec(),
     };
-
-    // Reserve the process-wide intake-byte budget for this body before handing
-    // it off, so a burst of large payloads backpressures here rather than piling
-    // up in mailboxes. The permit travels with the delivery and is released once
-    // the worker durably enqueues it.
-    let permit = app_state.workers().reserve_intake(body.len()).await;
 
     // Route to the repo's worker and await its durable-enqueue ack before
     // replying 200 (at-least-once intake; the server never opens the Store).
