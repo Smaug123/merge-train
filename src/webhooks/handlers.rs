@@ -127,7 +127,12 @@ pub fn handle_event(event: &GitHubEvent, state: &RepoState, ctx: &HandlerCtx) ->
                 context: e.context.clone(),
                 state: canonical(&e.state),
             });
-            out.triggers = evaluate_for_sha(state, &e.sha);
+            // Only a *terminal* status re-drives a train: a `pending` update can
+            // still report stale `CLEAN` mergeability from the old head, which
+            // could advance a waiting train before CI actually finished.
+            if e.state.is_terminal() {
+                out.triggers = evaluate_for_sha(state, &e.sha);
+            }
             out
         }
         GitHubEvent::PullRequestReview(e) => handle_review(e, state),
@@ -249,11 +254,34 @@ fn handle_predecessor_command(
         return HandlerOutput::default();
     }
 
-    // Late addition: declaring a predecessor that has *already merged* is a
-    // distinct (squash-vs-rebase) flow M5 handles; M3 only detects it and hands
-    // it off, so the user's command isn't silently rejected.
-    if let Some(pred) = state.prs.get(&predecessor)
-        && matches!(pred.state, PrState::Merged { .. })
+    // Validate first. If this comment already owns the declaration, an edit
+    // *updates* it (the update validator tolerates an existing predecessor);
+    // otherwise it's a fresh declaration, which rejects if a predecessor already
+    // exists — first declaration wins. Validating before the late-addition
+    // branch means a second declaration onto an already-merged PR is still
+    // rejected as `AlreadyHasPredecessor` (Codex review #55).
+    let validation = if declared_by_this_comment {
+        validate_predecessor_update(cached, predecessor, &state.prs, &state.default_branch)
+    } else {
+        validate_predecessor_declaration(cached, predecessor, &state.prs, &state.default_branch)
+    };
+
+    if let Err(e) = validation {
+        return HandlerOutput {
+            events: vec![],
+            effects: vec![reject(pr, &predecessor_rejection_message(&e))],
+            triggers: vec![],
+        };
+    }
+
+    // Validation passed. A predecessor that has *already merged* is a late
+    // addition (the validator accepts it as a "resolved" predecessor) — a
+    // distinct squash-vs-rebase flow M5 handles, so M3 only detects and hands
+    // it off rather than recording a normal declaration.
+    if state
+        .prs
+        .get(&predecessor)
+        .is_some_and(|p| matches!(p.state, PrState::Merged { .. }))
     {
         return HandlerOutput {
             events: vec![],
@@ -265,37 +293,18 @@ fn handle_predecessor_command(
         };
     }
 
-    // If this comment already owns the declaration, an edit *updates* it (the
-    // update validator tolerates an existing predecessor). Otherwise it's a
-    // fresh declaration, which rejects if a predecessor already exists — first
-    // declaration wins.
-    let validation = if declared_by_this_comment {
-        validate_predecessor_update(cached, predecessor, &state.prs, &state.default_branch)
-    } else {
-        validate_predecessor_declaration(cached, predecessor, &state.prs, &state.default_branch)
+    let mut out = HandlerOutput {
+        events: vec![StateEventPayload::PredecessorDeclared {
+            pr,
+            predecessor,
+            comment_id,
+        }],
+        effects: vec![ack(comment_id)],
+        triggers: vec![],
     };
-
-    match validation {
-        Ok(()) => {
-            let mut out = HandlerOutput {
-                events: vec![StateEventPayload::PredecessorDeclared {
-                    pr,
-                    predecessor,
-                    comment_id,
-                }],
-                effects: vec![ack(comment_id)],
-                triggers: vec![],
-            };
-            // Changing the stack under an active train is unsafe to cascade.
-            out.events.extend(topology_change_abort(state, pr));
-            out
-        }
-        Err(e) => HandlerOutput {
-            events: vec![],
-            effects: vec![reject(pr, &predecessor_rejection_message(&e))],
-            triggers: vec![],
-        },
-    }
+    // Changing the stack under an active train is unsafe to cascade.
+    out.events.extend(topology_change_abort(state, pr));
+    out
 }
 
 // ─── pull_request: state materialization ───
@@ -1380,6 +1389,72 @@ mod tests {
                 merged_predecessor: PrNumber(1),
             }]
         );
+        assert!(out.events.is_empty());
+    }
+
+    #[test]
+    fn only_terminal_status_evaluates_the_train() {
+        use crate::types::TrainState;
+        use crate::webhooks::events::{StatusEvent, StatusState};
+        let mut train = TrainRecord::new(PrNumber(1), ts());
+        train.state = TrainState::WaitingCi;
+        let mut snap = PersistedRepoSnapshot::new("main");
+        snap.prs.insert(PrNumber(1), open_pr(1, "main", None));
+        snap.active_trains.insert(PrNumber(1), train);
+        let state = RepoState::from_snapshot(snap);
+        let mk = |st| {
+            GitHubEvent::Status(StatusEvent {
+                repo: repo(),
+                sha: sha(),
+                state: st,
+                context: "ci".to_owned(),
+                description: None,
+                target_url: None,
+            })
+        };
+
+        // A pending status records but does NOT re-drive the train.
+        let pending = handle_event(&mk(StatusState::Pending), &state, &ctx());
+        assert!(matches!(
+            pending.events.as_slice(),
+            [StateEventPayload::StatusReceived { .. }]
+        ));
+        assert!(pending.triggers.is_empty());
+
+        // A terminal status does.
+        let success = handle_event(&mk(StatusState::Success), &state, &ctx());
+        assert!(
+            success
+                .triggers
+                .contains(&Trigger::EvaluateTrain { root: PrNumber(1) })
+        );
+    }
+
+    #[test]
+    fn second_predecessor_onto_a_merged_pr_is_rejected_not_late_addition() {
+        // #2 already declares predecessor #1; declaring merged #3 must reject
+        // (AlreadyHasPredecessor), not slip through as a late addition.
+        let pr2 = open_pr(2, "feature-1", Some(1));
+        let mut merged3 = open_pr(3, "main", None);
+        merged3.state = PrState::Merged {
+            merge_commit_sha: sha(),
+        };
+        let state = state_with(vec![open_pr(1, "main", None), merged3, pr2]);
+        let out = handle_event(
+            &comment(
+                CommentAction::Created,
+                Some(2),
+                "@merge-train predecessor #3",
+                1,
+            ),
+            &state,
+            &ctx(),
+        );
+        assert!(matches!(
+            out.effects.as_slice(),
+            [Effect::GitHub(GitHubEffect::PostComment { .. })]
+        ));
+        assert!(out.triggers.is_empty());
         assert!(out.events.is_empty());
     }
 }
