@@ -332,6 +332,11 @@ fn handle_pull_request(event: &PullRequestEvent, state: &RepoState) -> HandlerOu
     if let PrAction::Edited = event.action {
         return handle_pr_edited(pr, &event.base_branch, state);
     }
+    // A reopen carries current fields that may have changed while closed — it
+    // refreshes the cache, not just the open flag — so it's handled separately.
+    if let PrAction::Reopened = event.action {
+        return handle_pr_reopened(event, state);
+    }
 
     let payload = match event.action {
         PrAction::Opened => StateEventPayload::PrOpened {
@@ -348,7 +353,7 @@ fn handle_pull_request(event: &PullRequestEvent, state: &RepoState) -> HandlerOu
             },
             MergeStatus::NotMerged => StateEventPayload::PrClosed { pr },
         },
-        PrAction::Reopened => StateEventPayload::PrReopened { pr },
+        PrAction::Reopened => unreachable!("handled above"),
         PrAction::Synchronize => StateEventPayload::PrSynchronized {
             pr,
             new_head_sha: event.head_sha.clone(),
@@ -419,6 +424,41 @@ fn handle_pr_edited(pr: PrNumber, new_base: &str, state: &RepoState) -> HandlerO
                 pred.head_ref
             ),
         ));
+    }
+    out
+}
+
+/// A reopened PR may have changed (head pushed, retargeted, draft toggled) while
+/// closed, and the reopened webhook carries the *current* fields. So beyond
+/// marking it open, emit the field-refresh events for whatever actually changed
+/// — otherwise the cache keeps a stale head sha / base / draft (and a stale
+/// reconciliation marker, which `PrSynchronized` clears on a head change),
+/// which later train evaluation would trust (Codex review #55).
+fn handle_pr_reopened(event: &PullRequestEvent, state: &RepoState) -> HandlerOutput {
+    let pr = event.pr_number;
+    let mut out = HandlerOutput::event(StateEventPayload::PrReopened { pr });
+
+    if let Some(cached) = state.prs.get(&pr) {
+        if cached.head_sha != event.head_sha {
+            out.events.push(StateEventPayload::PrSynchronized {
+                pr,
+                new_head_sha: event.head_sha.clone(),
+            });
+        }
+        if cached.base_ref != event.base_branch {
+            out.events.push(StateEventPayload::PrBaseChanged {
+                pr,
+                old_base: cached.base_ref.clone(),
+                new_base: event.base_branch.clone(),
+            });
+        }
+        if cached.is_draft != event.is_draft {
+            out.events.push(if event.is_draft {
+                StateEventPayload::PrConvertedToDraft { pr }
+            } else {
+                StateEventPayload::PrReadyForReview { pr }
+            });
+        }
     }
     out
 }
@@ -1619,5 +1659,58 @@ mod tests {
             StateEventPayload::TrainAborted { root_pr: PrNumber(1), error, .. }
                 if error.kind == TrainErrorKind::PredecessorChanged
         )));
+    }
+
+    #[test]
+    fn reopening_a_changed_pr_refreshes_its_cache() {
+        // Cached #1: head sha(), base "main", not draft.
+        let state = state_with(vec![open_pr(1, "main", None)]);
+        let new_head = Sha::parse("c".repeat(40)).unwrap();
+        let event = GitHubEvent::PullRequest(PullRequestEvent {
+            repo: repo(),
+            action: PrAction::Reopened,
+            pr_number: PrNumber(1),
+            merge_status: MergeStatus::NotMerged,
+            head_sha: new_head.clone(),
+            base_branch: "develop".to_owned(),
+            head_branch: "feature-1".to_owned(),
+            is_draft: true,
+            author_id: 1,
+        });
+        let out = handle_event(&event, &state, &ctx());
+        assert!(
+            out.events
+                .iter()
+                .any(|e| matches!(e, StateEventPayload::PrReopened { .. }))
+        );
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            StateEventPayload::PrSynchronized { new_head_sha, .. } if *new_head_sha == new_head
+        )));
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            StateEventPayload::PrBaseChanged { new_base, .. } if new_base == "develop"
+        )));
+        assert!(
+            out.events
+                .iter()
+                .any(|e| matches!(e, StateEventPayload::PrConvertedToDraft { .. }))
+        );
+    }
+
+    #[test]
+    fn reopening_an_unchanged_pr_only_marks_open() {
+        let state = state_with(vec![open_pr(1, "main", None)]);
+        // pr_event(Reopened, ...) carries head sha(), base "main", not draft —
+        // all matching the cache.
+        let out = handle_event(
+            &pr_event(PrAction::Reopened, 1, "main", MergeStatus::NotMerged),
+            &state,
+            &ctx(),
+        );
+        assert_eq!(
+            out.events,
+            vec![StateEventPayload::PrReopened { pr: PrNumber(1) }]
+        );
     }
 }
