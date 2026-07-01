@@ -11,9 +11,9 @@ use crate::types::{PrNumber, Sha};
 /// serde-able form (seam a).
 ///
 /// Conflicts are *outcomes the engine branches on* (abort vs skip per
-/// DESIGN.md §Pause Conditions), so the interpreter returns them as
-/// `Ok(GitResponse::Merge(MergeOutcome::Conflict { .. }))`, never as `Err`.
-/// Only uncharacterizable git failures are interpreter errors.
+/// DESIGN.md §Pause Conditions), so the interpreter returns them inside
+/// `Ok(..)` responses (`Prepared`/`MergedForPush`), never as `Err`. Only
+/// uncharacterizable git failures are interpreter errors.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum MergeOutcome {
@@ -122,24 +122,6 @@ pub enum GitEffect {
         /// These are passed to `git fetch origin <refspec>...`. Use branch names like `"main"`,
         /// or full refspecs like `"refs/pull/N/head:refs/remotes/origin/pr/N"` for PR refs.
         refspecs: Vec<String>,
-    },
-
-    /// Checkout a ref or commit.
-    Checkout {
-        /// The target to checkout (branch name, tag, or SHA).
-        target: String,
-        /// If true, checkout in detached HEAD mode.
-        detach: bool,
-    },
-
-    /// Merge a branch or commit into HEAD.
-    Merge {
-        /// The target to merge (branch name or SHA).
-        target: String,
-        /// The merge strategy to use.
-        strategy: MergeStrategy,
-        /// The commit message for the merge.
-        message: String,
     },
 
     /// Prepare a descendant: merge the predecessor's pinned head into it
@@ -286,14 +268,6 @@ pub enum GitEffect {
         force: bool,
     },
 
-    /// Check if one commit is an ancestor of another.
-    IsAncestor {
-        /// The potential ancestor commit.
-        potential_ancestor: Sha,
-        /// The potential descendant commit.
-        descendant: Sha,
-    },
-
     /// Parse a revision to a SHA.
     RevParse {
         /// The revision to parse (e.g., "HEAD", "main", "abc123^").
@@ -310,23 +284,6 @@ pub enum GitEffect {
     RemoveWorktree {
         /// The name of the worktree to remove.
         name: String,
-    },
-
-    /// Abort an in-progress merge.
-    MergeAbort,
-
-    /// Hard reset to a target.
-    ResetHard {
-        /// The target to reset to (branch, SHA, etc.).
-        target: String,
-    },
-
-    /// Clean untracked files.
-    Clean {
-        /// If true, also remove untracked directories.
-        directories: bool,
-        /// If true, force clean (required for actual removal).
-        force: bool,
     },
 }
 
@@ -357,7 +314,7 @@ pub enum GitResponse {
     Ok,
     /// Operation returned a SHA (e.g., from RevParse).
     Sha(Sha),
-    /// Operation returned a boolean (e.g., from IsAncestor).
+    /// Operation returned a boolean (e.g., from ValidateSquashCommit).
     Bool(bool),
     /// Response to `CheckPushCompleted`.
     PushCheck {
@@ -369,8 +326,6 @@ pub enum GitResponse {
         /// recovery records it as the descendant's current head.
         remote_head: Option<Sha>,
     },
-    /// Response to the plain `Merge` effect.
-    Merge(MergeOutcome),
     /// Response to `Push`: the domain outcome of the push.
     Push(PushOutcome),
     /// Response to `PrepareDescendant`.
@@ -435,10 +390,6 @@ mod tests {
         prop_oneof![Just(MergeStrategy::Default), Just(MergeStrategy::Ours),]
     }
 
-    fn arb_message() -> impl Strategy<Value = String> {
-        ".{1,100}".prop_map(|s| s.to_string())
-    }
-
     fn arb_worktree_name() -> impl Strategy<Value = String> {
         "stack-[0-9]{1,10}".prop_map(|s| s.to_string())
     }
@@ -473,8 +424,6 @@ mod tests {
         fn _assert_all_variants_covered(e: GitEffect) {
             match e {
                 GitEffect::Fetch { .. } => {}
-                GitEffect::Checkout { .. } => {}
-                GitEffect::Merge { .. } => {}
                 GitEffect::PrepareDescendant { .. } => {}
                 GitEffect::MergeReconcile { .. } => {}
                 GitEffect::CatchUpDescendant { .. } => {}
@@ -483,13 +432,9 @@ mod tests {
                 GitEffect::CleanupWorktree => {}
                 GitEffect::ValidateSquashCommit { .. } => {}
                 GitEffect::Push { .. } => {}
-                GitEffect::IsAncestor { .. } => {}
                 GitEffect::RevParse { .. } => {}
                 GitEffect::CreateWorktree { .. } => {}
                 GitEffect::RemoveWorktree { .. } => {}
-                GitEffect::MergeAbort => {}
-                GitEffect::ResetHard { .. } => {}
-                GitEffect::Clean { .. } => {}
             }
         }
 
@@ -497,17 +442,6 @@ mod tests {
             // Fetch
             prop::collection::vec(arb_refspec(), 1..5)
                 .prop_map(|refspecs| GitEffect::Fetch { refspecs }),
-            // Checkout
-            (arb_target(), any::<bool>())
-                .prop_map(|(target, detach)| GitEffect::Checkout { target, detach }),
-            // Merge
-            (arb_target(), arb_merge_strategy(), arb_message()).prop_map(
-                |(target, strategy, message)| GitEffect::Merge {
-                    target,
-                    strategy,
-                    message
-                }
-            ),
             // PrepareDescendant
             (arb_target(), arb_pr_number()).prop_map(|(descendant_branch, predecessor_pr)| {
                 GitEffect::PrepareDescendant {
@@ -584,26 +518,12 @@ mod tests {
             // Push
             (arb_refspec(), any::<bool>())
                 .prop_map(|(refspec, force)| GitEffect::Push { refspec, force }),
-            // IsAncestor
-            (arb_sha(), arb_sha()).prop_map(|(potential_ancestor, descendant)| {
-                GitEffect::IsAncestor {
-                    potential_ancestor,
-                    descendant,
-                }
-            }),
             // RevParse
             arb_target().prop_map(|rev| GitEffect::RevParse { rev }),
             // CreateWorktree
             arb_worktree_name().prop_map(|name| GitEffect::CreateWorktree { name }),
             // RemoveWorktree
             arb_worktree_name().prop_map(|name| GitEffect::RemoveWorktree { name }),
-            // MergeAbort
-            Just(GitEffect::MergeAbort),
-            // ResetHard
-            arb_target().prop_map(|target| GitEffect::ResetHard { target }),
-            // Clean
-            (any::<bool>(), any::<bool>())
-                .prop_map(|(directories, force)| GitEffect::Clean { directories, force }),
         ]
     }
 
@@ -627,7 +547,6 @@ mod tests {
                     remote_head,
                 }
             }),
-            arb_merge_outcome().prop_map(GitResponse::Merge),
             arb_push_outcome().prop_map(GitResponse::Push),
             (
                 arb_merge_outcome(),

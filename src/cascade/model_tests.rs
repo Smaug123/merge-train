@@ -428,8 +428,6 @@ impl ModelWorld {
                 };
                 Ok(GitResponse::Bool(valid))
             }
-
-            other => panic!("the engine does not emit {other:?}"),
         }
     }
 

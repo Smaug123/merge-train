@@ -21,7 +21,7 @@ mod property_tests;
 pub(crate) mod test_support;
 
 // Re-export commonly used types from submodules
-pub use push::{PushIntent, PushResult, is_push_completed};
+pub use push::{PushCompletion, PushIntent, PushResult, is_push_completed};
 
 use std::path::{Path, PathBuf};
 use std::process::Output;

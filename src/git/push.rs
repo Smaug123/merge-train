@@ -113,6 +113,31 @@ pub fn get_remote_ref(worktree: &Path, branch: &str) -> GitResult<Option<Sha>> {
         .map_err(|_| GitError::InvalidSha(sha_str.to_string()))
 }
 
+/// The result of a push-completion check: the verdict plus the remote head
+/// the check observed.
+///
+/// When `completed` is true the remote head is *proven ours* (tree +
+/// parent-chain verification), so recovery records it as the branch's
+/// current head — keeping the cached head accurate so the branch's own
+/// `synchronize` webhook is a same-SHA no-op rather than a marker wipe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushCompletion {
+    /// Whether the intended push provably landed.
+    pub completed: bool,
+    /// The remote branch head observed during the check; `None` if the
+    /// branch does not exist on the remote.
+    pub remote_head: Option<Sha>,
+}
+
+impl PushCompletion {
+    fn incomplete(remote_head: Option<Sha>) -> Self {
+        PushCompletion {
+            completed: false,
+            remote_head,
+        }
+    }
+}
+
 /// Check if a push has already been completed.
 ///
 /// Merge commits are not reproducible (timestamps, GPG signatures vary),
@@ -129,7 +154,7 @@ pub fn get_remote_ref(worktree: &Path, branch: &str) -> GitResult<Option<Sha>> {
 ///
 /// # Returns
 ///
-/// `true` if the push was already completed (remote has our content).
+/// The completion verdict plus the observed remote head.
 ///
 /// # Note on ours merges
 ///
@@ -143,10 +168,10 @@ pub fn is_push_completed(
     expected_tree: &Sha,
     pre_push_sha: &Sha,
     expected_second_parent: Option<&Sha>,
-) -> GitResult<bool> {
+) -> GitResult<PushCompletion> {
     // Get the current remote ref
     let Some(remote_sha) = get_remote_ref(worktree, branch)? else {
-        return Ok(false);
+        return Ok(PushCompletion::incomplete(None));
     };
 
     // Fetch the remote ref to ensure we have it locally
@@ -155,13 +180,13 @@ pub fn is_push_completed(
     // Compare tree SHAs
     let remote_tree = get_tree_sha(worktree, remote_sha.as_str())?;
     if remote_tree != *expected_tree {
-        return Ok(false);
+        return Ok(PushCompletion::incomplete(Some(remote_sha)));
     }
 
     // Verify the parent chain includes pre_push_sha
     let is_ancestor = super::is_ancestor(worktree, pre_push_sha, &remote_sha)?;
     if !is_ancestor {
-        return Ok(false);
+        return Ok(PushCompletion::incomplete(Some(remote_sha)));
     }
 
     // Check for ours merge scenario: if the expected tree equals the pre-push tree,
@@ -176,7 +201,7 @@ pub fn is_push_completed(
 
         // First parent must match pre_push_sha
         if parents.first() != Some(pre_push_sha) {
-            return Ok(false);
+            return Ok(PushCompletion::incomplete(Some(remote_sha)));
         }
 
         // If we have an expected second parent, validate it too
@@ -184,14 +209,14 @@ pub fn is_push_completed(
             && parents.get(1) != Some(expected_p2)
         {
             // Second parent doesn't match - this is a different merge commit
-            return Ok(false);
+            return Ok(PushCompletion::incomplete(Some(remote_sha)));
         }
-
-        // Parents match - our merge commit made it
-        return Ok(true);
     }
 
-    Ok(true)
+    Ok(PushCompletion {
+        completed: true,
+        remote_head: Some(remote_sha),
+    })
 }
 
 /// Information needed to verify push completion during recovery.
@@ -235,7 +260,7 @@ impl PushIntent {
     }
 
     /// Check if this push has been completed.
-    pub fn is_completed(&self, worktree: &Path) -> GitResult<bool> {
+    pub fn is_completed(&self, worktree: &Path) -> GitResult<PushCompletion> {
         is_push_completed(
             worktree,
             &self.branch,
@@ -408,14 +433,20 @@ mod tests {
 
         // Push hasn't happened yet
         assert!(
-            !is_push_completed(&worktree, "main", &expected_tree, &pre_push_sha, None).unwrap()
+            !is_push_completed(&worktree, "main", &expected_tree, &pre_push_sha, None)
+                .unwrap()
+                .completed
         );
 
         // Do the push
         push_head_to_branch(&worktree, "main").unwrap();
 
         // Now it should be detected as completed
-        assert!(is_push_completed(&worktree, "main", &expected_tree, &pre_push_sha, None).unwrap());
+        assert!(
+            is_push_completed(&worktree, "main", &expected_tree, &pre_push_sha, None)
+                .unwrap()
+                .completed
+        );
     }
 
     #[test]
@@ -438,13 +469,13 @@ mod tests {
         let intent = PushIntent::new("main", expected_tree, pre_push_sha);
 
         // Not completed yet
-        assert!(!intent.is_completed(&worktree).unwrap());
+        assert!(!intent.is_completed(&worktree).unwrap().completed);
 
         // Do the push
         push_head_to_branch(&worktree, "main").unwrap();
 
         // Now completed
-        assert!(intent.is_completed(&worktree).unwrap());
+        assert!(intent.is_completed(&worktree).unwrap().completed);
     }
 
     #[test]
@@ -492,7 +523,9 @@ mod tests {
 
         // Push hasn't happened yet - remote still has pre_push_sha
         assert!(
-            !is_push_completed(&worktree, "main", &expected_tree, &pre_push_sha, None).unwrap(),
+            !is_push_completed(&worktree, "main", &expected_tree, &pre_push_sha, None)
+                .unwrap()
+                .completed,
             "Should not detect completion before push"
         );
 
@@ -502,7 +535,9 @@ mod tests {
         // Now it should be detected as completed (the fix makes this work)
         // Without expected second parent, it only checks first parent
         assert!(
-            is_push_completed(&worktree, "main", &expected_tree, &pre_push_sha, None).unwrap(),
+            is_push_completed(&worktree, "main", &expected_tree, &pre_push_sha, None)
+                .unwrap()
+                .completed,
             "Should detect ours-merge push as completed"
         );
 
@@ -515,7 +550,8 @@ mod tests {
                 &pre_push_sha,
                 Some(&feature_sha)
             )
-            .unwrap(),
+            .unwrap()
+            .completed,
             "Should detect ours-merge with correct second parent"
         );
     }
@@ -574,7 +610,8 @@ mod tests {
                 &pre_push_sha,
                 Some(&feature_sha)
             )
-            .unwrap(),
+            .unwrap()
+            .completed,
             "Should succeed with correct second parent"
         );
 
@@ -587,7 +624,8 @@ mod tests {
                 &pre_push_sha,
                 Some(&other_sha)
             )
-            .unwrap(),
+            .unwrap()
+            .completed,
             "Should reject wrong second parent"
         );
     }
