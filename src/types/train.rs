@@ -481,6 +481,9 @@ pub enum TrainErrorKind {
     PrClosed,
     CiFailed,
     CycleDetected,
+    /// A PR's predecessor relationship was changed or removed while a train
+    /// involving it was active, altering the stack out from under the cascade.
+    PredecessorChanged,
     ReviewDismissed,
     ApprovalWithdrawn,
     ApiError,
