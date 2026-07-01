@@ -1504,6 +1504,116 @@ fn externally_merged_current_pr_completes_and_updates_cache() {
     assert!(plan.events.is_empty());
 }
 
+/// `stop` on an unfrozen descendant below the current PR must find the train
+/// even after intermediate members merged: the open-only walk from the
+/// original root is blocked by the merged members, so membership must also
+/// traverse from the current PR.
+#[test]
+fn stop_below_merged_members_still_stops_the_train() {
+    // 1 ← 2 ← 3 ← 4; the train will merge 1 and 2, then park at current=3.
+    let shape = StackShape {
+        predecessors: vec![0, 1, 2],
+        advanced: vec![false; 4],
+    };
+    let (mut world, state) = seed(&shape);
+    world
+        .merge_states
+        .insert(pr_number(2), MergeStateStatus::Blocked);
+    let mut driver = Driver::new(world, state);
+    let root = pr_number(0);
+
+    let plan = start_train(&driver.state, root, driver.now).unwrap();
+    let outcome = driver.run_plan(plan, root, &mut |_, _| {});
+    assert_eq!(outcome, RunOutcome::Parked);
+    let train = &driver.state.active_trains[&root];
+    assert_eq!(train.current_pr, pr_number(2), "train parked at PR 3");
+    assert!(driver.state.prs[&pr_number(0)].state.is_merged());
+    assert!(driver.state.prs[&pr_number(1)].state.is_merged());
+
+    // Stop issued on PR 4 — an unfrozen descendant below the parked head.
+    let stop = stop_train(&driver.state, pr_number(3), false, driver.now).unwrap();
+    assert!(
+        stop.events
+            .iter()
+            .any(|e| matches!(e, StateEventPayload::TrainStopped { root_pr } if *root_pr == root)),
+        "stop below merged members must stop the active train, got {stop:?}"
+    );
+    let events = stop.events.clone();
+    driver.append(&events);
+    assert!(matches!(
+        driver.state.active_trains[&root].state,
+        TrainState::Stopped { .. }
+    ));
+}
+
+/// A descendant that closed after its retarget landed (but before the done
+/// event) is skipped during recovery, not completed: completing it would make
+/// a closed PR the train's next head and abort the whole train one refetch
+/// later.
+#[test]
+fn descendant_closed_after_retarget_is_skipped_on_recovery() {
+    let shape = StackShape {
+        predecessors: vec![0],
+        advanced: vec![true, false],
+    };
+    let (world, state) = seed(&shape);
+
+    // Uninterrupted run to harvest the crash point where pr-2's retarget
+    // landed but its done-event did not.
+    let mut uninterrupted = Driver::new(world, state.clone());
+    uninterrupted.run_to_completion(pr_number(0));
+    let crash_points = std::mem::take(&mut uninterrupted.crash_points);
+    let events = uninterrupted.log;
+
+    let (cut, mut world_at_cut) = crash_points
+        .into_iter()
+        .find(|(cut, world)| {
+            let facts = ReplayFacts::for_train(&events[..*cut], pr_number(0));
+            let unmatched_retarget = facts.unmatched().any(
+                |f| matches!(f, super::IntentFact::Retarget { pr, .. } if *pr == pr_number(1)),
+            );
+            unmatched_retarget && world.prs[&pr_number(1)].base_ref == "main"
+        })
+        .expect("a crash point between the retarget and its done event exists");
+
+    // The human closes pr-2 in the crash window.
+    world_at_cut.prs.get_mut(&pr_number(1)).unwrap().state = ModelPrState::Closed;
+
+    let mut replayed = state.clone();
+    for event in &events[..cut] {
+        replayed.apply_event(event);
+    }
+    let mut driver = Driver::new(world_at_cut, replayed);
+    driver.log = events[..cut].to_vec();
+    driver.seq = cut as u64;
+    driver.drive(vec![(pr_number(0), None)]);
+
+    assert!(
+        driver.log[cut..].iter().any(|e| matches!(
+            &e.payload,
+            StateEventPayload::DescendantSkipped { descendant_pr, .. }
+                if *descendant_pr == pr_number(1)
+        )),
+        "the closed descendant must be skipped"
+    );
+    assert!(
+        !driver
+            .log
+            .iter()
+            .any(|e| matches!(e.payload, StateEventPayload::TrainAborted { .. })),
+        "the train must not abort because a descendant closed"
+    );
+    assert!(
+        driver.state.active_trains.is_empty(),
+        "with its only descendant skipped, the train completes"
+    );
+    assert_eq!(
+        driver.world.squash_count.get(&pr_number(1)),
+        None,
+        "a closed descendant must never become the train head and be squashed"
+    );
+}
+
 /// BEHIND at evaluation time: the root is updated with main (intent-bracketed
 /// push), the train parks for CI, and a later evaluation completes the run.
 #[test]

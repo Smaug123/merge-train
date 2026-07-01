@@ -204,7 +204,7 @@ pub fn start_train(
         )));
     }
 
-    if let Some(root) = train_containing(state, pr) {
+    if let Some(root) = state.train_involving(pr) {
         return Ok(reject(format!(
             "A merge train involving PR #{pr} is already active (root #{root}). \
              Stop it with `@merge-train stop` before starting a new one."
@@ -269,7 +269,7 @@ pub fn stop_train(
     _force: bool,
     now: DateTime<Utc>,
 ) -> Result<StepPlan, CascadeError> {
-    let Some(root) = train_containing(state, pr) else {
+    let Some(root) = state.train_involving(pr) else {
         return Ok(StepPlan {
             events: Vec::new(),
             effects: Vec::new(),
@@ -280,7 +280,7 @@ pub fn stop_train(
     let train = state
         .active_trains
         .get(&root)
-        .expect("train_containing returned an active train");
+        .expect("train_involving returned an active train");
 
     let mut stopped = train.clone();
     stopped.stop(now);
@@ -972,6 +972,19 @@ fn retarget_check(
     }
     let mut events = ctx.resumed_events();
     events.extend(refresh_events(ctx, pr, &data, merge_state));
+
+    // A descendant that closed (or merged externally) after its retarget
+    // landed is a skip, not a completion: descendant closures are skip
+    // conditions (DESIGN.md §Expected state tracking), and completing it
+    // could make a closed PR the train's next head, aborting the whole train
+    // one refetch later. The unmatched retarget intent is settled by the
+    // skip's phase transition.
+    if data.state != PrState::Open {
+        let mut plan = skip_descendant(ctx, d, "it is no longer open")?;
+        plan.events.splice(0..0, events);
+        return Ok(plan);
+    }
+
     if data.base_ref == ctx.default_branch() {
         events.push(StateEventPayload::DoneRetarget {
             train_root: ctx.root(),
@@ -2275,25 +2288,6 @@ fn finish_with_status(ctx: &Ctx<'_>, mut plan: StepPlan, message: &str) -> StepP
         Ok(None) => plan,
         Err(_) => abort_too_large(ctx),
     }
-}
-
-/// The root of the active train whose stack involves `pr` (root, current PR,
-/// frozen descendant, or transitive descendant of the root).
-fn train_containing(state: &RepoState, pr: PrNumber) -> Option<PrNumber> {
-    state
-        .active_trains
-        .values()
-        .find(|t| {
-            t.state.is_active()
-                && (t.original_root_pr == pr
-                    || t.current_pr == pr
-                    || t.cascade_phase
-                        .progress()
-                        .is_some_and(|p| p.frozen_descendants().contains(&pr))
-                    || collect_all_descendants(t.original_root_pr, &state.descendants, &state.prs)
-                        .contains(&pr))
-        })
-        .map(|t| t.original_root_pr)
 }
 
 #[cfg(test)]

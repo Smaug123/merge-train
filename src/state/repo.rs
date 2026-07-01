@@ -105,6 +105,43 @@ impl RepoState {
         }
     }
 
+    /// The root of the active train whose stack involves `pr`: its root, its
+    /// current PR, a *frozen* descendant, or an unfrozen PR transitively below
+    /// the root or the current PR.
+    ///
+    /// The unfrozen cases matter: a train that has started but not yet
+    /// entered `Preparing` has no frozen set, yet a `stop` command or a
+    /// predecessor change anywhere below it must still reach it (Codex
+    /// review #55). Traversal is open-only and mid-train the members between
+    /// the root and the current PR are already merged — they block the walk
+    /// from the root — so the walk runs from **both** the root and the
+    /// current PR (GPT-5.5 review round 2).
+    pub fn train_involving(&self, pr: PrNumber) -> Option<PrNumber> {
+        self.active_trains
+            .values()
+            .find(|t| {
+                t.state.is_active()
+                    && (t.original_root_pr == pr
+                        || t.current_pr == pr
+                        || t.cascade_phase
+                            .progress()
+                            .is_some_and(|p| p.frozen_descendants().contains(&pr))
+                        || super::descendants::collect_all_descendants(
+                            t.original_root_pr,
+                            &self.descendants,
+                            &self.prs,
+                        )
+                        .contains(&pr)
+                        || super::descendants::collect_all_descendants(
+                            t.current_pr,
+                            &self.descendants,
+                            &self.prs,
+                        )
+                        .contains(&pr))
+            })
+            .map(|t| t.original_root_pr)
+    }
+
     /// THE single mutation entry point. Applies one event to the state.
     ///
     /// Total: events about unknown PRs/trains are skipped. Timestamps come from
@@ -1245,6 +1282,63 @@ mod tests {
             MergeStateStatus::Clean,
             "a same-SHA sync must not reset mergeability"
         );
+    }
+
+    /// `train_involving` must find members below the current PR even when
+    /// the open-only walk from the root is blocked by already-merged train
+    /// members (GPT-5.5 review round 2): stack 1←2←3←4, PRs 1 and 2 merged,
+    /// train parked at current=3 — a stop/topology event on the unfrozen
+    /// descendant 4 must still resolve to the train.
+    #[test]
+    fn train_involving_reaches_below_merged_members() {
+        let mk = |n: u64, pred: Option<u64>, state: PrState| {
+            CachedPr::new(
+                PrNumber(n),
+                Sha::parse(format!("{n:040}")).unwrap(),
+                format!("pr-{n}"),
+                pred.map_or("main".to_string(), |p| format!("pr-{p}")),
+                pred.map(PrNumber),
+                state,
+                MergeStateStatus::Unknown,
+                false,
+            )
+        };
+        let merged = |n: u64| PrState::Merged {
+            merge_commit_sha: Sha::parse(format!("{n:039}9")).unwrap(),
+        };
+        let prs: HashMap<_, _> = [
+            mk(1, None, merged(1)),
+            mk(2, Some(1), merged(2)),
+            mk(3, Some(2), PrState::Open),
+            mk(4, Some(3), PrState::Open),
+        ]
+        .into_iter()
+        .map(|p| (p.number, p))
+        .collect();
+
+        let mut train = TrainRecord::new(PrNumber(1), crate::test_utils::test_timestamp());
+        train.current_pr = PrNumber(3);
+        let snapshot = PersistedRepoSnapshot {
+            schema_version: SCHEMA_VERSION,
+            snapshot_at: crate::test_utils::test_timestamp(),
+            log_generation: 0,
+            log_position: 0,
+            next_seq: 0,
+            default_branch: "main".to_string(),
+            prs,
+            active_trains: HashMap::from([(PrNumber(1), train)]),
+            seen_dedupe_keys: HashMap::new(),
+        };
+        let state = RepoState::from_snapshot(snapshot);
+
+        for n in [1, 3, 4] {
+            assert_eq!(
+                state.train_involving(PrNumber(n)),
+                Some(PrNumber(1)),
+                "PR {n} must resolve to the active train"
+            );
+        }
+        assert_eq!(state.train_involving(PrNumber(99)), None);
     }
 
     /// Mergeability observations enter the cache through the log.

@@ -45,7 +45,6 @@ use crate::commands::{Command, parse_command};
 use crate::effects::Effect;
 use crate::effects::github::{GitHubEffect, Reaction};
 use crate::persistence::event::StateEventPayload;
-use crate::state::descendants::collect_all_descendants;
 use crate::state::validation::validate_predecessor_update;
 use crate::state::{PredecessorValidationError, RepoState, validate_predecessor_declaration};
 use crate::types::{CommentId, PrNumber, PrState, Sha, TrainError, TrainErrorKind};
@@ -533,26 +532,12 @@ fn topology_change_abort(state: &RepoState, pr: PrNumber) -> Option<StateEventPa
 }
 
 /// The root of an active train whose stack contains `pr`, for the topology-abort
-/// rule. Broader than [`active_train_root_for`]: besides the root, current PR,
-/// and *frozen* descendants, it includes **unfrozen** descendants — a train that
-/// has started but not yet entered `Preparing` hasn't frozen its set, so a
-/// predecessor change on any PR transitively below the root must still abort it
-/// (Codex review #55).
+/// rule. Broader than [`active_train_root_for`]: see
+/// [`RepoState::train_involving`] — unfrozen descendants count, traversed from
+/// both the root and the current PR (the cascade's stop command resolves
+/// membership with the same rule).
 fn topology_train_root_for(state: &RepoState, pr: PrNumber) -> Option<PrNumber> {
-    state
-        .active_trains
-        .values()
-        .find(|t| {
-            t.state.is_active()
-                && (t.original_root_pr == pr
-                    || t.current_pr == pr
-                    || t.cascade_phase
-                        .progress()
-                        .is_some_and(|p| p.frozen_descendants().contains(&pr))
-                    || collect_all_descendants(t.original_root_pr, &state.descendants, &state.prs)
-                        .contains(&pr))
-        })
-        .map(|t| t.original_root_pr)
+    state.train_involving(pr)
 }
 
 /// An `EvaluateTrain` trigger for the active train involving `pr`, if any.
