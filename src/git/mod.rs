@@ -10,6 +10,7 @@
 //! that a branch can only be checked out in one worktree at a time. Pushes use
 //! `HEAD:refs/heads/<branch>` refspecs.
 
+pub mod interpreter;
 pub mod merge;
 pub mod push;
 pub mod recovery;
@@ -353,8 +354,28 @@ pub fn get_parents(workdir: &Path, commit: &str) -> GitResult<Vec<Sha>> {
 pub fn fetch(workdir: &Path, refspecs: &[&str]) -> GitResult<()> {
     let mut args = vec!["fetch", "origin", "--"];
     args.extend(refspecs);
-    run_git_sync(workdir, &args)?;
-    Ok(())
+    match run_git_sync(workdir, &args) {
+        Ok(_) => Ok(()),
+        // A missing remote ref (branch deleted mid-cascade, PR ref GC'd) is a
+        // structured condition the cascade branches on (skip the descendant),
+        // not an opaque command failure. String-matching git's output is only
+        // sound because git_command pins LC_ALL=C.
+        Err(GitError::CommandFailed { stderr, .. })
+            if stderr.contains("couldn't find remote ref") =>
+        {
+            let missing = stderr
+                .lines()
+                .find_map(|l| l.strip_prefix("fatal: couldn't find remote ref "))
+                .unwrap_or("<unknown>")
+                .trim()
+                .to_string();
+            Err(GitError::FetchFailed {
+                refspec: missing,
+                details: stderr,
+            })
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Checkout a target in detached HEAD mode.

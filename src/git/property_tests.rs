@@ -20,62 +20,13 @@ use crate::git::merge::{
     ReconcileRequest, catch_up_descendant, prepare_descendant, reconcile_descendant,
 };
 use crate::git::recovery::{cleanup_worktree_on_abort, is_worktree_dirty};
+use crate::git::test_support::squash_merge_to_main;
 use crate::git::test_support::{
     create_branch_with_file, create_pr_ref, create_test_repo_with_origin, test_identity,
 };
 use crate::git::worktree::{cleanup_stale_worktrees, list_worktrees, worktree_for_stack};
 use crate::git::{GitConfig, MergeResult, is_ancestor, run_git_stdout, run_git_sync};
 use crate::types::{PrNumber, Sha};
-
-/// Result of a squash merge: the squash commit SHA and the prior main HEAD.
-struct SquashResult {
-    squash_sha: Sha,
-    prior_main_head: Sha,
-}
-
-/// Perform a squash merge of a branch into main.
-/// Returns both the squash commit SHA and the main HEAD before the squash.
-fn squash_merge_to_main(config: &GitConfig, branch_sha: &Sha) -> SquashResult {
-    let clone_dir = config.clone_dir();
-
-    // Capture main HEAD before the squash - this is the expected squash parent
-    let prior_main_head = run_git_stdout(&clone_dir, &["rev-parse", "refs/heads/main"]).unwrap();
-    let prior_main_head = Sha::parse(&prior_main_head).unwrap();
-
-    let temp_work = clone_dir.parent().unwrap().join("temp_squash");
-    std::fs::create_dir_all(&temp_work).unwrap();
-    run_git_sync(
-        &clone_dir,
-        &[
-            "worktree",
-            "add",
-            "--detach",
-            temp_work.to_str().unwrap(),
-            "refs/heads/main",
-        ],
-    )
-    .unwrap();
-    run_git_sync(&temp_work, &["config", "user.email", "test@test.com"]).unwrap();
-    run_git_sync(&temp_work, &["config", "user.name", "Test"]).unwrap();
-
-    // Squash merge
-    run_git_sync(&temp_work, &["merge", "--squash", branch_sha.as_str()]).unwrap();
-    run_git_sync(&temp_work, &["commit", "-m", "Squash merge"]).unwrap();
-
-    let squash_sha = run_git_stdout(&temp_work, &["rev-parse", "HEAD"]).unwrap();
-
-    run_git_sync(&temp_work, &["push", "origin", "HEAD:refs/heads/main"]).unwrap();
-    run_git_sync(
-        &clone_dir,
-        &["worktree", "remove", "--force", temp_work.to_str().unwrap()],
-    )
-    .unwrap();
-
-    SquashResult {
-        squash_sha: Sha::parse(&squash_sha).unwrap(),
-        prior_main_head,
-    }
-}
 
 /// Add a commit to main (simulating an independent PR landing).
 fn add_commit_to_main(config: &GitConfig, filename: &str, content: &str) -> Sha {

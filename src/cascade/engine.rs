@@ -165,8 +165,7 @@ fn worktree_prelude(root: PrNumber) -> Vec<Effect> {
 
 fn push_effect(branch: &str) -> Effect {
     Effect::Git(GitEffect::Push {
-        refspec: format!("HEAD:refs/heads/{branch}"),
-        force: false,
+        branch: branch.to_string(),
     })
 }
 
@@ -1742,10 +1741,7 @@ fn descendant_target(ctx: &Ctx<'_>, effect: &Effect) -> Option<PrNumber> {
             branch: descendant_branch,
             ..
         }) => descendant_branch.clone(),
-        Effect::Git(GitEffect::Push { refspec, .. }) => refspec
-            .strip_prefix("HEAD:refs/heads/")
-            .unwrap_or(refspec)
-            .to_string(),
+        Effect::Git(GitEffect::Push { branch }) => branch.clone(),
         Effect::GitHub(GitHubEffect::RetargetPr { pr, .. }) => {
             return ctx
                 .train

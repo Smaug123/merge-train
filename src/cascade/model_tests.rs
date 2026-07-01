@@ -358,10 +358,7 @@ impl ModelWorld {
                 Ok(GitResponse::MergedForPush { merge, push_point })
             }
 
-            GitEffect::Push { refspec, .. } => {
-                let branch = refspec
-                    .strip_prefix("HEAD:refs/heads/")
-                    .expect("engine pushes HEAD:refs/heads/<branch>");
+            GitEffect::Push { branch } => {
                 let head = self.worktree_head.clone().expect("push follows a merge");
                 let outcome = match self.head(branch) {
                     Some(remote) if remote == head => PushOutcome::AlreadyUpToDate,
@@ -801,8 +798,7 @@ impl Driver {
     fn check_bracketing(&self, effect: &Effect, root: PrNumber) {
         let facts = ReplayFacts::for_train(&self.log, root);
         match effect {
-            Effect::Git(GitEffect::Push { refspec, .. }) => {
-                let branch = refspec.strip_prefix("HEAD:refs/heads/").unwrap_or(refspec);
+            Effect::Git(GitEffect::Push { branch }) => {
                 assert!(
                     facts.unmatched().any(|f| matches!(
                         f,

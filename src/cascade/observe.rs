@@ -139,10 +139,10 @@ fn observe_single(effect: &Effect, response: &EffectResponse) -> Option<Observat
         }),
 
         (
-            Effect::Git(GitEffect::Push { refspec, .. }),
+            Effect::Git(GitEffect::Push { branch }),
             EffectResponse::Git(GitResponse::Push(outcome)),
         ) => Some(Observation::Pushed {
-            branch: branch_of_refspec(refspec),
+            branch: branch.clone(),
             outcome: outcome.clone(),
         }),
 
@@ -205,14 +205,4 @@ fn observe_single(effect: &Effect, response: &EffectResponse) -> Option<Observat
 
         _ => None,
     }
-}
-
-/// The branch name of a `HEAD:refs/heads/<branch>` push refspec (the only
-/// shape the engine emits). Falls back to the raw refspec so an unexpected
-/// shape surfaces loudly downstream instead of silently matching nothing.
-fn branch_of_refspec(refspec: &str) -> String {
-    refspec
-        .strip_prefix("HEAD:refs/heads/")
-        .unwrap_or(refspec)
-        .to_string()
 }

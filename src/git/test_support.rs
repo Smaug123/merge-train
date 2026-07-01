@@ -167,3 +167,53 @@ pub(crate) fn create_pr_ref(config: &GitConfig, pr_number: u64, sha: &Sha) {
     )
     .unwrap();
 }
+
+/// Result of a squash merge: the squash commit SHA and the prior main HEAD.
+pub(crate) struct SquashResult {
+    pub(crate) squash_sha: Sha,
+    pub(crate) prior_main_head: Sha,
+}
+
+/// Perform a squash merge of a branch into main.
+/// Returns both the squash commit SHA and the main HEAD before the squash.
+pub(crate) fn squash_merge_to_main(config: &GitConfig, branch_sha: &Sha) -> SquashResult {
+    let clone_dir = config.clone_dir();
+
+    // Capture main HEAD before the squash - this is the expected squash parent
+    let prior_main_head = run_git_stdout(&clone_dir, &["rev-parse", "refs/heads/main"]).unwrap();
+    let prior_main_head = Sha::parse(&prior_main_head).unwrap();
+
+    let temp_work = clone_dir.parent().unwrap().join("temp_squash");
+    std::fs::create_dir_all(&temp_work).unwrap();
+    run_git_sync(
+        &clone_dir,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            temp_work.to_str().unwrap(),
+            "refs/heads/main",
+        ],
+    )
+    .unwrap();
+    run_git_sync(&temp_work, &["config", "user.email", "test@test.com"]).unwrap();
+    run_git_sync(&temp_work, &["config", "user.name", "Test"]).unwrap();
+
+    // Squash merge
+    run_git_sync(&temp_work, &["merge", "--squash", branch_sha.as_str()]).unwrap();
+    run_git_sync(&temp_work, &["commit", "-m", "Squash merge"]).unwrap();
+
+    let squash_sha = run_git_stdout(&temp_work, &["rev-parse", "HEAD"]).unwrap();
+
+    run_git_sync(&temp_work, &["push", "origin", "HEAD:refs/heads/main"]).unwrap();
+    run_git_sync(
+        &clone_dir,
+        &["worktree", "remove", "--force", temp_work.to_str().unwrap()],
+    )
+    .unwrap();
+
+    SquashResult {
+        squash_sha: Sha::parse(&squash_sha).unwrap(),
+        prior_main_head,
+    }
+}

@@ -260,12 +260,13 @@ pub enum GitEffect {
         default_branch: String,
     },
 
-    /// Push refs to a remote.
+    /// Push the worktree's HEAD to a remote branch (never force: the bot
+    /// must not clobber human pushes — a rejection is the loud, recoverable
+    /// signal DESIGN.md's concurrent-push handling relies on). Interpreted by
+    /// `git::push::push_head_to_branch`.
     Push {
-        /// The refspec to push (e.g., "HEAD:refs/heads/feature").
-        refspec: String,
-        /// If true, force push.
-        force: bool,
+        /// The remote branch to push HEAD to.
+        branch: String,
     },
 
     /// Parse a revision to a SHA.
@@ -516,8 +517,7 @@ mod tests {
                 }
             }),
             // Push
-            (arb_refspec(), any::<bool>())
-                .prop_map(|(refspec, force)| GitEffect::Push { refspec, force }),
+            arb_target().prop_map(|branch| GitEffect::Push { branch }),
             // RevParse
             arb_target().prop_map(|rev| GitEffect::RevParse { rev }),
             // CreateWorktree
