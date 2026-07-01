@@ -16,6 +16,8 @@ mod observe;
 mod plan;
 
 #[cfg(test)]
+mod conformance_tests;
+#[cfg(test)]
 mod model_tests;
 
 pub use engine::{MAX_TRAIN_SIZE, advance, recover_train, start_train, stop_train};

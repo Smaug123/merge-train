@@ -272,10 +272,10 @@ pub fn classify_git_error(error: &GitError) -> EffectError {
 mod tests {
     use super::*;
     use crate::effects::{MergeOutcome, PushOutcome};
+    use crate::git::run_git_sync;
     use crate::git::test_support::{
         create_branch_with_file, create_pr_ref, create_test_repo_with_origin, squash_merge_to_main,
     };
-    use crate::git::run_git_sync;
     use crate::types::Sha;
 
     /// A root PR (#1, branch `pr-1`) with one stacked descendant (#2,
