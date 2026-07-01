@@ -208,7 +208,17 @@ impl CachedPr {
     /// Records a new head SHA, invalidating everything derived from the old
     /// head: cached mergeability (CI has not run on the new head) and any
     /// predecessor-squash reconciliation (verified against the old head).
+    ///
+    /// A same-SHA observation is a no-op: it changes nothing the derived
+    /// facts were computed against, so it must not invalidate them. This is
+    /// load-bearing for the cascade's own pushes — the engine records the
+    /// pushed head in the same batch as the push's done-event, so the later
+    /// `synchronize` webhook for that push re-observes the same SHA and must
+    /// not wipe the reconciliation marker recorded after it.
     pub fn record_new_head(&mut self, head_sha: Sha) {
+        if self.head_sha == head_sha {
+            return;
+        }
         self.head_sha = head_sha;
         self.merge_state_status = MergeStateStatus::Unknown;
         self.predecessor_squash_reconciled = None;

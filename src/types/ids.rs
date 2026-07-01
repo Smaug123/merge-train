@@ -16,7 +16,7 @@ pub struct InvalidSha {
 }
 
 /// A pull request number within a repository.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct PrNumber(pub u64);
 

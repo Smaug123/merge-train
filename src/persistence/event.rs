@@ -6,7 +6,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::types::{CascadePhase, CommentId, PrNumber, Sha, TrainError};
+use crate::types::{CascadePhase, CommentId, MergeStateStatus, PrNumber, Sha, TrainError};
 
 /// An event in the event log.
 ///
@@ -86,6 +86,39 @@ pub enum StateEventPayload {
         error: TrainError,
     },
 
+    /// A train has parked (`TrainState::WaitingCi`): a transient condition
+    /// (checks pending, approval temporarily missing, transient squash
+    /// failure) that auto-resolves. It resumes on the next relevant
+    /// observation (`train_resumed`). Durable so a restart knows the train is
+    /// waiting rather than mid-operation.
+    #[serde(rename = "train_parked")]
+    TrainParked {
+        /// The original root PR of the train.
+        root_pr: PrNumber,
+        /// Human-readable description of what the train is waiting for.
+        reason: String,
+    },
+
+    /// A parked train has resumed (`TrainState::Running`).
+    #[serde(rename = "train_resumed")]
+    TrainResumed {
+        /// The original root PR of the train.
+        root_pr: PrNumber,
+    },
+
+    /// The train's status comment was created on the root PR.
+    ///
+    /// Durable so replay restores `TrainRecord.status_comment_id` — without
+    /// it, a restarted bot would post a duplicate status comment instead of
+    /// updating the existing one.
+    #[serde(rename = "status_comment_posted")]
+    StatusCommentPosted {
+        /// The original root PR of the train.
+        root_pr: PrNumber,
+        /// The comment id GitHub assigned.
+        comment_id: CommentId,
+    },
+
     // ─── Phase transitions (always critical) ───
     /// The cascade has transitioned to a new phase.
     ///
@@ -112,6 +145,15 @@ pub enum StateEventPayload {
         /// so events written before this field existed still deserialize.
         #[serde(default)]
         last_squash_parent: Option<Sha>,
+        /// The pinned predecessor head that preparation merged into the
+        /// descendants (`PrepareResult::predecessor_head`), carried from the
+        /// `SquashPending` transition through the end of the cascade step.
+        /// Replay restores `TrainRecord.predecessor_head_sha` from it: it is
+        /// both the squash fencing pin (`SquashMerge.expected_sha`) and
+        /// `MergeReconcile.predecessor_pre_squash_head` — losing it across a
+        /// crash would disarm the force-push-race guard (M2 amendment 2).
+        #[serde(default)]
+        predecessor_head_sha: Option<Sha>,
         /// The new cascade phase with descendant tracking.
         phase: CascadePhase,
     },
@@ -149,6 +191,15 @@ pub enum StateEventPayload {
         pre_push_sha: Sha,
         /// Expected tree SHA after merge (deterministic, unlike commit SHA).
         expected_tree: Sha,
+        /// The pinned predecessor head this preparation merged
+        /// (`PrepareResult::predecessor_head`). Durable from the *first* prep
+        /// push: recovery mid-`Preparing` reads it so re-prepared descendants
+        /// are checked against the same pin, and the engine's consistency rule
+        /// ("any later descendant whose pinned head differs ⇒ abort") survives
+        /// a crash (M2 amendment 2). `#[serde(default)]` for events written
+        /// before the field existed.
+        #[serde(default)]
+        predecessor_head: Option<Sha>,
     },
 
     /// Done: preparation push completed successfully.
@@ -376,6 +427,18 @@ pub enum StateEventPayload {
         pr: PrNumber,
     },
 
+    /// A fresh mergeability observation for a PR (from `GetMergeState` /
+    /// `RefetchPr` responses). Mergeability enters the cache through the log
+    /// like every other fact; `apply_event` sets
+    /// `prs[pr].merge_state_status`.
+    #[serde(rename = "pr_merge_state_changed")]
+    PrMergeStateChanged {
+        /// The PR observed.
+        pr: PrNumber,
+        /// GitHub's computed merge state.
+        status: MergeStateStatus,
+    },
+
     /// A descendant PR was skipped during cascade.
     #[serde(rename = "descendant_skipped")]
     DescendantSkipped {
@@ -438,7 +501,9 @@ impl StateEventPayload {
             StateEventPayload::TrainStarted { .. }
             | StateEventPayload::TrainStopped { .. }
             | StateEventPayload::TrainCompleted { .. }
-            | StateEventPayload::TrainAborted { .. } => true,
+            | StateEventPayload::TrainAborted { .. }
+            | StateEventPayload::TrainParked { .. }
+            | StateEventPayload::TrainResumed { .. } => true,
 
             // Phase transitions
             StateEventPayload::PhaseTransition { .. }
@@ -463,7 +528,8 @@ impl StateEventPayload {
             StateEventPayload::FanOutCompleted { .. } => true,
 
             // Observational events (not critical for recovery)
-            StateEventPayload::PrMerged { .. }
+            StateEventPayload::StatusCommentPosted { .. }
+            | StateEventPayload::PrMerged { .. }
             | StateEventPayload::PrStateChanged { .. }
             | StateEventPayload::PredecessorDeclared { .. }
             | StateEventPayload::PredecessorRemoved { .. }
@@ -474,6 +540,7 @@ impl StateEventPayload {
             | StateEventPayload::PrSynchronized { .. }
             | StateEventPayload::PrConvertedToDraft { .. }
             | StateEventPayload::PrReadyForReview { .. }
+            | StateEventPayload::PrMergeStateChanged { .. }
             | StateEventPayload::DescendantSkipped { .. }
             | StateEventPayload::CheckSuiteCompleted { .. }
             | StateEventPayload::StatusReceived { .. }
@@ -528,12 +595,20 @@ mod tests {
                 root_pr: PrNumber(1),
                 error: TrainError::new(crate::types::TrainErrorKind::ApiError, "test"),
             },
+            StateEventPayload::TrainParked {
+                root_pr: PrNumber(1),
+                reason: "waiting for CI".to_string(),
+            },
+            StateEventPayload::TrainResumed {
+                root_pr: PrNumber(1),
+            },
             StateEventPayload::PhaseTransition {
                 train_root: PrNumber(1),
                 current_pr: PrNumber(1),
                 predecessor_pr: None,
                 last_squash_sha: None,
                 last_squash_parent: None,
+                predecessor_head_sha: None,
                 phase: CascadePhase::Idle,
             },
             StateEventPayload::SquashCommitted {
@@ -550,6 +625,7 @@ mod tests {
                 branch: "test".to_string(),
                 pre_push_sha: Sha::parse("0".repeat(40)).unwrap(),
                 expected_tree: Sha::parse("0".repeat(40)).unwrap(),
+                predecessor_head: None,
             },
             StateEventPayload::DonePushPrep {
                 train_root: PrNumber(1),
@@ -608,6 +684,14 @@ mod tests {
     #[test]
     fn non_critical_events_are_not_critical() {
         let non_critical_payloads = vec![
+            StateEventPayload::StatusCommentPosted {
+                root_pr: PrNumber(1),
+                comment_id: CommentId(12345),
+            },
+            StateEventPayload::PrMergeStateChanged {
+                pr: PrNumber(1),
+                status: MergeStateStatus::Clean,
+            },
             StateEventPayload::PrMerged {
                 pr: PrNumber(1),
                 merge_sha: Sha::parse("0".repeat(40)).unwrap(),

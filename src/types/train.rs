@@ -29,6 +29,17 @@ pub enum TrainState {
         ended_at: DateTime<Utc>,
     },
 
+    /// Train finished successfully (every PR merged or fanned out).
+    ///
+    /// Never present in `active_trains` (completion *removes* the record);
+    /// this variant exists for the final status comment, so GitHub-fallback
+    /// recovery (M6) reads "completed" rather than a stale "running" and does
+    /// not resurrect a finished train.
+    Completed {
+        /// When the train completed.
+        ended_at: DateTime<Utc>,
+    },
+
     /// Train was aborted due to an error. Requires `@merge-train start` to resume.
     Aborted {
         /// When the train was aborted.
@@ -48,6 +59,8 @@ impl TrainState {
     }
 
     /// Returns true if the train requires human intervention to resume.
+    /// (`Completed` is terminal but needs no intervention: there is nothing
+    /// left to resume.)
     pub fn requires_restart(&self) -> bool {
         matches!(
             self,
@@ -63,12 +76,12 @@ impl TrainState {
         }
     }
 
-    /// When the train ended (stopped or aborted), if it has.
+    /// When the train ended (stopped, aborted, or completed), if it has.
     pub fn ended_at(&self) -> Option<DateTime<Utc>> {
         match self {
-            TrainState::Stopped { ended_at } | TrainState::Aborted { ended_at, .. } => {
-                Some(*ended_at)
-            }
+            TrainState::Stopped { ended_at }
+            | TrainState::Aborted { ended_at, .. }
+            | TrainState::Completed { ended_at } => Some(*ended_at),
             _ => None,
         }
     }
