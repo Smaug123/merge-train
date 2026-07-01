@@ -206,6 +206,58 @@ analysis tractable.
 
 ## Stage M2 — Cascade engine (pure planner)
 
+> **Amendments (2026-07-01, applied during implementation).** This section was
+> written before the SQLite migration; the Store's event-sourcing model
+> invalidates some signature details below. The binding deviations:
+>
+> 1. **`StepPlan` has no `train` field.** `Store::append → apply_event` is the
+>    single mutation path; a returned "updated `TrainRecord` copy" would be a
+>    second source of truth that diverges from replay. Every train mutation the
+>    engine wants rides in `StepPlan.events`. Consequently `apply_event`
+>    derives `recovery_seq` deterministically (one bump per train-mutating
+>    event), so replayed state agrees with the live record and with the status
+>    comment M6 compares against.
+> 2. **The prepare-pin is made durable.** `TrainRecord.predecessor_head_sha`
+>    appeared in no event, so a crash in the prep→reconcile window lost the
+>    force-push-race guard `reconcile_descendant` requires (the same class as
+>    review finding #2 on `expected_sha`). `PhaseTransition` gains
+>    `predecessor_head_sha` (carried from `SquashPending` entry onward) and
+>    `IntentPushPrep` gains `predecessor_head` (durable from the first prep
+>    push), both `#[serde(default)]`.
+> 3. **`Effect::RecordReconciliation` is deleted** (seam c superseded). The
+>    engine emits `StateEventPayload::ReconciliationRecorded` in the same
+>    append batch as `DonePushReconcile` — atomic ordering instead of an
+>    executor special case.
+> 4. **Terminal-event-first, cleanup best-effort** (inverts model property 5).
+>    Cleanup-before-terminal requires threading a continuation through the
+>    executor between plans. Instead the terminal event lands first, worktree
+>    cleanup/removal is a best-effort effect after it, and every cascade-step
+>    entry defensively re-creates/cleans the worktree. A dirty worktree is
+>    re-establishable state; the guarantee (clean worktree before the next
+>    irreversible op) is preserved.
+> 5. **`recover_train` = `advance(state, root, Evaluate { facts })`.** Recovery
+>    and resume are one operation; `Observation::Evaluate` carries a
+>    [`ReplayFacts`] intent/done ledger for the current phase (M5 derives it
+>    from the events table). One planning path, verified once by property 4.
+> 6. **Executor stays dumb.** `observe(&[(Effect, outcome)]) -> Observation`
+>    is a pure M2 function mapping a plan's effect outcomes to the next
+>    observation (incl. the preflight trio → one observation); `StepPlan`
+>    separates observed `effects` from `best_effort` effects (status-comment
+>    updates, cleanup) whose failures are logged, never fed back.
+> 7. **New events** `train_parked`/`train_resumed` (WaitingCi durability),
+>    `status_comment_posted` (comment id durability — replay would otherwise
+>    post duplicate status comments), `pr_merge_state_changed` (mergeability
+>    observations enter the cache through the log like everything else). New
+>    compound `GitEffect`s beyond the list in seam (a): `UpdateRootForBehind`
+>    (→ `git::merge::update_root_for_behind`, the DESIGN `BEHIND` flow),
+>    `CleanupWorktree` (→ `git::recovery::cleanup_worktree_on_abort`). Push
+>    points are captured *inside* the merge-effect responses (`Prepared` /
+>    `MergedForPush` carry an optional `PushPoint` from
+>    `git::push::capture_pre_push_state`) rather than by a separate effect:
+>    the capture is only meaningful in the worktree-HEAD context of the merge,
+>    and a stateless engine cannot thread the prepare-pin across an extra
+>    observation round-trip.
+
 **Dependencies:** M1. **Implements:** DESIGN.md §Operation sequence,
 §Descendant set freezing, §Durability and commit points, §Expected state
 tracking, §Pause Conditions, §Fan-out handling.

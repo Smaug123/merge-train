@@ -2,8 +2,8 @@
 
 use crate::persistence::event::{StateEvent, StateEventPayload};
 use crate::types::{
-    CascadePhase, CommentId, DescendantProgress, PrNumber, Sha, TrainError, TrainErrorKind,
-    TrainRecord, TrainState,
+    CascadePhase, CommentId, DescendantProgress, MergeStateStatus, PrNumber, Sha, TrainError,
+    TrainErrorKind, TrainRecord, TrainState,
 };
 use chrono::{DateTime, Utc};
 use proptest::prelude::*;
@@ -51,6 +51,19 @@ pub fn arb_train_error_kind() -> impl Strategy<Value = TrainErrorKind> {
         TrainErrorKind::BaseBranchMismatch,
         TrainErrorKind::HeadShaChanged,
         TrainErrorKind::InternalInvariantViolation,
+    ])
+}
+
+pub fn arb_merge_state_status() -> impl Strategy<Value = MergeStateStatus> {
+    proptest::sample::select(&[
+        MergeStateStatus::Clean,
+        MergeStateStatus::Unstable,
+        MergeStateStatus::Blocked,
+        MergeStateStatus::Behind,
+        MergeStateStatus::Dirty,
+        MergeStateStatus::Unknown,
+        MergeStateStatus::Draft,
+        MergeStateStatus::HasHooks,
     ])
 }
 
@@ -189,6 +202,20 @@ pub fn arb_state_event_payload() -> impl Strategy<Value = StateEventPayload> {
                 error: e,
             }
         }),
+        // Train parking
+        (arb_pr_number(), "[a-z ]{1,30}".prop_map(String::from)).prop_map(|(r, reason)| {
+            StateEventPayload::TrainParked {
+                root_pr: r,
+                reason,
+            }
+        }),
+        arb_pr_number().prop_map(|r| StateEventPayload::TrainResumed { root_pr: r }),
+        (arb_pr_number(), arb_comment_id()).prop_map(|(r, cid)| {
+            StateEventPayload::StatusCommentPosted {
+                root_pr: r,
+                comment_id: cid,
+            }
+        }),
         // Phase transitions
         (
             arb_pr_number(),
@@ -196,15 +223,17 @@ pub fn arb_state_event_payload() -> impl Strategy<Value = StateEventPayload> {
             prop::option::of(arb_pr_number()),
             prop::option::of(arb_sha()),
             prop::option::of(arb_sha()),
+            prop::option::of(arb_sha()),
             arb_cascade_phase()
         )
             .prop_map(
-                |(tr, cp, pp, ls, lp, ph)| StateEventPayload::PhaseTransition {
+                |(tr, cp, pp, ls, lp, ph_sha, ph)| StateEventPayload::PhaseTransition {
                     train_root: tr,
                     current_pr: cp,
                     predecessor_pr: pp,
                     last_squash_sha: ls,
                     last_squash_parent: lp,
+                    predecessor_head_sha: ph_sha,
                     phase: ph
                 }
             ),
@@ -219,14 +248,22 @@ pub fn arb_state_event_payload() -> impl Strategy<Value = StateEventPayload> {
             StateEventPayload::ReconciliationRecorded { pr, squash_sha: sh }
         }),
         // Intent/done - prep
-        (arb_pr_number(), arb_branch_name(), arb_sha(), arb_sha()).prop_map(
-            |(tr, br, pre, exp)| StateEventPayload::IntentPushPrep {
-                train_root: tr,
-                branch: br,
-                pre_push_sha: pre,
-                expected_tree: exp
-            }
-        ),
+        (
+            arb_pr_number(),
+            arb_branch_name(),
+            arb_sha(),
+            arb_sha(),
+            prop::option::of(arb_sha())
+        )
+            .prop_map(
+                |(tr, br, pre, exp, ph)| StateEventPayload::IntentPushPrep {
+                    train_root: tr,
+                    branch: br,
+                    pre_push_sha: pre,
+                    expected_tree: exp,
+                    predecessor_head: ph
+                }
+            ),
         (arb_pr_number(), arb_branch_name()).prop_map(|(tr, br)| {
             StateEventPayload::DonePushPrep {
                 train_root: tr,
@@ -344,6 +381,9 @@ pub fn arb_state_event_payload() -> impl Strategy<Value = StateEventPayload> {
         }),
         arb_pr_number().prop_map(|pr| StateEventPayload::PrConvertedToDraft { pr }),
         arb_pr_number().prop_map(|pr| StateEventPayload::PrReadyForReview { pr }),
+        (arb_pr_number(), arb_merge_state_status()).prop_map(|(pr, status)| {
+            StateEventPayload::PrMergeStateChanged { pr, status }
+        }),
         (
             arb_pr_number(),
             arb_pr_number(),

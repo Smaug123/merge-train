@@ -18,16 +18,18 @@
 //! the materialized state are tolerated (skipped), because the log may contain
 //! events about PRs pruned from a later snapshot.
 //!
-//! # Scope (Stage M1)
+//! # Train fields are fully replay-derivable (M2)
 //!
-//! `apply_event` materializes the fields the current event vocabulary carries.
-//! Some `TrainRecord` fields the planner (M2) manages — `recovery_seq`,
-//! `predecessor_head_sha`, `status_comment_id`, the `Running`/`WaitingCi`
-//! distinction — are not yet derivable from events alone; pure-replay
-//! materialization is best-effort for those and is completed as later stages
-//! widen the vocabulary. The compaction-equivalence property is unaffected: it
-//! compares replay against replay, so whatever `apply_event` does
-//! deterministically holds on both sides.
+//! Every `TrainRecord` field is derived from events: `predecessor_head_sha`
+//! from `PhaseTransition.predecessor_head_sha` / `IntentPushPrep.predecessor_head`,
+//! `status_comment_id` from `StatusCommentPosted`, the `Running`/`WaitingCi`
+//! distinction from `TrainParked`/`TrainResumed`, and `recovery_seq` is bumped
+//! deterministically on each train-mutating event (`PhaseTransition`,
+//! `TrainParked`/`TrainResumed` when they change the state, `TrainStopped`,
+//! `TrainAborted`). This is load-bearing: the engine never returns an updated
+//! `TrainRecord` (that would be a second source of truth) — the record the
+//! live process sees IS the replayed one, so the status comment M6 compares
+//! `recovery_seq` against always agrees with a post-crash replay.
 
 use std::collections::{HashMap, HashSet};
 
@@ -126,16 +128,42 @@ impl RepoState {
 
             StateEventPayload::TrainStopped { root_pr } => {
                 if let Some(train) = self.active_trains.get_mut(root_pr) {
-                    train.state = TrainState::Stopped { ended_at: event.ts };
+                    train.stop(event.ts);
                 }
             }
 
             StateEventPayload::TrainAborted { root_pr, error } => {
                 if let Some(train) = self.active_trains.get_mut(root_pr) {
-                    train.state = TrainState::Aborted {
-                        ended_at: event.ts,
-                        error: error.clone(),
-                    };
+                    train.abort(error.clone(), event.ts);
+                }
+            }
+
+            // Parking is recorded only when it changes the state, so a
+            // redundant park/resume replays to the same record (determinism
+            // is what matters here, and "bump iff changed" is a function of
+            // the prior state on both the live and the replay side).
+            StateEventPayload::TrainParked { root_pr, .. } => {
+                if let Some(train) = self.active_trains.get_mut(root_pr)
+                    && train.state == TrainState::Running
+                {
+                    train.wait_for_ci();
+                }
+            }
+
+            StateEventPayload::TrainResumed { root_pr } => {
+                if let Some(train) = self.active_trains.get_mut(root_pr)
+                    && train.state == TrainState::WaitingCi
+                {
+                    train.resume();
+                }
+            }
+
+            StateEventPayload::StatusCommentPosted {
+                root_pr,
+                comment_id,
+            } => {
+                if let Some(train) = self.active_trains.get_mut(root_pr) {
+                    train.status_comment_id = Some(*comment_id);
                 }
             }
 
@@ -153,13 +181,16 @@ impl RepoState {
                 predecessor_pr,
                 last_squash_sha: _,
                 last_squash_parent,
+                predecessor_head_sha,
                 phase,
             } => {
                 if let Some(train) = self.active_trains.get_mut(train_root) {
                     train.current_pr = *current_pr;
                     train.predecessor_pr = *predecessor_pr;
                     train.last_squash_parent_sha = last_squash_parent.clone();
+                    train.predecessor_head_sha = predecessor_head_sha.clone();
                     train.cascade_phase = phase.clone();
+                    train.increment_seq();
                 }
             }
 
@@ -327,6 +358,14 @@ impl RepoState {
                 }
             }
 
+            // A fresh mergeability observation. Doesn't touch predecessor
+            // links, so no index rebuild is needed.
+            StateEventPayload::PrMergeStateChanged { pr, status } => {
+                if let Some(p) = self.prs.get_mut(pr) {
+                    p.merge_state_status = *status;
+                }
+            }
+
             // ─── Fan-out: old train retires, descendants become new roots ───
             StateEventPayload::FanOutCompleted {
                 old_root,
@@ -340,11 +379,26 @@ impl RepoState {
                 }
             }
 
+            // A prep-push intent carries the pinned predecessor head: the
+            // squash fencing pin must be durable from the *first* prep push
+            // (M2 amendment 2). No recovery_seq bump — the pin is threading
+            // context, not a phase change the status comment races against.
+            StateEventPayload::IntentPushPrep {
+                train_root,
+                predecessor_head,
+                ..
+            } => {
+                if let Some(train) = self.active_trains.get_mut(train_root)
+                    && predecessor_head.is_some()
+                {
+                    train.predecessor_head_sha = predecessor_head.clone();
+                }
+            }
+
             // ─── Intent/done bracketing: durability only, no materialized
             // state change (the resulting content lands via the following
             // PhaseTransition / SquashCommitted). ───
-            StateEventPayload::IntentPushPrep { .. }
-            | StateEventPayload::DonePushPrep { .. }
+            StateEventPayload::DonePushPrep { .. }
             | StateEventPayload::IntentSquash { .. }
             | StateEventPayload::IntentPushReconcile { .. }
             | StateEventPayload::DonePushReconcile { .. }
@@ -496,16 +550,47 @@ mod tests {
                 arb_small_pr(),
                 prop::option::of(arb_small_pr()),
                 prop::option::of(arb_sha()),
+                prop::option::of(arb_sha()),
                 arb_cascade_phase_small(),
             )
-                .prop_map(|(tr, cp, pp, lp, ph)| StateEventPayload::PhaseTransition {
+                .prop_map(
+                    |(tr, cp, pp, lp, ph_sha, ph)| StateEventPayload::PhaseTransition {
+                        train_root: tr,
+                        current_pr: cp,
+                        predecessor_pr: pp,
+                        last_squash_sha: None,
+                        last_squash_parent: lp,
+                        predecessor_head_sha: ph_sha,
+                        phase: ph,
+                    },
+                ),
+            (arb_small_pr(), Just("waiting".to_string())).prop_map(|(r, reason)| {
+                StateEventPayload::TrainParked {
+                    root_pr: r,
+                    reason,
+                }
+            }),
+            arb_small_pr().prop_map(|r| StateEventPayload::TrainResumed { root_pr: r }),
+            arb_small_pr().prop_map(|r| StateEventPayload::StatusCommentPosted {
+                root_pr: r,
+                comment_id: CommentId(7),
+            }),
+            (
+                arb_small_pr(),
+                arb_small_branch(),
+                arb_sha(),
+                arb_sha(),
+                prop::option::of(arb_sha()),
+            )
+                .prop_map(|(tr, br, pre, exp, ph)| StateEventPayload::IntentPushPrep {
                     train_root: tr,
-                    current_pr: cp,
-                    predecessor_pr: pp,
-                    last_squash_sha: None,
-                    last_squash_parent: lp,
-                    phase: ph,
+                    branch: br,
+                    pre_push_sha: pre,
+                    expected_tree: exp,
+                    predecessor_head: ph,
                 }),
+            (arb_small_pr(), crate::test_utils::arb_merge_state_status())
+                .prop_map(|(pr, status)| StateEventPayload::PrMergeStateChanged { pr, status }),
             (arb_small_pr(), arb_small_pr(), arb_sha()).prop_map(|(tr, pr, sha)| {
                 StateEventPayload::SquashCommitted {
                     train_root: tr,
@@ -1008,6 +1093,145 @@ mod tests {
         assert!(
             !is_root(&wrong.prs[&desc], &default_branch, &wrong.prs),
             "a reconciliation marker against the wrong squash must not confer rootness"
+        );
+    }
+
+    /// Every `TrainRecord` field the engine relies on is derived from events
+    /// (M2): the comment id, the WaitingCi/Running distinction, the prepare
+    /// pin, and a deterministic `recovery_seq` — replay must not understate
+    /// the live record's `recovery_seq` or M6's local-vs-comment precedence
+    /// silently inverts.
+    #[test]
+    fn train_record_is_fully_replay_derived() {
+        let mut state = state_with_pr(CachedPr::new(
+            PrNumber(1),
+            Sha::parse("a".repeat(40)).unwrap(),
+            "root-branch".to_string(),
+            "main".to_string(),
+            None,
+            PrState::Open,
+            MergeStateStatus::Unknown,
+            false,
+        ));
+        let pin = Sha::parse("b".repeat(40)).unwrap();
+
+        state.apply_event(&event(StateEventPayload::TrainStarted {
+            root_pr: PrNumber(1),
+            current_pr: PrNumber(1),
+        }));
+        assert_eq!(state.active_trains[&PrNumber(1)].recovery_seq, 0);
+
+        state.apply_event(&event(StateEventPayload::StatusCommentPosted {
+            root_pr: PrNumber(1),
+            comment_id: CommentId(42),
+        }));
+        state.apply_event(&event(StateEventPayload::PhaseTransition {
+            train_root: PrNumber(1),
+            current_pr: PrNumber(1),
+            predecessor_pr: None,
+            last_squash_sha: None,
+            last_squash_parent: None,
+            predecessor_head_sha: Some(pin.clone()),
+            phase: crate::types::CascadePhase::Idle,
+        }));
+        state.apply_event(&event(StateEventPayload::TrainParked {
+            root_pr: PrNumber(1),
+            reason: "waiting for CI".to_string(),
+        }));
+        // A redundant park must not bump the seq (determinism under replay of
+        // an idempotent re-park).
+        state.apply_event(&event(StateEventPayload::TrainParked {
+            root_pr: PrNumber(1),
+            reason: "waiting for CI".to_string(),
+        }));
+        state.apply_event(&event(StateEventPayload::TrainResumed {
+            root_pr: PrNumber(1),
+        }));
+
+        let train = &state.active_trains[&PrNumber(1)];
+        assert_eq!(train.status_comment_id, Some(CommentId(42)));
+        assert_eq!(train.predecessor_head_sha, Some(pin));
+        assert_eq!(train.state, TrainState::Running);
+        // PhaseTransition + park + resume = 3 bumps (the redundant park and
+        // the comment id are not state changes).
+        assert_eq!(train.recovery_seq, 3);
+
+        state.apply_event(&event(StateEventPayload::TrainStopped {
+            root_pr: PrNumber(1),
+        }));
+        let train = &state.active_trains[&PrNumber(1)];
+        assert!(matches!(train.state, TrainState::Stopped { .. }));
+        assert_eq!(train.recovery_seq, 4, "stop must bump recovery_seq");
+    }
+
+    /// The squash fencing pin is durable from the first prep-push intent
+    /// (M2 amendment 2): `IntentPushPrep.predecessor_head` materializes into
+    /// `TrainRecord.predecessor_head_sha`, and a pin-less intent (legacy
+    /// event) must not clear an existing pin.
+    #[test]
+    fn intent_push_prep_pins_predecessor_head() {
+        let mut state = state_with_pr(CachedPr::new(
+            PrNumber(1),
+            Sha::parse("a".repeat(40)).unwrap(),
+            "root-branch".to_string(),
+            "main".to_string(),
+            None,
+            PrState::Open,
+            MergeStateStatus::Unknown,
+            false,
+        ));
+        let pin = Sha::parse("b".repeat(40)).unwrap();
+        state.apply_event(&event(StateEventPayload::TrainStarted {
+            root_pr: PrNumber(1),
+            current_pr: PrNumber(1),
+        }));
+
+        state.apply_event(&event(StateEventPayload::IntentPushPrep {
+            train_root: PrNumber(1),
+            branch: "desc-branch".to_string(),
+            pre_push_sha: Sha::parse("c".repeat(40)).unwrap(),
+            expected_tree: Sha::parse("d".repeat(40)).unwrap(),
+            predecessor_head: Some(pin.clone()),
+        }));
+        assert_eq!(
+            state.active_trains[&PrNumber(1)].predecessor_head_sha,
+            Some(pin.clone())
+        );
+
+        state.apply_event(&event(StateEventPayload::IntentPushPrep {
+            train_root: PrNumber(1),
+            branch: "desc-branch".to_string(),
+            pre_push_sha: Sha::parse("c".repeat(40)).unwrap(),
+            expected_tree: Sha::parse("d".repeat(40)).unwrap(),
+            predecessor_head: None,
+        }));
+        assert_eq!(
+            state.active_trains[&PrNumber(1)].predecessor_head_sha,
+            Some(pin),
+            "a pin-less intent must not clear the durable pin"
+        );
+    }
+
+    /// Mergeability observations enter the cache through the log.
+    #[test]
+    fn merge_state_changed_materializes() {
+        let mut state = state_with_pr(CachedPr::new(
+            PrNumber(1),
+            Sha::parse("a".repeat(40)).unwrap(),
+            "feature".to_string(),
+            "main".to_string(),
+            None,
+            PrState::Open,
+            MergeStateStatus::Unknown,
+            false,
+        ));
+        state.apply_event(&event(StateEventPayload::PrMergeStateChanged {
+            pr: PrNumber(1),
+            status: MergeStateStatus::Clean,
+        }));
+        assert_eq!(
+            state.prs[&PrNumber(1)].merge_state_status,
+            MergeStateStatus::Clean
         );
     }
 }

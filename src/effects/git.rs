@@ -5,7 +5,75 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::Sha;
+use crate::types::{PrNumber, Sha};
+
+/// The domain outcome of a merge, mirroring [`crate::git::MergeResult`] in
+/// serde-able form (seam a).
+///
+/// Conflicts are *outcomes the engine branches on* (abort vs skip per
+/// DESIGN.md §Pause Conditions), so the interpreter returns them as
+/// `Ok(GitResponse::Merge(MergeOutcome::Conflict { .. }))`, never as `Err`.
+/// Only uncharacterizable git failures are interpreter errors.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum MergeOutcome {
+    /// Merge completed successfully, producing a new commit.
+    Success {
+        /// The SHA of the merge commit.
+        commit_sha: Sha,
+    },
+    /// Merge resulted in a conflict.
+    Conflict {
+        /// Files with conflicts.
+        conflicting_files: Vec<String>,
+    },
+    /// Merge was a no-op (already up-to-date).
+    AlreadyUpToDate,
+}
+
+impl From<crate::git::MergeResult> for MergeOutcome {
+    fn from(result: crate::git::MergeResult) -> Self {
+        match result {
+            crate::git::MergeResult::Success { commit_sha } => MergeOutcome::Success { commit_sha },
+            crate::git::MergeResult::Conflict { conflicting_files } => MergeOutcome::Conflict {
+                conflicting_files,
+            },
+            crate::git::MergeResult::AlreadyUpToDate => MergeOutcome::AlreadyUpToDate,
+        }
+    }
+}
+
+/// The domain outcome of a push, mirroring [`crate::git::push::PushResult`]
+/// (seam a). A non-fast-forward rejection is a domain outcome (someone else
+/// pushed; DESIGN.md §Concurrent push handling), NOT an interpreter error.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum PushOutcome {
+    /// Push succeeded.
+    Pushed {
+        /// The SHA that was pushed.
+        pushed_sha: Sha,
+    },
+    /// The remote already had this commit (idempotent re-push).
+    AlreadyUpToDate,
+    /// Push was rejected (non-fast-forward): the remote advanced under us.
+    Rejected {
+        /// git's explanation of the rejection.
+        details: String,
+    },
+}
+
+impl From<crate::git::push::PushResult> for PushOutcome {
+    fn from(result: crate::git::push::PushResult) -> Self {
+        match result {
+            crate::git::push::PushResult::Success { pushed_sha } => {
+                PushOutcome::Pushed { pushed_sha }
+            }
+            crate::git::push::PushResult::AlreadyUpToDate => PushOutcome::AlreadyUpToDate,
+            crate::git::push::PushResult::Rejected { details } => PushOutcome::Rejected { details },
+        }
+    }
+}
 
 /// Git merge strategy.
 ///
@@ -74,9 +142,26 @@ pub enum GitEffect {
         message: String,
     },
 
+    /// Prepare a descendant: merge the predecessor's pinned head into it
+    /// (BEFORE the predecessor is squash-merged). Interpreted by
+    /// `git::merge::prepare_descendant`; responds with
+    /// [`GitResponse::Prepared`], whose `predecessor_head` is the exact commit
+    /// the PR ref named at fetch time (the pin the whole force-push guard
+    /// hangs on).
+    ///
+    /// Do NOT merge main here — see DESIGN.md "Why merging $SQUASH_SHA^ is
+    /// essential".
+    PrepareDescendant {
+        /// The descendant's branch name.
+        descendant_branch: String,
+        /// The predecessor's PR number (fetched via `refs/pull/<n>/head`).
+        predecessor_pr: PrNumber,
+    },
+
     /// Reconciliation merge: two-step merge for squash commit integration.
     ///
-    /// This performs the reconciliation protocol from DESIGN.md:
+    /// This performs the reconciliation protocol from DESIGN.md — **merges
+    /// only, no push** (the push is a separate intent-bracketed [`GitEffect::Push`]):
     /// 1. `git merge $SQUASH_SHA^` - Merge the parent of the squash commit
     ///    (the default branch HEAD at the time of the squash)
     /// 2. `git merge -s ours $SQUASH_SHA` - Create a merge commit marking the
@@ -98,12 +183,20 @@ pub enum GitEffect {
     ///    `origin/{default_branch}` HEAD.
     /// 3. **Expected parent match**: the computed `$SQUASH_SHA^` equals
     ///    `expected_squash_parent`.
-    /// 4. **Preparation ancestry**: `predecessor_pre_squash_head` is an
-    ///    ancestor of the descendant's head. Without this, a force-push to
+    /// 4. **Squashed-head match**: the head named by the predecessor's PR ref
+    ///    (frozen at merge — the head GitHub actually squashed) equals
+    ///    `predecessor_pre_squash_head`.
+    /// 5. **Preparation ancestry**: `predecessor_pre_squash_head` is an
+    ///    ancestor of the descendant's head. Without 4+5, a force-push to
     ///    the predecessor between preparation and squash would let the
     ///    ours-merge record content as merged that was never merged —
     ///    silent, unrecoverable content loss.
     MergeReconcile {
+        /// The descendant's branch name.
+        descendant_branch: String,
+        /// The predecessor's PR number; its PR ref names the head that was
+        /// actually squash-merged (validation requirement 4).
+        predecessor_pr: PrNumber,
         /// The squash commit SHA to reconcile against.
         squash_sha: Sha,
         /// The expected parent of the squash commit (`$SQUASH_SHA^`),
@@ -118,9 +211,52 @@ pub enum GitEffect {
         /// Used to verify the squash parent is on the default branch history,
         /// ensuring we're reconciling against a valid squash merge.
         default_branch: String,
-        /// The branch to push the result to.
-        target_branch: String,
     },
+
+    /// Catch up a descendant with commits that landed on the default branch
+    /// AFTER the squash (a regular merge of `origin/<default_branch>`).
+    /// Interpreted by `git::merge::catch_up_descendant`. A conflict here is a
+    /// genuine conflict with post-squash main content (abort per DESIGN.md).
+    CatchUpDescendant {
+        /// The descendant's branch name.
+        descendant_branch: String,
+        /// The default branch name (e.g., "main").
+        default_branch: String,
+    },
+
+    /// Merge the default branch into the ROOT PR's branch to satisfy
+    /// "require branches up to date" protection (`mergeStateStatus: BEHIND`).
+    /// Interpreted by `git::merge::update_root_for_behind`. Only sound for the
+    /// root: it has no predecessor whose squash ordering could be violated.
+    UpdateRootForBehind {
+        /// The root PR's branch name.
+        branch: String,
+        /// The default branch name (e.g., "main").
+        default_branch: String,
+    },
+
+    /// Recovery check: did an intended push actually land? Interpreted by
+    /// `git::push::is_push_completed` (tree SHA + parent-chain verification —
+    /// commit SHAs are not reproducible across retries). Responds with
+    /// [`GitResponse::Bool`].
+    CheckPushCompleted {
+        /// The branch that was being pushed to.
+        branch: String,
+        /// The tree SHA the push intent expected.
+        expected_tree: Sha,
+        /// The remote ref before the intended push.
+        pre_push_sha: Sha,
+        /// For ours-merge pushes (reconciliation), the expected second parent
+        /// (the squash SHA): an ours-merge doesn't change the tree, so tree
+        /// comparison alone cannot identify our commit.
+        second_parent: Option<Sha>,
+    },
+
+    /// Return the worktree to a clean state after an abort (aborts any
+    /// in-progress merge, resets, cleans). Interpreted by
+    /// `git::recovery::cleanup_worktree_on_abort`. Idempotent; also issued
+    /// defensively at cascade-step entry.
+    CleanupWorktree,
 
     /// Validate a squash commit without performing reconciliation.
     ///
@@ -194,6 +330,25 @@ pub enum GitEffect {
     },
 }
 
+/// The push point captured immediately after a cascade merge, while the
+/// worktree HEAD still IS the merge result: HEAD's tree SHA and the remote
+/// ref about to be pushed over. These land in the push intent event so
+/// recovery can decide whether the push happened (DESIGN.md §Git push
+/// idempotency). Captured *inside* the merge effects (via
+/// `git::push::capture_pre_push_state`) rather than by a separate effect:
+/// the capture is only meaningful in the same worktree-HEAD context as the
+/// merge, and the pure engine has no scratch state to thread it across an
+/// extra observation round-trip.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PushPoint {
+    /// The tree SHA of the worktree's HEAD (deterministic across retries,
+    /// unlike merge-commit SHAs).
+    pub expected_tree: Sha,
+    /// The remote ref before our push; `None` if the branch is gone
+    /// (deleted mid-cascade — the descendant gets skipped).
+    pub pre_push_sha: Option<Sha>,
+}
+
 /// Response from a git effect.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
@@ -202,8 +357,31 @@ pub enum GitResponse {
     Ok,
     /// Operation returned a SHA (e.g., from RevParse).
     Sha(Sha),
-    /// Operation returned a boolean (e.g., from IsAncestor).
+    /// Operation returned a boolean (e.g., from IsAncestor, CheckPushCompleted).
     Bool(bool),
+    /// Response to the plain `Merge` effect.
+    Merge(MergeOutcome),
+    /// Response to `Push`: the domain outcome of the push.
+    Push(PushOutcome),
+    /// Response to `PrepareDescendant`.
+    Prepared {
+        /// The outcome of merging the predecessor into the descendant.
+        merge: MergeOutcome,
+        /// The exact predecessor commit that was merged (pinned from the PR
+        /// ref at fetch time). See `PrepareResult::predecessor_head`.
+        predecessor_head: Sha,
+        /// The push point, captured iff `merge` is `Success` (an
+        /// `AlreadyUpToDate` merge needs no push; a `Conflict` allows none).
+        push_point: Option<PushPoint>,
+    },
+    /// Response to `MergeReconcile`/`CatchUpDescendant`/`UpdateRootForBehind`:
+    /// a cascade merge whose result is destined for an intent-bracketed push.
+    MergedForPush {
+        /// The outcome of the merge.
+        merge: MergeOutcome,
+        /// The push point, captured iff `merge` is `Success`.
+        push_point: Option<PushPoint>,
+    },
 }
 
 #[cfg(test)]
@@ -255,6 +433,27 @@ mod tests {
         "stack-[0-9]{1,10}".prop_map(|s| s.to_string())
     }
 
+    fn arb_pr_number() -> impl Strategy<Value = PrNumber> {
+        (1u64..100_000).prop_map(PrNumber)
+    }
+
+    fn arb_merge_outcome() -> impl Strategy<Value = MergeOutcome> {
+        prop_oneof![
+            arb_sha().prop_map(|commit_sha| MergeOutcome::Success { commit_sha }),
+            prop::collection::vec("[a-z/.]{1,20}", 0..4)
+                .prop_map(|conflicting_files| MergeOutcome::Conflict { conflicting_files }),
+            Just(MergeOutcome::AlreadyUpToDate),
+        ]
+    }
+
+    fn arb_push_outcome() -> impl Strategy<Value = PushOutcome> {
+        prop_oneof![
+            arb_sha().prop_map(|pushed_sha| PushOutcome::Pushed { pushed_sha }),
+            Just(PushOutcome::AlreadyUpToDate),
+            ".{0,40}".prop_map(|details| PushOutcome::Rejected { details }),
+        ]
+    }
+
     fn arb_git_effect() -> impl Strategy<Value = GitEffect> {
         // COMPILE-TIME EXHAUSTIVENESS CHECK
         // When you add a new GitEffect variant, this match will fail to compile,
@@ -266,7 +465,12 @@ mod tests {
                 GitEffect::Fetch { .. } => {}
                 GitEffect::Checkout { .. } => {}
                 GitEffect::Merge { .. } => {}
+                GitEffect::PrepareDescendant { .. } => {}
                 GitEffect::MergeReconcile { .. } => {}
+                GitEffect::CatchUpDescendant { .. } => {}
+                GitEffect::UpdateRootForBehind { .. } => {}
+                GitEffect::CheckPushCompleted { .. } => {}
+                GitEffect::CleanupWorktree => {}
                 GitEffect::ValidateSquashCommit { .. } => {}
                 GitEffect::Push { .. } => {}
                 GitEffect::IsAncestor { .. } => {}
@@ -294,24 +498,72 @@ mod tests {
                     message
                 }
             ),
+            // PrepareDescendant
+            (arb_target(), arb_pr_number()).prop_map(|(descendant_branch, predecessor_pr)| {
+                GitEffect::PrepareDescendant {
+                    descendant_branch,
+                    predecessor_pr,
+                }
+            }),
             // MergeReconcile
-            (arb_sha(), arb_sha(), arb_sha(), arb_target(), arb_target()).prop_map(
-                |(
-                    squash_sha,
-                    expected_squash_parent,
-                    predecessor_pre_squash_head,
-                    default_branch,
-                    target_branch,
-                )| {
-                    GitEffect::MergeReconcile {
+            (
+                arb_target(),
+                arb_pr_number(),
+                arb_sha(),
+                arb_sha(),
+                arb_sha(),
+                arb_target(),
+            )
+                .prop_map(
+                    |(
+                        descendant_branch,
+                        predecessor_pr,
                         squash_sha,
                         expected_squash_parent,
                         predecessor_pre_squash_head,
                         default_branch,
-                        target_branch,
+                    )| {
+                        GitEffect::MergeReconcile {
+                            descendant_branch,
+                            predecessor_pr,
+                            squash_sha,
+                            expected_squash_parent,
+                            predecessor_pre_squash_head,
+                            default_branch,
+                        }
+                    },
+                ),
+            // CatchUpDescendant
+            (arb_target(), arb_target()).prop_map(|(descendant_branch, default_branch)| {
+                GitEffect::CatchUpDescendant {
+                    descendant_branch,
+                    default_branch,
+                }
+            }),
+            // UpdateRootForBehind
+            (arb_target(), arb_target()).prop_map(|(branch, default_branch)| {
+                GitEffect::UpdateRootForBehind {
+                    branch,
+                    default_branch,
+                }
+            }),
+            // CheckPushCompleted
+            (
+                arb_target(),
+                arb_sha(),
+                arb_sha(),
+                prop::option::of(arb_sha()),
+            )
+                .prop_map(|(branch, expected_tree, pre_push_sha, second_parent)| {
+                    GitEffect::CheckPushCompleted {
+                        branch,
+                        expected_tree,
+                        pre_push_sha,
+                        second_parent,
                     }
-                },
-            ),
+                }),
+            // CleanupWorktree
+            Just(GitEffect::CleanupWorktree),
             // ValidateSquashCommit
             (arb_sha(), arb_target()).prop_map(|(squash_sha, default_branch)| {
                 GitEffect::ValidateSquashCommit {
@@ -345,11 +597,37 @@ mod tests {
         ]
     }
 
+    fn arb_push_point() -> impl Strategy<Value = PushPoint> {
+        (arb_sha(), prop::option::of(arb_sha())).prop_map(|(expected_tree, pre_push_sha)| {
+            PushPoint {
+                expected_tree,
+                pre_push_sha,
+            }
+        })
+    }
+
     fn arb_git_response() -> impl Strategy<Value = GitResponse> {
         prop_oneof![
             Just(GitResponse::Ok),
             arb_sha().prop_map(GitResponse::Sha),
             any::<bool>().prop_map(GitResponse::Bool),
+            arb_merge_outcome().prop_map(GitResponse::Merge),
+            arb_push_outcome().prop_map(GitResponse::Push),
+            (
+                arb_merge_outcome(),
+                arb_sha(),
+                prop::option::of(arb_push_point())
+            )
+                .prop_map(|(merge, predecessor_head, push_point)| {
+                    GitResponse::Prepared {
+                        merge,
+                        predecessor_head,
+                        push_point,
+                    }
+                }),
+            (arb_merge_outcome(), prop::option::of(arb_push_point())).prop_map(
+                |(merge, push_point)| GitResponse::MergedForPush { merge, push_point }
+            ),
         ]
     }
 
@@ -400,6 +678,56 @@ mod tests {
                 let json = serde_json::to_string(&response).unwrap();
                 let parsed: GitResponse = serde_json::from_str(&json).unwrap();
                 prop_assert_eq!(response, parsed);
+            }
+        }
+    }
+
+    // ─── Outcome mirror tests ─────────────────────────────────────────────────
+
+    mod outcome_mirrors {
+        use super::*;
+
+        proptest! {
+            #[test]
+            fn merge_outcome_serde_roundtrip(outcome in arb_merge_outcome()) {
+                let json = serde_json::to_string(&outcome).unwrap();
+                let parsed: MergeOutcome = serde_json::from_str(&json).unwrap();
+                prop_assert_eq!(outcome, parsed);
+            }
+
+            #[test]
+            fn push_outcome_serde_roundtrip(outcome in arb_push_outcome()) {
+                let json = serde_json::to_string(&outcome).unwrap();
+                let parsed: PushOutcome = serde_json::from_str(&json).unwrap();
+                prop_assert_eq!(outcome, parsed);
+            }
+
+            /// The mirror conversion is variant- and field-faithful: no git
+            /// domain outcome is collapsed or dropped on its way into the
+            /// effect vocabulary.
+            #[test]
+            fn merge_result_conversion_is_faithful(outcome in arb_merge_outcome()) {
+                let result = match outcome.clone() {
+                    MergeOutcome::Success { commit_sha } =>
+                        crate::git::MergeResult::Success { commit_sha },
+                    MergeOutcome::Conflict { conflicting_files } =>
+                        crate::git::MergeResult::Conflict { conflicting_files },
+                    MergeOutcome::AlreadyUpToDate => crate::git::MergeResult::AlreadyUpToDate,
+                };
+                prop_assert_eq!(MergeOutcome::from(result), outcome);
+            }
+
+            #[test]
+            fn push_result_conversion_is_faithful(outcome in arb_push_outcome()) {
+                let result = match outcome.clone() {
+                    PushOutcome::Pushed { pushed_sha } =>
+                        crate::git::push::PushResult::Success { pushed_sha },
+                    PushOutcome::AlreadyUpToDate =>
+                        crate::git::push::PushResult::AlreadyUpToDate,
+                    PushOutcome::Rejected { details } =>
+                        crate::git::push::PushResult::Rejected { details },
+                };
+                prop_assert_eq!(PushOutcome::from(result), outcome);
             }
         }
     }
