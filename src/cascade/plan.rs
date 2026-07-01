@@ -224,6 +224,8 @@ pub enum Observation {
         branch: String,
         /// Whether the push completed.
         completed: bool,
+        /// The remote head the check observed; proven ours when `completed`.
+        remote_head: Option<Sha>,
     },
     /// A PR was retargeted to a new base.
     Retargeted {

@@ -1208,6 +1208,45 @@ mod tests {
         );
     }
 
+    /// A same-SHA `PrSynchronized` is a no-op: the cascade records its own
+    /// pushed heads, so the branch's later `synchronize` webhook re-observes
+    /// the same SHA — it must not wipe the reconciliation marker recorded
+    /// after the sync (that would orphan every fan-out root).
+    #[test]
+    fn same_sha_synchronize_preserves_derived_state() {
+        let head = Sha::parse("a".repeat(40)).unwrap();
+        let marker = Sha::parse("c".repeat(40)).unwrap();
+        let mut pr = CachedPr::new(
+            PrNumber(1),
+            head.clone(),
+            "feature".to_string(),
+            "main".to_string(),
+            None,
+            PrState::Open,
+            MergeStateStatus::Clean,
+            false,
+        );
+        pr.predecessor_squash_reconciled = Some(marker.clone());
+        let mut state = state_with_pr(pr);
+
+        state.apply_event(&event(StateEventPayload::PrSynchronized {
+            pr: PrNumber(1),
+            new_head_sha: head,
+        }));
+
+        let p = &state.prs[&PrNumber(1)];
+        assert_eq!(
+            p.predecessor_squash_reconciled,
+            Some(marker),
+            "a same-SHA sync must not wipe the reconciliation marker"
+        );
+        assert_eq!(
+            p.merge_state_status,
+            MergeStateStatus::Clean,
+            "a same-SHA sync must not reset mergeability"
+        );
+    }
+
     /// Mergeability observations enter the cache through the log.
     #[test]
     fn merge_state_changed_materializes() {

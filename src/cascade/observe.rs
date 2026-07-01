@@ -171,10 +171,14 @@ fn observe_single(effect: &Effect, response: &EffectResponse) -> Option<Observat
 
         (
             Effect::Git(GitEffect::CheckPushCompleted { branch, .. }),
-            EffectResponse::Git(GitResponse::Bool(completed)),
+            EffectResponse::Git(GitResponse::PushCheck {
+                completed,
+                remote_head,
+            }),
         ) => Some(Observation::PushChecked {
             branch: branch.clone(),
             completed: *completed,
+            remote_head: remote_head.clone(),
         }),
 
         (

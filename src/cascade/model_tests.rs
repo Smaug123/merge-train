@@ -387,12 +387,19 @@ impl ModelWorld {
                 second_parent,
             } => {
                 let Some(remote) = self.head(branch) else {
-                    return Ok(GitResponse::Bool(false));
+                    return Ok(GitResponse::PushCheck {
+                        completed: false,
+                        remote_head: None,
+                    });
+                };
+                let check = |completed: bool| GitResponse::PushCheck {
+                    completed,
+                    remote_head: Some(remote.clone()),
                 };
                 if self.tree_sha(&remote) != *expected_tree
                     || !self.is_ancestor(pre_push_sha, &remote)
                 {
-                    return Ok(GitResponse::Bool(false));
+                    return Ok(check(false));
                 }
                 // Ours-merge case: the tree didn't change, identify our commit
                 // by its parents.
@@ -402,9 +409,9 @@ impl ModelWorld {
                         && second_parent
                             .as_ref()
                             .is_none_or(|p2| parents.get(1) == Some(p2));
-                    return Ok(GitResponse::Bool(ok));
+                    return Ok(check(ok));
                 }
-                Ok(GitResponse::Bool(true))
+                Ok(check(true))
             }
 
             GitEffect::ValidateSquashCommit {
@@ -522,6 +529,20 @@ impl ModelWorld {
 
             other => panic!("the engine does not emit {other:?}"),
         }
+    }
+
+    /// A human squash-merges the PR through the GitHub UI (not the bot: no
+    /// audit count, no expected-sha fencing).
+    fn external_squash(&mut self, pr: PrNumber) {
+        let model_pr = self.prs[&pr].clone();
+        let head = self.head(&model_pr.branch).expect("open PR has a branch");
+        let main = self.default_branch.clone();
+        let main_head = self.head(&main).unwrap();
+        let head_atoms = self.atoms(&head).clone();
+        let squash = self.commit(vec![main_head], head_atoms);
+        self.branches.insert(main, squash.clone());
+        self.pr_refs.insert(pr, head);
+        self.prs.get_mut(&pr).unwrap().state = ModelPrState::Merged { sha: squash };
     }
 
     /// A fast-forward push by someone else (adds a commit to the branch).
@@ -951,14 +972,22 @@ fn assert_stack_fully_merged(driver: &Driver, shape: &StackShape) {
                 _ => None,
             })
             .collect();
-        assert_eq!(
-            markers.len(),
-            1,
-            "PR {number} must be reconciled exactly once"
+        assert!(
+            !markers.is_empty(),
+            "PR {number} must be reconciled at least once"
         );
-        assert_eq!(
-            &markers[0], pred_squash,
+        assert!(
+            markers.iter().all(|m| m == pred_squash),
             "PR {number} reconciled against the wrong squash"
+        );
+        // The marker must survive to the end of the run: the cascade's own
+        // pushes (and their head syncs) must not wipe it.
+        assert_eq!(
+            driver.state.prs[&number]
+                .predecessor_squash_reconciled
+                .as_ref(),
+            Some(pred_squash),
+            "PR {number}'s reconciliation marker was lost"
         );
         assert_eq!(driver.world.prs[&number].base_ref, "main");
     }
@@ -1401,6 +1430,78 @@ fn descendant_closed_mid_cascade_is_skipped() {
     assert_eq!(driver.world.squash_count.get(&pr_number(0)), Some(&1));
     assert_eq!(driver.world.squash_count.get(&pr_number(2)), Some(&1));
     assert!(driver.state.active_trains.is_empty());
+}
+
+/// A current PR retargeted away from the default branch (while parked or
+/// between effects) must never be squashed — GitHub merges into the PR's
+/// current base, so proceeding would merge the stack into the wrong branch.
+#[test]
+fn retargeted_current_pr_aborts_instead_of_squashing() {
+    let shape = StackShape {
+        predecessors: vec![],
+        advanced: vec![false],
+    };
+    let (mut world, state) = seed(&shape);
+    // A human retargets the PR before the train evaluates; the cache still
+    // says `main`.
+    world.prs.get_mut(&pr_number(0)).unwrap().base_ref = "release".to_string();
+    let mut driver = Driver::new(world, state);
+    let root = pr_number(0);
+
+    let plan = start_train(&driver.state, root, driver.now).unwrap();
+    let outcome = driver.run_plan(plan, root, &mut |_, _| {});
+    assert_eq!(outcome, RunOutcome::Done);
+
+    match &driver.state.active_trains[&root].state {
+        TrainState::Aborted { error, .. } => {
+            assert_eq!(error.kind, TrainErrorKind::BaseBranchMismatch)
+        }
+        other => panic!("expected abort, got {other:?}"),
+    }
+    assert_eq!(
+        driver.world.squash_count.get(&root),
+        None,
+        "a retargeted PR must never be squashed"
+    );
+    // The refetched base was persisted, not just acted on.
+    assert_eq!(driver.state.prs[&root].base_ref, "release");
+}
+
+/// When the refetch is the only witness of an external merge, the fetched
+/// state must land in the cache: the train completes AND the cached PR is
+/// merged, so future starts/topology don't operate on a phantom-open PR.
+#[test]
+fn externally_merged_current_pr_completes_and_updates_cache() {
+    let shape = StackShape {
+        predecessors: vec![],
+        advanced: vec![false],
+    };
+    let (mut world, state) = seed(&shape);
+    world.external_squash(pr_number(0));
+    let mut driver = Driver::new(world, state);
+    let root = pr_number(0);
+
+    let plan = start_train(&driver.state, root, driver.now).unwrap();
+    let outcome = driver.run_plan(plan, root, &mut |_, _| {});
+    assert_eq!(outcome, RunOutcome::Done);
+
+    assert!(
+        driver.state.active_trains.is_empty(),
+        "an externally merged PR with no descendants completes the train"
+    );
+    assert!(
+        driver.state.prs[&root].state.is_merged(),
+        "the externally observed merge must be persisted to the cache"
+    );
+    assert_eq!(
+        driver.world.squash_count.get(&root),
+        None,
+        "the bot must not re-squash an externally merged PR"
+    );
+    // And a fresh `start` on it is now correctly rejected as not-open.
+    let plan = start_train(&driver.state, root, driver.now).unwrap();
+    assert_eq!(plan.control, Control::Done);
+    assert!(plan.events.is_empty());
 }
 
 /// BEHIND at evaluation time: the root is updated with main (intent-bracketed

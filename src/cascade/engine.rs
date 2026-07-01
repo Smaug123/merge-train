@@ -144,10 +144,11 @@ impl Ctx<'_> {
     }
 }
 
-/// The name of a train's worktree (`stack-<root>`, parsed back by
-/// `git::parse_stack_dir_name`).
+/// The name of a train's worktree: `stack-<root number>`, the convention
+/// `git::parse_stack_dir_name` parses back (the numeric id — NOT `PrNumber`'s
+/// `#`-prefixed `Display`).
 fn worktree_name(root: PrNumber) -> String {
-    format!("stack-{root}")
+    format!("stack-{}", root.0)
 }
 
 /// Worktree prelude for plans that (re-)enter git work after a GitHub
@@ -354,7 +355,11 @@ pub fn advance(
         Observation::Squashed { pr, sha } => on_squashed(&ctx, pr, sha),
         Observation::Resolved { rev, sha } => on_resolved(&ctx, &rev, sha),
         Observation::SquashValidated { sha, valid } => on_squash_validated(&ctx, sha, valid),
-        Observation::PushChecked { branch, completed } => on_push_checked(&ctx, &branch, completed),
+        Observation::PushChecked {
+            branch,
+            completed,
+            remote_head,
+        } => on_push_checked(&ctx, &branch, completed, remote_head),
         Observation::Retargeted { pr } => on_retargeted(&ctx, pr),
         Observation::PrRefreshed {
             pr,
@@ -695,10 +700,11 @@ fn current_pr_decision(
             ctx.current()
         )));
     }
-    let mut events = vec![StateEventPayload::PrMergeStateChanged {
-        pr,
-        status: merge_state,
-    }];
+    // Persist everything the refetch taught us BEFORE acting on it: the
+    // decisions below are recorded as events, but the fetched facts (state,
+    // head, base, draft) must land in the cache too, or replay and future
+    // topology decisions (is_root, `start` validation) operate on stale data.
+    let mut events = refresh_events(ctx, pr, &data, merge_state);
 
     match &data.state {
         PrState::Merged { merge_commit_sha } => {
@@ -745,6 +751,23 @@ fn current_pr_decision(
             events,
             TrainErrorKind::PrClosed,
             format!("PR #{pr} was closed without merging; the train cannot continue."),
+        )),
+        // GitHub's squash endpoint merges into the PR's *current* base. A
+        // current PR whose base is no longer the default branch (edited while
+        // the train was parked or effects were in flight) must never proceed
+        // toward the squash — that would merge the stack into the wrong
+        // branch.
+        PrState::Open if data.base_ref != ctx.default_branch() => Ok(abort_plan(
+            ctx,
+            events,
+            TrainErrorKind::BaseBranchMismatch,
+            format!(
+                "PR #{pr} now targets `{}` instead of `{}`; squashing it would merge \
+                 the stack into the wrong branch. Retarget it back and restart the \
+                 train.",
+                data.base_ref,
+                ctx.default_branch()
+            ),
         )),
         PrState::Open => match merge_state {
             MergeStateStatus::Clean | MergeStateStatus::Unstable => {
@@ -948,10 +971,7 @@ fn retarget_check(
         return Err(ctx.unexpected(format!("PrRefreshed for #{pr} (expected #{d})")));
     }
     let mut events = ctx.resumed_events();
-    events.push(StateEventPayload::PrMergeStateChanged {
-        pr,
-        status: merge_state,
-    });
+    events.extend(refresh_events(ctx, pr, &data, merge_state));
     if data.base_ref == ctx.default_branch() {
         events.push(StateEventPayload::DoneRetarget {
             train_root: ctx.root(),
@@ -1209,14 +1229,28 @@ fn on_root_caught_up(
 
 fn on_pushed(ctx: &Ctx<'_>, branch: &str, outcome: PushOutcome) -> Result<StepPlan, CascadeError> {
     let phase = ctx.train.cascade_phase.kind();
+    // The pushed head, when this push moved the branch. Recording it (as a
+    // `PrSynchronized` in the done batch) keeps the cached head current AND
+    // makes the branch's own `synchronize` webhook a same-SHA no-op, so it
+    // cannot wipe a reconciliation marker recorded after the sync.
+    let pushed_sha = match &outcome {
+        PushOutcome::Pushed { pushed_sha } => Some(pushed_sha.clone()),
+        _ => None,
+    };
+    let sync_event = |pr: PrNumber| {
+        pushed_sha
+            .clone()
+            .map(|new_head_sha| StateEventPayload::PrSynchronized { pr, new_head_sha })
+    };
     match outcome {
         PushOutcome::Pushed { .. } | PushOutcome::AlreadyUpToDate => match phase {
             // The root BEHIND catch-up push: CI reruns on the new head.
             PhaseKind::Idle | PhaseKind::SquashPending => {
-                let events = vec![StateEventPayload::DonePushPrep {
+                let mut events = vec![StateEventPayload::DonePushPrep {
                     train_root: ctx.root(),
                     branch: branch.to_string(),
                 }];
+                events.extend(sync_event(ctx.current()));
                 Ok(park_plan(
                     ctx,
                     events,
@@ -1228,12 +1262,14 @@ fn on_pushed(ctx: &Ctx<'_>, branch: &str, outcome: PushOutcome) -> Result<StepPl
             }
             PhaseKind::Preparing => {
                 let d = ctx.descendant_for_branch(branch)?;
+                let mut events = vec![StateEventPayload::DonePushPrep {
+                    train_root: ctx.root(),
+                    branch: branch.to_string(),
+                }];
+                events.extend(sync_event(d));
                 after_descendant_marked(
                     ctx,
-                    vec![StateEventPayload::DonePushPrep {
-                        train_root: ctx.root(),
-                        branch: branch.to_string(),
-                    }],
+                    events,
                     PhaseOutcome::DescendantCompleted { pr: d },
                     None,
                 )
@@ -1241,27 +1277,41 @@ fn on_pushed(ctx: &Ctx<'_>, branch: &str, outcome: PushOutcome) -> Result<StepPl
             PhaseKind::Reconciling => {
                 let d = ctx.descendant_for_branch(branch)?;
                 let squash_sha = expect_squash_sha(ctx)?;
+                let mut events = vec![StateEventPayload::DonePushReconcile {
+                    train_root: ctx.root(),
+                    branch: branch.to_string(),
+                }];
+                // Sync strictly BEFORE the marker: recording the new head
+                // invalidates any old marker, and the marker being recorded
+                // is for exactly this head.
+                events.extend(sync_event(d));
+                events.push(StateEventPayload::ReconciliationRecorded { pr: d, squash_sha });
                 after_descendant_marked(
                     ctx,
-                    vec![
-                        StateEventPayload::DonePushReconcile {
-                            train_root: ctx.root(),
-                            branch: branch.to_string(),
-                        },
-                        StateEventPayload::ReconciliationRecorded { pr: d, squash_sha },
-                    ],
+                    events,
                     PhaseOutcome::DescendantCompleted { pr: d },
                     None,
                 )
             }
             PhaseKind::CatchingUp => {
                 let d = ctx.descendant_for_branch(branch)?;
+                let squash_sha = expect_squash_sha(ctx)?;
+                let mut events = vec![StateEventPayload::DonePushCatchup {
+                    train_root: ctx.root(),
+                    branch: branch.to_string(),
+                }];
+                if let Some(sync) = sync_event(d) {
+                    // The catch-up push moved the head, which invalidates the
+                    // marker recorded during Reconciling — but this head is
+                    // the cascade's own merge of the default branch into the
+                    // already-reconciled head, so the reconciliation still
+                    // holds by construction: re-assert it after the sync.
+                    events.push(sync);
+                    events.push(StateEventPayload::ReconciliationRecorded { pr: d, squash_sha });
+                }
                 after_descendant_marked(
                     ctx,
-                    vec![StateEventPayload::DonePushCatchup {
-                        train_root: ctx.root(),
-                        branch: branch.to_string(),
-                    }],
+                    events,
                     PhaseOutcome::DescendantCompleted { pr: d },
                     None,
                 )
@@ -1313,8 +1363,23 @@ fn on_pushed(ctx: &Ctx<'_>, branch: &str, outcome: PushOutcome) -> Result<StepPl
     }
 }
 
-fn on_push_checked(ctx: &Ctx<'_>, branch: &str, completed: bool) -> Result<StepPlan, CascadeError> {
+fn on_push_checked(
+    ctx: &Ctx<'_>,
+    branch: &str,
+    completed: bool,
+    remote_head: Option<Sha>,
+) -> Result<StepPlan, CascadeError> {
     let phase = ctx.train.cascade_phase.kind();
+    // When the check proves the push landed, the observed remote head IS the
+    // cascade's own merge commit (tree + parent-chain proof): record it so
+    // the cache stays current and the branch's own `synchronize` webhook
+    // becomes a same-SHA no-op instead of wiping the reconciliation marker.
+    let sync_event = |pr: PrNumber| {
+        remote_head
+            .clone()
+            .filter(|_| completed)
+            .map(|new_head_sha| StateEventPayload::PrSynchronized { pr, new_head_sha })
+    };
     match phase {
         // The root BEHIND push: settle the bracket, then re-evaluate.
         PhaseKind::Idle | PhaseKind::SquashPending => {
@@ -1338,18 +1403,21 @@ fn on_push_checked(ctx: &Ctx<'_>, branch: &str, completed: bool) -> Result<StepP
                     train_root: ctx.root(),
                     branch: branch.to_string(),
                 });
+                plan.events.extend(sync_event(ctx.current()));
             }
             Ok(plan)
         }
         PhaseKind::Preparing => {
             let d = ctx.descendant_for_branch(branch)?;
             if completed {
+                let mut events = vec![StateEventPayload::DonePushPrep {
+                    train_root: ctx.root(),
+                    branch: branch.to_string(),
+                }];
+                events.extend(sync_event(d));
                 after_descendant_marked(
                     ctx,
-                    vec![StateEventPayload::DonePushPrep {
-                        train_root: ctx.root(),
-                        branch: branch.to_string(),
-                    }],
+                    events,
                     PhaseOutcome::DescendantCompleted { pr: d },
                     None,
                 )
@@ -1370,15 +1438,17 @@ fn on_push_checked(ctx: &Ctx<'_>, branch: &str, completed: bool) -> Result<StepP
             let d = ctx.descendant_for_branch(branch)?;
             if completed {
                 let squash_sha = expect_squash_sha(ctx)?;
+                let mut events = vec![StateEventPayload::DonePushReconcile {
+                    train_root: ctx.root(),
+                    branch: branch.to_string(),
+                }];
+                // Sync strictly before the marker (recording a new head
+                // invalidates any old marker).
+                events.extend(sync_event(d));
+                events.push(StateEventPayload::ReconciliationRecorded { pr: d, squash_sha });
                 after_descendant_marked(
                     ctx,
-                    vec![
-                        StateEventPayload::DonePushReconcile {
-                            train_root: ctx.root(),
-                            branch: branch.to_string(),
-                        },
-                        StateEventPayload::ReconciliationRecorded { pr: d, squash_sha },
-                    ],
+                    events,
                     PhaseOutcome::DescendantCompleted { pr: d },
                     None,
                 )
@@ -1398,12 +1468,21 @@ fn on_push_checked(ctx: &Ctx<'_>, branch: &str, completed: bool) -> Result<StepP
         PhaseKind::CatchingUp => {
             let d = ctx.descendant_for_branch(branch)?;
             if completed {
+                let squash_sha = expect_squash_sha(ctx)?;
+                let mut events = vec![StateEventPayload::DonePushCatchup {
+                    train_root: ctx.root(),
+                    branch: branch.to_string(),
+                }];
+                if let Some(sync) = sync_event(d) {
+                    // The proven catch-up head invalidates the Reconciling
+                    // marker, but it is the cascade's own merge of the
+                    // default branch into the reconciled head — re-assert.
+                    events.push(sync);
+                    events.push(StateEventPayload::ReconciliationRecorded { pr: d, squash_sha });
+                }
                 after_descendant_marked(
                     ctx,
-                    vec![StateEventPayload::DonePushCatchup {
-                        train_root: ctx.root(),
-                        branch: branch.to_string(),
-                    }],
+                    events,
                     PhaseOutcome::DescendantCompleted { pr: d },
                     None,
                 )
@@ -1974,6 +2053,71 @@ fn expect_squash_sha(ctx: &Ctx<'_>) -> Result<Sha, CascadeError> {
         .ok_or_else(|| ctx.unexpected("phase carries no squash sha".to_string()))
 }
 
+/// Events materializing a fresh `RefetchPr` observation into the cache.
+///
+/// State delta first (merged/closed/reopened), then — for open PRs — head,
+/// base, and draft deltas, then the mergeability observation last (head/base
+/// changes reset cached mergeability, and the fetched value postdates them).
+/// Without these, a refetch that is the only witness of an external merge,
+/// close, or retarget would leave the cache contradicting the decision the
+/// engine just recorded.
+fn refresh_events(
+    ctx: &Ctx<'_>,
+    pr: PrNumber,
+    data: &PrData,
+    merge_state: MergeStateStatus,
+) -> Vec<StateEventPayload> {
+    let mut events = Vec::new();
+    let cached = ctx.state.prs.get(&pr);
+
+    match (&data.state, cached.map(|c| &c.state)) {
+        (PrState::Merged { merge_commit_sha }, Some(PrState::Open | PrState::Closed)) => {
+            events.push(StateEventPayload::PrMerged {
+                pr,
+                merge_sha: merge_commit_sha.clone(),
+            });
+        }
+        (PrState::Closed, Some(PrState::Open)) => {
+            events.push(StateEventPayload::PrClosed { pr });
+        }
+        (PrState::Open, Some(PrState::Closed)) => {
+            events.push(StateEventPayload::PrReopened { pr });
+        }
+        _ => {}
+    }
+
+    if let Some(c) = cached
+        && data.state == PrState::Open
+    {
+        if c.head_sha != data.head_sha {
+            events.push(StateEventPayload::PrSynchronized {
+                pr,
+                new_head_sha: data.head_sha.clone(),
+            });
+        }
+        if c.base_ref != data.base_ref {
+            events.push(StateEventPayload::PrBaseChanged {
+                pr,
+                old_base: c.base_ref.clone(),
+                new_base: data.base_ref.clone(),
+            });
+        }
+        if c.is_draft != data.is_draft {
+            events.push(if data.is_draft {
+                StateEventPayload::PrConvertedToDraft { pr }
+            } else {
+                StateEventPayload::PrReadyForReview { pr }
+            });
+        }
+    }
+
+    events.push(StateEventPayload::PrMergeStateChanged {
+        pr,
+        status: merge_state,
+    });
+    events
+}
+
 /// A `PhaseTransition` event carrying the train's threading context.
 fn phase_transition(
     ctx: &Ctx<'_>,
@@ -2150,4 +2294,24 @@ fn train_containing(state: &RepoState, pr: PrNumber) -> Option<PrNumber> {
                         .contains(&pr))
         })
         .map(|t| t.original_root_pr)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The emitted worktree effect names must round-trip through the git
+    /// layer's directory convention, or create/remove/cleanup operate on
+    /// directories the rest of the repo never looks at.
+    #[test]
+    fn worktree_names_match_the_stack_dir_convention() {
+        for n in [1u64, 123, 40_000] {
+            let name = worktree_name(PrNumber(n));
+            assert_eq!(
+                crate::git::parse_stack_dir_name(std::path::Path::new(&name)),
+                Some(PrNumber(n)),
+                "worktree name {name} must parse back to PR {n}"
+            );
+        }
+    }
 }

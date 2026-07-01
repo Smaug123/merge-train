@@ -238,7 +238,7 @@ pub enum GitEffect {
     /// Recovery check: did an intended push actually land? Interpreted by
     /// `git::push::is_push_completed` (tree SHA + parent-chain verification —
     /// commit SHAs are not reproducible across retries). Responds with
-    /// [`GitResponse::Bool`].
+    /// [`GitResponse::PushCheck`], carrying the observed remote head.
     CheckPushCompleted {
         /// The branch that was being pushed to.
         branch: String,
@@ -357,8 +357,18 @@ pub enum GitResponse {
     Ok,
     /// Operation returned a SHA (e.g., from RevParse).
     Sha(Sha),
-    /// Operation returned a boolean (e.g., from IsAncestor, CheckPushCompleted).
+    /// Operation returned a boolean (e.g., from IsAncestor).
     Bool(bool),
+    /// Response to `CheckPushCompleted`.
+    PushCheck {
+        /// Whether the intended push provably landed (tree + parent-chain
+        /// verification per DESIGN.md §Git push idempotency).
+        completed: bool,
+        /// The remote branch head the check observed (`None` if the branch is
+        /// gone). When `completed` is true this head is *proven ours*, so
+        /// recovery records it as the descendant's current head.
+        remote_head: Option<Sha>,
+    },
     /// Response to the plain `Merge` effect.
     Merge(MergeOutcome),
     /// Response to `Push`: the domain outcome of the push.
@@ -611,6 +621,12 @@ mod tests {
             Just(GitResponse::Ok),
             arb_sha().prop_map(GitResponse::Sha),
             any::<bool>().prop_map(GitResponse::Bool),
+            (any::<bool>(), prop::option::of(arb_sha())).prop_map(|(completed, remote_head)| {
+                GitResponse::PushCheck {
+                    completed,
+                    remote_head,
+                }
+            }),
             arb_merge_outcome().prop_map(GitResponse::Merge),
             arb_push_outcome().prop_map(GitResponse::Push),
             (

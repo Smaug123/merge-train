@@ -256,7 +256,20 @@ analysis tractable.
 >    `git::push::capture_pre_push_state`) rather than by a separate effect:
 >    the capture is only meaningful in the worktree-HEAD context of the merge,
 >    and a stateless engine cannot thread the prepare-pin across an extra
->    observation round-trip.
+>    observation round-trip. `CheckPushCompleted` responds with
+>    `GitResponse::PushCheck { completed, remote_head }` (not a bare bool):
+>    when the check proves the push landed, the observed remote head is
+>    proven ours and recovery records it as the branch's current head.
+> 8. **Refetched PR facts are persisted, and the cache tracks the cascade's
+>    own pushes.** Every `RefetchPr` decision point first emits the fetched
+>    deltas as events (merged/closed/reopened, head, base, draft, then
+>    mergeability), and every done-push batch records the pushed head as
+>    `PrSynchronized`. `CachedPr::record_new_head` is a no-op for a same-SHA
+>    observation, so the branch's own `synchronize` webhook cannot wipe the
+>    `ReconciliationRecorded` marker written after the sync (a catch-up push
+>    re-asserts the marker, which remains true by construction). An open
+>    current PR whose refetched base is not the default branch aborts with
+>    `BaseBranchMismatch` before any squash can merge into the wrong branch.
 
 **Dependencies:** M1. **Implements:** DESIGN.md §Operation sequence,
 §Descendant set freezing, §Durability and commit points, §Expected state
