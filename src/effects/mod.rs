@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 pub mod git;
 pub mod github;
 
-pub use git::{GitEffect, GitResponse, MergeOutcome, MergeStrategy, PushOutcome};
+pub use git::{GitEffect, GitResponse, MergeOutcome, MergeStrategy, PushOutcome, PushPoint};
 pub use github::{
     BranchProtectionData, CommentData, GitHubEffect, GitHubResponse, PrData, Reaction,
     RepoSettingsData, RulesetData,

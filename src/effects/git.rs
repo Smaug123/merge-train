@@ -35,9 +35,9 @@ impl From<crate::git::MergeResult> for MergeOutcome {
     fn from(result: crate::git::MergeResult) -> Self {
         match result {
             crate::git::MergeResult::Success { commit_sha } => MergeOutcome::Success { commit_sha },
-            crate::git::MergeResult::Conflict { conflicting_files } => MergeOutcome::Conflict {
-                conflicting_files,
-            },
+            crate::git::MergeResult::Conflict { conflicting_files } => {
+                MergeOutcome::Conflict { conflicting_files }
+            }
             crate::git::MergeResult::AlreadyUpToDate => MergeOutcome::AlreadyUpToDate,
         }
     }
@@ -625,9 +625,8 @@ mod tests {
                         push_point,
                     }
                 }),
-            (arb_merge_outcome(), prop::option::of(arb_push_point())).prop_map(
-                |(merge, push_point)| GitResponse::MergedForPush { merge, push_point }
-            ),
+            (arb_merge_outcome(), prop::option::of(arb_push_point()))
+                .prop_map(|(merge, push_point)| GitResponse::MergedForPush { merge, push_point }),
         ]
     }
 

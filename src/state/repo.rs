@@ -553,8 +553,8 @@ mod tests {
                 prop::option::of(arb_sha()),
                 arb_cascade_phase_small(),
             )
-                .prop_map(
-                    |(tr, cp, pp, lp, ph_sha, ph)| StateEventPayload::PhaseTransition {
+                .prop_map(|(tr, cp, pp, lp, ph_sha, ph)| {
+                    StateEventPayload::PhaseTransition {
                         train_root: tr,
                         current_pr: cp,
                         predecessor_pr: pp,
@@ -562,14 +562,10 @@ mod tests {
                         last_squash_parent: lp,
                         predecessor_head_sha: ph_sha,
                         phase: ph,
-                    },
-                ),
-            (arb_small_pr(), Just("waiting".to_string())).prop_map(|(r, reason)| {
-                StateEventPayload::TrainParked {
-                    root_pr: r,
-                    reason,
-                }
-            }),
+                    }
+                },),
+            (arb_small_pr(), Just("waiting".to_string()))
+                .prop_map(|(r, reason)| { StateEventPayload::TrainParked { root_pr: r, reason } }),
             arb_small_pr().prop_map(|r| StateEventPayload::TrainResumed { root_pr: r }),
             arb_small_pr().prop_map(|r| StateEventPayload::StatusCommentPosted {
                 root_pr: r,

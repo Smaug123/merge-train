@@ -73,6 +73,7 @@ pub fn arb_train_state() -> impl Strategy<Value = TrainState> {
         Just(TrainState::WaitingCi),
         Just(TrainState::NeedsManualReview),
         arb_datetime().prop_map(|ended_at| TrainState::Stopped { ended_at }),
+        arb_datetime().prop_map(|ended_at| TrainState::Completed { ended_at }),
         (arb_datetime(), arb_train_error())
             .prop_map(|(ended_at, error)| TrainState::Aborted { ended_at, error }),
     ]
@@ -203,12 +204,8 @@ pub fn arb_state_event_payload() -> impl Strategy<Value = StateEventPayload> {
             }
         }),
         // Train parking
-        (arb_pr_number(), "[a-z ]{1,30}".prop_map(String::from)).prop_map(|(r, reason)| {
-            StateEventPayload::TrainParked {
-                root_pr: r,
-                reason,
-            }
-        }),
+        (arb_pr_number(), "[a-z ]{1,30}".prop_map(String::from))
+            .prop_map(|(r, reason)| { StateEventPayload::TrainParked { root_pr: r, reason } }),
         arb_pr_number().prop_map(|r| StateEventPayload::TrainResumed { root_pr: r }),
         (arb_pr_number(), arb_comment_id()).prop_map(|(r, cid)| {
             StateEventPayload::StatusCommentPosted {
@@ -226,17 +223,17 @@ pub fn arb_state_event_payload() -> impl Strategy<Value = StateEventPayload> {
             prop::option::of(arb_sha()),
             arb_cascade_phase()
         )
-            .prop_map(
-                |(tr, cp, pp, ls, lp, ph_sha, ph)| StateEventPayload::PhaseTransition {
+            .prop_map(|(tr, cp, pp, ls, lp, ph_sha, ph)| {
+                StateEventPayload::PhaseTransition {
                     train_root: tr,
                     current_pr: cp,
                     predecessor_pr: pp,
                     last_squash_sha: ls,
                     last_squash_parent: lp,
                     predecessor_head_sha: ph_sha,
-                    phase: ph
+                    phase: ph,
                 }
-            ),
+            }),
         (arb_pr_number(), arb_pr_number(), arb_sha()).prop_map(|(tr, pr, sh)| {
             StateEventPayload::SquashCommitted {
                 train_root: tr,
@@ -255,15 +252,13 @@ pub fn arb_state_event_payload() -> impl Strategy<Value = StateEventPayload> {
             arb_sha(),
             prop::option::of(arb_sha())
         )
-            .prop_map(
-                |(tr, br, pre, exp, ph)| StateEventPayload::IntentPushPrep {
-                    train_root: tr,
-                    branch: br,
-                    pre_push_sha: pre,
-                    expected_tree: exp,
-                    predecessor_head: ph
-                }
-            ),
+            .prop_map(|(tr, br, pre, exp, ph)| StateEventPayload::IntentPushPrep {
+                train_root: tr,
+                branch: br,
+                pre_push_sha: pre,
+                expected_tree: exp,
+                predecessor_head: ph
+            }),
         (arb_pr_number(), arb_branch_name()).prop_map(|(tr, br)| {
             StateEventPayload::DonePushPrep {
                 train_root: tr,
@@ -381,9 +376,8 @@ pub fn arb_state_event_payload() -> impl Strategy<Value = StateEventPayload> {
         }),
         arb_pr_number().prop_map(|pr| StateEventPayload::PrConvertedToDraft { pr }),
         arb_pr_number().prop_map(|pr| StateEventPayload::PrReadyForReview { pr }),
-        (arb_pr_number(), arb_merge_state_status()).prop_map(|(pr, status)| {
-            StateEventPayload::PrMergeStateChanged { pr, status }
-        }),
+        (arb_pr_number(), arb_merge_state_status())
+            .prop_map(|(pr, status)| { StateEventPayload::PrMergeStateChanged { pr, status } }),
         (
             arb_pr_number(),
             arb_pr_number(),
