@@ -358,21 +358,27 @@ impl ModelWorld {
                 Ok(GitResponse::MergedForPush { merge, push_point })
             }
 
-            GitEffect::Push { branch } => {
+            GitEffect::Push {
+                branch,
+                expected_remote,
+            } => {
+                // Compare-and-swap semantics (--force-with-lease with an
+                // explicit expected value): the remote must still be exactly
+                // the head the merge was computed against. A deleted branch
+                // is a rejection, never a re-creation.
                 let head = self.worktree_head.clone().expect("push follows a merge");
                 let outcome = match self.head(branch) {
                     Some(remote) if remote == head => PushOutcome::AlreadyUpToDate,
-                    Some(remote) if self.is_ancestor(&remote, &head) => {
+                    Some(remote) if remote == *expected_remote => {
                         self.record_push(branch, &head);
                         PushOutcome::Pushed { pushed_sha: head }
                     }
                     Some(_) => PushOutcome::Rejected {
-                        details: "non-fast-forward".to_string(),
+                        details: "stale info".to_string(),
                     },
-                    None => {
-                        self.record_push(branch, &head);
-                        PushOutcome::Pushed { pushed_sha: head }
-                    }
+                    None => PushOutcome::Rejected {
+                        details: "branch deleted (stale info)".to_string(),
+                    },
                 };
                 Ok(GitResponse::Push(outcome))
             }
@@ -798,7 +804,7 @@ impl Driver {
     fn check_bracketing(&self, effect: &Effect, root: PrNumber) {
         let facts = ReplayFacts::for_train(&self.log, root);
         match effect {
-            Effect::Git(GitEffect::Push { branch }) => {
+            Effect::Git(GitEffect::Push { branch, .. }) => {
                 assert!(
                     facts.unmatched().any(|f| matches!(
                         f,
@@ -1369,6 +1375,57 @@ fn deleted_descendant_branch_is_skipped() {
     // pr-3 continues the train (a fan-out of one) and merges.
     assert_eq!(driver.world.squash_count.get(&pr_number(2)), Some(&1));
     assert_eq!(driver.world.squash_count.get(&pr_number(0)), Some(&1));
+    assert!(driver.state.active_trains.is_empty());
+}
+
+/// A branch deleted between the preparation merge and its push: the CAS push
+/// rejects (it must not re-create the ref), the re-preparation observes the
+/// missing branch, and the descendant is skipped — never resurrected.
+#[test]
+fn branch_deleted_between_merge_and_push_is_skipped() {
+    let shape = StackShape {
+        predecessors: vec![0],
+        advanced: vec![true, false],
+    };
+    let (world, state) = seed(&shape);
+    let mut driver = Driver::new(world, state);
+    let root = pr_number(0);
+
+    let mut injected = false;
+    let plan = start_train(&driver.state, root, driver.now).unwrap();
+    let outcome = driver.run_plan(plan, root, &mut |d, _| {
+        // The observation boundary right after pr-2's preparation merge (the
+        // worktree HEAD is the merge result) and before the intent+push plan:
+        // the branch disappears in exactly the merge→push window.
+        if !injected
+            && d.state
+                .active_trains
+                .get(&pr_number(0))
+                .is_some_and(|t| t.cascade_phase.kind() == crate::types::PhaseKind::Preparing)
+            && d.world.worktree_head.is_some()
+        {
+            injected = true;
+            d.world.branches.remove("pr-2");
+        }
+    });
+    assert!(injected, "the injection point must be reached");
+    assert_eq!(outcome, RunOutcome::Done);
+
+    assert!(
+        !driver.world.branches.contains_key("pr-2"),
+        "the deleted branch must never be re-created by a push"
+    );
+    assert!(
+        driver.log.iter().any(|e| matches!(
+            &e.payload,
+            StateEventPayload::DescendantSkipped { descendant_pr, .. }
+                if *descendant_pr == pr_number(1)
+        )),
+        "the deleted descendant must be skipped"
+    );
+    // The root still merges; the skipped descendant never does.
+    assert_eq!(driver.world.squash_count.get(&root), Some(&1));
+    assert_eq!(driver.world.squash_count.get(&pr_number(1)), None);
     assert!(driver.state.active_trains.is_empty());
 }
 

@@ -139,7 +139,7 @@ fn observe_single(effect: &Effect, response: &EffectResponse) -> Option<Observat
         }),
 
         (
-            Effect::Git(GitEffect::Push { branch }),
+            Effect::Git(GitEffect::Push { branch, .. }),
             EffectResponse::Git(GitResponse::Push(outcome)),
         ) => Some(Observation::Pushed {
             branch: branch.clone(),

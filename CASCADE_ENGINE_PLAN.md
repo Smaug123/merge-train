@@ -429,8 +429,14 @@ cleanly via M1 `apply_event`; stop on existing train *always* contains
 >    variants (`Checkout`, plain `Merge`, `IsAncestor`, `MergeAbort`,
 >    `ResetHard`, `Clean`) and the producer-less `GitResponse::Merge` are
 >    deleted, so the interpreter's match is exhaustive with no wildcard.
->    `GitEffect::Push` carries just `branch` (the bot pushes HEAD and never
->    forces); `is_push_completed` returns
+>    `GitEffect::Push` is a **compare-and-swap**: it carries `branch` +
+>    `expected_remote` (the push point's `pre_push_sha`) and the interpreter
+>    pushes with `--force-with-lease=<branch>:<expected>`. A plain push would
+>    silently *re-create* a branch deleted in the merge→push window,
+>    resurrecting a dead descendant (Codex M4 review); the lease makes
+>    deletion and foreign advance both reject as the domain outcome
+>    `Rejected`, and can never discard anything because our head descends
+>    from the expected value by construction. `is_push_completed` returns
 >    `PushCompletion { completed, remote_head }` to feed the engine's
 >    `PushCheck` response.
 > 3. **`classify_git_error`** (same file) is the fixed `GitError` →

@@ -163,9 +163,10 @@ fn worktree_prelude(root: PrNumber) -> Vec<Effect> {
     ]
 }
 
-fn push_effect(branch: &str) -> Effect {
+fn push_effect(branch: &str, expected_remote: &Sha) -> Effect {
     Effect::Git(GitEffect::Push {
         branch: branch.to_string(),
+        expected_remote: expected_remote.clone(),
     })
 }
 
@@ -1072,11 +1073,11 @@ fn on_prepared(
                 events: vec![StateEventPayload::IntentPushPrep {
                     train_root: ctx.root(),
                     branch: branch.to_string(),
-                    pre_push_sha,
+                    pre_push_sha: pre_push_sha.clone(),
                     expected_tree,
                     predecessor_head: Some(pin),
                 }],
-                effects: vec![push_effect(branch)],
+                effects: vec![push_effect(branch, &pre_push_sha)],
                 best_effort: Vec::new(),
                 control: Control::Continue,
             }),
@@ -1128,10 +1129,10 @@ fn on_reconciled(
                 events: vec![StateEventPayload::IntentPushReconcile {
                     train_root: ctx.root(),
                     branch: branch.to_string(),
-                    pre_push_sha,
+                    pre_push_sha: pre_push_sha.clone(),
                     expected_tree,
                 }],
-                effects: vec![push_effect(branch)],
+                effects: vec![push_effect(branch, &pre_push_sha)],
                 best_effort: Vec::new(),
                 control: Control::Continue,
             }),
@@ -1177,10 +1178,10 @@ fn on_caught_up(
                 events: vec![StateEventPayload::IntentPushCatchup {
                     train_root: ctx.root(),
                     branch: branch.to_string(),
-                    pre_push_sha,
+                    pre_push_sha: pre_push_sha.clone(),
                     expected_tree,
                 }],
-                effects: vec![push_effect(branch)],
+                effects: vec![push_effect(branch, &pre_push_sha)],
                 best_effort: Vec::new(),
                 control: Control::Continue,
             }),
@@ -1219,11 +1220,11 @@ fn on_root_caught_up(
                 events: vec![StateEventPayload::IntentPushPrep {
                     train_root: ctx.root(),
                     branch: branch.to_string(),
-                    pre_push_sha,
+                    pre_push_sha: pre_push_sha.clone(),
                     expected_tree,
                     predecessor_head: None,
                 }],
-                effects: vec![push_effect(branch)],
+                effects: vec![push_effect(branch, &pre_push_sha)],
                 best_effort: Vec::new(),
                 control: Control::Continue,
             }),
@@ -1741,7 +1742,7 @@ fn descendant_target(ctx: &Ctx<'_>, effect: &Effect) -> Option<PrNumber> {
             branch: descendant_branch,
             ..
         }) => descendant_branch.clone(),
-        Effect::Git(GitEffect::Push { branch }) => branch.clone(),
+        Effect::Git(GitEffect::Push { branch, .. }) => branch.clone(),
         Effect::GitHub(GitHubEffect::RetargetPr { pr, .. }) => {
             return ctx
                 .train

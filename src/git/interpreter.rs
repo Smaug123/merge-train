@@ -146,8 +146,11 @@ impl WorktreeGitInterpreter {
                 })
             }
 
-            GitEffect::Push { branch } => {
-                let outcome = push_head_to_branch(&self.worktree, branch)?;
+            GitEffect::Push {
+                branch,
+                expected_remote,
+            } => {
+                let outcome = push_head_to_branch(&self.worktree, branch, expected_remote)?;
                 Ok(GitResponse::Push(outcome.into()))
             }
 
@@ -340,6 +343,7 @@ mod tests {
         let pushed = interpreter
             .interpret(&GitEffect::Push {
                 branch: "pr-2".to_string(),
+                expected_remote: push_point.pre_push_sha.clone().unwrap(),
             })
             .unwrap();
         let GitResponse::Push(PushOutcome::Pushed { pushed_sha }) = pushed else {
@@ -441,24 +445,72 @@ mod tests {
                 predecessor_pr: PrNumber(1),
             })
             .unwrap();
-        assert!(matches!(
-            response,
-            GitResponse::Prepared {
-                merge: MergeOutcome::Success { .. },
-                ..
-            }
-        ));
+        let GitResponse::Prepared {
+            merge: MergeOutcome::Success { .. },
+            push_point: Some(push_point),
+            ..
+        } = response
+        else {
+            panic!("expected a successful prepare, got {response:?}");
+        };
         // A human lands a commit on pr-2 between our merge and our push.
         create_branch_with_file(&config, "pr-2", "human.txt", "fix", "pr-2");
 
         let pushed = interpreter
             .interpret(&GitEffect::Push {
                 branch: "pr-2".to_string(),
+                expected_remote: push_point.pre_push_sha.unwrap(),
             })
             .unwrap();
         assert!(
             matches!(pushed, GitResponse::Push(PushOutcome::Rejected { .. })),
             "a foreign advance must reject, got {pushed:?}"
+        );
+    }
+
+    #[test]
+    fn deleted_branch_push_is_refused_not_resurrected() {
+        // The Codex M4 finding: a branch deleted between the merge (which
+        // captured pre_push_sha) and the push must reject — a plain push
+        // would CREATE the missing ref, resurrecting a dead descendant.
+        let (_temp, config, interpreter, _pin) = stacked_fixture();
+        let response = interpreter
+            .interpret(&GitEffect::PrepareDescendant {
+                descendant_branch: "pr-2".to_string(),
+                predecessor_pr: PrNumber(1),
+            })
+            .unwrap();
+        let GitResponse::Prepared {
+            push_point: Some(push_point),
+            ..
+        } = response
+        else {
+            panic!("expected a successful prepare, got {response:?}");
+        };
+
+        // The branch disappears in the merge→push window.
+        run_git_sync(
+            &config.clone_dir(),
+            &["update-ref", "-d", "refs/heads/pr-2"],
+        )
+        .unwrap();
+
+        let pushed = interpreter
+            .interpret(&GitEffect::Push {
+                branch: "pr-2".to_string(),
+                expected_remote: push_point.pre_push_sha.unwrap(),
+            })
+            .unwrap();
+        assert!(
+            matches!(pushed, GitResponse::Push(PushOutcome::Rejected { .. })),
+            "pushing over a deleted branch must reject, got {pushed:?}"
+        );
+        // And the attempt must not have re-created the branch.
+        let recreated =
+            crate::git::push::get_remote_ref(&config.worktree_path(PrNumber(1)), "pr-2").unwrap();
+        assert!(
+            recreated.is_none(),
+            "the rejected push must not resurrect the deleted branch"
         );
     }
 
@@ -506,9 +558,22 @@ mod tests {
                 predecessor_pr: PrNumber(1),
             })
             .unwrap();
+        let GitResponse::Prepared {
+            push_point: Some(prep_point),
+            ..
+        } = interpreter
+            .interpret(&GitEffect::PrepareDescendant {
+                descendant_branch: "pr-2".to_string(),
+                predecessor_pr: PrNumber(1),
+            })
+            .unwrap()
+        else {
+            panic!("expected a push point from the re-prepare");
+        };
         interpreter
             .interpret(&GitEffect::Push {
                 branch: "pr-2".to_string(),
+                expected_remote: prep_point.pre_push_sha.unwrap(),
             })
             .unwrap();
 
@@ -550,6 +615,7 @@ mod tests {
         interpreter
             .interpret(&GitEffect::Push {
                 branch: "pr-2".to_string(),
+                expected_remote: push_point.pre_push_sha.clone().unwrap(),
             })
             .unwrap();
         let check = interpreter

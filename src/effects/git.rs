@@ -260,13 +260,20 @@ pub enum GitEffect {
         default_branch: String,
     },
 
-    /// Push the worktree's HEAD to a remote branch (never force: the bot
-    /// must not clobber human pushes — a rejection is the loud, recoverable
-    /// signal DESIGN.md's concurrent-push handling relies on). Interpreted by
+    /// Push the worktree's HEAD to a remote branch, compare-and-swap style:
+    /// the push succeeds only if the remote ref still equals
+    /// `expected_remote` (via `--force-with-lease=<branch>:<sha>`). Anything
+    /// else — a foreign advance, or the branch having been *deleted* (a plain
+    /// push would silently re-create it, resurrecting a dead descendant) —
+    /// is the domain outcome `Rejected`, the loud recoverable signal
+    /// DESIGN.md's concurrent-push handling relies on. Interpreted by
     /// `git::push::push_head_to_branch`.
     Push {
         /// The remote branch to push HEAD to.
         branch: String,
+        /// The remote head the pushed merge was computed against (the push
+        /// point's `pre_push_sha`).
+        expected_remote: Sha,
     },
 
     /// Parse a revision to a SHA.
@@ -517,7 +524,10 @@ mod tests {
                 }
             }),
             // Push
-            arb_target().prop_map(|branch| GitEffect::Push { branch }),
+            (arb_target(), arb_sha()).prop_map(|(branch, expected_remote)| GitEffect::Push {
+                branch,
+                expected_remote,
+            }),
             // RevParse
             arb_target().prop_map(|rev| GitEffect::RevParse { rev }),
             // CreateWorktree

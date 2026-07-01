@@ -32,24 +32,41 @@ pub enum PushResult {
     AlreadyUpToDate,
 }
 
-/// Push the current HEAD to a remote branch.
+/// Push the current HEAD to a remote branch, compare-and-swap style.
 ///
-/// Uses detached HEAD mode: pushes with `HEAD:refs/heads/<branch>`.
+/// Uses detached HEAD mode (`HEAD:refs/heads/<branch>`) with
+/// `--force-with-lease=refs/heads/<branch>:<expected_remote>`: the push
+/// succeeds only if the remote ref still equals the head the pushed merge
+/// was computed against. This rejects (rather than clobbers) a foreign
+/// advance, and rejects (rather than **re-creates**) a branch that was
+/// deleted in the merge→push window — a plain push treats a missing
+/// destination as branch creation, silently resurrecting a dead descendant.
+/// Our head always descends from `expected_remote` by construction, so the
+/// lease's force semantics can never discard anything.
 ///
 /// # Arguments
 ///
 /// * `worktree` - Path to the worktree
 /// * `branch` - The remote branch name to push to
+/// * `expected_remote` - The remote head observed when the pushed merge was made
 ///
 /// # Returns
 ///
 /// The result of the push operation.
-pub fn push_head_to_branch(worktree: &Path, branch: &str) -> GitResult<PushResult> {
+pub fn push_head_to_branch(
+    worktree: &Path,
+    branch: &str,
+    expected_remote: &Sha,
+) -> GitResult<PushResult> {
     let refspec = format!("HEAD:refs/heads/{}", branch);
+    let lease = format!(
+        "--force-with-lease=refs/heads/{}:{}",
+        branch, expected_remote
+    );
     let head_sha = rev_parse(worktree, "HEAD")?;
 
     let output = super::git_command(worktree)
-        .args(["push", "origin", &refspec])
+        .args(["push", &lease, "origin", &refspec])
         .output()?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -70,6 +87,7 @@ pub fn push_head_to_branch(worktree: &Path, branch: &str) -> GitResult<PushResul
     // Check for rejection
     if stderr.contains("non-fast-forward")
         || stderr.contains("rejected")
+        || stderr.contains("stale info")
         || stderr.contains("failed to push")
     {
         return Ok(PushResult::Rejected {
@@ -289,10 +307,13 @@ mod tests {
     use crate::types::PrNumber;
 
     #[test]
-    fn push_head_to_branch_creates_branch() {
-        let (_temp_dir, config, _) = create_test_repo_with_origin();
+    fn push_refuses_to_create_a_missing_branch() {
+        // The compare-and-swap lease means a branch deleted in the
+        // merge→push window is REJECTED, not silently re-created: a plain
+        // push would resurrect a dead descendant's branch and let the
+        // cascade march on over it.
+        let (_temp_dir, config, initial_sha) = create_test_repo_with_origin();
 
-        // Get a worktree and make a commit
         let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
         run_git_sync(&worktree, &["config", "user.email", "test@test.com"]).unwrap();
         run_git_sync(&worktree, &["config", "user.name", "Test"]).unwrap();
@@ -301,14 +322,16 @@ mod tests {
         run_git_sync(&worktree, &["add", "."]).unwrap();
         run_git_sync(&worktree, &["commit", "-m", "Add new file"]).unwrap();
 
-        // Push to a new branch
-        let result = push_head_to_branch(&worktree, "feature-123").unwrap();
+        // The branch we expected to update does not exist (deleted).
+        let result = push_head_to_branch(&worktree, "feature-123", &initial_sha).unwrap();
+        assert!(matches!(result, PushResult::Rejected { .. }));
 
-        assert!(matches!(result, PushResult::Success { .. }));
-
-        // Verify the branch exists on the remote
+        // And it must NOT have been created by the attempt.
         let remote_ref = get_remote_ref(&worktree, "feature-123").unwrap();
-        assert!(remote_ref.is_some());
+        assert!(
+            remote_ref.is_none(),
+            "the rejected push must not create the branch"
+        );
     }
 
     #[test]
@@ -319,18 +342,20 @@ mod tests {
         run_git_sync(&worktree, &["config", "user.email", "test@test.com"]).unwrap();
         run_git_sync(&worktree, &["config", "user.name", "Test"]).unwrap();
 
-        // First commit and push
+        // First commit; seed the branch with a raw push (the cascade never
+        // creates branches — humans do).
         std::fs::write(worktree.join("file1.txt"), "content1").unwrap();
         run_git_sync(&worktree, &["add", "."]).unwrap();
         run_git_sync(&worktree, &["commit", "-m", "First commit"]).unwrap();
-        push_head_to_branch(&worktree, "feature").unwrap();
+        run_git_sync(&worktree, &["push", "origin", "HEAD:refs/heads/feature"]).unwrap();
+        let expected_remote = rev_parse(&worktree, "HEAD").unwrap();
 
-        // Second commit and push
+        // Second commit and leased push.
         std::fs::write(worktree.join("file2.txt"), "content2").unwrap();
         run_git_sync(&worktree, &["add", "."]).unwrap();
         run_git_sync(&worktree, &["commit", "-m", "Second commit"]).unwrap();
 
-        let result = push_head_to_branch(&worktree, "feature").unwrap();
+        let result = push_head_to_branch(&worktree, "feature", &expected_remote).unwrap();
         assert!(matches!(result, PushResult::Success { .. }));
 
         // Verify HEAD matches remote
@@ -347,11 +372,12 @@ mod tests {
         run_git_sync(&worktree, &["config", "user.email", "test@test.com"]).unwrap();
         run_git_sync(&worktree, &["config", "user.name", "Test"]).unwrap();
 
-        // Create and push a branch
+        // Create and push a branch, remembering the pre-divergence base.
+        let base = rev_parse(&worktree, "HEAD").unwrap();
         std::fs::write(worktree.join("file1.txt"), "content1").unwrap();
         run_git_sync(&worktree, &["add", "."]).unwrap();
         run_git_sync(&worktree, &["commit", "-m", "First commit"]).unwrap();
-        push_head_to_branch(&worktree, "feature").unwrap();
+        run_git_sync(&worktree, &["push", "origin", "HEAD:refs/heads/feature"]).unwrap();
 
         // Reset back and create a different commit
         run_git_sync(&worktree, &["reset", "--hard", "HEAD~1"]).unwrap();
@@ -359,8 +385,8 @@ mod tests {
         run_git_sync(&worktree, &["add", "."]).unwrap();
         run_git_sync(&worktree, &["commit", "-m", "Different commit"]).unwrap();
 
-        // Try to push - should be rejected
-        let result = push_head_to_branch(&worktree, "feature").unwrap();
+        // The lease expects the base but the remote moved on: rejected.
+        let result = push_head_to_branch(&worktree, "feature", &base).unwrap();
         assert!(matches!(result, PushResult::Rejected { .. }));
     }
 
@@ -439,7 +465,7 @@ mod tests {
         );
 
         // Do the push
-        push_head_to_branch(&worktree, "main").unwrap();
+        push_head_to_branch(&worktree, "main", &pre_push_sha).unwrap();
 
         // Now it should be detected as completed
         assert!(
@@ -466,13 +492,13 @@ mod tests {
 
         let expected_tree = get_tree_sha(&worktree, "HEAD").unwrap();
 
-        let intent = PushIntent::new("main", expected_tree, pre_push_sha);
+        let intent = PushIntent::new("main", expected_tree, pre_push_sha.clone());
 
         // Not completed yet
         assert!(!intent.is_completed(&worktree).unwrap().completed);
 
         // Do the push
-        push_head_to_branch(&worktree, "main").unwrap();
+        push_head_to_branch(&worktree, "main", &pre_push_sha).unwrap();
 
         // Now completed
         assert!(intent.is_completed(&worktree).unwrap().completed);
@@ -530,7 +556,7 @@ mod tests {
         );
 
         // Do the push
-        push_head_to_branch(&worktree, "main").unwrap();
+        push_head_to_branch(&worktree, "main", &pre_push_sha).unwrap();
 
         // Now it should be detected as completed (the fix makes this work)
         // Without expected second parent, it only checks first parent
@@ -599,7 +625,7 @@ mod tests {
         let expected_tree = get_tree_sha(&worktree, "HEAD").unwrap();
 
         // Push the merge
-        push_head_to_branch(&worktree, "main").unwrap();
+        push_head_to_branch(&worktree, "main", &pre_push_sha).unwrap();
 
         // With correct second parent - should succeed
         assert!(
