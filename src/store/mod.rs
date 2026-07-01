@@ -173,6 +173,52 @@ impl Store {
         self.next_seq
     }
 
+    /// Reads the materialized [`PersistedRepoSnapshot`] from the repo DB at
+    /// `db_path`, **without** opening the full `Store` or taking the per-repo
+    /// lock — for read-only observers like the `/state` endpoint. Returns `None`
+    /// if the DB or its cached-state row is absent.
+    ///
+    /// WAL lets this read run concurrently with the owning worker's writer
+    /// without blocking it. The connection is opened read-write but marked
+    /// `query_only`: a pure read-only open can fail to initialize WAL
+    /// shared-memory when no writer is currently attached, while `query_only`
+    /// still forbids writes.
+    pub fn read_snapshot(db_path: &Path) -> Result<Option<PersistedRepoSnapshot>, StoreError> {
+        if !db_path.exists() {
+            return Ok(None);
+        }
+        let conn = Connection::open(db_path)?;
+        conn.pragma_update(None, "query_only", true)?;
+
+        // Mirror `Store::open`'s schema checks (Codex review #54): fail loud on
+        // an incompatible store or snapshot version rather than serving state a
+        // normal load would reject and hiding an upgrade/corruption issue.
+        let found: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if found != STORE_SCHEMA_VERSION {
+            return Err(StoreError::SchemaMismatch {
+                expected: STORE_SCHEMA_VERSION,
+                found,
+            });
+        }
+
+        let json: Option<String> = conn
+            .query_row("SELECT snapshot FROM repo_state WHERE id = 0", [], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        let Some(json) = json else {
+            return Ok(None);
+        };
+        let snapshot: PersistedRepoSnapshot = serde_json::from_str(&json)?;
+        if snapshot.schema_version != SCHEMA_VERSION {
+            return Err(StoreError::CachedStateSchemaMismatch {
+                expected: SCHEMA_VERSION,
+                found: snapshot.schema_version,
+            });
+        }
+        Ok(Some(snapshot))
+    }
+
     /// THE single mutation entry point: append `payload` (stamped with `ts` by
     /// the caller — timestamps enter at the shell), apply it to the in-memory
     /// state, and upsert the cache, all in one transaction. A crash before the
@@ -726,5 +772,117 @@ mod tests {
         assert!(!store.is_duplicate(&key).unwrap());
         assert_eq!(store.prune_deliveries(cutoff).unwrap(), 1);
         assert!(store.claim_next_delivery().unwrap().is_none());
+    }
+
+    #[test]
+    fn read_snapshot_returns_the_cached_state() {
+        use crate::types::PrNumber;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        {
+            let mut store = Store::open(&path).unwrap();
+            store
+                .append(
+                    StateEventPayload::TrainStarted {
+                        root_pr: PrNumber(7),
+                        current_pr: PrNumber(7),
+                    },
+                    test_timestamp(),
+                )
+                .unwrap();
+        }
+        let snapshot = Store::read_snapshot(&path).unwrap().expect("a snapshot");
+        assert!(snapshot.active_trains.contains_key(&PrNumber(7)));
+    }
+
+    #[test]
+    fn read_snapshot_is_none_for_missing_db() {
+        let dir = tempdir().unwrap();
+        assert!(
+            Store::read_snapshot(&dir.path().join("absent.db"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn read_snapshot_rejects_store_schema_mismatch() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        drop(Store::open(&path).unwrap());
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "user_version", STORE_SCHEMA_VERSION + 1)
+                .unwrap();
+        }
+        match Store::read_snapshot(&path) {
+            Err(StoreError::SchemaMismatch { expected, found }) => {
+                assert_eq!(expected, STORE_SCHEMA_VERSION);
+                assert_eq!(found, STORE_SCHEMA_VERSION + 1);
+            }
+            other => panic!("expected SchemaMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_snapshot_rejects_cached_state_schema_mismatch() {
+        use crate::types::PrNumber;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        {
+            let mut store = Store::open(&path).unwrap();
+            store
+                .append(
+                    StateEventPayload::TrainStarted {
+                        root_pr: PrNumber(1),
+                        current_pr: PrNumber(1),
+                    },
+                    test_timestamp(),
+                )
+                .unwrap();
+        }
+        {
+            let conn = Connection::open(&path).unwrap();
+            let json: String = conn
+                .query_row("SELECT snapshot FROM repo_state WHERE id = 0", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            let mut snap: PersistedRepoSnapshot = serde_json::from_str(&json).unwrap();
+            snap.schema_version = SCHEMA_VERSION + 1;
+            let bad = serde_json::to_string(&snap).unwrap();
+            conn.execute("UPDATE repo_state SET snapshot = ?1 WHERE id = 0", [bad])
+                .unwrap();
+        }
+        match Store::read_snapshot(&path) {
+            Err(StoreError::CachedStateSchemaMismatch { expected, found }) => {
+                assert_eq!(expected, SCHEMA_VERSION);
+                assert_eq!(found, SCHEMA_VERSION + 1);
+            }
+            other => panic!("expected CachedStateSchemaMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_snapshot_reads_concurrently_with_the_writer() {
+        use crate::types::PrNumber;
+        // WAL: the read-only read succeeds while the owning Store still holds the
+        // DB open (and its lock).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let mut store = Store::open(&path).unwrap();
+        store
+            .append(
+                StateEventPayload::TrainStarted {
+                    root_pr: PrNumber(3),
+                    current_pr: PrNumber(3),
+                },
+                test_timestamp(),
+            )
+            .unwrap();
+        let snapshot = Store::read_snapshot(&path).unwrap().expect("a snapshot");
+        assert!(snapshot.active_trains.contains_key(&PrNumber(3)));
+        drop(store);
     }
 }
