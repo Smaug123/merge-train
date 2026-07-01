@@ -65,6 +65,20 @@ pub fn push_head_to_branch(
     );
     let head_sha = rev_parse(worktree, "HEAD")?;
 
+    // The no-clobber invariant, machine-enforced rather than by-convention:
+    // the lease's force semantics are only sound because HEAD descends from
+    // the lease base (so a matching remote loses nothing). A caller passing
+    // a base HEAD does not contain — e.g. a lease captured from a live
+    // remote query after the merge — would authorize discarding that base's
+    // history; refuse it as a contract violation.
+    if !super::is_ancestor(worktree, expected_remote, &head_sha)? {
+        return Err(GitError::LeaseBaseNotAncestor {
+            branch: branch.to_string(),
+            expected_remote: expected_remote.clone(),
+            head: head_sha,
+        });
+    }
+
     let output = super::git_command(worktree)
         .args(["push", &lease, "origin", &refspec])
         .output()?;
@@ -289,13 +303,48 @@ impl PushIntent {
     }
 }
 
-/// Record the current state before a push for recovery purposes.
+/// Record the push point for HEAD: its tree SHA, and the base the upcoming
+/// push descends from.
 ///
-/// Returns the tree SHA of HEAD and the current remote ref SHA.
+/// The base is read from the **local remote-tracking ref**
+/// (`refs/remotes/origin/<branch>`, as of the merge's own fetch) — NOT a
+/// live remote query. This is load-bearing for the compare-and-swap push: a
+/// live query races with concurrent pushes, and capturing a *post-merge*
+/// foreign head as the lease value would make `--force-with-lease` authorize
+/// force-pushing our (older-based) merge over the foreign commit. The
+/// tracking ref is the head the merge functions checked out and merged onto,
+/// so HEAD provably descends from it. `None` if the branch was never fetched
+/// into this worktree.
 pub fn capture_pre_push_state(worktree: &Path, branch: &str) -> GitResult<(Sha, Option<Sha>)> {
     let tree_sha = get_tree_sha(worktree, "HEAD")?;
-    let remote_sha = get_remote_ref(worktree, branch)?;
+    let remote_sha = local_tracking_ref(worktree, branch)?;
     Ok((tree_sha, remote_sha))
+}
+
+/// The local remote-tracking ref for a branch, `None` if absent.
+fn local_tracking_ref(worktree: &Path, branch: &str) -> GitResult<Option<Sha>> {
+    let output = super::git_command(worktree)
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/remotes/origin/{branch}"),
+        ])
+        .output()?;
+    // Exit 0 = ref exists, exit 1 (quiet) = absent, other = error.
+    match output.status.code() {
+        Some(0) => {
+            let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            Sha::parse(&sha)
+                .map(Some)
+                .map_err(|_| GitError::InvalidSha(sha))
+        }
+        Some(1) => Ok(None),
+        _ => Err(GitError::CommandFailed {
+            command: format!("git rev-parse --verify refs/remotes/origin/{branch}"),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -425,18 +474,114 @@ mod tests {
         run_git_sync(&worktree, &["add", "."]).unwrap();
         run_git_sync(&worktree, &["commit", "-m", "New commit"]).unwrap();
 
-        // Capture state for new branch (doesn't exist yet)
+        // Capture state for a branch never fetched into this worktree.
         let (tree_sha, remote_sha) = capture_pre_push_state(&worktree, "new-branch").unwrap();
 
         // Tree SHA should be valid
         assert_eq!(tree_sha.as_str().len(), 40);
 
-        // Remote should be None (branch doesn't exist)
+        // Base should be None (no locally-known base to lease against)
         assert!(remote_sha.is_none());
 
-        // Capture state for existing branch
+        // After a fetch there is a locally-known base.
+        crate::git::fetch(&worktree, &["main"]).unwrap();
         let (_, remote_sha) = capture_pre_push_state(&worktree, "main").unwrap();
         assert!(remote_sha.is_some());
+    }
+
+    #[test]
+    fn capture_returns_the_fetched_base_not_the_live_remote() {
+        // The lease-soundness pin (Codex M4 round 2, P1): a foreign push
+        // landing after our fetch must NOT become the lease value — leasing
+        // against a post-merge foreign head would authorize force-pushing
+        // our older-based merge over it. The captured base is the head our
+        // merge was computed on: the local tracking ref as of the fetch.
+        let (_temp_dir, config, _) = create_test_repo_with_origin();
+        let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
+        run_git_sync(&worktree, &["config", "user.email", "test@test.com"]).unwrap();
+        run_git_sync(&worktree, &["config", "user.name", "Test"]).unwrap();
+
+        crate::git::fetch(&worktree, &["main"]).unwrap();
+        let fetched_base = rev_parse(&worktree, "origin/main").unwrap();
+
+        // A foreign push advances the remote after our fetch.
+        run_git_sync(&worktree, &["checkout", "--detach", "origin/main"]).unwrap();
+        std::fs::write(worktree.join("foreign.txt"), "foreign").unwrap();
+        run_git_sync(&worktree, &["add", "."]).unwrap();
+        run_git_sync(&worktree, &["commit", "-m", "Foreign commit"]).unwrap();
+        let foreign = rev_parse(&worktree, "HEAD").unwrap();
+        run_git_sync(
+            &worktree,
+            &[
+                "push",
+                "origin",
+                "HEAD:refs/heads/moving",
+                "HEAD:refs/heads/main",
+            ],
+        )
+        .unwrap();
+        // Undo the tracking-ref update the push itself performed, restoring
+        // the state a mid-window foreign push (from another machine) leaves:
+        // remote moved, our tracking ref still at the fetched base.
+        run_git_sync(
+            &worktree,
+            &[
+                "update-ref",
+                "refs/remotes/origin/main",
+                fetched_base.as_str(),
+            ],
+        )
+        .unwrap();
+
+        let (_, captured) = capture_pre_push_state(&worktree, "main").unwrap();
+        assert_eq!(
+            captured.as_ref(),
+            Some(&fetched_base),
+            "the capture must be the fetched base, not the live remote"
+        );
+        assert_ne!(
+            captured,
+            Some(foreign),
+            "a live query would capture the foreign head"
+        );
+    }
+
+    #[test]
+    fn push_refuses_a_lease_that_is_not_an_ancestor_of_head() {
+        // The no-clobber belt: even if a caller supplies a foreign head as
+        // the lease (the exact bug the capture semantics prevent), the push
+        // refuses rather than force-pushing over it.
+        let (_temp_dir, config, _) = create_test_repo_with_origin();
+        let worktree = worktree_for_stack(&config, PrNumber(123)).unwrap();
+        run_git_sync(&worktree, &["config", "user.email", "test@test.com"]).unwrap();
+        run_git_sync(&worktree, &["config", "user.name", "Test"]).unwrap();
+
+        // A foreign commit on a side branch (present locally, not in HEAD's
+        // ancestry).
+        crate::git::fetch(&worktree, &["main"]).unwrap();
+        run_git_sync(&worktree, &["checkout", "--detach", "origin/main"]).unwrap();
+        std::fs::write(worktree.join("foreign.txt"), "foreign").unwrap();
+        run_git_sync(&worktree, &["add", "."]).unwrap();
+        run_git_sync(&worktree, &["commit", "-m", "Foreign commit"]).unwrap();
+        let foreign = rev_parse(&worktree, "HEAD").unwrap();
+        run_git_sync(&worktree, &["push", "origin", "HEAD:refs/heads/main"]).unwrap();
+
+        // Our (unrelated) HEAD, based on the old main.
+        run_git_sync(&worktree, &["checkout", "--detach", "HEAD~1"]).unwrap();
+        std::fs::write(worktree.join("ours.txt"), "ours").unwrap();
+        run_git_sync(&worktree, &["add", "."]).unwrap();
+        run_git_sync(&worktree, &["commit", "-m", "Our commit"]).unwrap();
+
+        // Leasing against the foreign head (which matches the remote!) must
+        // refuse — a plain --force-with-lease would clobber it.
+        let error = push_head_to_branch(&worktree, "main", &foreign).unwrap_err();
+        assert!(
+            matches!(error, GitError::LeaseBaseNotAncestor { .. }),
+            "expected LeaseBaseNotAncestor, got {error:?}"
+        );
+        // The foreign commit survives on the remote.
+        let remote = get_remote_ref(&worktree, "main").unwrap().unwrap();
+        assert_eq!(remote, foreign);
     }
 
     #[test]

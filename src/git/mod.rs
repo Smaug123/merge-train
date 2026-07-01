@@ -76,6 +76,19 @@ pub enum GitError {
         descendant_head: Sha,
     },
 
+    /// A compare-and-swap push was requested whose lease base is not an
+    /// ancestor of HEAD: pushing would discard the base's history if the
+    /// remote still matched it. The push contract requires the lease to be
+    /// the base the pushed merge was computed on — this is a caller bug.
+    #[error(
+        "push lease for {branch} is not an ancestor of HEAD: lease {expected_remote},          HEAD {head}"
+    )]
+    LeaseBaseNotAncestor {
+        branch: String,
+        expected_remote: Sha,
+        head: Sha,
+    },
+
     /// Reconciliation refused: the head that was actually squash-merged (per
     /// the predecessor's PR ref, which is frozen at merge time) differs from
     /// the head preparation merged into the descendant. The predecessor was

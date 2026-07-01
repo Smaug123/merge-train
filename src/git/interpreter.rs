@@ -257,12 +257,12 @@ pub fn classify_git_error(error: &GitError) -> EffectError {
             kind: TrainErrorKind::NonSquashMerge,
             detail: error.to_string(),
         },
-        GitError::InvalidSha(_) | GitError::InvalidCheckoutTarget { .. } => {
-            EffectError::Permanent {
-                kind: TrainErrorKind::InternalInvariantViolation,
-                detail: error.to_string(),
-            }
-        }
+        GitError::InvalidSha(_)
+        | GitError::InvalidCheckoutTarget { .. }
+        | GitError::LeaseBaseNotAncestor { .. } => EffectError::Permanent {
+            kind: TrainErrorKind::InternalInvariantViolation,
+            detail: error.to_string(),
+        },
         GitError::CommandFailed { .. } | GitError::WorktreeError { .. } | GitError::Io(_) => {
             EffectError::Transient {
                 detail: error.to_string(),
@@ -751,6 +751,17 @@ mod tests {
             ),
             (
                 GitError::InvalidSha("junk".to_string()),
+                EffectError::Permanent {
+                    kind: TrainErrorKind::InternalInvariantViolation,
+                    detail: String::new(),
+                },
+            ),
+            (
+                GitError::LeaseBaseNotAncestor {
+                    branch: "pr-2".to_string(),
+                    expected_remote: sha(),
+                    head: sha(),
+                },
                 EffectError::Permanent {
                     kind: TrainErrorKind::InternalInvariantViolation,
                     detail: String::new(),

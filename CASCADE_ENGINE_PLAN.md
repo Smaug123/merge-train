@@ -435,8 +435,14 @@ cleanly via M1 `apply_event`; stop on existing train *always* contains
 >    silently *re-create* a branch deleted in the merge→push window,
 >    resurrecting a dead descendant (Codex M4 review); the lease makes
 >    deletion and foreign advance both reject as the domain outcome
->    `Rejected`, and can never discard anything because our head descends
->    from the expected value by construction. `is_push_completed` returns
+>    `Rejected`. Lease soundness (Codex M4 round 2, P1): the lease value is
+>    the **fetched base the merge descends from** (the local
+>    `refs/remotes/origin/<branch>` tracking ref, never a live remote query —
+>    a live query races with concurrent pushes and would lease against a
+>    foreign head, authorizing its clobbering), and `push_head_to_branch`
+>    additionally refuses any lease base that is not an ancestor of HEAD
+>    (`GitError::LeaseBaseNotAncestor` → internal-invariant abort), so the
+>    no-clobber property is machine-enforced, not by-convention. `is_push_completed` returns
 >    `PushCompletion { completed, remote_head }` to feed the engine's
 >    `PushCheck` response.
 > 3. **`classify_git_error`** (same file) is the fixed `GitError` →

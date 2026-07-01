@@ -309,8 +309,11 @@ pub struct PushPoint {
     /// The tree SHA of the worktree's HEAD (deterministic across retries,
     /// unlike merge-commit SHAs).
     pub expected_tree: Sha,
-    /// The remote ref before our push; `None` if the branch is gone
-    /// (deleted mid-cascade — the descendant gets skipped).
+    /// The base the pushed merge descends from: the branch's local
+    /// remote-tracking ref as of the merge's own fetch (never a live remote
+    /// query — that would race with concurrent pushes and could lease
+    /// against a foreign head). `None` if the branch was never fetched (the
+    /// descendant gets skipped).
     pub pre_push_sha: Option<Sha>,
 }
 
