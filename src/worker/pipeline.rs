@@ -916,16 +916,20 @@ impl Processor {
         // observations, and the store would diverge from reality (Codex M5
         // review, P1). Stops then suppress the *continuation*, which has not
         // run yet and is therefore safe to drop.
-        let mut fanned_into: Vec<PrNumber> = Vec::new();
+        let mut stops = stops;
         let planned = match observe(&outcomes) {
             Ok(obs) => match cascade::advance(self.store.state(), root, obs, Utc::now()) {
                 Ok(plan) => {
                     // A fan-out retires `root` and spawns new roots; a stop
                     // for `root` queued during this batch must retire those
-                    // too (below), or it resolves to "no active train" and
-                    // the continuation the user refused runs anyway (Codex
-                    // M5 round 13).
-                    fanned_into = plan
+                    // too, or it resolves to "no active train" and the
+                    // continuation the user refused runs anyway (Codex M5
+                    // round 13). The expansion is made durable BEFORE the
+                    // fan-out integrates (Codex M5 round 15): a crash
+                    // between the two leaves rows naming the new-root PRs,
+                    // which pre-fan-out still resolve to the old train — so
+                    // every window recovers to a stopped cascade.
+                    let fanned_into: Vec<PrNumber> = plan
                         .events
                         .iter()
                         .find_map(|e| match e {
@@ -937,6 +941,27 @@ impl Processor {
                             _ => None,
                         })
                         .unwrap_or_default();
+                    if !fanned_into.is_empty() {
+                        let mut expanded = Vec::with_capacity(stops.len());
+                        for stop in stops {
+                            if stop.pr != root {
+                                expanded.push(stop);
+                                continue;
+                            }
+                            let replacements: Vec<(PrNumber, bool)> =
+                                fanned_into.iter().map(|&pr| (pr, stop.force)).collect();
+                            let ids = self.store.replace_pending_stop(stop.id, &replacements)?;
+                            for (&(pr, force), id) in replacements.iter().zip(ids) {
+                                expanded.push(QueuedStop {
+                                    id,
+                                    pr,
+                                    force,
+                                    cancelled_queued_start: false,
+                                });
+                            }
+                        }
+                        stops = expanded;
+                    }
                     self.integrate_plan(root, plan)?
                 }
                 Err(e) => {
@@ -949,29 +974,6 @@ impl Processor {
                 None
             }
         };
-
-        // Expand a stop naming the just-fanned-out root into stops for every
-        // train the fan-out spawned: the user stopped the cascade before its
-        // continuations existed. (The durable row is shared; deleting it once
-        // per expansion is an idempotent DELETE.)
-        let stops: Vec<QueuedStop> = stops
-            .into_iter()
-            .flat_map(|stop| {
-                if stop.pr == root && !fanned_into.is_empty() {
-                    fanned_into
-                        .iter()
-                        .map(|&new_root| QueuedStop {
-                            id: stop.id,
-                            pr: new_root,
-                            force: stop.force,
-                            cancelled_queued_start: false,
-                        })
-                        .collect()
-                } else {
-                    vec![stop]
-                }
-            })
-            .collect();
 
         let (mut cleanup, mut retired) = self.apply_stops(stops)?;
         let (mut abort_cleanup, aborted) = self.apply_deferred_aborts(aborts)?;

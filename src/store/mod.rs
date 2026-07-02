@@ -449,6 +449,34 @@ impl Store {
         Ok(stops)
     }
 
+    /// Atomically replaces a pending stop with stops for `prs` — the fan-out
+    /// expansion: a stop for a root whose train is about to fan out becomes
+    /// stops for every spawned root, and the replacement must be durable
+    /// BEFORE the fan-out integrates or a crash in between loses the
+    /// acknowledged stop (Codex M5 round 15: the old-root row resolves to no
+    /// train after the fan-out). Returns the new row ids, in `prs` order.
+    pub fn replace_pending_stop(
+        &mut self,
+        old_id: i64,
+        prs: &[(PrNumber, bool)],
+    ) -> Result<Vec<i64>, StoreError> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM pending_stops WHERE id = ?1",
+            rusqlite::params![old_id],
+        )?;
+        let mut ids = Vec::with_capacity(prs.len());
+        for (pr, force) in prs {
+            tx.execute(
+                "INSERT INTO pending_stops (pr, force_stop) VALUES (?1, ?2)",
+                rusqlite::params![pr.0 as i64, *force],
+            )?;
+            ids.push(tx.last_insert_rowid());
+        }
+        tx.commit()?;
+        Ok(ids)
+    }
+
     /// Removes an applied stop. Deleting after (not atomically with) the
     /// stop's event append means a crash in between replays the stop, which
     /// is harmless: stopping an already-stopped train answers "no active

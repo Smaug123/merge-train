@@ -1586,6 +1586,61 @@ fn command_on_an_unfetchable_pr_is_denied_not_dropped() {
     );
 }
 
+/// The fan-out stop expansion is durable BEFORE the fan-out integrates
+/// (Codex M5 round 15): a crash between them must reload stop rows naming
+/// the spawned roots, whose trains then stop at startup with no further
+/// traffic. This drives the post-crash state directly: fan-out applied,
+/// expanded rows persisted, expanded stops never applied.
+#[test]
+fn expanded_fanout_stops_survive_a_crash() {
+    let (mut world, heads) = World::linear_stack(1);
+    {
+        let mut processor = world.processor();
+        world.enqueue_stack_setup(&mut processor, 1, &heads);
+        drain(&mut processor);
+        // The crash artifact: the fan-out landed, the expansion's rows are
+        // durable, the stops were never applied.
+        processor
+            .store_mut()
+            .append_batch(
+                &[
+                    crate::persistence::event::StateEventPayload::TrainStarted {
+                        root_pr: PrNumber(1),
+                        current_pr: PrNumber(1),
+                    },
+                    crate::persistence::event::StateEventPayload::FanOutCompleted {
+                        old_root: PrNumber(1),
+                        new_roots: vec![PrNumber(2), PrNumber(3)],
+                        original_root_pr: PrNumber(1),
+                    },
+                ],
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        processor
+            .store_mut()
+            .replace_pending_stop(0, &[(PrNumber(2), false), (PrNumber(3), false)])
+            .unwrap();
+    } // crash
+
+    let mut processor = world.processor();
+    drain(&mut processor);
+
+    assert!(
+        processor
+            .state()
+            .active_trains
+            .values()
+            .all(|t| !t.state.is_active()),
+        "the persisted expanded stops must retire the spawned trains; {:?}",
+        processor.state().active_trains
+    );
+    assert!(
+        processor.store_mut().pending_stops().unwrap().is_empty(),
+        "applied stops must consume their rows"
+    );
+}
+
 /// A stop for the original root racing the *fan-out boundary* must retire
 /// the trains the fan-out spawns: integrated first, `FanOutCompleted`
 /// removes the old root, the stop resolves to "no active train", and the
