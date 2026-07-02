@@ -1170,9 +1170,8 @@ mod tests {
         // The merge endpoint's state complaint — including "already merged"
         // externally. Must NOT abort: parking re-derives from a fresh refetch,
         // which adopts an external squash or aborts with the precise kind.
-        let err = GitHubApiError::from_octocrab(
-            github_error(405, "Pull Request is not mergeable").await,
-        );
+        let err =
+            GitHubApiError::from_octocrab(github_error(405, "Pull Request is not mergeable").await);
         assert_eq!(err.kind, GitHubErrorKind::Permanent, "precondition");
         assert!(matches!(
             classify_github_error(&err),

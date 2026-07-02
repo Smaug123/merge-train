@@ -69,10 +69,7 @@ pub fn authorize_by_author(
                 AuthorDecision::Allowed
             } else {
                 AuthorDecision::Denied {
-                    reason: format!(
-                        "Only the PR author can issue `{}`.",
-                        command_name(command)
-                    ),
+                    reason: format!("Only the PR author can issue `{}`.", command_name(command)),
                 }
             }
         }

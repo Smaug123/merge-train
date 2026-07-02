@@ -161,6 +161,12 @@ impl Processor {
         &mut self.store
     }
 
+    /// The materialized repo state.
+    #[cfg(test)]
+    pub fn state(&self) -> &crate::state::RepoState {
+        self.store.state()
+    }
+
     pub fn github(&self) -> &GitHubExec {
         &self.deps.github
     }
@@ -544,7 +550,13 @@ impl Processor {
         // human's stop preempts whatever this saga would do next. (Stops for
         // *other* trains are equally safe here — nothing of theirs is in
         // flight — and their cleanup rides on the returned batch.)
-        let mut boundary_cleanup = self.run_boundary_stops()?;
+        let (mut boundary_cleanup, cancel_saga) = self.run_boundary_stops(root)?;
+        if cancel_saga {
+            // The stop targeted this saga before its train existed (the
+            // start's preflight window): cancel the start instead of letting
+            // `advance` create the train the user just refused.
+            return self.finish_or_pump(root, boundary_cleanup);
+        }
 
         let obs = match observe(&outcomes) {
             Ok(obs) => obs,
@@ -589,19 +601,44 @@ impl Processor {
     }
 
     /// Applies every queued `StopTrain` now (terminal events only — cheap and
-    /// safe at an observation boundary), returning their cleanup effects.
-    fn run_boundary_stops(&mut self) -> Result<Vec<Effect>, StoreError> {
+    /// safe at an observation boundary), returning their cleanup effects and
+    /// whether the in-flight saga must be cancelled.
+    ///
+    /// The cancellation case is the start-flow window: a stop that arrives
+    /// while the start's preflight fetch is in flight finds no train to stop
+    /// (`TrainStarted` only lands after preflight), yet letting the saga
+    /// advance would start a train the user just refused. A stop naming the
+    /// saga's own root therefore cancels the saga itself. (A stop naming a
+    /// *descendant* in that sub-second window cannot be resolved to the
+    /// stack — there is no train record yet — and still answers "no active
+    /// train"; the commenter re-issues once the status comment appears.)
+    fn run_boundary_stops(
+        &mut self,
+        saga_root: PrNumber,
+    ) -> Result<(Vec<Effect>, bool), StoreError> {
         let mut cleanup = Vec::new();
+        let mut cancel_saga = false;
         let mut remaining = VecDeque::new();
         while let Some(work) = self.pending.pop_front() {
             let PendingWork::Trigger(Trigger::StopTrain { pr, force }) = work else {
                 remaining.push_back(work);
                 continue;
             };
+            if self.store.state().train_involving(pr).is_none() && pr == saga_root {
+                cancel_saga = true;
+                cleanup.push(Effect::GitHub(GitHubEffect::PostComment {
+                    pr,
+                    body: "🛑 Merge train start cancelled.".to_owned(),
+                }));
+                continue;
+            }
             let now = Utc::now();
             match cascade::stop_train(self.store.state(), pr, force, now) {
                 Ok(plan) => {
-                    debug_assert!(plan.effects.is_empty(), "stop plans have no observed effects");
+                    debug_assert!(
+                        plan.effects.is_empty(),
+                        "stop plans have no observed effects"
+                    );
                     self.store.append_batch(&plan.events, now)?;
                     cleanup.extend(plan.best_effort);
                 }
@@ -609,7 +646,7 @@ impl Processor {
             }
         }
         self.pending = remaining;
-        Ok(cleanup)
+        Ok((cleanup, cancel_saga))
     }
 
     /// Appends a plan's events and turns its effects into a batch. `None`
@@ -630,7 +667,9 @@ impl Processor {
         let feedback = matches!(control, Control::Continue);
         if let Control::FanOut { new_roots } = control {
             for new_root in new_roots {
-                self.queue(PendingWork::Trigger(Trigger::EvaluateTrain { root: new_root }));
+                self.queue(PendingWork::Trigger(Trigger::EvaluateTrain {
+                    root: new_root,
+                }));
             }
         }
 
@@ -660,9 +699,7 @@ fn command_in(event: &GitHubEvent, deps: &WorkerDeps) -> Option<(PrNumber, Comma
     let GitHubEvent::IssueComment(comment) = event else {
         return None;
     };
-    if comment.author_id == deps.bot_user_id
-        || comment.action == CommentAction::Deleted
-    {
+    if comment.author_id == deps.bot_user_id || comment.action == CommentAction::Deleted {
         return None;
     }
     let pr = comment.pr_number?;

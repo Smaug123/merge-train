@@ -167,9 +167,9 @@ async fn main() {
         name: config
             .git_user_name
             .unwrap_or_else(|| identity.login.clone()),
-        email: config.git_user_email.unwrap_or_else(|| {
-            format!("{}@users.noreply.github.com", identity.login)
-        }),
+        email: config
+            .git_user_email
+            .unwrap_or_else(|| format!("{}@users.noreply.github.com", identity.login)),
         signing_key: config.git_signing_key,
     };
 

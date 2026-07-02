@@ -198,11 +198,11 @@ impl fmt::Display for DedupeKey {
 mod tests {
     use super::*;
     use crate::types::RepoId;
+    use crate::webhooks::events::MergeStatus;
     use crate::webhooks::events::{
         CheckSuiteAction, CheckSuiteEvent, IssueCommentEvent, PullRequestEvent,
         PullRequestReviewEvent, ReviewAction, ReviewState, StatusEvent, StatusState,
     };
-    use crate::webhooks::events::MergeStatus;
     use proptest::prelude::*;
 
     fn repo() -> RepoId {
@@ -778,5 +778,4 @@ mod tests {
             )
         );
     }
-
 }

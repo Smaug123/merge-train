@@ -22,21 +22,21 @@ use crate::types::{CommentId, MergeStateStatus, PrNumber, PrState, Sha, TrainErr
 
 /// A fake PR's lifecycle state.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum FakePrState {
+pub enum FakePrState {
     Open,
     Merged { squash_sha: Sha },
 }
 
 /// A PR as the fake GitHub tracks it.
 #[derive(Debug, Clone)]
-pub(crate) struct FakePr {
+pub struct FakePr {
     pub branch: String,
     pub base_ref: String,
     pub state: FakePrState,
 }
 
 /// The GitHub half of a test world whose git half is real.
-pub(crate) struct FakeGitHub {
+pub struct FakeGitHub {
     pub config: GitConfig,
     pub prs: HashMap<PrNumber, FakePr>,
     pub next_comment: u64,

@@ -1,0 +1,1014 @@
+//! Worker integration tests: real git, real Store, fake GitHub.
+//!
+//! The pipeline/saga tests drive [`Processor`] synchronously — the exact
+//! calls the worker thread makes, minus the threads — so every durability
+//! boundary is a call boundary and crashes are simulated by dropping the
+//! `Store` and reopening it. The registry tests at the bottom exercise the
+//! real async intake path end-to-end.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+use tempfile::TempDir;
+
+use crate::cascade::{EffectOutcome, ReplayFacts};
+use crate::git::interpreter::WorktreeGitInterpreter;
+use crate::git::test_support::{
+    create_branch_with_file, create_pr_ref, create_test_repo_with_origin,
+};
+use crate::git::{GitConfig, run_git_stdout};
+use crate::github::test_support::{FakeGitHub, FakePr, FakePrState};
+use crate::state::RepoState;
+use crate::store::Store;
+use crate::types::{PrNumber, Sha};
+
+use super::executor::{GitHubExec, SagaBatch, execute_batch};
+use super::pipeline::{PipelineOutcome, Processor, WorkerDeps};
+use super::test_support::TEST_BOT_ID;
+use super::{GitSettings, IntakeDelivery, WorkerMsg};
+
+// ─── Identities ───
+
+/// The PR author in these tests.
+const AUTHOR: u64 = 100;
+/// A user who is not the PR author and holds no role unless granted.
+const STRANGER: u64 = 200;
+
+// ─── Payload builders (the raw JSON the pipeline parses) ───
+
+fn repo_json(config: &GitConfig) -> String {
+    format!(
+        r#"{{ "owner": {{ "login": "{}" }}, "name": "{}" }}"#,
+        config.owner, config.repo
+    )
+}
+
+fn pr_opened_body(
+    config: &GitConfig,
+    number: u64,
+    head: &Sha,
+    branch: &str,
+    base: &str,
+) -> Vec<u8> {
+    format!(
+        r#"{{
+            "action": "opened",
+            "pull_request": {{
+                "number": {number},
+                "state": "open",
+                "draft": false,
+                "merged": false,
+                "head": {{ "sha": "{head}", "ref": "{branch}" }},
+                "base": {{ "sha": "{base_sha}", "ref": "{base}" }},
+                "user": {{ "id": {AUTHOR}, "login": "author" }},
+                "updated_at": "2026-07-01T10:00:00Z"
+            }},
+            "repository": {repo}
+        }}"#,
+        base_sha = "0".repeat(40),
+        repo = repo_json(config),
+    )
+    .into_bytes()
+}
+
+fn comment_body(
+    config: &GitConfig,
+    pr: u64,
+    text: &str,
+    commenter_id: u64,
+    commenter_login: &str,
+    comment_id: u64,
+) -> Vec<u8> {
+    format!(
+        r#"{{
+            "action": "created",
+            "comment": {{
+                "id": {comment_id},
+                "body": "{text}",
+                "user": {{ "id": {commenter_id}, "login": "{commenter_login}" }},
+                "updated_at": "2026-07-01T10:00:0{comment_id}Z"
+            }},
+            "issue": {{
+                "number": {pr},
+                "pull_request": {{ "url": "..." }},
+                "user": {{ "id": {AUTHOR}, "login": "author" }}
+            }},
+            "repository": {repo}
+        }}"#,
+        comment_id = comment_id % 10,
+        repo = repo_json(config),
+    )
+    .into_bytes()
+}
+
+fn check_suite_green_body(config: &GitConfig, head: &Sha, prs: &[u64], suite_id: u64) -> Vec<u8> {
+    let prs_json: Vec<String> = prs
+        .iter()
+        .map(|n| format!("{{ \"number\": {n} }}"))
+        .collect();
+    format!(
+        r#"{{
+            "action": "completed",
+            "check_suite": {{
+                "id": {suite_id},
+                "head_sha": "{head}",
+                "conclusion": "success",
+                "pull_requests": [{prs}],
+                "updated_at": "2026-07-01T11:00:00Z"
+            }},
+            "repository": {repo}
+        }}"#,
+        prs = prs_json.join(", "),
+        repo = repo_json(config),
+    )
+    .into_bytes()
+}
+
+// ─── The world: a real stack on a real remote + a fake GitHub ───
+
+struct World {
+    _temp: TempDir,
+    state_dir: TempDir,
+    config: GitConfig,
+    github: Arc<Mutex<FakeGitHub>>,
+    /// Monotonic delivery-id source.
+    next_delivery: u64,
+}
+
+impl World {
+    /// A linear stack of `n` PRs on a real repo: `pr-1` targets main, each
+    /// `pr-k` targets `pr-(k-1)`. The root's branch gets an extra commit
+    /// after descendants fork, so preparation does real merge work.
+    fn linear_stack(n: usize) -> (World, Vec<Sha>) {
+        let (temp, config, _initial) = create_test_repo_with_origin();
+        let mut fake_prs = HashMap::new();
+        let mut heads = Vec::new();
+        for i in 1..=n {
+            let branch = format!("pr-{i}");
+            let base = if i == 1 {
+                "main".to_owned()
+            } else {
+                format!("pr-{}", i - 1)
+            };
+            let head = create_branch_with_file(
+                &config,
+                &branch,
+                &format!("pr-{i}.txt"),
+                &format!("content {i}"),
+                &base,
+            );
+            create_pr_ref(&config, i as u64, &head);
+            fake_prs.insert(
+                PrNumber(i as u64),
+                FakePr {
+                    branch,
+                    base_ref: base,
+                    state: FakePrState::Open,
+                },
+            );
+            heads.push(head);
+        }
+        // Advance the root after the fork so preparation is a real merge.
+        if n > 1 {
+            let head = create_branch_with_file(&config, "pr-1", "pr-1-fix.txt", "fix", "pr-1");
+            create_pr_ref(&config, 1, &head);
+            heads[0] = head;
+        }
+        let github = Arc::new(Mutex::new(FakeGitHub::new(config.clone(), fake_prs)));
+        let world = World {
+            _temp: temp,
+            state_dir: TempDir::new().unwrap(),
+            config,
+            github,
+            next_delivery: 0,
+        };
+        (world, heads)
+    }
+
+    fn db_path(&self) -> PathBuf {
+        self.state_dir.path().join("state.db")
+    }
+
+    fn deps(&self) -> WorkerDeps {
+        WorkerDeps {
+            github: GitHubExec::Fake(self.github.clone()),
+            git: GitSettings {
+                base_dir: self.config.base_dir.clone(),
+                owner: self.config.owner.clone(),
+                repo: self.config.repo.clone(),
+                commit_identity: self.config.commit_identity.clone(),
+                worktree_max_age: self.config.worktree_max_age,
+                clone_url: None,
+            },
+            bot_user_id: TEST_BOT_ID,
+            bot_name: "merge-train".to_owned(),
+        }
+    }
+
+    fn processor(&self) -> Processor {
+        Processor::new(Store::open(&self.db_path()).unwrap(), self.deps())
+    }
+
+    /// Durably enqueues a raw delivery (as the intake path would).
+    fn enqueue(&mut self, processor: &mut Processor, event_type: &str, body: Vec<u8>) {
+        self.next_delivery += 1;
+        let id = format!("delivery-{}", self.next_delivery);
+        processor
+            .store_mut()
+            .enqueue(&id, event_type, "{}", &body, chrono::Utc::now())
+            .unwrap();
+    }
+
+    /// The standard opening moves: every PR announced, predecessors declared
+    /// by the author.
+    fn enqueue_stack_setup(&mut self, processor: &mut Processor, n: usize, heads: &[Sha]) {
+        let config = self.config.clone();
+        for i in 1..=n {
+            let base = if i == 1 {
+                "main".to_owned()
+            } else {
+                format!("pr-{}", i - 1)
+            };
+            let body = pr_opened_body(&config, i as u64, &heads[i - 1], &format!("pr-{i}"), &base);
+            self.enqueue(processor, "pull_request", body);
+        }
+        for i in 2..=n {
+            let body = comment_body(
+                &config,
+                i as u64,
+                &format!("@merge-train predecessor #{}", i - 1),
+                AUTHOR,
+                "author",
+                i as u64 * 10,
+            );
+            self.enqueue(processor, "issue_comment", body);
+        }
+    }
+}
+
+// ─── The synchronous drive loop (the worker thread, minus the threads) ───
+
+/// Executes one batch exactly as the executor thread would.
+fn execute(processor: &Processor, batch: &SagaBatch) -> Vec<EffectOutcome> {
+    let interpreter = WorktreeGitInterpreter::new(processor.git_config(), batch.root);
+    execute_batch(&interpreter, processor.github(), batch)
+}
+
+/// Runs queued sagas to quiescence (Park/Done and no pending work).
+fn run_sagas(processor: &mut Processor) {
+    let mut steps = 0;
+    let mut next = processor.pump().unwrap();
+    while let Some(batch) = next {
+        steps += 1;
+        assert!(steps < 500, "saga did not terminate");
+        let outcomes = execute(processor, &batch);
+        next = processor
+            .on_outcomes(batch.root, outcomes, batch.feedback)
+            .unwrap();
+    }
+}
+
+/// Processes every pending delivery, then runs sagas, until quiescent.
+fn drain(processor: &mut Processor) {
+    let mut rounds = 0;
+    loop {
+        rounds += 1;
+        assert!(rounds < 100, "drain did not settle");
+        let mut did_work = false;
+        while let Some(delivery) = processor.claim().unwrap() {
+            did_work = true;
+            assert_eq!(
+                processor.process_claimed(delivery).unwrap(),
+                PipelineOutcome::Processed,
+                "no test in this harness expects a release"
+            );
+        }
+        run_sagas(processor);
+        if !did_work {
+            return;
+        }
+    }
+}
+
+/// Drives to full train completion, nudging any `WaitingCi` train with a
+/// green check-suite webhook for its root's current heads (reality's job).
+fn drive_to_completion(world: &mut World, processor: &mut Processor) {
+    for _ in 0..20 {
+        drain(processor);
+        let waiting: Vec<PrNumber> = processor
+            .state()
+            .active_trains
+            .values()
+            .filter(|t| t.state.is_active())
+            .map(|t| t.current_pr)
+            .collect();
+        if waiting.is_empty() {
+            return;
+        }
+        for pr in waiting {
+            let (head, suite) = {
+                let github = world.github.lock().unwrap();
+                let branch = github.prs[&pr].branch.clone();
+                (github.branch_head(&branch), world.next_delivery + 900)
+            };
+            let body = check_suite_green_body(&world.config, &head, &[pr.0], suite);
+            world.enqueue(processor, "check_suite", body);
+        }
+    }
+    panic!(
+        "trains did not complete: {:?}",
+        processor.state().active_trains
+    );
+}
+
+fn start_command(world: &mut World, processor: &mut Processor, pr: u64) {
+    let body = comment_body(
+        &world.config,
+        pr,
+        "@merge-train start",
+        AUTHOR,
+        "author",
+        500 + pr,
+    );
+    world.enqueue(processor, "issue_comment", body);
+}
+
+// ─── End-to-end: the money test ───
+
+#[test]
+fn start_command_runs_train_to_completion_end_to_end() {
+    let (mut world, heads) = World::linear_stack(3);
+    let mut processor = world.processor();
+
+    world.enqueue_stack_setup(&mut processor, 3, &heads);
+    start_command(&mut world, &mut processor, 1);
+    drive_to_completion(&mut world, &mut processor);
+
+    let github = world.github.lock().unwrap();
+    let clone_dir = world.config.clone_dir();
+
+    // Every PR squashed exactly once; every train retired.
+    for i in 1..=3u64 {
+        let pr = PrNumber(i);
+        assert!(
+            matches!(github.prs[&pr].state, FakePrState::Merged { .. }),
+            "PR {pr} did not merge"
+        );
+        assert_eq!(github.squash_count.get(&pr), Some(&1));
+        assert!(processor.state().prs[&pr].state.is_merged());
+    }
+    assert!(processor.state().active_trains.is_empty());
+
+    // All content — including the root's post-fork fix — reached real main.
+    let main_tree =
+        run_git_stdout(&clone_dir, &["ls-tree", "--name-only", "refs/heads/main"]).unwrap();
+    for name in ["pr-1.txt", "pr-1-fix.txt", "pr-2.txt", "pr-3.txt"] {
+        assert!(main_tree.contains(name), "{name} missing from main");
+    }
+
+    // Delivery accounting: everything processed and closed.
+    assert!(processor.claim().unwrap().is_none());
+
+    // No dangling intents in the durable ledger.
+    let events = processor.store_mut().events().unwrap();
+    for i in 1..=3u64 {
+        let facts = ReplayFacts::for_train(&events, PrNumber(i));
+        assert_eq!(facts.unmatched().count(), 0, "unmatched intents on #{i}");
+    }
+}
+
+// ─── Dedupe ───
+
+#[test]
+fn duplicate_content_under_new_delivery_id_is_skipped() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    drain(&mut processor);
+
+    let declared_events = processor.store_mut().events().unwrap().len();
+
+    // GitHub redelivers the predecessor comment under a fresh delivery id:
+    // identical content, so the dedupe key already exists.
+    let body = comment_body(
+        &world.config,
+        2,
+        "@merge-train predecessor #1",
+        AUTHOR,
+        "author",
+        20,
+    );
+    world.enqueue(&mut processor, "issue_comment", body);
+    drain(&mut processor);
+
+    assert_eq!(
+        processor.store_mut().events().unwrap().len(),
+        declared_events,
+        "a duplicate delivery must not re-run the handler"
+    );
+}
+
+// ─── Authorization ───
+
+#[test]
+fn unauthorized_start_is_rejected_with_a_comment_and_no_train() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+
+    let body = comment_body(
+        &world.config,
+        1,
+        "@merge-train start",
+        STRANGER,
+        "stranger",
+        77,
+    );
+    world.enqueue(&mut processor, "issue_comment", body);
+    drain(&mut processor);
+
+    assert!(processor.state().active_trains.is_empty());
+    let github = world.github.lock().unwrap();
+    assert!(
+        github
+            .posted_comments
+            .iter()
+            .any(|(pr, text)| *pr == PrNumber(1) && text.contains("Only the PR author")),
+        "expected a rejection comment, got {:?}",
+        github.posted_comments
+    );
+}
+
+#[test]
+fn maintainer_stop_is_authorized_via_role_lookup() {
+    let (mut world, heads) = World::linear_stack(2);
+    world.github.lock().unwrap().roles.insert(
+        "maintainer".to_owned(),
+        crate::effects::github::CollaboratorRole::Maintain,
+    );
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    start_command(&mut world, &mut processor, 1);
+
+    // Process the backlog only up to the first saga batch, then stop mid-way
+    // is covered elsewhere; here the train may even complete — a stop on a
+    // finished train is the "no active train" comment, so instead stop a
+    // *running* train: process deliveries but no sagas yet.
+    while let Some(delivery) = processor.claim().unwrap() {
+        assert_eq!(
+            processor.process_claimed(delivery).unwrap(),
+            PipelineOutcome::Processed
+        );
+    }
+
+    // The maintainer (not the author) asks for a stop before the saga runs.
+    let body = comment_body(
+        &world.config,
+        1,
+        "@merge-train stop",
+        STRANGER,
+        "maintainer",
+        88,
+    );
+    world.enqueue(&mut processor, "issue_comment", body);
+    drain(&mut processor);
+
+    // The train never became active (stopped before/at start) or was stopped;
+    // either way nothing merged and no train is active.
+    assert!(
+        processor
+            .state()
+            .active_trains
+            .values()
+            .all(|t| !t.state.is_active()),
+        "stop must terminate the train"
+    );
+    assert_eq!(
+        world
+            .github
+            .lock()
+            .unwrap()
+            .squash_count
+            .values()
+            .sum::<u32>(),
+        0,
+        "nothing may merge after a pre-run stop"
+    );
+}
+
+#[test]
+fn stranger_without_role_cannot_stop() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+
+    let body = comment_body(
+        &world.config,
+        1,
+        "@merge-train stop",
+        STRANGER,
+        "stranger",
+        99,
+    );
+    world.enqueue(&mut processor, "issue_comment", body);
+    drain(&mut processor);
+
+    let github = world.github.lock().unwrap();
+    assert!(
+        github
+            .posted_comments
+            .iter()
+            .any(|(_, text)| text.contains("admin/maintainer")),
+        "expected a role rejection, got {:?}",
+        github.posted_comments
+    );
+}
+
+// ─── Stop honored at an observation boundary ───
+
+#[test]
+fn stop_mid_saga_takes_effect_at_the_next_observation_boundary() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    start_command(&mut world, &mut processor, 1);
+
+    // Process all deliveries; take the FIRST saga batch but do not feed its
+    // outcomes back yet — its effects are "in flight".
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+    let batch = processor.pump().unwrap().expect("start plans a saga");
+    let outcomes = execute(&processor, &batch);
+
+    // The author's stop arrives while those effects execute.
+    let body = comment_body(&world.config, 1, "@merge-train stop", AUTHOR, "author", 66);
+    world.enqueue(&mut processor, "issue_comment", body);
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+
+    // At the observation boundary the stop preempts the next plan.
+    let mut next = processor
+        .on_outcomes(batch.root, outcomes, batch.feedback)
+        .unwrap();
+    let mut steps = 0;
+    while let Some(batch) = next {
+        steps += 1;
+        assert!(steps < 10, "post-stop cleanup must terminate");
+        assert!(
+            batch.effects.is_empty(),
+            "no further observed (cascade-advancing) effects may run after \
+             the stop, got {:?}",
+            batch.effects
+        );
+        let outcomes = execute(&processor, &batch);
+        next = processor
+            .on_outcomes(batch.root, outcomes, batch.feedback)
+            .unwrap();
+    }
+
+    assert!(
+        processor
+            .state()
+            .active_trains
+            .values()
+            .all(|t| !t.state.is_active())
+    );
+    assert_eq!(
+        world
+            .github
+            .lock()
+            .unwrap()
+            .squash_count
+            .values()
+            .sum::<u32>(),
+        0,
+        "the squash must never run once a stop preempts the boundary"
+    );
+}
+
+// ─── Referenced-PR precache ───
+
+#[test]
+fn predecessor_command_precaches_the_unknown_target() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+
+    // Only PR #2 is announced by webhook; #1 exists solely on GitHub's side.
+    let body = pr_opened_body(&world.config, 2, &heads[1], "pr-2", "pr-1");
+    world.enqueue(&mut processor, "pull_request", body);
+    let body = comment_body(
+        &world.config,
+        2,
+        "@merge-train predecessor #1",
+        AUTHOR,
+        "author",
+        30,
+    );
+    world.enqueue(&mut processor, "issue_comment", body);
+    drain(&mut processor);
+
+    // The unknown target was fetched, cached, and the declaration validated.
+    assert!(processor.state().prs.contains_key(&PrNumber(1)));
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor,
+        Some(PrNumber(1))
+    );
+}
+
+// ─── Crash-point sweep over the delivery pipeline ───
+
+/// Replays the same delivery workload with a crash (drop + reopen of the
+/// `Store`) injected at every claim/process boundary; the final materialized
+/// state must equal the no-crash run and no delivery may be lost.
+#[test]
+fn crash_at_every_pipeline_boundary_loses_nothing() {
+    fn seed_and_enqueue(world: &mut World, heads: &[Sha]) -> Processor {
+        let mut processor = world.processor();
+        world.enqueue_stack_setup(&mut processor, 2, heads);
+        let body = check_suite_green_body(&world.config, &heads[1], &[2], 700);
+        world.enqueue(&mut processor, "check_suite", body);
+        processor
+    }
+
+    fn run(world: &World, mut processor: Processor, crash_at: Option<usize>) -> RepoState {
+        let mut boundary = 0;
+        loop {
+            let crash = |p: Processor| -> Processor {
+                drop(p);
+                world.processor()
+            };
+            if Some(boundary) == crash_at {
+                processor = crash(processor);
+            }
+            boundary += 1;
+            let Some(delivery) = processor.claim().unwrap() else {
+                break;
+            };
+            if Some(boundary) == crash_at {
+                // Crash with the delivery claimed but unprocessed: reopen
+                // requeues it.
+                processor = crash(processor);
+                boundary += 1;
+                continue;
+            }
+            boundary += 1;
+            assert_eq!(
+                processor.process_claimed(delivery).unwrap(),
+                PipelineOutcome::Processed
+            );
+        }
+        assert!(processor.claim().unwrap().is_none(), "no delivery stranded");
+        processor.state().clone()
+    }
+
+    // The no-crash baseline. (Separate worlds: each has its own repo/state.)
+    let (mut world, heads) = World::linear_stack(2);
+    let processor = seed_and_enqueue(&mut world, &heads);
+    let baseline = run(&world, processor, None);
+
+    // ~2 boundaries per delivery; sweep generously past the end.
+    for crash_at in 0..12 {
+        let (mut world, heads) = World::linear_stack(2);
+        let processor = seed_and_enqueue(&mut world, &heads);
+        let state = run(&world, processor, Some(crash_at));
+        // Heads differ across worlds (fresh repos), so compare shape:
+        // same PRs cached, same predecessor edges, same train set.
+        assert_eq!(
+            state.prs.keys().collect::<std::collections::BTreeSet<_>>(),
+            baseline
+                .prs
+                .keys()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "crash at boundary {crash_at} lost a cached PR"
+        );
+        assert_eq!(
+            state.prs[&PrNumber(2)].predecessor,
+            baseline.prs[&PrNumber(2)].predecessor,
+            "crash at boundary {crash_at} lost the predecessor declaration"
+        );
+        assert_eq!(state.default_branch, baseline.default_branch);
+    }
+}
+
+// ─── Inherited mid-flight trains are refused until M6 ───
+
+#[test]
+fn inherited_mid_flight_train_refuses_evaluation_but_stops_cleanly() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    start_command(&mut world, &mut processor, 1);
+
+    // Run the saga a few steps in (train active, mid-cascade), then "crash".
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+    let mut batch = processor.pump().unwrap().expect("start plans a saga");
+    for _ in 0..4 {
+        let outcomes = execute(&processor, &batch);
+        match processor
+            .on_outcomes(batch.root, outcomes, batch.feedback)
+            .unwrap()
+        {
+            Some(next) => batch = next,
+            None => break,
+        }
+    }
+    assert!(
+        processor
+            .state()
+            .active_trains
+            .values()
+            .any(|t| t.state.is_active()),
+        "precondition: the train is mid-flight"
+    );
+    drop(processor);
+
+    // A fresh process inherits the mid-flight train.
+    let mut processor = world.processor();
+
+    // CI webhooks would normally re-drive it; the worker must refuse.
+    let head = {
+        let github = world.github.lock().unwrap();
+        github.branch_head("pr-1")
+    };
+    let body = check_suite_green_body(&world.config, &head, &[1], 800);
+    world.enqueue(&mut processor, "check_suite", body);
+    drain(&mut processor);
+    assert!(
+        processor
+            .state()
+            .active_trains
+            .values()
+            .any(|t| t.state.is_active()),
+        "an inherited mid-flight train must not advance before M6"
+    );
+    assert_eq!(
+        world
+            .github
+            .lock()
+            .unwrap()
+            .squash_count
+            .values()
+            .sum::<u32>(),
+        0
+    );
+
+    // But a stop works: terminal event + cleanup.
+    let body = comment_body(&world.config, 1, "@merge-train stop", AUTHOR, "author", 44);
+    world.enqueue(&mut processor, "issue_comment", body);
+    drain(&mut processor);
+    assert!(
+        processor
+            .state()
+            .active_trains
+            .values()
+            .all(|t| !t.state.is_active())
+    );
+}
+
+// ─── cache_fill_events: the unknown-PR upsert oracle ───
+
+mod cache_fill {
+    use chrono::Utc;
+    use proptest::prelude::*;
+
+    use crate::effects::PrData;
+    use crate::persistence::event::StateEvent;
+    use crate::persistence::snapshot::PersistedRepoSnapshot;
+    use crate::state::RepoState;
+    use crate::types::{MergeStateStatus, PrNumber, PrState, Sha};
+    use crate::worker::pipeline::cache_fill_events;
+
+    fn arb_pr_state() -> impl Strategy<Value = PrState> {
+        prop_oneof![
+            Just(PrState::Open),
+            Just(PrState::Closed),
+            "[0-9a-f]{40}".prop_map(|s| PrState::Merged {
+                merge_commit_sha: Sha::parse(s).unwrap()
+            }),
+        ]
+    }
+
+    proptest! {
+        /// Applying the fill events to a state that has never seen the PR
+        /// caches exactly the fetched facts.
+        #[test]
+        fn fill_events_materialize_the_fetched_pr(
+            number in 1u64..10000,
+            head in "[0-9a-f]{40}",
+            state in arb_pr_state(),
+            is_draft in any::<bool>(),
+        ) {
+            let pr = PrNumber(number);
+            let data = PrData {
+                number: pr,
+                head_sha: Sha::parse(head).unwrap(),
+                head_ref: "feature".to_owned(),
+                base_ref: "main".to_owned(),
+                state: state.clone(),
+                is_draft,
+            };
+            let mut repo = RepoState::from_snapshot(PersistedRepoSnapshot::new("main"));
+            for (i, payload) in cache_fill_events(pr, &data, MergeStateStatus::Clean)
+                .into_iter()
+                .enumerate()
+            {
+                repo.apply_event(&StateEvent { seq: i as u64, ts: Utc::now(), payload });
+            }
+
+            let cached = &repo.prs[&pr];
+            prop_assert_eq!(&cached.head_sha, &data.head_sha);
+            prop_assert_eq!(&cached.base_ref, &data.base_ref);
+            // Merged/closed states survive the upsert.
+            match &state {
+                PrState::Open => prop_assert!(cached.state.is_open()),
+                PrState::Closed => prop_assert_eq!(&cached.state, &PrState::Closed),
+                PrState::Merged { .. } => prop_assert!(cached.state.is_merged()),
+            }
+        }
+    }
+}
+
+// ─── The async intake path (registry + worker thread) ───
+
+mod registry {
+    use super::*;
+    use crate::worker::test_support::fake_shared_deps;
+    use crate::worker::{EnqueueOutcome, WorkerRegistry};
+    use tokio::sync::oneshot;
+
+    // A minimal valid `pull_request` payload for repo o/r.
+    fn pull_request_body() -> Vec<u8> {
+        br#"{
+            "action": "synchronize",
+            "number": 7,
+            "pull_request": {
+                "number": 7,
+                "state": "open",
+                "draft": false,
+                "merged": false,
+                "head": { "sha": "deadbeef", "ref": "feature" },
+                "base": { "sha": "cafef00d", "ref": "main" },
+                "user": { "id": 1, "login": "u" },
+                "updated_at": "2026-07-01T10:00:00Z"
+            },
+            "repository": { "name": "r", "owner": { "login": "o" } }
+        }"#
+        .to_vec()
+    }
+
+    async fn send_delivery(
+        registry: &WorkerRegistry,
+        sender: &tokio::sync::mpsc::Sender<WorkerMsg>,
+        id: &str,
+        body: Vec<u8>,
+    ) -> Result<EnqueueOutcome, crate::store::StoreError> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        sender
+            .send(WorkerMsg::Enqueue {
+                delivery: IntakeDelivery {
+                    delivery_id: id.into(),
+                    event_type: "pull_request".into(),
+                    headers: "{}".into(),
+                    body: body.clone(),
+                },
+                ack: ack_tx,
+                permit: registry.reserve_intake(body.len()).await,
+            })
+            .await
+            .unwrap();
+        ack_rx.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn registry_routes_enqueue_and_processes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, _fake) = fake_shared_deps(dir.path(), Default::default());
+        let registry = WorkerRegistry::new(dir.path(), deps);
+
+        let sender = registry.sender_for("o", "r").await.unwrap();
+        assert_eq!(
+            send_delivery(&registry, &sender, "d1", pull_request_body())
+                .await
+                .unwrap(),
+            EnqueueOutcome::Enqueued
+        );
+        // Redelivery of the same id is reported as a duplicate.
+        assert_eq!(
+            send_delivery(&registry, &sender, "d1", pull_request_body())
+                .await
+                .unwrap(),
+            EnqueueOutcome::Duplicate
+        );
+    }
+
+    #[tokio::test]
+    async fn services_new_intake_with_backlog_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_dir = dir.path().join("o").join("r");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        // Pre-seed a backlog of pending deliveries, then release the lock so
+        // the worker can open the DB and find them waiting.
+        {
+            let mut store = Store::open(&db_dir.join("state.db")).unwrap();
+            for i in 0..50 {
+                store
+                    .enqueue(
+                        &format!("backlog-{i}"),
+                        "pull_request",
+                        "{}",
+                        &pull_request_body(),
+                        chrono::Utc::now(),
+                    )
+                    .unwrap();
+            }
+        }
+
+        let (deps, _fake) = fake_shared_deps(dir.path(), Default::default());
+        let registry = WorkerRegistry::new(dir.path(), deps);
+        let sender = registry.sender_for("o", "r").await.unwrap();
+
+        // A fresh delivery is durably enqueued and acked despite the backlog.
+        assert_eq!(
+            send_delivery(&registry, &sender, "fresh", pull_request_body())
+                .await
+                .unwrap(),
+            EnqueueOutcome::Enqueued
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_existing_spawns_workers_for_queued_repos() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_dir = dir.path().join("o").join("r");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        {
+            let mut store = Store::open(&db_dir.join("state.db")).unwrap();
+            store
+                .enqueue(
+                    "d1",
+                    "pull_request",
+                    "{}",
+                    &pull_request_body(),
+                    chrono::Utc::now(),
+                )
+                .unwrap();
+        }
+
+        let (deps, _fake) = fake_shared_deps(dir.path(), Default::default());
+        let registry = WorkerRegistry::new(dir.path(), deps);
+        registry.recover_existing().await;
+
+        // That worker now owns the repo's Store: re-enqueuing the same id is
+        // seen as a duplicate (the recovered worker opened the existing DB).
+        let sender = registry.sender_for("o", "r").await.unwrap();
+        assert_eq!(
+            send_delivery(&registry, &sender, "d1", pull_request_body())
+                .await
+                .unwrap(),
+            EnqueueOutcome::Duplicate
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_existing_is_a_noop_without_state_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, _fake) = fake_shared_deps(dir.path(), Default::default());
+        let registry = WorkerRegistry::new(dir.path().join("does-not-exist"), deps);
+        registry.recover_existing().await; // must not panic
+    }
+
+    #[tokio::test]
+    async fn registry_returns_same_sender_for_same_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, _fake) = fake_shared_deps(dir.path(), Default::default());
+        let registry = WorkerRegistry::new(dir.path(), deps);
+        let a = registry.sender_for("o", "r").await.unwrap();
+        let b = registry.sender_for("o", "r").await.unwrap();
+        assert!(a.same_channel(&b), "one worker (one Store) per repo");
+    }
+
+    #[tokio::test]
+    async fn open_failure_surfaces_as_open_error() {
+        // Hold the repo lock with a Store; a worker open must fail Locked.
+        let dir = tempfile::tempdir().unwrap();
+        let db_dir = dir.path().join("o").join("r");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let _held = Store::open(&db_dir.join("state.db")).unwrap();
+
+        let (deps, _fake) = fake_shared_deps(dir.path(), Default::default());
+        let registry = WorkerRegistry::new(dir.path(), deps);
+        let err = registry.sender_for("o", "r").await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::worker::WorkerError::Open(crate::store::StoreError::Locked(_))
+            ),
+            "expected Open(Locked), got {err:?}"
+        );
+    }
+}

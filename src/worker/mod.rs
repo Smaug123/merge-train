@@ -35,6 +35,8 @@
 pub mod authz;
 pub mod executor;
 mod pipeline;
+#[cfg(test)]
+mod tests;
 
 pub use pipeline::{GitSettings, PipelineOutcome, WorkerDeps};
 
@@ -491,10 +493,7 @@ fn fatal(e: StoreError) {
 
 /// Handles one mailbox message; a saga-outcome message may yield the next
 /// batch to execute.
-fn handle_msg(
-    processor: &mut Processor,
-    msg: WorkerMsg,
-) -> Result<Option<SagaBatch>, StoreError> {
+fn handle_msg(processor: &mut Processor, msg: WorkerMsg) -> Result<Option<SagaBatch>, StoreError> {
     match msg {
         // `_permit` is held until this arm returns — i.e. until after the
         // enqueue and the `delivery` body have been consumed — then dropped,

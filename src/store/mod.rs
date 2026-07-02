@@ -789,7 +789,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut store = open_temp(&dir);
         let ts = test_timestamp();
-        store.enqueue("d1", "pull_request", "{}", b"{}", ts).unwrap();
+        store
+            .enqueue("d1", "pull_request", "{}", b"{}", ts)
+            .unwrap();
 
         let claimed = store.claim_next_delivery().unwrap().unwrap();
         assert!(store.claim_next_delivery().unwrap().is_none());
