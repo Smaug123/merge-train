@@ -763,6 +763,58 @@ fn permanent_permission_lookup_failure_fails_closed() {
     );
 }
 
+/// A start whose preflight batch FAILS (e.g. 5xx on branch protection after
+/// retries) dies before its train exists, so the engine has nowhere to feed
+/// the failure — the acked start used to vanish with only a log line (Codex
+/// M5 round 14, P1). The user must be told to re-issue, and the worker must
+/// remain fully operable.
+#[test]
+fn failed_start_preflight_answers_the_user_instead_of_vanishing() {
+    let (mut world, heads) = World::linear_stack(1);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 1, &heads);
+    start_command(&mut world, &mut processor, 1);
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+    let batch = processor.pump().unwrap().expect("start plans preflight");
+
+    // GitHub goes down for the preflight execution, then recovers.
+    world.github.lock().unwrap().unavailable = true;
+    let outcomes = execute(&processor, &batch);
+    assert!(outcomes.iter().any(|o| o.result.is_err()));
+    world.github.lock().unwrap().unavailable = false;
+
+    let mut next = processor
+        .on_outcomes(batch.root, outcomes, batch.feedback)
+        .unwrap();
+    while let Some(batch) = next {
+        let outcomes = execute(&processor, &batch);
+        next = processor
+            .on_outcomes(batch.root, outcomes, batch.feedback)
+            .unwrap();
+    }
+
+    assert!(processor.state().active_trains.is_empty());
+    {
+        let github = world.github.lock().unwrap();
+        assert!(
+            github
+                .posted_comments
+                .iter()
+                .any(|(pr, text)| *pr == PrNumber(1) && text.contains("re-issue")),
+            "the user must learn the start failed, got {:?}",
+            github.posted_comments
+        );
+    }
+
+    // The worker is fully operable: a re-issued start completes.
+    let body = comment_body(&world.config, 1, "@merge-train start", AUTHOR, "author", 8);
+    world.enqueue(&mut processor, "issue_comment", body);
+    drive_to_completion(&mut world, &mut processor);
+    assert!(processor.state().prs[&PrNumber(1)].state.is_merged());
+}
+
 // ─── Stop honored at an observation boundary ───
 
 #[test]

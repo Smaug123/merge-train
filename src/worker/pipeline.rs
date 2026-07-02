@@ -887,6 +887,29 @@ impl Processor {
             return self.finish_or_pump(root, cleanup);
         }
 
+        // A FAILED batch before the train exists is the start's preflight
+        // dying (5xx on settings/protection): the engine has nowhere to feed
+        // the failure — `advance` pre-train is specified only for the
+        // success observation — and the acked, deduped start would vanish
+        // with a log line (Codex M5 round 14, P1). Answer the user instead;
+        // re-issuing is the retry (preflight performed nothing irreversible).
+        if self.store.state().train_involving(root).is_none()
+            && let Some(failed) = outcomes.iter().find(|o| o.result.is_err())
+        {
+            warn!(%root, failure = ?failed.result, "start preflight failed; answering the user");
+            let (mut cleanup, _) = self.apply_stops(stops)?;
+            let (mut abort_cleanup, _) = self.apply_deferred_aborts(aborts)?;
+            cleanup.append(&mut abort_cleanup);
+            cleanup.push(Effect::GitHub(GitHubEffect::PostComment {
+                pr: root,
+                body: "⚠️ Could not start the merge train: GitHub was unavailable \
+                       while checking repository settings. Please re-issue \
+                       `start`."
+                    .to_owned(),
+            }));
+            return self.finish_or_pump(root, cleanup);
+        }
+
         // Integrate the completed outcomes FIRST: these effects already ran
         // (a squash may have merged a PR on GitHub), so their records must
         // land before any stop retires the train — a stopped train ignores
