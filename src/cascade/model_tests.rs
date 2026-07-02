@@ -376,9 +376,14 @@ impl ModelWorld {
                     Some(_) => PushOutcome::Rejected {
                         details: "stale info".to_string(),
                     },
-                    None => PushOutcome::Rejected {
-                        details: "branch deleted (stale info)".to_string(),
-                    },
+                    // A deleted destination is the structured branch-gone
+                    // failure (skip path), not an ordinary rejection (which
+                    // aborts during reconcile/catch-up).
+                    None => {
+                        return Err(EffectError::BranchGone {
+                            branch: branch.clone(),
+                        });
+                    }
                 };
                 Ok(GitResponse::Push(outcome))
             }
@@ -1425,6 +1430,70 @@ fn branch_deleted_between_merge_and_push_is_skipped() {
     );
     // The root still merges; the skipped descendant never does.
     assert_eq!(driver.world.squash_count.get(&root), Some(&1));
+    assert_eq!(driver.world.squash_count.get(&pr_number(1)), None);
+    assert!(driver.state.active_trains.is_empty());
+}
+
+/// A branch deleted between the reconcile merge and its push (Codex M4
+/// round 3): rejection during Reconciling would abort the train, but a
+/// deleted branch must take the skip path instead.
+#[test]
+fn branch_deleted_between_reconcile_merge_and_push_is_skipped() {
+    let shape = StackShape {
+        predecessors: vec![0, 0],
+        advanced: vec![true, false, false],
+    };
+    let (world, state) = seed(&shape);
+    let mut driver = Driver::new(world, state);
+    let root = pr_number(0);
+
+    let mut injected = false;
+    let plan = start_train(&driver.state, root, driver.now).unwrap();
+    let outcome = driver.run_plan(plan, root, &mut |d, _| {
+        // The first observation boundary inside Reconciling is right after
+        // pr-2's reconcile merge (the PT and the MergeReconcile effect share
+        // a plan) and before its intent+push plan.
+        if !injected
+            && d.state
+                .active_trains
+                .get(&root)
+                .is_some_and(|t| t.cascade_phase.kind() == crate::types::PhaseKind::Reconciling)
+        {
+            injected = true;
+            d.world.branches.remove("pr-2");
+        }
+    });
+    assert!(injected, "the injection point must be reached");
+
+    // Drive whatever remains (the surviving sibling fans out or continues).
+    match outcome {
+        RunOutcome::Done => {}
+        RunOutcome::Parked => driver.drive(vec![(root, None)]),
+        RunOutcome::FanOut(roots) => driver.drive(roots.into_iter().map(|r| (r, None)).collect()),
+    }
+
+    assert!(
+        !driver
+            .log
+            .iter()
+            .any(|e| matches!(e.payload, StateEventPayload::TrainAborted { .. })),
+        "a deleted descendant branch must not abort the train"
+    );
+    assert!(
+        driver.log.iter().any(|e| matches!(
+            &e.payload,
+            StateEventPayload::DescendantSkipped { descendant_pr, .. }
+                if *descendant_pr == pr_number(1)
+        )),
+        "the deleted descendant must be skipped"
+    );
+    assert!(
+        !driver.world.branches.contains_key("pr-2"),
+        "the deleted branch must never be re-created"
+    );
+    // Root and the surviving sibling both merge; the deleted one never does.
+    assert_eq!(driver.world.squash_count.get(&root), Some(&1));
+    assert_eq!(driver.world.squash_count.get(&pr_number(2)), Some(&1));
     assert_eq!(driver.world.squash_count.get(&pr_number(1)), None);
     assert!(driver.state.active_trains.is_empty());
 }

@@ -76,6 +76,14 @@ pub enum GitError {
         descendant_head: Sha,
     },
 
+    /// The push destination branch no longer exists on the remote: it was
+    /// deleted between the merge and the push. Distinct from an ordinary
+    /// lease rejection (foreign advance) because the cascade's response
+    /// differs — a deleted descendant branch is *skipped*, while a foreign
+    /// advance during reconciliation aborts the train.
+    #[error("push destination refs/heads/{branch} no longer exists on the remote")]
+    PushDestinationGone { branch: String },
+
     /// A compare-and-swap push was requested whose lease base is not an
     /// ancestor of HEAD: pushing would discard the base's history if the
     /// remote still matched it. The push contract requires the lease to be

@@ -442,7 +442,11 @@ cleanly via M1 `apply_event`; stop on existing train *always* contains
 >    foreign head, authorizing its clobbering), and `push_head_to_branch`
 >    additionally refuses any lease base that is not an ancestor of HEAD
 >    (`GitError::LeaseBaseNotAncestor` → internal-invariant abort), so the
->    no-clobber property is machine-enforced, not by-convention. `is_push_completed` returns
+>    no-clobber property is machine-enforced, not by-convention. A rejection
+>    whose destination ref no longer exists is diagnosed as the structured
+>    `GitError::PushDestinationGone` → `BranchGone` (Codex M4 round 3):
+>    deletion must take the descendant-skip path, while an ordinary lease
+>    rejection during reconcile/catch-up aborts the train. `is_push_completed` returns
 >    `PushCompletion { completed, remote_head }` to feed the engine's
 >    `PushCheck` response.
 > 3. **`classify_git_error`** (same file) is the fixed `GitError` →

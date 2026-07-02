@@ -104,6 +104,14 @@ pub fn push_head_to_branch(
         || stderr.contains("stale info")
         || stderr.contains("failed to push")
     {
+        // A deleted destination fails the lease with the same "stale info"
+        // as a foreign advance, but the cascade's responses differ (skip the
+        // descendant vs abort the train): diagnose which one this was.
+        if get_remote_ref(worktree, branch)?.is_none() {
+            return Err(GitError::PushDestinationGone {
+                branch: branch.to_string(),
+            });
+        }
         return Ok(PushResult::Rejected {
             details: stderr.to_string(),
         });
@@ -372,8 +380,8 @@ mod tests {
         run_git_sync(&worktree, &["commit", "-m", "Add new file"]).unwrap();
 
         // The branch we expected to update does not exist (deleted).
-        let result = push_head_to_branch(&worktree, "feature-123", &initial_sha).unwrap();
-        assert!(matches!(result, PushResult::Rejected { .. }));
+        let error = push_head_to_branch(&worktree, "feature-123", &initial_sha).unwrap_err();
+        assert!(matches!(error, GitError::PushDestinationGone { .. }));
 
         // And it must NOT have been created by the attempt.
         let remote_ref = get_remote_ref(&worktree, "feature-123").unwrap();

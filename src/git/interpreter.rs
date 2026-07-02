@@ -245,6 +245,9 @@ pub fn classify_git_error(error: &GitError) -> EffectError {
         GitError::FetchFailed { refspec, .. } => EffectError::BranchGone {
             branch: refspec.clone(),
         },
+        GitError::PushDestinationGone { branch } => EffectError::BranchGone {
+            branch: branch.clone(),
+        },
         GitError::PredecessorHeadChanged { .. } => EffectError::Permanent {
             kind: TrainErrorKind::HeadShaChanged,
             detail: error.to_string(),
@@ -495,15 +498,15 @@ mod tests {
         )
         .unwrap();
 
-        let pushed = interpreter
+        let error = interpreter
             .interpret(&GitEffect::Push {
                 branch: "pr-2".to_string(),
                 expected_remote: push_point.pre_push_sha.unwrap(),
             })
-            .unwrap();
+            .unwrap_err();
         assert!(
-            matches!(pushed, GitResponse::Push(PushOutcome::Rejected { .. })),
-            "pushing over a deleted branch must reject, got {pushed:?}"
+            matches!(classify_git_error(&error), EffectError::BranchGone { .. }),
+            "pushing over a deleted branch must classify BranchGone (the skip              path — an ordinary rejection would abort mid-reconcile), got {error:?}"
         );
         // And the attempt must not have re-created the branch.
         let recreated =
@@ -754,6 +757,14 @@ mod tests {
                 EffectError::Permanent {
                     kind: TrainErrorKind::InternalInvariantViolation,
                     detail: String::new(),
+                },
+            ),
+            (
+                GitError::PushDestinationGone {
+                    branch: "pr-2".to_string(),
+                },
+                EffectError::BranchGone {
+                    branch: "pr-2".to_string(),
                 },
             ),
             (
