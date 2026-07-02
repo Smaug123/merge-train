@@ -676,13 +676,10 @@ fn seed(shape: &StackShape) -> (ModelWorld, RepoState) {
     let snapshot = PersistedRepoSnapshot {
         schema_version: SCHEMA_VERSION,
         snapshot_at: test_timestamp(),
-        log_generation: 0,
-        log_position: 0,
         next_seq: 0,
         default_branch: "main".to_string(),
         prs,
         active_trains: HashMap::new(),
-        seen_dedupe_keys: HashMap::new(),
     };
     (world, RepoState::from_snapshot(snapshot))
 }

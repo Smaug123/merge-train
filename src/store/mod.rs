@@ -242,6 +242,72 @@ impl Store {
         Ok(event)
     }
 
+    /// Appends `payloads` in order as ONE transaction — the whole batch commits
+    /// or none of it does. This is the durability shape a cascade `StepPlan`
+    /// requires: the relative order of a plan's events (e.g. `PrSynchronized`
+    /// strictly before `ReconciliationRecorded`, a terminal event before
+    /// nothing else) must be atomic, never observable half-applied.
+    pub fn append_batch(
+        &mut self,
+        payloads: &[StateEventPayload],
+        ts: DateTime<Utc>,
+    ) -> Result<Vec<StateEvent>, StoreError> {
+        if payloads.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut next_state = self.state.clone();
+        let mut seq = self.next_seq;
+        let mut events = Vec::with_capacity(payloads.len());
+
+        let tx = self.conn.transaction()?;
+        for payload in payloads {
+            let event = StateEvent {
+                seq,
+                ts,
+                payload: payload.clone(),
+            };
+            insert_and_apply(&tx, &mut next_state, &event)?;
+            events.push(event);
+            seq += 1;
+        }
+        upsert_cache(&tx, &next_state, seq, ts)?;
+        tx.commit()?;
+
+        self.state = next_state;
+        self.next_seq = seq;
+        Ok(events)
+    }
+
+    /// Reads the full event log in append order.
+    ///
+    /// The worker derives [`crate::cascade::ReplayFacts`] from this on every
+    /// train evaluation. Reading the whole log is O(events-so-far); acceptable
+    /// until log pruning/compaction exists (deferred to bootstrap, M6), at
+    /// which point a bounded suffix read replaces it.
+    pub fn events(&self) -> Result<Vec<StateEvent>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT seq, ts, payload FROM events ORDER BY seq")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut events = Vec::new();
+        for row in rows {
+            let (seq, ts, payload) = row?;
+            events.push(StateEvent {
+                seq: seq as u64,
+                ts: parse_ts(&ts)?,
+                payload: serde_json::from_str(&payload)?,
+            });
+        }
+        Ok(events)
+    }
+
     /// Enqueues a pending webhook delivery. Returns `false` if a delivery with
     /// the same id is already present (idempotent intake — GitHub redelivers).
     pub fn enqueue(
@@ -385,25 +451,8 @@ impl Store {
         let mut state = RepoState::from_snapshot(PersistedRepoSnapshot::new(
             self.state.default_branch.clone(),
         ));
-        let mut stmt = self
-            .conn
-            .prepare("SELECT seq, ts, payload FROM events ORDER BY seq")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })?;
-        for row in rows {
-            let (seq, ts, payload) = row?;
-            let payload: StateEventPayload = serde_json::from_str(&payload)?;
-            let ts = parse_ts(&ts)?;
-            state.apply_event(&StateEvent {
-                seq: seq as u64,
-                ts,
-                payload,
-            });
+        for event in self.events()? {
+            state.apply_event(&event);
         }
         Ok(state)
     }
@@ -444,7 +493,7 @@ fn upsert_cache(
     next_seq: u64,
     ts: DateTime<Utc>,
 ) -> Result<(), StoreError> {
-    let cache_json = serde_json::to_string(&state.to_snapshot(0, 0, next_seq, ts))?;
+    let cache_json = serde_json::to_string(&state.to_snapshot(next_seq, ts))?;
     tx.execute(
         "INSERT INTO repo_state (id, snapshot) VALUES (0, ?1)
          ON CONFLICT(id) DO UPDATE SET snapshot = excluded.snapshot",
@@ -577,6 +626,58 @@ mod tests {
             let reopened = Store::open(&path).unwrap();
             prop_assert_eq!(reopened.state(), &state_before);
             prop_assert_eq!(reopened.next_seq(), seq_before);
+        }
+
+        /// One `append_batch` is observationally equal to appending the same
+        /// payloads one at a time: same state, same `next_seq`, same log.
+        #[test]
+        fn append_batch_equals_sequential_appends(
+            payloads in prop::collection::vec(arb_state_event_payload(), 0..20),
+        ) {
+            let dir_batch = tempdir().unwrap();
+            let dir_seq = tempdir().unwrap();
+            let mut batched = open_temp(&dir_batch);
+            let mut sequential = open_temp(&dir_seq);
+            let ts = test_timestamp();
+
+            let events = batched.append_batch(&payloads, ts).unwrap();
+            for payload in &payloads {
+                sequential.append(payload.clone(), ts).unwrap();
+            }
+
+            prop_assert_eq!(batched.state(), sequential.state());
+            prop_assert_eq!(batched.next_seq(), sequential.next_seq());
+            prop_assert_eq!(&events, &batched.events().unwrap());
+            prop_assert_eq!(&events, &sequential.events().unwrap());
+        }
+
+        /// `events` reads back exactly what was written, in append order,
+        /// across a mix of single appends, batches, and delivery commits.
+        #[test]
+        fn events_reads_back_the_log_in_order(
+            singles in prop::collection::vec(arb_state_event_payload(), 0..8),
+            batch in prop::collection::vec(arb_state_event_payload(), 0..8),
+            committed in prop::collection::vec(arb_state_event_payload(), 0..8),
+        ) {
+            let dir = tempdir().unwrap();
+            let mut store = open_temp(&dir);
+            let ts = test_timestamp();
+
+            let mut expected = Vec::new();
+            for payload in &singles {
+                expected.push(store.append(payload.clone(), ts).unwrap());
+            }
+            expected.extend(store.append_batch(&batch, ts).unwrap());
+            store.enqueue("d1", "pull_request", "{}", b"{}", ts).unwrap();
+            store.claim_next_delivery().unwrap().unwrap();
+            store.commit_delivery("d1", &committed, None, ts).unwrap();
+            expected.extend(committed.iter().enumerate().map(|(i, p)| StateEvent {
+                seq: (singles.len() + batch.len() + i) as u64,
+                ts,
+                payload: p.clone(),
+            }));
+
+            prop_assert_eq!(store.events().unwrap(), expected);
         }
     }
 

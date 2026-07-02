@@ -2,9 +2,8 @@
 //!
 //! [`PersistedRepoSnapshot`] is the serialized form of a [`crate::state::RepoState`]:
 //! the SQLite [`crate::store::Store`] keeps it (as JSON) in its single
-//! `repo_state` row, the `/state` endpoint returns it, and the status-comment
-//! backup embeds it. Durability is the Store's job; this module is just the
-//! shared data type and its serde.
+//! `repo_state` row and the `/state` endpoint returns it. Durability is the
+//! Store's job; this module is just the shared data type and its serde.
 
 use std::collections::HashMap;
 
@@ -20,7 +19,11 @@ use crate::types::{CachedPr, PrNumber, TrainRecord};
 /// variants, so v1 `TrainRecord`s no longer deserialize. Backward compatibility
 /// is intentionally dropped; the version bump makes a stale snapshot reject with
 /// a clear mismatch rather than a cryptic serde error.
-pub const SCHEMA_VERSION: u32 = 2;
+///
+/// Bumped to 3 by the cascade worker (M5): dedupe keys live solely in the
+/// Store's `dedupe_keys` table, so `seen_dedupe_keys` is gone, along with the
+/// vestigial filesystem-log fields `log_generation`/`log_position`.
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Persisted state snapshot — the serialized `RepoState` the Store caches.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,14 +33,6 @@ pub struct PersistedRepoSnapshot {
 
     /// When this snapshot was last updated (ISO 8601).
     pub snapshot_at: DateTime<Utc>,
-
-    /// Legacy log generation (always 0 under SQLite; retained for format
-    /// stability with the status-comment backup).
-    pub log_generation: u64,
-
-    /// Legacy log position (always 0 under SQLite; retained for format
-    /// stability).
-    pub log_position: u64,
 
     /// Next sequence number to assign (globally monotonic).
     pub next_seq: u64,
@@ -50,10 +45,6 @@ pub struct PersistedRepoSnapshot {
 
     /// Active trains, keyed by original root PR number.
     pub active_trains: HashMap<PrNumber, TrainRecord>,
-
-    /// Seen dedupe keys with timestamps for TTL-based pruning.
-    /// Key format: "event_type:pr:id" or "event_type:pr:action:sha"
-    pub seen_dedupe_keys: HashMap<String, DateTime<Utc>>,
 }
 
 impl PersistedRepoSnapshot {
@@ -62,19 +53,11 @@ impl PersistedRepoSnapshot {
         PersistedRepoSnapshot {
             schema_version: SCHEMA_VERSION,
             snapshot_at: Utc::now(),
-            log_generation: 0,
-            log_position: 0,
             next_seq: 0,
             default_branch: default_branch.into(),
             prs: HashMap::new(),
             active_trains: HashMap::new(),
-            seen_dedupe_keys: HashMap::new(),
         }
-    }
-
-    /// Updates the `snapshot_at` timestamp to now.
-    pub fn touch(&mut self) {
-        self.snapshot_at = Utc::now();
     }
 }
 
@@ -182,42 +165,23 @@ mod tests {
         (arb_pr_number(), arb_datetime()).prop_map(|(pr, t)| TrainRecord::new(pr, t))
     }
 
-    fn arb_dedupe_key() -> impl Strategy<Value = String> {
-        "[a-z_]+:[0-9]+:[a-z_]+".prop_map(String::from)
-    }
-
     fn arb_snapshot() -> impl Strategy<Value = PersistedRepoSnapshot> {
         (
             arb_datetime(),
-            0u64..1000,
-            0u64..1000000,
             0u64..1000000,
             arb_branch_name(),
             prop::collection::hash_map(arb_pr_number(), arb_cached_pr(), 0..10),
             prop::collection::hash_map(arb_pr_number(), arb_train_record(), 0..3),
-            prop::collection::hash_map(arb_dedupe_key(), arb_datetime(), 0..10),
         )
             .prop_map(
-                |(
-                    snapshot_at,
-                    log_generation,
-                    log_position,
-                    next_seq,
-                    default_branch,
-                    prs,
-                    active_trains,
-                    seen_dedupe_keys,
-                )| {
+                |(snapshot_at, next_seq, default_branch, prs, active_trains)| {
                     PersistedRepoSnapshot {
                         schema_version: SCHEMA_VERSION,
                         snapshot_at,
-                        log_generation,
-                        log_position,
                         next_seq,
                         default_branch,
                         prs,
                         active_trains,
-                        seen_dedupe_keys,
                     }
                 },
             )
@@ -239,12 +203,9 @@ mod tests {
         let snapshot = PersistedRepoSnapshot::new("main");
 
         assert_eq!(snapshot.schema_version, SCHEMA_VERSION);
-        assert_eq!(snapshot.log_generation, 0);
-        assert_eq!(snapshot.log_position, 0);
         assert_eq!(snapshot.next_seq, 0);
         assert_eq!(snapshot.default_branch, "main");
         assert!(snapshot.prs.is_empty());
         assert!(snapshot.active_trains.is_empty());
-        assert!(snapshot.seen_dedupe_keys.is_empty());
     }
 }
