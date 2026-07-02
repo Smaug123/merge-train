@@ -529,6 +529,16 @@ leaves a dirty worktree, which `git::recovery::cleanup_worktree_on_restart`
 >    so a `stop` takes effect after at most one effect batch (DESIGN's
 >    bounded staleness) without any priority queue: `classify_priority`
 >    stays unwired and deliveries process strictly in arrival order.
+>    Ordering at the boundary (Codex M5 round 1, P1): the completed batch's
+>    outcomes integrate (`observe` → `advance` → append) *before* stops
+>    retire the train — those effects already ran, and a stopped train
+>    ignores observations, so stopping first silently discarded e.g. an
+>    executed squash and the store diverged from GitHub. The stop then
+>    suppresses only the planned *continuation* (not yet run; a suppressed
+>    intent is the crash-before-dispatch state the recovery contract
+>    already covers). Exception: the start-cancel window (stop naming the
+>    saga root before its train exists) still skips integration outright —
+>    preflight outcomes are pure reads.
 > 2. **Atomic close-first.** `Store::commit_delivery` (handler events +
 >    dedupe key + `done`, one transaction) runs *before* handler effects and
 >    engine work, keeping S2's exactly-once intake invariant; everything
@@ -562,18 +572,31 @@ leaves a dirty worktree, which `git::recovery::cleanup_worktree_on_restart`
 > 8. **GitHub unavailability stalls intake** (correctness over
 >    availability): pre-close pipeline steps that need GitHub (discovery,
 >    authorization, precache) release the delivery back to `pending`
->    (`Store::release_delivery`) and the worker waits for the next mailbox
->    message — in-order processing pauses rather than guessing.
->    `classify_github_error` maps API errors to `EffectError` (405
->    not-mergeable → `Transient`, park → refetch-adopt).
+>    (`Store::release_delivery`) and the worker stalls — but schedules its
+>    own retry (`WorkerMsg::RetryStalled` after `stall_retry_delay`, 30s),
+>    because the webhook was already acked and no external party will
+>    redeliver it (Codex M5 round 1). `classify_github_error` maps API
+>    errors to `EffectError` (405 not-mergeable → `Transient`, park →
+>    refetch-adopt).
 > 9. **Crash boundary (iv) as planned:** inherited non-Idle trains are
->    refused loudly until M6 (`stop` still works). The crash-point oracle
+>    refused loudly until M6 (`stop` still works); any train-lifecycle
+>    event for the root clears the refusal marker, so the documented
+>    stop-then-restart recovery works without a process restart (Codex M5
+>    round 1). The crash-point oracle
 >    became a sweep that drops and reopens the `Store` at every pipeline
 >    boundary and asserts the final state equals the no-crash run
 >    (`src/worker/tests.rs`); the end-to-end oracle drives a real stacked
 >    train — real git repo, real Store, fake GitHub — to completion and
 >    checks the squash content on `origin/main` and an empty unmatched
 >    intent ledger.
+> 10. **Git auth via credential helper, never the URL** (Codex M5 round 1,
+>    P1): clone URLs are credential-free; `ensure_clone` persists a
+>    credential helper (`clone --config`) that reads `GITHUB_TOKEN` from
+>    the process environment at each fetch/push, so the token never
+>    appears in git command lines, error output, or on-disk config.
+>    `GITHUB_TOKEN` must be a *user-scoped* token: startup identity is
+>    `GET /user` (resolved question 3), which App installation tokens
+>    cannot call; App-auth support is deferred.
 
 **Dependencies:** M2, M3, M4. **Implements:** DESIGN.md §Per-repo serial
 event processing worker loop, §Event processing flow, §Restart safety steps
