@@ -448,7 +448,11 @@ fn run(
                     serviced += 1;
                     stalled = false;
                     match handle_msg(&mut processor, msg) {
-                        Ok(Some(batch)) => dispatch(&processor, batch, tx.clone()),
+                        Ok(Some(batch)) => {
+                            if !dispatch(&processor, batch, tx.clone()) {
+                                return fatal_spawn();
+                            }
+                        }
                         Ok(None) => {}
                         Err(e) => return fatal(e),
                     }
@@ -461,7 +465,11 @@ fn run(
         // (2) Start the next queued saga if the slot is free.
         if !processor.saga_in_flight() {
             match processor.pump() {
-                Ok(Some(batch)) => dispatch(&processor, batch, tx.clone()),
+                Ok(Some(batch)) => {
+                    if !dispatch(&processor, batch, tx.clone()) {
+                        return fatal_spawn();
+                    }
+                }
                 Ok(None) => {}
                 Err(e) => return fatal(e),
             }
@@ -501,7 +509,11 @@ fn run(
                 Some(msg) => {
                     stalled = false;
                     match handle_msg(&mut processor, msg) {
-                        Ok(Some(batch)) => dispatch(&processor, batch, tx.clone()),
+                        Ok(Some(batch)) => {
+                            if !dispatch(&processor, batch, tx.clone()) {
+                                return fatal_spawn();
+                            }
+                        }
                         Ok(None) => {}
                         Err(e) => return fatal(e),
                     }
@@ -533,6 +545,14 @@ fn prune_expired_intake(processor: &mut Processor) -> Result<(), StoreError> {
         info!(keys, deliveries, "pruned expired intake bookkeeping");
     }
     Ok(())
+}
+
+/// Executor-thread spawn failure: the saga slot is marked in-flight and no
+/// outcome will ever arrive, so the worker stops (dropping the Store) and
+/// the next delivery respawns it with `processing`→`pending` recovery —
+/// wedging forever is the one unacceptable outcome (Codex M5 round 6).
+fn fatal_spawn() {
+    error!("failed to spawn a saga executor thread; stopping worker (it will respawn and recover)");
 }
 
 /// A Store error means we can no longer characterize this repo's state. Stop
@@ -618,7 +638,13 @@ fn schedule_stall_retry(delay: std::time::Duration, tx: mpsc::Sender<WorkerMsg>)
 /// Hands a batch to a fresh executor thread. The thread ensures the clone
 /// exists (first git use), builds the per-saga interpreter, executes, and
 /// reports back through the worker's own mailbox.
-fn dispatch(processor: &Processor, batch: SagaBatch, tx: mpsc::Sender<WorkerMsg>) {
+///
+/// Returns `false` when the executor thread could not be spawned: the saga
+/// slot is already marked in-flight and no outcome will ever arrive, so the
+/// worker must die (drop the Store → respawn recovers) rather than sit
+/// wedged forever (Codex M5 round 6).
+#[must_use]
+fn dispatch(processor: &Processor, batch: SagaBatch, tx: mpsc::Sender<WorkerMsg>) -> bool {
     let github = processor.github().clone();
     let config = processor.git_config();
     let clone_url = processor.git_settings().clone_url.clone();
@@ -662,12 +688,7 @@ fn dispatch(processor: &Processor, batch: SagaBatch, tx: mpsc::Sender<WorkerMsg>
                 feedback: batch.feedback,
             });
         });
-    if spawned.is_err() {
-        // Thread spawn failure: the saga slot stays occupied and the batch is
-        // lost until restart. Loud, and the fail-fast path will recover the
-        // repo on the next delivery.
-        error!("failed to spawn saga executor thread");
-    }
+    spawned.is_ok()
 }
 
 /// Whether a directory entry is itself a directory (used to walk

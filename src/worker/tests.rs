@@ -1157,6 +1157,75 @@ fn active_train_is_evaluated_at_startup_without_new_traffic() {
     );
 }
 
+/// Startup evaluations must not overtake the durable backlog: a pending
+/// (already-acked) delivery may carry a train-terminating fact — here a
+/// review dismissal — and evaluating first would plan (and possibly execute
+/// irreversible) effects against state that predates it (Codex M5 round 6,
+/// P1). The evaluations queue only once the backlog first drains.
+#[test]
+fn startup_evaluations_do_not_overtake_the_acked_backlog() {
+    let (mut world, heads) = World::linear_stack(1);
+    {
+        let mut processor = world.processor();
+        world.enqueue_stack_setup(&mut processor, 1, &heads);
+        drain(&mut processor);
+        // Crash artifact: an active train plus an acked-but-unprocessed
+        // delivery that dismisses its review (the handler aborts on it).
+        processor
+            .store_mut()
+            .append_batch(
+                &[crate::persistence::event::StateEventPayload::TrainStarted {
+                    root_pr: PrNumber(1),
+                    current_pr: PrNumber(1),
+                }],
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        let body = format!(
+            r#"{{
+                "action": "dismissed",
+                "review": {{
+                    "id": 778,
+                    "user": {{ "id": 555, "login": "reviewer" }},
+                    "state": "dismissed",
+                    "body": null
+                }},
+                "pull_request": {{ "number": 1 }},
+                "repository": {repo}
+            }}"#,
+            repo = repo_json(&world.config),
+        );
+        world.enqueue(&mut processor, "pull_request_review", body.into_bytes());
+    } // crash
+
+    let mut processor = world.processor();
+    // Mirror the worker loop's ordering: sagas pump BEFORE backlog claims.
+    assert!(
+        processor.pump().unwrap().is_none(),
+        "no saga may start before the acked backlog has been applied"
+    );
+    drain(&mut processor);
+
+    assert_eq!(
+        world
+            .github
+            .lock()
+            .unwrap()
+            .squash_count
+            .values()
+            .sum::<u32>(),
+        0,
+        "the acked dismissal must retire the train before any evaluation acts"
+    );
+    assert!(
+        processor
+            .state()
+            .active_trains
+            .values()
+            .all(|t| !t.state.is_active())
+    );
+}
+
 // ─── Clone-on-first-use ───
 
 /// The clone must never see the GitHub token: the origin URL stays clean and
@@ -1187,6 +1256,88 @@ fn ensure_clone_uses_an_env_credential_helper_and_a_credential_free_origin() {
     assert!(
         !origin.contains('@'),
         "origin URL must carry no credentials, got: {origin}"
+    );
+}
+
+/// A stop for a train whose `start` is still *queued* (waiting for the saga
+/// slot behind another train) must suppress that queued start — otherwise
+/// the stop answers "no active train" and the start then runs anyway
+/// (Codex M5 round 6; the same race as stop-during-preflight, one step
+/// earlier in the queue).
+#[test]
+fn stop_cancels_a_queued_not_yet_started_start() {
+    let (mut world, heads) = World::linear_stack(2);
+    world
+        .github
+        .lock()
+        .unwrap()
+        .prs
+        .get_mut(&PrNumber(2))
+        .unwrap()
+        .base_ref = "main".to_owned();
+    let mut processor = world.processor();
+    // Announce both PRs as *independent roots*: base `main`, no
+    // predecessors — so `start 2` is a legitimate queued start.
+    for i in 1..=2u64 {
+        let body = pr_opened_body(
+            &world.config,
+            i,
+            &heads[(i - 1) as usize],
+            &format!("pr-{i}"),
+            "main",
+        );
+        world.enqueue(&mut processor, "pull_request", body);
+    }
+    start_command(&mut world, &mut processor, 1);
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+
+    // Train 1's preflight saga occupies the slot.
+    let batch = processor.pump().unwrap().expect("start 1 plans preflight");
+    let outcomes = execute(&processor, &batch);
+
+    // While it runs: start 2 (queues behind the slot), then stop 2.
+    start_command(&mut world, &mut processor, 2);
+    let body = comment_body(&world.config, 2, "@merge-train stop", AUTHOR, "author", 71);
+    world.enqueue(&mut processor, "issue_comment", body);
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+
+    // Feed train 1's outcomes; run everything to quiescence.
+    let mut next = processor
+        .on_outcomes(batch.root, outcomes, batch.feedback)
+        .unwrap();
+    while let Some(batch) = next {
+        let outcomes = execute(&processor, &batch);
+        next = processor
+            .on_outcomes(batch.root, outcomes, batch.feedback)
+            .unwrap();
+    }
+    drain(&mut processor);
+
+    // Train 2 must never have started.
+    let events = processor.store_mut().events().unwrap();
+    assert!(
+        !events.iter().any(|e| matches!(
+            e.payload,
+            crate::persistence::event::StateEventPayload::TrainStarted {
+                root_pr: PrNumber(2),
+                ..
+            }
+        )),
+        "the stopped queued start must never run"
+    );
+    assert!(
+        world
+            .github
+            .lock()
+            .unwrap()
+            .posted_comments
+            .iter()
+            .any(|(pr, text)| *pr == PrNumber(2) && text.contains("start cancelled")),
+        "expected a start-cancelled answer"
     );
 }
 

@@ -148,6 +148,9 @@ pub(crate) struct Processor {
     /// GitHub recovery), so evaluation is refused loudly until then. `stop`
     /// still works.
     inherited_mid_flight: HashSet<PrNumber>,
+    /// Active-train evaluations owed at startup, queued when the durable
+    /// backlog first drains (`Some` until then; see [`Processor::claim`]).
+    startup_evaluates: Option<Vec<PrNumber>>,
 }
 
 impl Processor {
@@ -170,22 +173,25 @@ impl Processor {
         }
 
         // Startup work (Codex M5 round 2): persisted stops that never
-        // reached their observation boundary apply first; then every active
-        // train gets an evaluation, so an acknowledged CI success whose
-        // trigger died with the process still resumes a parked train.
-        // (Inherited non-Idle trains refuse that evaluation until M6 — the
-        // marker above — but parked trains are phase-Idle and resume fine.)
+        // reached their observation boundary apply first. Startup
+        // *evaluations* of active trains (so an acknowledged CI success
+        // whose trigger died with the process still resumes a parked train)
+        // are computed here but queue only once the durable backlog first
+        // drains — see [`Processor::claim`] — or their effects would run
+        // against state that predates already-acked deliveries (Codex M5
+        // round 6, P1: e.g. a queued topology-change abort overtaken by a
+        // squash).
         let mut pending = VecDeque::new();
         for (id, pr, force) in store.pending_stops()? {
             pending.push_back(PendingWork::Stop { id, pr, force });
         }
-        for train in store.state().active_trains.values() {
-            if train.state.is_active() {
-                pending.push_back(PendingWork::Trigger(Trigger::EvaluateTrain {
-                    root: train.original_root_pr,
-                }));
-            }
-        }
+        let startup_evaluates = store
+            .state()
+            .active_trains
+            .values()
+            .filter(|t| t.state.is_active())
+            .map(|t| t.original_root_pr)
+            .collect();
 
         Ok(Processor {
             store,
@@ -193,6 +199,7 @@ impl Processor {
             pending,
             in_flight: None,
             inherited_mid_flight,
+            startup_evaluates: Some(startup_evaluates),
         })
     }
 
@@ -242,8 +249,21 @@ impl Processor {
     }
 
     /// Claims the next pending delivery, if any.
+    ///
+    /// The first time the backlog turns up empty, the startup evaluations
+    /// queue: every already-acked delivery has now been applied, so the
+    /// evaluations plan against current state rather than overtaking the
+    /// backlog (Codex M5 round 6, P1).
     pub fn claim(&mut self) -> Result<Option<Delivery>, StoreError> {
-        self.store.claim_next_delivery()
+        let claimed = self.store.claim_next_delivery()?;
+        if claimed.is_none()
+            && let Some(roots) = self.startup_evaluates.take()
+        {
+            for root in roots {
+                self.queue(PendingWork::Trigger(Trigger::EvaluateTrain { root }));
+            }
+        }
+        Ok(claimed)
     }
 
     // ─── The per-delivery pipeline ───
@@ -316,7 +336,7 @@ impl Processor {
             if let Command::Predecessor(target) = &command {
                 referenced.push(*target);
             }
-            if let Err(ReleaseDelivery) = self.precache(&referenced) {
+            if let Err(ReleaseDelivery) = self.precache(&referenced)? {
                 return self.release(&id);
             }
         }
@@ -519,7 +539,15 @@ impl Processor {
 
     /// Fetches and caches referenced PRs the bot has never seen, so commands
     /// validate against facts instead of being dropped.
-    fn precache(&mut self, referenced: &[PrNumber]) -> Result<(), ReleaseDelivery> {
+    ///
+    /// The outer `Result` is the store: an append failure is a broken Store,
+    /// not GitHub unavailability, and must take the worker's fatal path (drop
+    /// → reopen → recover), never the release-and-retry path (Codex M5
+    /// round 6).
+    fn precache(
+        &mut self,
+        referenced: &[PrNumber],
+    ) -> Result<Result<(), ReleaseDelivery>, StoreError> {
         for &pr in referenced {
             if self.store.state().prs.contains_key(&pr) {
                 continue;
@@ -530,17 +558,15 @@ impl Processor {
                     merge_state,
                 }) => {
                     let events = cache_fill_events(pr, &data, merge_state);
-                    if self.store.append_batch(&events, Utc::now()).is_err() {
-                        return Err(ReleaseDelivery);
-                    }
+                    self.store.append_batch(&events, Utc::now())?;
                 }
                 Ok(other) => {
                     error!(?other, "RefetchPr answered the wrong variant");
-                    return Err(ReleaseDelivery);
+                    return Ok(Err(ReleaseDelivery));
                 }
                 Err(EffectError::Transient { detail }) => {
                     warn!(%pr, detail, "cannot fetch referenced PR; releasing delivery");
-                    return Err(ReleaseDelivery);
+                    return Ok(Err(ReleaseDelivery));
                 }
                 Err(e) => {
                     // Permanent (e.g. the number does not exist): proceed
@@ -549,7 +575,7 @@ impl Processor {
                 }
             }
         }
-        Ok(())
+        Ok(Ok(()))
     }
 
     /// Runs one handler-emitted effect. Failures are logged, never fed back —
@@ -921,6 +947,23 @@ impl Processor {
         let mut cleanup = Vec::new();
         let mut stopped_roots = HashSet::new();
         for (id, pr, force) in stops {
+            // A start for this PR still queued behind the saga slot has no
+            // train record yet; the stop suppresses the queued start itself,
+            // or it would answer "no active train" and the train would then
+            // start anyway (Codex M5 round 6 — the stop-during-preflight
+            // race, one step earlier in the queue).
+            let before = self.pending.len();
+            self.pending.retain(
+                |w| !matches!(w, PendingWork::Trigger(Trigger::StartTrain { pr: p }) if *p == pr),
+            );
+            if self.pending.len() != before && self.store.state().train_involving(pr).is_none() {
+                cleanup.push(Effect::GitHub(GitHubEffect::PostComment {
+                    pr,
+                    body: "🛑 Merge train start cancelled.".to_owned(),
+                }));
+                self.store.delete_pending_stop(id)?;
+                continue;
+            }
             let now = Utc::now();
             match cascade::stop_train(self.store.state(), pr, force, now) {
                 Ok(plan) => {
