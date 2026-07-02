@@ -18,165 +18,21 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use proptest::prelude::*;
 
-use crate::effects::github::GitHubEffect;
-use crate::effects::{Effect, GitHubResponse, PrData, RepoSettingsData};
+use crate::effects::Effect;
 use crate::git::interpreter::{WorktreeGitInterpreter, classify_git_error};
 use crate::git::test_support::{
-    create_branch_with_file, create_pr_ref, create_test_repo_with_origin, squash_merge_to_main,
+    create_branch_with_file, create_pr_ref, create_test_repo_with_origin,
 };
 use crate::git::{GitConfig, run_git_stdout, run_git_sync};
+use crate::github::test_support::{FakeGitHub, FakePr, FakePrState};
 use crate::persistence::event::{StateEvent, StateEventPayload};
 use crate::persistence::snapshot::{PersistedRepoSnapshot, SCHEMA_VERSION};
 use crate::state::RepoState;
 use crate::test_utils::test_timestamp;
-use crate::types::{CachedPr, CommentId, MergeStateStatus, PrNumber, PrState, Sha, TrainErrorKind};
+use crate::types::{CachedPr, MergeStateStatus, PrNumber, PrState};
 
 use super::plan::{EffectError, EffectOutcome, EffectResponse};
 use super::{Control, Observation, ReplayFacts, StepPlan, advance, observe, start_train};
-
-// ─── The GitHub half of the world (the git half is real) ───
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum FakePrState {
-    Open,
-    Merged { squash_sha: Sha },
-}
-
-#[derive(Debug, Clone)]
-struct FakePr {
-    branch: String,
-    base_ref: String,
-    state: FakePrState,
-}
-
-struct FakeGitHub {
-    config: GitConfig,
-    prs: HashMap<PrNumber, FakePr>,
-    next_comment: u64,
-    squash_count: HashMap<PrNumber, u32>,
-}
-
-impl FakeGitHub {
-    /// The real head of an open PR's branch on the bare remote.
-    fn branch_head(&self, branch: &str) -> Sha {
-        let sha = run_git_stdout(
-            &self.config.clone_dir(),
-            &["rev-parse", &format!("refs/heads/{branch}")],
-        )
-        .unwrap();
-        Sha::parse(sha).unwrap()
-    }
-
-    /// GitHub keeps `refs/pull/<n>/head` tracking the PR branch while open
-    /// and frozen after merge. The bot's pushes move branches via the real
-    /// interpreter, so re-mirror after every effect.
-    fn sync_pr_refs(&self) {
-        for (number, pr) in &self.prs {
-            if matches!(pr.state, FakePrState::Open) {
-                let head = self.branch_head(&pr.branch);
-                create_pr_ref(&self.config, number.0, &head);
-            }
-        }
-    }
-
-    fn execute(&mut self, effect: &GitHubEffect) -> Result<GitHubResponse, EffectError> {
-        match effect {
-            GitHubEffect::GetRepoSettings => Ok(GitHubResponse::RepoSettings(RepoSettingsData {
-                default_branch: "main".to_string(),
-                allow_squash_merge: true,
-                allow_merge_commit: false,
-                allow_rebase_merge: false,
-            })),
-            GitHubEffect::GetBranchProtection { .. } => Ok(GitHubResponse::BranchProtectionUnknown),
-            GitHubEffect::GetRulesets => Ok(GitHubResponse::RulesetsUnknown),
-
-            GitHubEffect::SquashMerge { pr, expected_sha } => {
-                let fake = self.prs.get(pr).expect("squash of a known PR").clone();
-                if !matches!(fake.state, FakePrState::Open) {
-                    return Err(EffectError::Permanent {
-                        kind: TrainErrorKind::ApiError,
-                        detail: format!("PR {pr} is not open"),
-                    });
-                }
-                let head = self.branch_head(&fake.branch);
-                if head != *expected_sha {
-                    return Err(EffectError::Permanent {
-                        kind: TrainErrorKind::HeadShaChanged,
-                        detail: format!("expected {expected_sha}, head is {head}"),
-                    });
-                }
-                // A real squash commit on the bare remote's main.
-                let squash = squash_merge_to_main(&self.config, expected_sha);
-                self.prs.get_mut(pr).unwrap().state = FakePrState::Merged {
-                    squash_sha: squash.squash_sha.clone(),
-                };
-                *self.squash_count.entry(*pr).or_insert(0) += 1;
-                Ok(GitHubResponse::Merged {
-                    sha: squash.squash_sha,
-                })
-            }
-
-            GitHubEffect::RetargetPr { pr, new_base } => {
-                let fake = self.prs.get_mut(pr).expect("retarget of a known PR");
-                if !matches!(fake.state, FakePrState::Open) {
-                    return Err(EffectError::Permanent {
-                        kind: TrainErrorKind::PrClosed,
-                        detail: format!("PR {pr} is not open"),
-                    });
-                }
-                fake.base_ref = new_base.clone();
-                Ok(GitHubResponse::Retargeted)
-            }
-
-            GitHubEffect::RefetchPr { pr } => {
-                let fake = self.prs.get(pr).expect("refetch of a known PR");
-                let (state, head_sha, merge_state) = match &fake.state {
-                    FakePrState::Open => (
-                        PrState::Open,
-                        self.branch_head(&fake.branch),
-                        MergeStateStatus::Clean,
-                    ),
-                    FakePrState::Merged { squash_sha } => {
-                        // The frozen PR ref names the squashed head.
-                        let head = run_git_stdout(
-                            &self.config.clone_dir(),
-                            &["rev-parse", &format!("refs/pull/{}/head", pr.0)],
-                        )
-                        .unwrap();
-                        (
-                            PrState::Merged {
-                                merge_commit_sha: squash_sha.clone(),
-                            },
-                            Sha::parse(head).unwrap(),
-                            MergeStateStatus::Unknown,
-                        )
-                    }
-                };
-                Ok(GitHubResponse::PrRefetched {
-                    pr: PrData {
-                        number: *pr,
-                        head_sha,
-                        head_ref: fake.branch.clone(),
-                        base_ref: fake.base_ref.clone(),
-                        state,
-                        is_draft: false,
-                    },
-                    merge_state,
-                })
-            }
-
-            GitHubEffect::PostComment { .. } => {
-                let id = CommentId(self.next_comment);
-                self.next_comment += 1;
-                Ok(GitHubResponse::CommentPosted { id })
-            }
-            GitHubEffect::UpdateComment { .. } => Ok(GitHubResponse::CommentUpdated),
-            GitHubEffect::AddReaction { .. } => Ok(GitHubResponse::ReactionAdded),
-
-            other => panic!("the engine does not emit {other:?}"),
-        }
-    }
-}
 
 // ─── Stack seeding on a real repo ───
 
@@ -265,12 +121,7 @@ fn seed(shape: &StackShape) -> (tempfile::TempDir, GitConfig, FakeGitHub, RepoSt
         prs: cached,
         active_trains: HashMap::new(),
     };
-    let github = FakeGitHub {
-        config: config.clone(),
-        prs: fake_prs,
-        next_comment: 1,
-        squash_count: HashMap::new(),
-    };
+    let github = FakeGitHub::new(config.clone(), fake_prs);
     (temp, config, github, RepoState::from_snapshot(snapshot))
 }
 

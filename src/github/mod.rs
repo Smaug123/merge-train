@@ -13,10 +13,13 @@ mod client;
 mod error;
 mod interpreter;
 mod retry;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 pub use client::OctocrabClient;
 pub use error::{GitHubApiError, GitHubErrorKind};
 pub use interpreter::{
-    interpret_github_effect, is_sha_mismatch_error, resolve_merge_state, should_fallback_to_unknown,
+    classify_github_error, interpret_github_effect, is_sha_mismatch_error, resolve_merge_state,
+    should_fallback_to_unknown,
 };
 pub use retry::{RetryConfig, RetryPolicy};
