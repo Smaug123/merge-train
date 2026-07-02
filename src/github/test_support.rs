@@ -190,6 +190,14 @@ impl FakeGitHub {
             }
 
             GitHubEffect::RefetchPr { pr } => {
+                // Real GitHub answers 404 for a PR that does not exist —
+                // a Permanent error, not a panic.
+                if !self.prs.contains_key(pr) {
+                    return Err(EffectError::Permanent {
+                        kind: TrainErrorKind::ApiError,
+                        detail: format!("no such PR #{pr} (fake 404)"),
+                    });
+                }
                 let (data, merge_state) = self.pr_data(*pr);
                 Ok(GitHubResponse::PrRefetched {
                     pr: data,
@@ -197,7 +205,15 @@ impl FakeGitHub {
                 })
             }
 
-            GitHubEffect::GetPr { pr } => Ok(GitHubResponse::Pr(self.pr_data(*pr).0)),
+            GitHubEffect::GetPr { pr } => {
+                if !self.prs.contains_key(pr) {
+                    return Err(EffectError::Permanent {
+                        kind: TrainErrorKind::ApiError,
+                        detail: format!("no such PR #{pr} (fake 404)"),
+                    });
+                }
+                Ok(GitHubResponse::Pr(self.pr_data(*pr).0))
+            }
 
             GitHubEffect::GetCollaboratorPermission { username } => {
                 if self.permission_lookup_broken {

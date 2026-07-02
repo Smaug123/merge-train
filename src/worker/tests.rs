@@ -1506,6 +1506,34 @@ fn saga_outcomes_park_until_the_backlog_drains() {
     );
 }
 
+/// A command whose own PR is *permanently* unfetchable (bad token access,
+/// deleted PR) must be denied with an explanation — proceeding uncached
+/// turned the acknowledged command into a silently-logged engine error, and
+/// with the delivery closed it would never retry (Codex M5 round 12).
+#[test]
+fn command_on_an_unfetchable_pr_is_denied_not_dropped() {
+    let (mut world, heads) = World::linear_stack(1);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 1, &heads);
+
+    // PR 99 exists on neither the fake nor the store: the fake answers the
+    // fetch with a permanent 404.
+    let body = comment_body(&world.config, 99, "@merge-train start", AUTHOR, "author", 9);
+    world.enqueue(&mut processor, "issue_comment", body);
+    drain(&mut processor);
+
+    assert!(processor.state().active_trains.is_empty());
+    let github = world.github.lock().unwrap();
+    assert!(
+        github
+            .posted_comments
+            .iter()
+            .any(|(pr, text)| *pr == PrNumber(99) && text.contains("cannot fetch")),
+        "expected an explanatory denial, got {:?}",
+        github.posted_comments
+    );
+}
+
 // ─── Referenced-PR precache ───
 
 #[test]

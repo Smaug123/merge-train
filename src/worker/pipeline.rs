@@ -369,12 +369,19 @@ impl Processor {
                 Err(ReleaseDelivery) => return self.release(&id),
             }
 
-            let mut referenced = vec![pr];
-            if let Command::Predecessor(target) = &command {
-                referenced.push(*target);
-            }
-            if let Err(ReleaseDelivery) = self.precache(&referenced)? {
-                return self.release(&id);
+            let optional = match &command {
+                Command::Predecessor(target) => vec![*target],
+                _ => Vec::new(),
+            };
+            match self.precache(pr, &optional)? {
+                PrecacheOutcome::Ready => {}
+                PrecacheOutcome::Release => return self.release(&id),
+                PrecacheOutcome::Deny(reason) => {
+                    self.store
+                        .commit_delivery(&id, &[], key.as_ref(), &[], Utc::now())?;
+                    self.best_effort_github(GitHubEffect::PostComment { pr, body: reason });
+                    return Ok(PipelineOutcome::Processed);
+                }
             }
         }
 
@@ -574,8 +581,16 @@ impl Processor {
         }
     }
 
-    /// Fetches and caches referenced PRs the bot has never seen, so commands
-    /// validate against facts instead of being dropped.
+    /// Fetches and caches the command's own PR and any optionally referenced
+    /// PRs the bot has never seen, so commands validate against facts instead
+    /// of being dropped.
+    ///
+    /// A permanent fetch failure is answered differently by role (Codex M5
+    /// round 12): the *command PR* is required — proceeding uncached turns
+    /// the acknowledged command into a silently-logged engine error, so the
+    /// command is denied with an explanation instead. An *optional* referent
+    /// (a predecessor target) proceeds uncached: validation rejects it
+    /// loudly with a comment of its own.
     ///
     /// The outer `Result` is the store: an append failure is a broken Store,
     /// not GitHub unavailability, and must take the worker's fatal path (drop
@@ -583,9 +598,12 @@ impl Processor {
     /// round 6).
     fn precache(
         &mut self,
-        referenced: &[PrNumber],
-    ) -> Result<Result<(), ReleaseDelivery>, StoreError> {
-        for &pr in referenced {
+        command_pr: PrNumber,
+        optional: &[PrNumber],
+    ) -> Result<PrecacheOutcome, StoreError> {
+        for (pr, required) in
+            std::iter::once((command_pr, true)).chain(optional.iter().map(|&pr| (pr, false)))
+        {
             if self.store.state().prs.contains_key(&pr) {
                 continue;
             }
@@ -599,20 +617,27 @@ impl Processor {
                 }
                 Ok(other) => {
                     error!(?other, "RefetchPr answered the wrong variant");
-                    return Ok(Err(ReleaseDelivery));
+                    return Ok(PrecacheOutcome::Release);
                 }
                 Err(EffectError::Transient { detail }) => {
                     warn!(%pr, detail, "cannot fetch referenced PR; releasing delivery");
-                    return Ok(Err(ReleaseDelivery));
+                    return Ok(PrecacheOutcome::Release);
+                }
+                Err(e) if required => {
+                    error!(%pr, error = ?e, "the command's PR is permanently unfetchable; denying");
+                    return Ok(PrecacheOutcome::Deny(format!(
+                        "The bot cannot fetch PR #{pr} (permanent API failure — does the                          bot's token have access to this repository?); refusing the command."
+                    )));
                 }
                 Err(e) => {
-                    // Permanent (e.g. the number does not exist): proceed
-                    // uncached — validation rejects it loudly.
+                    // Permanent on an optional referent (e.g. the number does
+                    // not exist): proceed uncached — validation rejects it
+                    // loudly.
                     warn!(%pr, error = ?e, "referenced PR unfetchable; proceeding uncached");
                 }
             }
         }
-        Ok(Ok(()))
+        Ok(PrecacheOutcome::Ready)
     }
 
     /// Runs one handler-emitted effect. Failures are logged, never fed back —
@@ -1096,6 +1121,17 @@ impl Processor {
 
 /// Marker: the delivery must be released and retried later.
 struct ReleaseDelivery;
+
+/// How the referenced-PR precache ended.
+enum PrecacheOutcome {
+    /// Everything needed is cached (or acceptably uncached); proceed.
+    Ready,
+    /// GitHub was transiently unavailable: release the delivery.
+    Release,
+    /// The command's own PR is permanently unfetchable: refuse the command
+    /// with this explanation.
+    Deny(String),
+}
 
 /// The command a delivery carries, if the pipeline must authorize one.
 ///
