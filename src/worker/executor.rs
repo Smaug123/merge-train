@@ -39,9 +39,25 @@ pub fn ensure_clone(config: &GitConfig, clone_url: Option<&str>) -> Result<(), G
     let clone_dir_str = clone_dir.to_str().ok_or_else(|| GitError::WorktreeError {
         details: format!("clone path is not valid UTF-8: {}", clone_dir.display()),
     })?;
-    run_git_sync(&repo_dir, &["clone", url, clone_dir_str])?;
+    // `--config` persists the helper into the new clone (taking effect for
+    // the initial fetch too), so every later fetch/push authenticates the
+    // same way without the URL ever carrying credentials.
+    let helper = format!("credential.helper={CREDENTIAL_HELPER}");
+    run_git_sync(
+        &repo_dir,
+        &["clone", "--config", &helper, url, clone_dir_str],
+    )?;
     Ok(())
 }
+
+/// The credential helper wired into fresh clones: it reads the token from
+/// the process environment at each fetch/push, so the secret never appears
+/// in command lines, git error messages, or the on-disk origin URL (a failed
+/// clone would otherwise print the token into the worker's logs — Codex M5
+/// review, P1). `GITHUB_TOKEN` is guaranteed present in production: startup
+/// refuses to run without it, and git subprocesses inherit the environment.
+const CREDENTIAL_HELPER: &str =
+    r#"!f() { echo "username=x-access-token"; echo "password=${GITHUB_TOKEN}"; }; f"#;
 
 /// How the worker reaches GitHub. The real arm blocks on the async octocrab
 /// interpreter (the worker and executor are plain OS threads); the test arm

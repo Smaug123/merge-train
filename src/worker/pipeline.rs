@@ -73,6 +73,8 @@ pub struct WorkerDeps {
     pub bot_user_id: u64,
     /// The bot's mention name, without `@`.
     pub bot_name: String,
+    /// How long the worker waits before retrying a released delivery.
+    pub stall_retry_delay: std::time::Duration,
 }
 
 /// The git-side settings a [`GitConfig`] is derived from per saga (the
@@ -167,8 +169,18 @@ impl Processor {
         self.store.state()
     }
 
+    /// The roots still refused evaluation as inherited-mid-cascade.
+    #[cfg(test)]
+    pub fn inherited_markers(&self) -> &HashSet<PrNumber> {
+        &self.inherited_mid_flight
+    }
+
     pub fn github(&self) -> &GitHubExec {
         &self.deps.github
+    }
+
+    pub fn stall_retry_delay(&self) -> std::time::Duration {
+        self.deps.stall_retry_delay
     }
 
     pub fn git_settings(&self) -> &GitSettings {
@@ -282,6 +294,7 @@ impl Processor {
         let output = handle_event(&event, self.store.state(), &ctx);
         self.store
             .commit_delivery(&id, &output.events, key.as_ref(), Utc::now())?;
+        self.clear_inherited_markers(&output.events);
 
         // Handler-terminated trains need worker-side cleanup (the engine's
         // own aborts carry cleanup in their plans; handler aborts have no
@@ -456,6 +469,26 @@ impl Processor {
         }
     }
 
+    /// Inherited-marker upkeep: a root stays refused only while the inherited
+    /// mid-cascade record is the live one. Any train-lifecycle event for the
+    /// root supersedes that record — most importantly the documented recovery
+    /// path, stop → fresh `start` (Codex M5 review: without this, the marker
+    /// refused the restarted train's evaluation until the process restarted).
+    fn clear_inherited_markers(&mut self, events: &[StateEventPayload]) {
+        if self.inherited_mid_flight.is_empty() {
+            return;
+        }
+        for event in events {
+            if let StateEventPayload::TrainStarted { root_pr, .. }
+            | StateEventPayload::TrainStopped { root_pr }
+            | StateEventPayload::TrainAborted { root_pr, .. }
+            | StateEventPayload::TrainCompleted { root_pr, .. } = event
+            {
+                self.inherited_mid_flight.remove(root_pr);
+            }
+        }
+    }
+
     // ─── The saga machine ───
 
     /// Starts the next queued saga if the slot is free. Returns the effect
@@ -546,38 +579,67 @@ impl Processor {
             return self.pump();
         }
 
-        // Observation boundary: queued stops act before the next plan, so a
-        // human's stop preempts whatever this saga would do next. (Stops for
-        // *other* trains are equally safe here — nothing of theirs is in
-        // flight — and their cleanup rides on the returned batch.)
-        let (mut boundary_cleanup, cancel_saga) = self.run_boundary_stops(root)?;
-        if cancel_saga {
-            // The stop targeted this saga before its train existed (the
-            // start's preflight window): cancel the start instead of letting
-            // `advance` create the train the user just refused.
-            return self.finish_or_pump(root, boundary_cleanup);
+        // Observation boundary: queued stops act here, so a human's stop
+        // preempts whatever this saga would do next.
+        let stops = self.take_queued_stops();
+
+        // The start-cancel window: a stop naming this saga's root while no
+        // train record exists yet means the outcomes in flight are the
+        // start's preflight *reads* — discarding them loses nothing durable,
+        // and letting `advance` run would start the train the user just
+        // refused. (A stop naming a *descendant* in that sub-second window
+        // cannot be resolved to the stack — there is no train record yet —
+        // and takes the normal path's "no active train" answer; the
+        // commenter re-issues once the status comment appears.)
+        if stops.iter().any(|(pr, _)| *pr == root)
+            && self.store.state().train_involving(root).is_none()
+        {
+            let others = stops.into_iter().filter(|(pr, _)| *pr != root).collect();
+            let (mut cleanup, _) = self.apply_stops(others)?;
+            cleanup.push(Effect::GitHub(GitHubEffect::PostComment {
+                pr: root,
+                body: "🛑 Merge train start cancelled.".to_owned(),
+            }));
+            return self.finish_or_pump(root, cleanup);
         }
 
-        let obs = match observe(&outcomes) {
-            Ok(obs) => obs,
+        // Integrate the completed outcomes FIRST: these effects already ran
+        // (a squash may have merged a PR on GitHub), so their records must
+        // land before any stop retires the train — a stopped train ignores
+        // observations, and the store would diverge from reality (Codex M5
+        // review, P1). Stops then suppress the *continuation*, which has not
+        // run yet and is therefore safe to drop.
+        let planned = match observe(&outcomes) {
+            Ok(obs) => match cascade::advance(self.store.state(), root, obs, Utc::now()) {
+                Ok(plan) => self.integrate_plan(root, plan)?,
+                Err(e) => {
+                    error!(%root, error = %e, "engine rejected an observation; abandoning step");
+                    None
+                }
+            },
             Err(e) => {
                 error!(%root, error = %e, "cannot observe executed outcomes; abandoning step");
-                return self.finish_or_pump(root, boundary_cleanup);
+                None
             }
         };
-        match cascade::advance(self.store.state(), root, obs, Utc::now()) {
-            Ok(plan) => {
-                if let Some(mut batch) = self.integrate_plan(root, plan)? {
-                    batch.best_effort.append(&mut boundary_cleanup);
-                    Ok(Some(batch))
-                } else {
-                    self.finish_or_pump(root, boundary_cleanup)
-                }
+
+        let (mut cleanup, stopped_roots) = self.apply_stops(stops)?;
+        if stopped_roots.contains(&root) {
+            // A stop retired this train at the boundary: its planned
+            // continuation must not run. The plan's events are already
+            // durable; an intent among them whose effect never ran is the
+            // same state a crash before dispatch leaves, which the recovery
+            // contract already covers — and a stopped train is never
+            // evaluated anyway.
+            self.in_flight = None;
+            return self.finish_or_pump(root, cleanup);
+        }
+        match planned {
+            Some(mut batch) => {
+                batch.best_effort.append(&mut cleanup);
+                Ok(Some(batch))
             }
-            Err(e) => {
-                error!(%root, error = %e, "engine rejected an observation; abandoning step");
-                self.finish_or_pump(root, boundary_cleanup)
-            }
+            None => self.finish_or_pump(root, cleanup),
         }
     }
 
@@ -600,38 +662,31 @@ impl Processor {
         }))
     }
 
-    /// Applies every queued `StopTrain` now (terminal events only — cheap and
-    /// safe at an observation boundary), returning their cleanup effects and
-    /// whether the in-flight saga must be cancelled.
-    ///
-    /// The cancellation case is the start-flow window: a stop that arrives
-    /// while the start's preflight fetch is in flight finds no train to stop
-    /// (`TrainStarted` only lands after preflight), yet letting the saga
-    /// advance would start a train the user just refused. A stop naming the
-    /// saga's own root therefore cancels the saga itself. (A stop naming a
-    /// *descendant* in that sub-second window cannot be resolved to the
-    /// stack — there is no train record yet — and still answers "no active
-    /// train"; the commenter re-issues once the status comment appears.)
-    fn run_boundary_stops(
-        &mut self,
-        saga_root: PrNumber,
-    ) -> Result<(Vec<Effect>, bool), StoreError> {
-        let mut cleanup = Vec::new();
-        let mut cancel_saga = false;
+    /// Extracts every queued `StopTrain` trigger, preserving other pending
+    /// work in order.
+    fn take_queued_stops(&mut self) -> Vec<(PrNumber, bool)> {
+        let mut stops = Vec::new();
         let mut remaining = VecDeque::new();
         while let Some(work) = self.pending.pop_front() {
-            let PendingWork::Trigger(Trigger::StopTrain { pr, force }) = work else {
-                remaining.push_back(work);
-                continue;
-            };
-            if self.store.state().train_involving(pr).is_none() && pr == saga_root {
-                cancel_saga = true;
-                cleanup.push(Effect::GitHub(GitHubEffect::PostComment {
-                    pr,
-                    body: "🛑 Merge train start cancelled.".to_owned(),
-                }));
-                continue;
+            match work {
+                PendingWork::Trigger(Trigger::StopTrain { pr, force }) => stops.push((pr, force)),
+                other => remaining.push_back(other),
             }
+        }
+        self.pending = remaining;
+        stops
+    }
+
+    /// Applies stops now (terminal events only — cheap and safe at an
+    /// observation boundary), returning their best-effort cleanup and the
+    /// roots whose trains were actually retired.
+    fn apply_stops(
+        &mut self,
+        stops: Vec<(PrNumber, bool)>,
+    ) -> Result<(Vec<Effect>, HashSet<PrNumber>), StoreError> {
+        let mut cleanup = Vec::new();
+        let mut stopped_roots = HashSet::new();
+        for (pr, force) in stops {
             let now = Utc::now();
             match cascade::stop_train(self.store.state(), pr, force, now) {
                 Ok(plan) => {
@@ -639,14 +694,21 @@ impl Processor {
                         plan.effects.is_empty(),
                         "stop plans have no observed effects"
                     );
+                    for event in &plan.events {
+                        if let StateEventPayload::TrainStopped { root_pr }
+                        | StateEventPayload::TrainAborted { root_pr, .. } = event
+                        {
+                            stopped_roots.insert(*root_pr);
+                        }
+                    }
                     self.store.append_batch(&plan.events, now)?;
+                    self.clear_inherited_markers(&plan.events);
                     cleanup.extend(plan.best_effort);
                 }
                 Err(e) => error!(%pr, error = %e, "stop_train refused"),
             }
         }
-        self.pending = remaining;
-        Ok((cleanup, cancel_saga))
+        Ok((cleanup, stopped_roots))
     }
 
     /// Appends a plan's events and turns its effects into a batch. `None`
@@ -663,6 +725,7 @@ impl Processor {
             control,
         } = plan;
         self.store.append_batch(&events, Utc::now())?;
+        self.clear_inherited_markers(&events);
 
         let feedback = matches!(control, Control::Continue);
         if let Control::FanOut { new_roots } = control {

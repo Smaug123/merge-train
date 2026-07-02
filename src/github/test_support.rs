@@ -47,6 +47,11 @@ pub struct FakeGitHub {
     pub roles: HashMap<String, CollaboratorRole>,
     /// Every `PostComment` body, for asserting rejections/acks.
     pub posted_comments: Vec<(PrNumber, String)>,
+    /// Outage injection: while set, every effect fails `Transient`.
+    pub unavailable: bool,
+    /// `GetRepoSettings` attempts (including failed ones), for asserting the
+    /// worker's stall-retry behaviour.
+    pub settings_fetches: u32,
 }
 
 impl FakeGitHub {
@@ -58,6 +63,8 @@ impl FakeGitHub {
             squash_count: HashMap::new(),
             roles: HashMap::new(),
             posted_comments: Vec::new(),
+            unavailable: false,
+            settings_fetches: 0,
         }
     }
 
@@ -122,6 +129,14 @@ impl FakeGitHub {
     }
 
     pub fn execute(&mut self, effect: &GitHubEffect) -> Result<GitHubResponse, EffectError> {
+        if matches!(effect, GitHubEffect::GetRepoSettings) {
+            self.settings_fetches += 1;
+        }
+        if self.unavailable {
+            return Err(EffectError::Transient {
+                detail: "fake GitHub outage (test-injected)".to_owned(),
+            });
+        }
         match effect {
             GitHubEffect::GetRepoSettings => Ok(GitHubResponse::RepoSettings(RepoSettingsData {
                 default_branch: "main".to_string(),

@@ -120,6 +120,10 @@ pub enum WorkerMsg {
         /// Whether the outcomes feed `observe` → `advance`.
         feedback: bool,
     },
+    /// Self-message from the stall-retry timer: a released delivery (GitHub
+    /// was unavailable) is due for another attempt. Carries nothing — waking
+    /// the loop clears the stall, and the next turn re-claims.
+    RetryStalled,
 }
 
 /// Why routing a delivery to a worker failed (distinct from a successful
@@ -163,14 +167,21 @@ pub struct SharedDeps {
     pub commit_identity: CommitIdentity,
     /// Maximum age for stale worktree cleanup.
     pub worktree_max_age: std::time::Duration,
-    /// Base URL for clone-on-first-use, e.g.
-    /// `https://x-access-token:<token>@github.com`; the per-repo URL appends
-    /// `/{owner}/{repo}.git`. `None` means clones must already exist.
+    /// Base URL for clone-on-first-use, e.g. `https://github.com`; the
+    /// per-repo URL appends `/{owner}/{repo}.git`. Must carry NO credentials —
+    /// clones authenticate via a credential helper reading `GITHUB_TOKEN`
+    /// from the process environment (see [`executor::ensure_clone`]), keeping
+    /// the token out of command lines and error output. `None` means clones
+    /// must already exist.
     pub clone_url_base: Option<String>,
     /// The bot's GitHub user id (fetched at startup, resolved question 3).
     pub bot_user_id: u64,
     /// The bot's mention name, without `@`.
     pub bot_name: String,
+    /// How long a worker waits before retrying a released delivery (GitHub
+    /// was unavailable for a pipeline step). Bounds the recovery latency
+    /// when no other webhook traffic arrives to wake the worker.
+    pub stall_retry_delay: std::time::Duration,
 }
 
 impl SharedDeps {
@@ -198,6 +209,7 @@ impl SharedDeps {
             },
             bot_user_id: self.bot_user_id,
             bot_name: self.bot_name.clone(),
+            stall_retry_delay: self.stall_retry_delay,
         }
     }
 }
@@ -460,7 +472,14 @@ fn run(
                     processed = true;
                     match processor.process_claimed(delivery) {
                         Ok(PipelineOutcome::Processed) => {}
-                        Ok(PipelineOutcome::Released) => stalled = true,
+                        Ok(PipelineOutcome::Released) => {
+                            // The webhook is already acked, so nothing external
+                            // retries this delivery: schedule our own wake-up
+                            // (Codex M5 review) rather than waiting for
+                            // unrelated traffic that may never come.
+                            stalled = true;
+                            schedule_stall_retry(processor.stall_retry_delay(), tx.clone());
+                        }
                         Err(e) => return fatal(e),
                     }
                 }
@@ -570,6 +589,26 @@ fn handle_msg(processor: &mut Processor, msg: WorkerMsg) -> Result<Option<SagaBa
             outcomes,
             feedback,
         } => processor.on_outcomes(root, outcomes, feedback),
+        // Receiving any message clears the stall in `run`; the timer message
+        // exists purely to guarantee one arrives.
+        WorkerMsg::RetryStalled => Ok(None),
+    }
+}
+
+/// Arms a one-shot timer that wakes the worker to retry a released delivery.
+/// One timer per release: a retry that releases again arms the next one, so
+/// the retry cadence is bounded by `delay`.
+fn schedule_stall_retry(delay: std::time::Duration, tx: mpsc::Sender<WorkerMsg>) {
+    let spawned = std::thread::Builder::new()
+        .name("stall-retry-timer".to_owned())
+        .spawn(move || {
+            std::thread::sleep(delay);
+            let _ = tx.blocking_send(WorkerMsg::RetryStalled);
+        });
+    if spawned.is_err() {
+        // The stall then lasts until the next unrelated message; loud but
+        // not fatal.
+        error!("failed to spawn the stall-retry timer thread");
     }
 }
 
@@ -680,6 +719,7 @@ pub(crate) mod test_support {
             clone_url_base: None,
             bot_user_id: TEST_BOT_ID,
             bot_name: "merge-train".to_owned(),
+            stall_retry_delay: std::time::Duration::from_millis(25),
         };
         (deps, fake)
     }

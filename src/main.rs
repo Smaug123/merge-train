@@ -25,7 +25,12 @@ struct Config {
     /// Secret for verifying webhook signatures. Non-empty.
     webhook_secret: Vec<u8>,
 
-    /// GitHub token (PAT or installation token). Non-empty.
+    /// GitHub token. Non-empty. Must be a *user-scoped* token (a classic or
+    /// fine-grained PAT, or a GitHub App user-to-server token): startup
+    /// resolves the bot's identity via `GET /user`, which App
+    /// *installation* tokens cannot call — supporting those needs an
+    /// App-auth identity source and token refresh, deferred until someone
+    /// deploys this as a GitHub App.
     github_token: String,
 
     /// Overrides for the git commit identity (defaults derive from the bot's
@@ -104,11 +109,13 @@ struct BotIdentity {
 }
 
 async fn fetch_bot_identity(octocrab: &octocrab::Octocrab) -> Result<BotIdentity, String> {
-    let user = octocrab
-        .current()
-        .user()
-        .await
-        .map_err(|e| format!("cannot fetch the bot's identity (GET /user): {e}"))?;
+    let user = octocrab.current().user().await.map_err(|e| {
+        format!(
+            "cannot fetch the bot's identity (GET /user): {e}. Note that \
+             GITHUB_TOKEN must be a user-scoped token (PAT or user-to-server); \
+             GitHub App installation tokens cannot answer GET /user."
+        )
+    })?;
     Ok(BotIdentity {
         user_id: user.id.into_inner(),
         login: user.login,
@@ -181,12 +188,14 @@ async fn main() {
         repos_dir: config.repos_dir,
         commit_identity,
         worktree_max_age: std::time::Duration::from_secs(24 * 60 * 60),
-        clone_url_base: Some(format!(
-            "https://x-access-token:{}@github.com",
-            config.github_token
-        )),
+        // No credentials in the URL: clones authenticate via a credential
+        // helper reading GITHUB_TOKEN from the environment (see
+        // worker::executor::ensure_clone), so the token never reaches git
+        // command lines or error output.
+        clone_url_base: Some("https://github.com".to_owned()),
         bot_user_id: identity.user_id,
         bot_name: identity.login,
+        stall_retry_delay: std::time::Duration::from_secs(30),
     };
 
     // Create application state

@@ -203,6 +203,7 @@ impl World {
             },
             bot_user_id: TEST_BOT_ID,
             bot_name: "merge-train".to_owned(),
+            stall_retry_delay: std::time::Duration::from_millis(25),
         }
     }
 
@@ -589,6 +590,191 @@ fn stop_mid_saga_takes_effect_at_the_next_observation_boundary() {
     );
 }
 
+/// A stop that lands while an *irreversible* effect is in flight must not
+/// discard that effect's record: the squash already merged the PR on GitHub,
+/// so its outcome must be integrated before the stop retires the train, or
+/// the store diverges from reality (Codex M5 review, P1).
+#[test]
+fn stop_during_inflight_squash_records_the_merge_before_stopping() {
+    let (mut world, heads) = World::linear_stack(1);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 1, &heads);
+    start_command(&mut world, &mut processor, 1);
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+
+    // Drive batches, pausing at the boundary right after the squash executed
+    // (a root-only train squashes without waiting on CI in this harness).
+    let mut next = processor.pump().unwrap();
+    let mut in_flight = None;
+    while let Some(batch) = next {
+        let outcomes = execute(&processor, &batch);
+        let squashed = world
+            .github
+            .lock()
+            .unwrap()
+            .squash_count
+            .values()
+            .sum::<u32>()
+            == 1;
+        if squashed {
+            in_flight = Some((batch, outcomes));
+            break;
+        }
+        next = processor
+            .on_outcomes(batch.root, outcomes, batch.feedback)
+            .unwrap();
+    }
+    let (batch, outcomes) = in_flight.expect("the squash batch never executed");
+
+    // The author's stop lands while the squash outcomes are in flight.
+    let body = comment_body(&world.config, 1, "@merge-train stop", AUTHOR, "author", 7);
+    world.enqueue(&mut processor, "issue_comment", body);
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+
+    // Feed the outcomes back and run everything to quiescence.
+    let mut next = processor
+        .on_outcomes(batch.root, outcomes, batch.feedback)
+        .unwrap();
+    while let Some(batch) = next {
+        let outcomes = execute(&processor, &batch);
+        next = processor
+            .on_outcomes(batch.root, outcomes, batch.feedback)
+            .unwrap();
+    }
+    drain(&mut processor);
+
+    // GitHub performed the merge; the store must know.
+    assert!(matches!(
+        world.github.lock().unwrap().prs[&PrNumber(1)].state,
+        FakePrState::Merged { .. }
+    ));
+    assert!(
+        processor.state().prs[&PrNumber(1)].state.is_merged(),
+        "the executed squash was never recorded in the store"
+    );
+    assert!(
+        processor
+            .state()
+            .active_trains
+            .values()
+            .all(|t| !t.state.is_active())
+    );
+    let events = processor.store_mut().events().unwrap();
+    let facts = ReplayFacts::for_train(&events, PrNumber(1));
+    assert_eq!(
+        facts.unmatched().count(),
+        0,
+        "IntentSquash must have its Done record even though a stop was queued"
+    );
+}
+
+/// The mirror pin: a stop at an observation boundary of an *existing* train
+/// still suppresses the planned continuation — nothing irreversible that has
+/// not yet run may start after the stop.
+#[test]
+fn stop_mid_saga_on_an_existing_train_suppresses_the_continuation() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    start_command(&mut world, &mut processor, 1);
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+
+    // Complete the preflight so the train record exists, leaving the next
+    // batch (preparation work) in flight.
+    let preflight = processor.pump().unwrap().expect("start plans preflight");
+    let outcomes = execute(&processor, &preflight);
+    let batch = processor
+        .on_outcomes(preflight.root, outcomes, preflight.feedback)
+        .unwrap()
+        .expect("preflight completion continues the saga");
+    assert!(
+        processor.state().active_trains.contains_key(&PrNumber(1)),
+        "the train must exist before the stop for this test to bite"
+    );
+    let outcomes = execute(&processor, &batch);
+    let remote_head_before = world.github.lock().unwrap().branch_head("pr-2");
+
+    // The author's stop lands while that batch's outcomes are in flight.
+    let body = comment_body(&world.config, 1, "@merge-train stop", AUTHOR, "author", 8);
+    world.enqueue(&mut processor, "issue_comment", body);
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+
+    let mut next = processor
+        .on_outcomes(batch.root, outcomes, batch.feedback)
+        .unwrap();
+    let mut steps = 0;
+    while let Some(batch) = next {
+        steps += 1;
+        assert!(steps < 10, "post-stop cleanup must terminate");
+        assert!(
+            batch.effects.is_empty(),
+            "no observed effects may run after the stop, got {:?}",
+            batch.effects
+        );
+        let outcomes = execute(&processor, &batch);
+        next = processor
+            .on_outcomes(batch.root, outcomes, batch.feedback)
+            .unwrap();
+    }
+    drain(&mut processor);
+
+    assert!(
+        processor
+            .state()
+            .active_trains
+            .values()
+            .all(|t| !t.state.is_active())
+    );
+    let github = world.github.lock().unwrap();
+    assert_eq!(github.squash_count.values().sum::<u32>(), 0);
+    assert_eq!(
+        github.branch_head("pr-2"),
+        remote_head_before,
+        "the suppressed continuation must not have pushed"
+    );
+}
+
+// ─── Clone-on-first-use ───
+
+/// The clone must never see the GitHub token: the origin URL stays clean and
+/// auth comes from a credential helper that reads `GITHUB_TOKEN` from the
+/// process environment at each fetch/push — otherwise any failed git command
+/// prints the secret into logs and `ps` output (Codex M5 review, P1).
+#[test]
+fn ensure_clone_uses_an_env_credential_helper_and_a_credential_free_origin() {
+    let dir = TempDir::new().unwrap();
+    // A local bare repo stands in for GitHub's remote.
+    let remote = dir.path().join("remote.git");
+    run_git_stdout(dir.path(), &["init", "--bare", remote.to_str().unwrap()]).unwrap();
+
+    let config = crate::worker::test_support::test_git_config(dir.path());
+    super::executor::ensure_clone(&config, Some(remote.to_str().unwrap())).unwrap();
+
+    let clone_dir = config.clone_dir();
+    let helper = run_git_stdout(&clone_dir, &["config", "credential.helper"]).unwrap();
+    assert!(
+        helper.contains("${GITHUB_TOKEN}"),
+        "the helper must defer to the environment, got: {helper}"
+    );
+    assert!(
+        !helper.contains("ghp_") && !helper.contains("x-access-token:"),
+        "no literal secret material in the helper: {helper}"
+    );
+    let origin = run_git_stdout(&clone_dir, &["remote", "get-url", "origin"]).unwrap();
+    assert!(
+        !origin.contains('@'),
+        "origin URL must carry no credentials, got: {origin}"
+    );
+}
+
 // ─── Referenced-PR precache ───
 
 #[test]
@@ -758,6 +944,7 @@ fn inherited_mid_flight_train_refuses_evaluation_but_stops_cleanly() {
     );
 
     // But a stop works: terminal event + cleanup.
+    assert!(!processor.inherited_markers().is_empty());
     let body = comment_body(&world.config, 1, "@merge-train stop", AUTHOR, "author", 44);
     world.enqueue(&mut processor, "issue_comment", body);
     drain(&mut processor);
@@ -768,6 +955,27 @@ fn inherited_mid_flight_train_refuses_evaluation_but_stops_cleanly() {
             .values()
             .all(|t| !t.state.is_active())
     );
+    // Stopping the inherited train must clear its refuse-evaluation marker,
+    // or a restarted train that parks (e.g. waiting on CI in production,
+    // where mergeability starts Unknown) is refused every evaluation until
+    // the process restarts (Codex M5 review).
+    assert!(
+        processor.inherited_markers().is_empty(),
+        "the stop must clear the inherited marker"
+    );
+
+    // The documented recovery path continues: re-issuing `start` must yield
+    // a train that actually advances.
+    // (A fresh comment id: re-using the first start's would dedupe.)
+    let body = comment_body(&world.config, 1, "@merge-train start", AUTHOR, "author", 99);
+    world.enqueue(&mut processor, "issue_comment", body);
+    drive_to_completion(&mut world, &mut processor);
+    for i in 1..=2u64 {
+        assert!(
+            processor.state().prs[&PrNumber(i)].state.is_merged(),
+            "PR #{i} did not merge after the stop-and-restart recovery"
+        );
+    }
 }
 
 // ─── cache_fill_events: the unknown-PR upsert oracle ───
@@ -841,7 +1049,9 @@ mod registry {
     use crate::worker::{EnqueueOutcome, WorkerRegistry};
     use tokio::sync::oneshot;
 
-    // A minimal valid `pull_request` payload for repo o/r.
+    // A minimal valid `pull_request` payload for repo o/r. The SHAs must be
+    // real 40-hex-char values or the parser rejects the payload as malformed
+    // and the pipeline closes it before doing any work.
     fn pull_request_body() -> Vec<u8> {
         br#"{
             "action": "synchronize",
@@ -851,8 +1061,8 @@ mod registry {
                 "state": "open",
                 "draft": false,
                 "merged": false,
-                "head": { "sha": "deadbeef", "ref": "feature" },
-                "base": { "sha": "cafef00d", "ref": "main" },
+                "head": { "sha": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", "ref": "feature" },
+                "base": { "sha": "cafef00dcafef00dcafef00dcafef00dcafef00d", "ref": "main" },
                 "user": { "id": 1, "login": "u" },
                 "updated_at": "2026-07-01T10:00:00Z"
             },
@@ -990,6 +1200,68 @@ mod registry {
         let a = registry.sender_for("o", "r").await.unwrap();
         let b = registry.sender_for("o", "r").await.unwrap();
         assert!(a.same_channel(&b), "one worker (one Store) per repo");
+    }
+
+    /// A released delivery (GitHub down during a pipeline step) must retry on
+    /// the worker's own timer: the webhook was already acked, so no external
+    /// party will redeliver it (Codex M5 review).
+    #[tokio::test]
+    async fn released_delivery_retries_without_new_webhook_traffic() {
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, fake) = fake_shared_deps(dir.path(), Default::default());
+        fake.lock().unwrap().unavailable = true;
+        let registry = WorkerRegistry::new(dir.path(), deps);
+        let sender = registry.sender_for("o", "r").await.unwrap();
+
+        // First contact requires default-branch discovery (GetRepoSettings);
+        // with GitHub down the delivery is acked, claimed, and released.
+        assert_eq!(
+            send_delivery(&registry, &sender, "d1", pull_request_body())
+                .await
+                .unwrap(),
+            EnqueueOutcome::Enqueued
+        );
+
+        // A second discovery attempt can only come from the stall-retry
+        // timer: no further messages are sent.
+        wait_for(
+            &fake,
+            |f| f.settings_fetches >= 1,
+            "discovery never attempted",
+        )
+        .await;
+        wait_for(
+            &fake,
+            |f| f.settings_fetches >= 2,
+            "no stall retry happened",
+        )
+        .await;
+
+        // GitHub recovers; the retry loop completes the delivery on its own.
+        let lifted_at = fake.lock().unwrap().settings_fetches;
+        fake.lock().unwrap().unavailable = false;
+        wait_for(
+            &fake,
+            |f| f.settings_fetches > lifted_at,
+            "no retry after the outage lifted",
+        )
+        .await;
+    }
+
+    /// Polls `cond` against the fake until it holds (10s deadline).
+    async fn wait_for(
+        fake: &Arc<Mutex<FakeGitHub>>,
+        cond: impl Fn(&FakeGitHub) -> bool,
+        msg: &str,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if cond(&fake.lock().unwrap()) {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "{msg}");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test]
