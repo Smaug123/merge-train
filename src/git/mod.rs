@@ -239,11 +239,16 @@ pub(crate) fn git_command(workdir: &Path) -> std::process::Command {
     // - HOME: ssh needs it for ~/.ssh/config, keys, and known_hosts. Git
     //   config injection via ~/.gitconfig is still blocked: GIT_CONFIG_GLOBAL
     //   and GIT_CONFIG_NOSYSTEM below are pinned regardless of HOME.
-    // - SSH_AUTH_SOCK: agent-based SSH auth for fetch/push/ls-remote.
+    // - SSH_AUTH_SOCK: agent-based SSH auth for fetch/push/ls-push/ls-remote.
+    // - GITHUB_TOKEN: the credential helper wired into clones
+    //   (`worker::executor::CREDENTIAL_HELPER`) reads it at fetch/push time;
+    //   scrubbing it would make every authenticated HTTPS operation run
+    //   with an empty password (Codex M5 round 5, P1). The value still never
+    //   reaches command lines or git config.
     // Deliberately NOT preserved: GIT_SSH/GIT_SSH_COMMAND (arbitrary command
     // execution; deployments needing a custom SSH wrapper must configure it
     // explicitly when such a knob exists) and credential-helper overrides.
-    for var in ["PATH", "HOME", "SSH_AUTH_SOCK"] {
+    for var in ["PATH", "HOME", "SSH_AUTH_SOCK", "GITHUB_TOKEN"] {
         if let Some(value) = std::env::var_os(var) {
             cmd.env(var, value);
         }
@@ -429,6 +434,30 @@ pub(crate) fn worktree_path_str(path: &Path) -> GitResult<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The credential helper wired into clones (`worker::executor`) reads
+    /// `${GITHUB_TOKEN}` at fetch/push time, so `git_command`'s env
+    /// allowlist must pass it through to git subprocesses — without it,
+    /// every authenticated HTTPS operation runs with an empty password
+    /// despite startup having validated the token (Codex M5 round 5, P1).
+    #[test]
+    fn git_subprocesses_see_the_github_token() {
+        // Safety: Rust guards its own env access with a lock; nothing else
+        // in the test suite reads GITHUB_TOKEN.
+        unsafe { std::env::set_var("GITHUB_TOKEN", "helper-visible") };
+        let dir = tempfile::tempdir().unwrap();
+        run_git_stdout(dir.path(), &["init"]).unwrap();
+        let out = run_git_stdout(
+            dir.path(),
+            &[
+                "-c",
+                "alias.dump-token=!printenv GITHUB_TOKEN",
+                "dump-token",
+            ],
+        )
+        .unwrap();
+        assert_eq!(out, "helper-visible");
+    }
 
     #[test]
     fn parse_stack_dir_name_valid() {
