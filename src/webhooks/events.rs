@@ -107,6 +107,16 @@ pub struct IssueCommentEvent {
     /// The comment author's login name.
     pub author_login: String,
 
+    /// The *actor's* user ID (`sender.id`): who performed this action. On
+    /// `created` this equals `author_id`; on `edited` it is the editor, who
+    /// may be someone else with edit rights — authorization MUST use the
+    /// sender, or an editor impersonates the original author (Codex M5
+    /// round 2, P1).
+    pub sender_id: u64,
+
+    /// The actor's login name (`sender.login`), for role lookups.
+    pub sender_login: String,
+
     /// The *issue's* author's user ID (`issue.user.id`). When the comment is
     /// on a PR (`pr_number` is `Some`), this is the PR author — the identity
     /// DESIGN §Command authorization compares the commenter against for
@@ -591,6 +601,8 @@ mod tests {
                         comment_id: CommentId(comment_id),
                         body,
                         author_id,
+                        sender_id: author_id,
+                        sender_login: author_login.clone(),
                         author_login,
                         pr_author_id,
                         updated_at,

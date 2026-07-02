@@ -131,6 +131,7 @@ struct RawIssueCommentPayload {
     comment: RawComment,
     issue: RawIssue,
     repository: RawRepository,
+    sender: RawUser,
 }
 
 #[derive(Debug, Deserialize)]
@@ -184,6 +185,8 @@ fn parse_issue_comment(payload: &[u8]) -> Result<IssueCommentEvent, ParseError> 
         body,
         author_id: raw.comment.user.id,
         author_login: raw.comment.user.login,
+        sender_id: raw.sender.id,
+        sender_login: raw.sender.login,
         pr_author_id: raw.issue.user.id,
         updated_at: raw.comment.updated_at,
     })
@@ -482,7 +485,8 @@ mod tests {
             "repository": {
                 "owner": { "login": "myorg" },
                 "name": "myrepo"
-            }
+            },
+            "sender": { "id": 100, "login": "octocat" }
         }"#;
 
         let result = parse_webhook("issue_comment", payload.as_bytes()).unwrap();
@@ -522,7 +526,8 @@ mod tests {
             "repository": {
                 "owner": { "login": "org" },
                 "name": "repo"
-            }
+            },
+            "sender": { "id": 1, "login": "user" }
         }"#;
 
         let result = parse_webhook("issue_comment", payload.as_bytes()).unwrap();
@@ -554,7 +559,8 @@ mod tests {
             "repository": {
                 "owner": { "login": "org" },
                 "name": "repo"
-            }
+            },
+            "sender": { "id": 1, "login": "user" }
         }"#;
 
         let result = parse_webhook("issue_comment", payload.as_bytes()).unwrap();
@@ -591,7 +597,8 @@ mod tests {
             "repository": {
                 "owner": { "login": "org" },
                 "name": "repo"
-            }
+            },
+            "sender": { "id": 1, "login": "user" }
         }"#;
 
         let result = parse_webhook("issue_comment", payload.as_bytes()).unwrap();
@@ -1117,7 +1124,8 @@ mod tests {
             "comment": { "id": 1, "body": "test", "user": { "id": 1, "login": "u" },
             "comment": { "id": 1, "body": "test", "user": { "id": 1, "login": "u" }     "updated_at": "2024-01-15T10:00:00Z"
             "comment": { "id": 1, "body": "test", "user": { "id": 1, "login": "u" } },
-            "issue": { "number": 1, "user": { "id": 2, "login": "a" } }
+            "issue": { "number": 1, "user": { "id": 2, "login": "a" } },
+            "sender": { "id": 1, "login": "u" }
         }"#;
         let result = parse_webhook("issue_comment", payload.as_bytes());
         assert!(result.is_err());
@@ -1129,7 +1137,8 @@ mod tests {
             "action": "invalid_action",
             "comment": { "id": 1, "body": "test", "user": { "id": 1, "login": "u" }, "updated_at": "2024-01-15T10:00:00Z" },
             "issue": { "number": 1, "user": { "id": 2, "login": "a" } },
-            "repository": { "owner": { "login": "o" }, "name": "r" }
+            "repository": { "owner": { "login": "o" }, "name": "r" },
+            "sender": { "id": 1, "login": "u" }
         }"#;
         let result = parse_webhook("issue_comment", payload.as_bytes());
         assert!(matches!(

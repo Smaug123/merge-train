@@ -426,7 +426,10 @@ fn run(
     mut rx: mpsc::Receiver<WorkerMsg>,
     tx: mpsc::Sender<WorkerMsg>,
 ) {
-    let mut processor = Processor::new(store, deps);
+    let mut processor = match Processor::new(store, deps) {
+        Ok(processor) => processor,
+        Err(e) => return fatal(e),
+    };
     let mut stalled = false;
 
     // Prune once at startup, then again at every idle boundary below, so the

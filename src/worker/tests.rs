@@ -80,9 +80,30 @@ fn comment_body(
     commenter_login: &str,
     comment_id: u64,
 ) -> Vec<u8> {
+    comment_body_with_action(
+        config,
+        pr,
+        text,
+        commenter_id,
+        commenter_login,
+        comment_id,
+        "created",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn comment_body_with_action(
+    config: &GitConfig,
+    pr: u64,
+    text: &str,
+    commenter_id: u64,
+    commenter_login: &str,
+    comment_id: u64,
+    action: &str,
+) -> Vec<u8> {
     format!(
         r#"{{
-            "action": "created",
+            "action": "{action}",
             "comment": {{
                 "id": {comment_id},
                 "body": "{text}",
@@ -94,7 +115,8 @@ fn comment_body(
                 "pull_request": {{ "url": "..." }},
                 "user": {{ "id": {AUTHOR}, "login": "author" }}
             }},
-            "repository": {repo}
+            "repository": {repo},
+            "sender": {{ "id": {commenter_id}, "login": "{commenter_login}" }}
         }}"#,
         comment_id = comment_id % 10,
         repo = repo_json(config),
@@ -208,7 +230,7 @@ impl World {
     }
 
     fn processor(&self) -> Processor {
-        Processor::new(Store::open(&self.db_path()).unwrap(), self.deps())
+        Processor::new(Store::open(&self.db_path()).unwrap(), self.deps()).unwrap()
     }
 
     /// Durably enqueues a raw delivery (as the intake path would).
@@ -437,6 +459,92 @@ fn unauthorized_start_is_rejected_with_a_comment_and_no_train() {
             .iter()
             .any(|(pr, text)| *pr == PrNumber(1) && text.contains("Only the PR author")),
         "expected a rejection comment, got {:?}",
+        github.posted_comments
+    );
+}
+
+/// Commands run only from *created* comments. On `issue_comment.edited`,
+/// GitHub keeps `comment.user` as the original author while the editor is in
+/// `sender` — accepting commands from edits lets anyone who can edit another
+/// user's comment impersonate them to the authorization gates (Codex M5
+/// round 2, P1). Edits also re-key dedupe by `updated_at`, so an accepted
+/// edit would re-run the command on every unrelated edit.
+#[test]
+fn edited_comment_commands_are_ignored() {
+    let (mut world, heads) = World::linear_stack(1);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 1, &heads);
+
+    let body = comment_body_with_action(
+        &world.config,
+        1,
+        "@merge-train start",
+        AUTHOR,
+        "author",
+        88,
+        "edited",
+    );
+    world.enqueue(&mut processor, "issue_comment", body);
+    drain(&mut processor);
+
+    assert!(
+        processor.state().active_trains.is_empty(),
+        "an edited comment must never run a command"
+    );
+    assert_eq!(
+        world
+            .github
+            .lock()
+            .unwrap()
+            .squash_count
+            .values()
+            .sum::<u32>(),
+        0,
+        "the edited comment's command ran a train to completion"
+    );
+}
+
+/// The sender pin: predecessor declarations stay live under edits, so those
+/// ARE authorized on edits — against the *editor* (`sender`), never the
+/// original comment author.
+#[test]
+fn edited_predecessor_authorizes_the_editor_not_the_comment_author() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    drain(&mut processor);
+
+    // A stranger edits the author's comment into a predecessor declaration:
+    // comment.user stays the author, sender is the editor.
+    let body = format!(
+        r#"{{
+            "action": "edited",
+            "comment": {{
+                "id": 61,
+                "body": "@merge-train predecessor #1",
+                "user": {{ "id": {AUTHOR}, "login": "author" }},
+                "updated_at": "2026-07-01T12:00:00Z"
+            }},
+            "issue": {{
+                "number": 2,
+                "pull_request": {{ "url": "..." }},
+                "user": {{ "id": {AUTHOR}, "login": "author" }}
+            }},
+            "repository": {repo},
+            "sender": {{ "id": {STRANGER}, "login": "stranger" }}
+        }}"#,
+        repo = repo_json(&world.config),
+    );
+    world.enqueue(&mut processor, "issue_comment", body.into_bytes());
+    drain(&mut processor);
+
+    let github = world.github.lock().unwrap();
+    assert!(
+        github
+            .posted_comments
+            .iter()
+            .any(|(pr, text)| *pr == PrNumber(2) && text.contains("Only the PR author")),
+        "the editing stranger must be denied, got {:?}",
         github.posted_comments
     );
 }
@@ -672,6 +780,99 @@ fn stop_during_inflight_squash_records_the_merge_before_stopping() {
     );
 }
 
+/// A handler abort (here: review dismissed) landing while an irreversible
+/// effect is in flight must not discard that effect's outcome. Handler
+/// `TrainAborted` events for the in-flight saga root are deferred to the
+/// observation boundary — the same ordering queued stops get (Codex M5
+/// round 2, P1); committed mid-saga they made `advance` see an inactive
+/// train and drop the executed squash's record.
+#[test]
+fn handler_abort_during_inflight_squash_records_the_merge_first() {
+    let (mut world, heads) = World::linear_stack(1);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 1, &heads);
+    start_command(&mut world, &mut processor, 1);
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+
+    // Drive batches, pausing right after the squash executed.
+    let mut next = processor.pump().unwrap();
+    let mut in_flight = None;
+    while let Some(batch) = next {
+        let outcomes = execute(&processor, &batch);
+        let squashed = world
+            .github
+            .lock()
+            .unwrap()
+            .squash_count
+            .values()
+            .sum::<u32>()
+            == 1;
+        if squashed {
+            in_flight = Some((batch, outcomes));
+            break;
+        }
+        next = processor
+            .on_outcomes(batch.root, outcomes, batch.feedback)
+            .unwrap();
+    }
+    let (batch, outcomes) = in_flight.expect("the squash batch never executed");
+
+    // A review dismissal arrives while the squash outcomes are in flight:
+    // the handler aborts the train.
+    let body = format!(
+        r#"{{
+            "action": "dismissed",
+            "review": {{
+                "id": 777,
+                "user": {{ "id": 555, "login": "reviewer" }},
+                "state": "dismissed",
+                "body": null
+            }},
+            "pull_request": {{ "number": 1 }},
+            "repository": {repo}
+        }}"#,
+        repo = repo_json(&world.config),
+    );
+    world.enqueue(&mut processor, "pull_request_review", body.into_bytes());
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+
+    // Feed the outcomes back and run to quiescence.
+    let mut next = processor
+        .on_outcomes(batch.root, outcomes, batch.feedback)
+        .unwrap();
+    while let Some(batch) = next {
+        let outcomes = execute(&processor, &batch);
+        next = processor
+            .on_outcomes(batch.root, outcomes, batch.feedback)
+            .unwrap();
+    }
+    drain(&mut processor);
+
+    // GitHub performed the merge; the store must know, abort or no abort.
+    assert!(
+        processor.state().prs[&PrNumber(1)].state.is_merged(),
+        "the executed squash was never recorded in the store"
+    );
+    assert!(
+        processor
+            .state()
+            .active_trains
+            .values()
+            .all(|t| !t.state.is_active())
+    );
+    let events = processor.store_mut().events().unwrap();
+    let facts = ReplayFacts::for_train(&events, PrNumber(1));
+    assert_eq!(
+        facts.unmatched().count(),
+        0,
+        "IntentSquash must have its Done record despite the handler abort"
+    );
+}
+
 /// The mirror pin: a stop at an observation boundary of an *existing* train
 /// still suppresses the planned continuation — nothing irreversible that has
 /// not yet run may start after the stop.
@@ -739,6 +940,91 @@ fn stop_mid_saga_on_an_existing_train_suppresses_the_continuation() {
         github.branch_head("pr-2"),
         remote_head_before,
         "the suppressed continuation must not have pushed"
+    );
+}
+
+/// An acknowledged stop must survive a crash. The stop delivery closes
+/// (exactly-once intake) while its trigger waits for the saga's observation
+/// boundary — if that intention lives only in RAM, a crash silently drops
+/// the stop and the train keeps merging (Codex M5 round 2, P1). Stops are
+/// therefore persisted in the close transaction and reloaded at startup.
+#[test]
+fn acknowledged_stop_survives_a_crash_before_its_boundary() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    start_command(&mut world, &mut processor, 1);
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+
+    // Preflight completes (the train now exists); the next batch is in
+    // flight when the stop arrives, so the stop queues for the boundary.
+    let preflight = processor.pump().unwrap().expect("start plans preflight");
+    let outcomes = execute(&processor, &preflight);
+    let _batch = processor
+        .on_outcomes(preflight.root, outcomes, preflight.feedback)
+        .unwrap()
+        .expect("preflight completion continues the saga");
+    assert!(processor.state().active_trains.contains_key(&PrNumber(1)));
+
+    let body = comment_body(&world.config, 1, "@merge-train stop", AUTHOR, "author", 55);
+    world.enqueue(&mut processor, "issue_comment", body);
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+
+    // Crash before the boundary: the saga outcomes and the RAM queue die.
+    drop(processor);
+
+    // On restart the persisted stop must still retire the train, with no
+    // further webhook traffic.
+    let mut processor = world.processor();
+    drain(&mut processor);
+    assert!(
+        processor
+            .state()
+            .active_trains
+            .values()
+            .all(|t| !t.state.is_active()),
+        "the acknowledged stop was lost across the crash"
+    );
+}
+
+/// The evaluate half of trigger-work recovery: an active train whose pending
+/// evaluation died with the process (e.g. an acknowledged CI success whose
+/// trigger was queued but not yet run) must be re-evaluated at startup, not
+/// wait for unrelated webhook traffic (Codex M5 round 2, P1). Evaluation is
+/// derived state — `Evaluate { facts }` re-reads everything — so startup
+/// simply queues one for every active train.
+#[test]
+fn active_train_is_evaluated_at_startup_without_new_traffic() {
+    let (mut world, heads) = World::linear_stack(1);
+    {
+        let mut processor = world.processor();
+        world.enqueue_stack_setup(&mut processor, 1, &heads);
+        drain(&mut processor);
+        // Manufacture the crash artifact: an active, phase-Idle train whose
+        // evaluation trigger no longer exists anywhere.
+        processor
+            .store_mut()
+            .append_batch(
+                &[crate::persistence::event::StateEventPayload::TrainStarted {
+                    root_pr: PrNumber(1),
+                    current_pr: PrNumber(1),
+                }],
+                chrono::Utc::now(),
+            )
+            .unwrap();
+    } // crash
+
+    let mut processor = world.processor();
+    drain(&mut processor);
+
+    assert!(
+        processor.state().prs[&PrNumber(1)].state.is_merged(),
+        "the startup evaluation must advance the train; state: {:?}",
+        processor.state().active_trains
     );
 }
 
@@ -1284,7 +1570,7 @@ mod registry {
             let claimed = store.claim_next_delivery().unwrap().unwrap();
             assert_eq!(claimed.delivery_id, "ancient");
             store
-                .commit_delivery("ancient", &[], Some(&key), old)
+                .commit_delivery("ancient", &[], Some(&key), &[], old)
                 .unwrap();
             assert!(store.is_duplicate(&key).unwrap());
         }

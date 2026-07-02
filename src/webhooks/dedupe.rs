@@ -223,6 +223,8 @@ mod tests {
             body: String::new(),
             author_id: 1,
             author_login: "a".to_owned(),
+            sender_id: 1,
+            sender_login: "a".to_owned(),
             pr_author_id: 2,
             updated_at,
         }

@@ -187,9 +187,14 @@ fn handle_issue_comment(
         },
         // Created or edited: re-interpret the body, honoring a predecessor
         // declaration this very comment may already own (Codex review #55).
-        CommentAction::Created | CommentAction::Edited => {
-            handle_comment_command(pr, event.comment_id, &event.body, state, &ctx.bot_name)
-        }
+        action @ (CommentAction::Created | CommentAction::Edited) => handle_comment_command(
+            pr,
+            event.comment_id,
+            &event.body,
+            state,
+            &ctx.bot_name,
+            action,
+        ),
     }
 }
 
@@ -199,12 +204,18 @@ fn handle_issue_comment(
 /// that currently owns `pr`'s predecessor declaration is handled specially:
 /// editing the declaration away retracts it, and editing it to a different
 /// predecessor updates it (rather than rejecting as already-declared).
+///
+/// Start/stop commands fire only from *created* comments: a command is an
+/// utterance, not a state, so an edit neither runs one nor re-runs one
+/// (Codex M5 round 2 — accepting edits let comment editors impersonate the
+/// original author, and re-ran commands on every unrelated edit).
 fn handle_comment_command(
     pr: PrNumber,
     comment_id: CommentId,
     body: &str,
     state: &RepoState,
     bot_name: &str,
+    action: CommentAction,
 ) -> HandlerOutput {
     // Does this comment currently own pr's predecessor declaration?
     let declared = state
@@ -229,6 +240,8 @@ fn handle_comment_command(
         HandlerOutput::default()
     };
     match command {
+        Some(Command::Start | Command::Stop | Command::StopForce)
+            if action != CommentAction::Created => {}
         Some(Command::Start) => {
             out.effects.push(ack(comment_id));
             out.triggers.push(Trigger::StartTrain { pr });
@@ -741,6 +754,8 @@ mod tests {
             body: body.to_owned(),
             author_id: author,
             author_login: "alice".to_owned(),
+            sender_id: author,
+            sender_login: "alice".to_owned(),
             // Deliberately never equal to a commenter id used in these tests:
             // the pure handlers assume authorization already happened (M5's
             // job) and must not read this field.

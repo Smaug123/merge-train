@@ -110,11 +110,27 @@ pub enum PipelineOutcome {
 #[derive(Debug, PartialEq, Eq)]
 enum PendingWork {
     /// A handler-emitted trigger (`LateAddition` is answered inline and never
-    /// queued).
+    /// queued; `StopTrain` becomes the durable [`PendingWork::Stop`]).
     Trigger(Trigger),
+    /// An authorized stop command, persisted in the `pending_stops` table by
+    /// the delivery's close (an acknowledged stop must survive a crash while
+    /// it waits out an in-flight saga — Codex M5 round 2, P1). `id` is the
+    /// durable row, deleted when the stop applies.
+    Stop { id: i64, pr: PrNumber, force: bool },
     /// Best-effort cleanup for a train the handlers aborted directly
     /// (worktree + final comment/status), run once the saga slot frees.
     AbortCleanup { root: PrNumber },
+    /// A handler `TrainAborted` for the root whose saga is in flight,
+    /// deferred to the observation boundary: committed mid-saga it would
+    /// make `advance` see an inactive train and discard the outcomes of
+    /// effects that already ran (Codex M5 round 2, P1 — the same ordering
+    /// queued stops get). Volatile until applied; a crash loses it, and the
+    /// train is then recovered like any inherited active train (the abort's
+    /// *cause* events are durable, so evaluation re-derives it under M6).
+    DeferredAbort {
+        root: PrNumber,
+        error: crate::types::TrainError,
+    },
 }
 
 /// The per-repo decision core: the Store, the pending-work queue, and the
@@ -133,7 +149,7 @@ pub(crate) struct Processor {
 }
 
 impl Processor {
-    pub fn new(store: Store, deps: WorkerDeps) -> Processor {
+    pub fn new(store: Store, deps: WorkerDeps) -> Result<Processor, StoreError> {
         let inherited_mid_flight: HashSet<PrNumber> = store
             .state()
             .active_trains
@@ -150,13 +166,32 @@ impl Processor {
                  re-issue `start`."
             );
         }
-        Processor {
+
+        // Startup work (Codex M5 round 2): persisted stops that never
+        // reached their observation boundary apply first; then every active
+        // train gets an evaluation, so an acknowledged CI success whose
+        // trigger died with the process still resumes a parked train.
+        // (Inherited non-Idle trains refuse that evaluation until M6 — the
+        // marker above — but parked trains are phase-Idle and resume fine.)
+        let mut pending = VecDeque::new();
+        for (id, pr, force) in store.pending_stops()? {
+            pending.push_back(PendingWork::Stop { id, pr, force });
+        }
+        for train in store.state().active_trains.values() {
+            if train.state.is_active() {
+                pending.push_back(PendingWork::Trigger(Trigger::EvaluateTrain {
+                    root: train.original_root_pr,
+                }));
+            }
+        }
+
+        Ok(Processor {
             store,
             deps,
-            pending: VecDeque::new(),
+            pending,
             in_flight: None,
             inherited_mid_flight,
-        }
+        })
     }
 
     pub fn store_mut(&mut self) -> &mut Store {
@@ -265,7 +300,7 @@ impl Processor {
                     // Handled-by-rejection: close (recording the key) and
                     // tell the commenter. The handler never sees it.
                     self.store
-                        .commit_delivery(&id, &[], key.as_ref(), Utc::now())?;
+                        .commit_delivery(&id, &[], key.as_ref(), &[], Utc::now())?;
                     self.best_effort_github(GitHubEffect::PostComment {
                         pr,
                         body: rejection,
@@ -292,14 +327,53 @@ impl Processor {
             now: Utc::now(),
         };
         let output = handle_event(&event, self.store.state(), &ctx);
-        self.store
-            .commit_delivery(&id, &output.events, key.as_ref(), Utc::now())?;
-        self.clear_inherited_markers(&output.events);
+
+        // Handler aborts for the *in-flight* saga root defer to the
+        // observation boundary: committed now, `advance` would see an
+        // inactive train and discard the outcomes of effects that already
+        // ran (Codex M5 round 2, P1). Aborts for other roots (nothing of
+        // theirs is in flight) commit with the delivery as usual.
+        let mut events = output.events;
+        if let Some(saga_root) = self.in_flight {
+            let mut deferred = Vec::new();
+            events.retain(|e| match e {
+                StateEventPayload::TrainAborted { root_pr, error } if *root_pr == saga_root => {
+                    deferred.push((*root_pr, error.clone()));
+                    false
+                }
+                _ => true,
+            });
+            for (root, error) in deferred {
+                info!(%root, "deferring handler abort to the saga's observation boundary");
+                self.queue(PendingWork::DeferredAbort { root, error });
+            }
+        }
+
+        // Authorized stops persist in the close transaction: the stop may
+        // wait out a multi-minute saga before its observation boundary, and
+        // an acknowledged stop must survive a crash in that window (Codex M5
+        // round 2, P1).
+        let stops: Vec<(PrNumber, bool)> = output
+            .triggers
+            .iter()
+            .filter_map(|t| match t {
+                Trigger::StopTrain { pr, force } => Some((*pr, *force)),
+                _ => None,
+            })
+            .collect();
+
+        let stop_ids =
+            self.store
+                .commit_delivery(&id, &events, key.as_ref(), &stops, Utc::now())?;
+        self.clear_inherited_markers(&events);
+        for (&(pr, force), id) in stops.iter().zip(stop_ids) {
+            self.queue(PendingWork::Stop { id, pr, force });
+        }
 
         // Handler-terminated trains need worker-side cleanup (the engine's
         // own aborts carry cleanup in their plans; handler aborts have no
         // plan).
-        for payload in &output.events {
+        for payload in &events {
             if let StateEventPayload::TrainAborted { root_pr, .. } = payload {
                 self.queue(PendingWork::AbortCleanup { root: *root_pr });
             }
@@ -329,6 +403,8 @@ impl Processor {
                         ),
                     });
                 }
+                // Persisted (and queued) above.
+                Trigger::StopTrain { .. } => {}
                 other => self.queue(PendingWork::Trigger(other)),
             }
         }
@@ -343,7 +419,7 @@ impl Processor {
         key: Option<&DedupeKey>,
         reason: &str,
     ) -> Result<PipelineOutcome, StoreError> {
-        self.store.commit_delivery(id, &[], key, Utc::now())?;
+        self.store.commit_delivery(id, &[], key, &[], Utc::now())?;
         info!(delivery_id = %id, reason, "delivery closed without events");
         Ok(PipelineOutcome::Processed)
     }
@@ -364,7 +440,9 @@ impl Processor {
         let GitHubEvent::IssueComment(comment) = event else {
             return Ok(None);
         };
-        match authorize_by_author(command, comment.author_id, comment.pr_author_id) {
+        // Authorize the *actor* (`sender`): on `created` that is the comment
+        // author; on `edited` it is the editor, who may not be the author.
+        match authorize_by_author(command, comment.sender_id, comment.pr_author_id) {
             AuthorDecision::Allowed => Ok(None),
             AuthorDecision::Denied { reason } => Ok(Some(reason)),
             AuthorDecision::NeedsRole => {
@@ -372,7 +450,7 @@ impl Processor {
                     .deps
                     .github
                     .execute(GitHubEffect::GetCollaboratorPermission {
-                        username: comment.author_login.clone(),
+                        username: comment.sender_login.clone(),
                     });
                 match response {
                     Ok(GitHubResponse::CollaboratorPermission { role }) => {
@@ -504,9 +582,27 @@ impl Processor {
                 PendingWork::Trigger(Trigger::StartTrain { pr }) => {
                     (pr, cascade::start_train(state, pr, now))
                 }
-                PendingWork::Trigger(Trigger::StopTrain { pr, force }) => {
+                PendingWork::Trigger(Trigger::StopTrain { .. }) => {
+                    unreachable!("stops are persisted and queued as PendingWork::Stop")
+                }
+                // No saga is in flight here, so the stop applies now; its
+                // durable row goes with it (delete-after-append: a crash in
+                // between replays the stop harmlessly).
+                PendingWork::Stop { id, pr, force } => {
                     let root = state.train_involving(pr).unwrap_or(pr);
-                    (root, cascade::stop_train(state, pr, force, now))
+                    let plan = cascade::stop_train(state, pr, force, now);
+                    let integrated = match plan {
+                        Ok(plan) => self.integrate_plan(root, plan)?,
+                        Err(e) => {
+                            error!(%root, error = %e, "engine refused to plan");
+                            None
+                        }
+                    };
+                    self.store.delete_pending_stop(id)?;
+                    match integrated {
+                        Some(batch) => return Ok(Some(batch)),
+                        None => continue,
+                    }
                 }
                 PendingWork::Trigger(Trigger::EvaluateTrain { root }) => {
                     if !state
@@ -546,6 +642,22 @@ impl Processor {
                         feedback: false,
                     }));
                 }
+                // A deferred abort whose saga boundary never consumed it
+                // (e.g. the saga ended on a best-effort batch): no effects
+                // are in flight now, so it applies immediately.
+                PendingWork::DeferredAbort { root, error } => {
+                    let (cleanup, _) = self.apply_deferred_aborts(vec![(root, error)])?;
+                    if cleanup.is_empty() {
+                        continue;
+                    }
+                    self.in_flight = Some(root);
+                    return Ok(Some(SagaBatch {
+                        root,
+                        effects: Vec::new(),
+                        best_effort: cleanup,
+                        feedback: false,
+                    }));
+                }
             };
             match plan {
                 Ok(plan) => {
@@ -579,9 +691,11 @@ impl Processor {
             return self.pump();
         }
 
-        // Observation boundary: queued stops act here, so a human's stop
-        // preempts whatever this saga would do next.
+        // Observation boundary: queued stops and deferred handler aborts act
+        // here, so a human's stop (or a handler's abort) preempts whatever
+        // this saga would do next.
         let stops = self.take_queued_stops();
+        let aborts = self.take_deferred_aborts();
 
         // The start-cancel window: a stop naming this saga's root while no
         // train record exists yet means the outcomes in flight are the
@@ -591,11 +705,18 @@ impl Processor {
         // cannot be resolved to the stack — there is no train record yet —
         // and takes the normal path's "no active train" answer; the
         // commenter re-issues once the status comment appears.)
-        if stops.iter().any(|(pr, _)| *pr == root)
+        if stops.iter().any(|(_, pr, _)| *pr == root)
             && self.store.state().train_involving(root).is_none()
         {
-            let others = stops.into_iter().filter(|(pr, _)| *pr != root).collect();
+            let (cancels, others): (Vec<_>, Vec<_>) =
+                stops.into_iter().partition(|(_, pr, _)| *pr == root);
             let (mut cleanup, _) = self.apply_stops(others)?;
+            let (mut abort_cleanup, _) = self.apply_deferred_aborts(aborts)?;
+            cleanup.append(&mut abort_cleanup);
+            // Cancelling the start IS these stops' application.
+            for (id, _, _) in cancels {
+                self.store.delete_pending_stop(id)?;
+            }
             cleanup.push(Effect::GitHub(GitHubEffect::PostComment {
                 pr: root,
                 body: "🛑 Merge train start cancelled.".to_owned(),
@@ -623,14 +744,17 @@ impl Processor {
             }
         };
 
-        let (mut cleanup, stopped_roots) = self.apply_stops(stops)?;
-        if stopped_roots.contains(&root) {
-            // A stop retired this train at the boundary: its planned
-            // continuation must not run. The plan's events are already
-            // durable; an intent among them whose effect never ran is the
-            // same state a crash before dispatch leaves, which the recovery
-            // contract already covers — and a stopped train is never
-            // evaluated anyway.
+        let (mut cleanup, mut retired) = self.apply_stops(stops)?;
+        let (mut abort_cleanup, aborted) = self.apply_deferred_aborts(aborts)?;
+        cleanup.append(&mut abort_cleanup);
+        retired.extend(aborted);
+        if retired.contains(&root) {
+            // A stop or deferred abort retired this train at the boundary:
+            // its planned continuation must not run. The plan's events are
+            // already durable; an intent among them whose effect never ran
+            // is the same state a crash before dispatch leaves, which the
+            // recovery contract already covers — and a retired train is
+            // never evaluated anyway.
             self.in_flight = None;
             return self.finish_or_pump(root, cleanup);
         }
@@ -662,14 +786,13 @@ impl Processor {
         }))
     }
 
-    /// Extracts every queued `StopTrain` trigger, preserving other pending
-    /// work in order.
-    fn take_queued_stops(&mut self) -> Vec<(PrNumber, bool)> {
+    /// Extracts every queued stop, preserving other pending work in order.
+    fn take_queued_stops(&mut self) -> Vec<(i64, PrNumber, bool)> {
         let mut stops = Vec::new();
         let mut remaining = VecDeque::new();
         while let Some(work) = self.pending.pop_front() {
             match work {
-                PendingWork::Trigger(Trigger::StopTrain { pr, force }) => stops.push((pr, force)),
+                PendingWork::Stop { id, pr, force } => stops.push((id, pr, force)),
                 other => remaining.push_back(other),
             }
         }
@@ -677,16 +800,62 @@ impl Processor {
         stops
     }
 
+    /// Extracts every queued deferred handler abort.
+    fn take_deferred_aborts(&mut self) -> Vec<(PrNumber, crate::types::TrainError)> {
+        let mut aborts = Vec::new();
+        let mut remaining = VecDeque::new();
+        while let Some(work) = self.pending.pop_front() {
+            match work {
+                PendingWork::DeferredAbort { root, error } => aborts.push((root, error)),
+                other => remaining.push_back(other),
+            }
+        }
+        self.pending = remaining;
+        aborts
+    }
+
+    /// Applies deferred handler aborts now, returning their best-effort
+    /// cleanup and the roots actually retired. Idempotent: a train that
+    /// completed, stopped, or aborted in the meantime is skipped.
+    fn apply_deferred_aborts(
+        &mut self,
+        aborts: Vec<(PrNumber, crate::types::TrainError)>,
+    ) -> Result<(Vec<Effect>, HashSet<PrNumber>), StoreError> {
+        let mut cleanup = Vec::new();
+        let mut retired = HashSet::new();
+        for (root, error) in aborts {
+            let still_active = self
+                .store
+                .state()
+                .active_trains
+                .get(&root)
+                .is_some_and(|t| t.state.is_active());
+            if !still_active {
+                continue;
+            }
+            let events = vec![StateEventPayload::TrainAborted {
+                root_pr: root,
+                error,
+            }];
+            self.store.append_batch(&events, Utc::now())?;
+            self.clear_inherited_markers(&events);
+            cleanup.extend(cascade::handler_abort_cleanup(self.store.state(), root));
+            retired.insert(root);
+        }
+        Ok((cleanup, retired))
+    }
+
     /// Applies stops now (terminal events only — cheap and safe at an
     /// observation boundary), returning their best-effort cleanup and the
-    /// roots whose trains were actually retired.
+    /// roots whose trains were actually retired. Each stop's durable row is
+    /// deleted after its append (a crash in between replays it harmlessly).
     fn apply_stops(
         &mut self,
-        stops: Vec<(PrNumber, bool)>,
+        stops: Vec<(i64, PrNumber, bool)>,
     ) -> Result<(Vec<Effect>, HashSet<PrNumber>), StoreError> {
         let mut cleanup = Vec::new();
         let mut stopped_roots = HashSet::new();
-        for (pr, force) in stops {
+        for (id, pr, force) in stops {
             let now = Utc::now();
             match cascade::stop_train(self.store.state(), pr, force, now) {
                 Ok(plan) => {
@@ -707,6 +876,7 @@ impl Processor {
                 }
                 Err(e) => error!(%pr, error = %e, "stop_train refused"),
             }
+            self.store.delete_pending_stop(id)?;
         }
         Ok((cleanup, stopped_roots))
     }
@@ -756,18 +926,32 @@ impl Processor {
 /// Marker: the delivery must be released and retried later.
 struct ReleaseDelivery;
 
-/// The command a delivery carries, if the pipeline must authorize one: a
-/// created/edited non-bot comment on a PR whose body parses as a command.
+/// The command a delivery carries, if the pipeline must authorize one.
+///
+/// Start/stop commands fire only from *created* comments — a command is an
+/// utterance, not a state, and honoring edits would both re-run the command
+/// on every unrelated edit (edits re-key dedupe by `updated_at`) and widen
+/// the editor-impersonation hole (Codex M5 round 2, P1). Predecessor
+/// declarations DO live in the comment (editing the declaring comment
+/// legitimately updates or retracts it — the handler's semantics), so those
+/// are authorized on edits too — against the *sender*, who on an edit is
+/// the editor, not the original comment author.
 fn command_in(event: &GitHubEvent, deps: &WorkerDeps) -> Option<(PrNumber, Command)> {
     let GitHubEvent::IssueComment(comment) = event else {
         return None;
     };
-    if comment.author_id == deps.bot_user_id || comment.action == CommentAction::Deleted {
+    if comment.sender_id == deps.bot_user_id {
         return None;
     }
     let pr = comment.pr_number?;
     let command = parse_command(&comment.body, &deps.bot_name)?;
-    Some((pr, command))
+    match comment.action {
+        CommentAction::Created => Some((pr, command)),
+        CommentAction::Edited => {
+            matches!(command, Command::Predecessor(_)).then_some((pr, command))
+        }
+        CommentAction::Deleted => None,
+    }
 }
 
 /// The events that upsert a PR the bot has never seen into the cache, from a

@@ -31,13 +31,14 @@ use thiserror::Error;
 use crate::persistence::event::{StateEvent, StateEventPayload};
 use crate::persistence::snapshot::{PersistedRepoSnapshot, SCHEMA_VERSION};
 use crate::state::RepoState;
+use crate::types::PrNumber;
 use crate::webhooks::dedupe::DedupeKey;
 
 /// Schema version for the SQLite store. Bump on a breaking schema change; a DB
 /// at a different version is rejected loudly rather than mis-read.
 ///
 /// v2 added the `deliveries` and `dedupe_keys` tables (the webhook queue).
-const STORE_SCHEMA_VERSION: i64 = 2;
+const STORE_SCHEMA_VERSION: i64 = 3;
 
 /// Errors from the store.
 #[derive(Debug, Error)]
@@ -374,17 +375,22 @@ impl Store {
         Ok(delivery)
     }
 
-    /// Closes a delivery: appends its final state events, records the dedupe key
-    /// (if any), and marks it `done` — all in one transaction, so the result and
-    /// the close commit together (no window where state advanced but the
-    /// delivery is still open). See `SQLITE_MIGRATION_PLAN.md`.
+    /// Closes a delivery: appends its final state events, records the dedupe
+    /// key (if any), persists any authorized `stops` the delivery carries,
+    /// and marks it `done` — all in one transaction, so the result and the
+    /// close commit together (no window where state advanced but the delivery
+    /// is still open). See `SQLITE_MIGRATION_PLAN.md`.
+    ///
+    /// Returns the `pending_stops` row ids for `stops`, in order — the caller
+    /// deletes each row (`delete_pending_stop`) once the stop is applied.
     pub fn commit_delivery(
         &mut self,
         delivery_id: &str,
         events: &[StateEventPayload],
         dedupe: Option<&DedupeKey>,
+        stops: &[(PrNumber, bool)],
         ts: DateTime<Utc>,
-    ) -> Result<(), StoreError> {
+    ) -> Result<Vec<i64>, StoreError> {
         let mut next_state = self.state.clone();
         let mut seq = self.next_seq;
 
@@ -405,6 +411,14 @@ impl Store {
                 rusqlite::params![key.as_str(), ts.to_rfc3339()],
             )?;
         }
+        let mut stop_ids = Vec::with_capacity(stops.len());
+        for (pr, force) in stops {
+            tx.execute(
+                "INSERT INTO pending_stops (pr, force_stop) VALUES (?1, ?2)",
+                rusqlite::params![pr.0 as i64, *force],
+            )?;
+            stop_ids.push(tx.last_insert_rowid());
+        }
         tx.execute(
             "UPDATE deliveries SET status = 'done' WHERE delivery_id = ?1",
             rusqlite::params![delivery_id],
@@ -413,6 +427,37 @@ impl Store {
 
         self.state = next_state;
         self.next_seq = seq;
+        Ok(stop_ids)
+    }
+
+    /// The persisted stop commands not yet applied, in arrival order.
+    pub fn pending_stops(&self) -> Result<Vec<(i64, PrNumber, bool)>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, pr, force_stop FROM pending_stops ORDER BY id")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                PrNumber(r.get::<_, i64>(1)? as u64),
+                r.get::<_, bool>(2)?,
+            ))
+        })?;
+        let mut stops = Vec::new();
+        for row in rows {
+            stops.push(row?);
+        }
+        Ok(stops)
+    }
+
+    /// Removes an applied stop. Deleting after (not atomically with) the
+    /// stop's event append means a crash in between replays the stop, which
+    /// is harmless: stopping an already-stopped train answers "no active
+    /// train" as a best-effort comment.
+    pub fn delete_pending_stop(&mut self, id: i64) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM pending_stops WHERE id = ?1",
+            rusqlite::params![id],
+        )?;
         Ok(())
     }
 
@@ -546,6 +591,15 @@ fn init_schema(conn: &Connection) -> Result<(), StoreError> {
         CREATE TABLE dedupe_keys (
             key     TEXT PRIMARY KEY,
             seen_at TEXT NOT NULL
+        );
+        -- Authorized stop commands awaiting their observation boundary.
+        -- Inserted in the same transaction as the delivery's close, so an
+        -- acknowledged stop survives a crash while it waits out an
+        -- in-flight saga (Codex M5 round 2). Deleted when applied.
+        CREATE TABLE pending_stops (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            pr         INTEGER NOT NULL,
+            force_stop INTEGER NOT NULL
         );",
     )?;
     // `user_version` is a transactional header write, so the DDL above and this
@@ -684,7 +738,7 @@ mod tests {
             expected.extend(store.append_batch(&batch, ts).unwrap());
             store.enqueue("d1", "pull_request", "{}", b"{}", ts).unwrap();
             store.claim_next_delivery().unwrap().unwrap();
-            store.commit_delivery("d1", &committed, None, ts).unwrap();
+            store.commit_delivery("d1", &committed, None, &[], ts).unwrap();
             expected.extend(committed.iter().enumerate().map(|(i, p)| StateEvent {
                 seq: (singles.len() + batch.len() + i) as u64,
                 ts,
@@ -801,7 +855,7 @@ mod tests {
         assert_eq!(reclaimed.delivery_id, "d1");
 
         // Releasing a closed delivery is a no-op — it must not reopen.
-        store.commit_delivery("d1", &[], None, ts).unwrap();
+        store.commit_delivery("d1", &[], None, &[], ts).unwrap();
         store.release_delivery("d1").unwrap();
         assert!(store.claim_next_delivery().unwrap().is_none());
     }
@@ -842,6 +896,7 @@ mod tests {
                     current_pr: PrNumber(7),
                 }],
                 Some(&key),
+                &[],
                 ts,
             )
             .unwrap();
@@ -902,7 +957,9 @@ mod tests {
         store.enqueue("d1", "status", "{}", b"x", old).unwrap();
         store.claim_next_delivery().unwrap();
         let key = DedupeKey::issue_comment_created(PrNumber(1), CommentId(1));
-        store.commit_delivery("d1", &[], Some(&key), old).unwrap();
+        store
+            .commit_delivery("d1", &[], Some(&key), &[], old)
+            .unwrap();
 
         assert!(store.is_duplicate(&key).unwrap());
         assert_eq!(store.prune_dedupe(cutoff).unwrap(), 1);
