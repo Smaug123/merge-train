@@ -1453,13 +1453,14 @@ fn start_stop_start_sequence_runs_the_final_start() {
     );
 }
 
-/// When the pre-boundary backlog drain stalls (GitHub down while an acked
-/// delivery needs it), the saga outcomes must PARK rather than advance: the
-/// unprocessed delivery may be a stop or topology change, and dispatching
-/// the next batch would run effects past it (Codex M5 round 8). The worker
-/// loop resumes the parked boundary once the stall clears.
+/// Saga outcomes always PARK at arrival: the observation boundary may only
+/// run once the acked backlog has been applied (an unprocessed delivery may
+/// be a stop or topology change — rounds 7/8), and the *main loop* does that
+/// draining one delivery per turn so intake acks stay prompt however deep
+/// the backlog is (round 10). The loop resumes the boundary when its claim
+/// finds the backlog empty; the saga slot stays occupied until then.
 #[test]
-fn stalled_boundary_drain_parks_the_outcomes() {
+fn saga_outcomes_park_until_the_backlog_drains() {
     let (mut world, heads) = World::linear_stack(1);
     let mut processor = world.processor();
     world.enqueue_stack_setup(&mut processor, 1, &heads);
@@ -1470,8 +1471,8 @@ fn stalled_boundary_drain_parks_the_outcomes() {
     let batch = processor.pump().unwrap().expect("start plans preflight");
     let outcomes = execute(&processor, &batch);
 
-    // A stranger's stop needs a role lookup; GitHub goes down before the
-    // boundary, so the drain releases it.
+    // An acked delivery (a stranger's stop, which will need GitHub when
+    // processed) is still waiting when the outcomes arrive.
     let body = comment_body(
         &world.config,
         1,
@@ -1481,10 +1482,7 @@ fn stalled_boundary_drain_parks_the_outcomes() {
         7,
     );
     world.enqueue(&mut processor, "issue_comment", body);
-    world.github.lock().unwrap().unavailable = true;
 
-    let (tx, _rx) = tokio::sync::mpsc::channel(8);
-    let mut stalled = false;
     let mut parked = None;
     let next = super::handle_msg(
         &mut processor,
@@ -1493,18 +1491,15 @@ fn stalled_boundary_drain_parks_the_outcomes() {
             outcomes,
             feedback: batch.feedback,
         },
-        &tx,
-        &mut stalled,
         &mut parked,
     )
     .unwrap();
 
     assert!(
         next.is_none(),
-        "no batch may dispatch past the stalled acked delivery"
+        "no batch may dispatch before the backlog is applied"
     );
-    assert!(stalled, "the drain must adopt the stall");
-    assert!(parked.is_some(), "the boundary must wait for the delivery");
+    assert!(parked.is_some(), "the boundary must wait for the backlog");
     assert!(
         processor.saga_in_flight(),
         "the saga slot stays occupied while the boundary is parked"

@@ -453,7 +453,7 @@ fn run(
                 Ok(msg) => {
                     serviced += 1;
                     stalled = false;
-                    match handle_msg(&mut processor, msg, &tx, &mut stalled, &mut parked) {
+                    match handle_msg(&mut processor, msg, &mut parked) {
                         Ok(Some(batch)) => {
                             if !dispatch(&processor, batch, tx.clone()) {
                                 return fatal_spawn();
@@ -535,7 +535,7 @@ fn run(
             match rx.blocking_recv() {
                 Some(msg) => {
                     stalled = false;
-                    match handle_msg(&mut processor, msg, &tx, &mut stalled, &mut parked) {
+                    match handle_msg(&mut processor, msg, &mut parked) {
                         Ok(Some(batch)) => {
                             if !dispatch(&processor, batch, tx.clone()) {
                                 return fatal_spawn();
@@ -593,20 +593,10 @@ fn fatal(e: StoreError) {
     error!(error = %e, "fatal store error; stopping worker (it will respawn and recover)");
 }
 
-/// Handles one mailbox message; a saga-outcome message may yield the next
-/// batch to execute.
-///
-/// A `SagaOutcomes` message first drains the delivery backlog: a stop acked
-/// while the batch executed is still a raw delivery row at this point, and
-/// feeding the outcomes first would run the boundary without it — letting
-/// one more effect batch (possibly a squash) start under an acknowledged
-/// stop (Codex M5 round 7, P1). A drain that hits GitHub-unavailable sets
-/// `stalled` (and arms the retry timer) exactly like the main loop's claim.
+/// Handles one mailbox message.
 fn handle_msg(
     processor: &mut Processor,
     msg: WorkerMsg,
-    tx: &mpsc::Sender<WorkerMsg>,
-    stalled: &mut bool,
     parked: &mut Option<(PrNumber, Vec<EffectOutcome>, bool)>,
 ) -> Result<Option<SagaBatch>, StoreError> {
     match msg {
@@ -647,35 +637,22 @@ fn handle_msg(
                 None => Ok(None),
             }
         }
+        // Outcomes always PARK; the observation boundary runs only once the
+        // acked backlog has been applied (a waiting stop or topology change
+        // is still a raw delivery row here — rounds 7/8). The main loop's
+        // one-delivery-per-turn cadence does the draining, so intake acks
+        // stay prompt however deep the backlog is (round 10) — the loop's
+        // step (3) resumes the boundary when its claim finds the backlog
+        // empty. The saga slot stays occupied meanwhile: exactly the
+        // in-order pause the release/stall mechanism promises.
         WorkerMsg::SagaOutcomes {
             root,
             outcomes,
             feedback,
         } => {
-            while !*stalled {
-                match processor.claim()? {
-                    Some(delivery) => match processor.process_claimed(delivery)? {
-                        PipelineOutcome::Processed => {}
-                        PipelineOutcome::Released => {
-                            *stalled = true;
-                            schedule_stall_retry(processor.stall_retry_delay(), tx.clone());
-                        }
-                    },
-                    None => break,
-                }
-            }
-            if *stalled {
-                // The drain hit GitHub-unavailable with acked deliveries
-                // still pending; advancing now would run effects past them
-                // (Codex M5 round 8). Park the outcomes — the loop resumes
-                // them once the stall clears and the backlog drains. The
-                // saga slot stays occupied meanwhile, which is exactly the
-                // in-order pause we want.
-                debug_assert!(parked.is_none(), "one saga, one parked slot");
-                *parked = Some((root, outcomes, feedback));
-                return Ok(None);
-            }
-            processor.on_outcomes(root, outcomes, feedback)
+            debug_assert!(parked.is_none(), "one saga, one parked slot");
+            *parked = Some((root, outcomes, feedback));
+            Ok(None)
         }
         // Receiving any message clears the stall in `run`; the timer message
         // exists purely to guarantee one arrives.
@@ -724,6 +701,16 @@ fn dispatch(processor: &Processor, batch: SagaBatch, tx: mpsc::Sender<WorkerMsg>
                 .any(|e| matches!(e, Effect::Git(_)));
             if needs_git && let Err(e) = executor::ensure_clone(&config, clone_url.as_deref()) {
                 warn!(error = %e, "repo clone unavailable; failing the batch as transient");
+                // Best-effort effects fail independently: the API-only ones
+                // (comments, status updates) do not need the clone, so a
+                // clone failure must not suppress them (Codex M5 round 10).
+                for effect in &batch.best_effort {
+                    if let Effect::GitHub(api) = effect
+                        && let Err(e) = github.execute(api.clone())
+                    {
+                        warn!(?effect, error = ?e, "best-effort effect failed (ignored)");
+                    }
+                }
                 // Fail the first observed effect so the engine parks and
                 // re-derives; a best-effort-only batch just reports empty.
                 let outcomes = batch
