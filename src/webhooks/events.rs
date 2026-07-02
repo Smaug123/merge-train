@@ -105,6 +105,13 @@ pub struct IssueCommentEvent {
 
     /// The comment author's login name.
     pub author_login: String,
+
+    /// The *issue's* author's user ID (`issue.user.id`). When the comment is
+    /// on a PR (`pr_number` is `Some`), this is the PR author — the identity
+    /// DESIGN §Command authorization compares the commenter against for
+    /// author-only commands, present in every payload so authorization needs
+    /// no extra API call.
+    pub pr_author_id: u64,
 }
 
 /// Action performed on a pull request.
@@ -486,11 +493,19 @@ mod tests {
             proptest::option::of(1u64..10000u64),
             1u64..10000u64,
             "[a-zA-Z0-9 @#]{0,100}",
-            1u64..1000000u64,
+            (1u64..1000000u64, 1u64..1000000u64),
             "[a-z][a-z0-9]{0,15}",
         )
             .prop_map(
-                |(repo, action, pr_number, comment_id, body, author_id, author_login)| {
+                |(
+                    repo,
+                    action,
+                    pr_number,
+                    comment_id,
+                    body,
+                    (author_id, pr_author_id),
+                    author_login,
+                )| {
                     IssueCommentEvent {
                         repo,
                         action,
@@ -499,6 +514,7 @@ mod tests {
                         body,
                         author_id,
                         author_login,
+                        pr_author_id,
                     }
                 },
             )

@@ -67,7 +67,8 @@ pub enum ParseError {
 ///     },
 ///     "issue": {
 ///         "number": 42,
-///         "pull_request": { "url": "..." }
+///         "pull_request": { "url": "..." },
+///         "user": { "id": 789, "login": "pr-author" }
 ///     },
 ///     "repository": {
 ///         "owner": { "login": "owner" },
@@ -142,6 +143,7 @@ struct RawIssue {
     number: u64,
     // If this field is present, the issue is actually a PR
     pull_request: Option<serde_json::Value>,
+    user: RawUser,
 }
 
 fn parse_issue_comment(payload: &[u8]) -> Result<IssueCommentEvent, ParseError> {
@@ -179,6 +181,7 @@ fn parse_issue_comment(payload: &[u8]) -> Result<IssueCommentEvent, ParseError> 
         body,
         author_id: raw.comment.user.id,
         author_login: raw.comment.user.login,
+        pr_author_id: raw.issue.user.id,
     })
 }
 
@@ -458,7 +461,8 @@ mod tests {
             },
             "issue": {
                 "number": 42,
-                "pull_request": { "url": "https://api.github.com/repos/owner/repo/pulls/42" }
+                "pull_request": { "url": "https://api.github.com/repos/owner/repo/pulls/42" },
+                "user": { "id": 200, "login": "pr-author" }
             },
             "repository": {
                 "owner": { "login": "myorg" },
@@ -478,6 +482,9 @@ mod tests {
                 assert_eq!(e.body, "@merge-train start");
                 assert_eq!(e.author_id, 100);
                 assert_eq!(e.author_login, "octocat");
+                // The PR author comes from issue.user, NOT comment.user —
+                // authorization compares the two.
+                assert_eq!(e.pr_author_id, 200);
             }
             _ => panic!("expected IssueComment"),
         }
@@ -493,7 +500,8 @@ mod tests {
                 "user": { "id": 1, "login": "user" }
             },
             "issue": {
-                "number": 10
+                "number": 10,
+                "user": { "id": 2, "login": "issue-author" }
             },
             "repository": {
                 "owner": { "login": "org" },
@@ -523,7 +531,8 @@ mod tests {
             },
             "issue": {
                 "number": 10,
-                "pull_request": {}
+                "pull_request": {},
+                "user": { "id": 2, "login": "pr-author" }
             },
             "repository": {
                 "owner": { "login": "org" },
@@ -558,7 +567,8 @@ mod tests {
             },
             "issue": {
                 "number": 10,
-                "pull_request": {}
+                "pull_request": {},
+                "user": { "id": 2, "login": "pr-author" }
             },
             "repository": {
                 "owner": { "login": "org" },
@@ -1070,7 +1080,7 @@ mod tests {
         let payload = r#"{
             "action": "created",
             "comment": { "id": 1, "body": "test", "user": { "id": 1, "login": "u" } },
-            "issue": { "number": 1 }
+            "issue": { "number": 1, "user": { "id": 2, "login": "a" } }
         }"#;
         let result = parse_webhook("issue_comment", payload.as_bytes());
         assert!(result.is_err());
@@ -1081,7 +1091,7 @@ mod tests {
         let payload = r#"{
             "action": "invalid_action",
             "comment": { "id": 1, "body": "test", "user": { "id": 1, "login": "u" } },
-            "issue": { "number": 1 },
+            "issue": { "number": 1, "user": { "id": 2, "login": "a" } },
             "repository": { "owner": { "login": "o" }, "name": "r" }
         }"#;
         let result = parse_webhook("issue_comment", payload.as_bytes());

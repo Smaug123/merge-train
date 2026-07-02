@@ -741,6 +741,10 @@ mod tests {
             body: body.to_owned(),
             author_id: author,
             author_login: "alice".to_owned(),
+            // Deliberately never equal to a commenter id used in these tests:
+            // the pure handlers assume authorization already happened (M5's
+            // job) and must not read this field.
+            pr_author_id: 999_999,
         })
     }
 

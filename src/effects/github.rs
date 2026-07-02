@@ -105,6 +105,13 @@ pub enum GitHubEffect {
     /// List all comments on a PR.
     ListComments { pr: PrNumber },
 
+    // ─── Collaborators ────────────────────────────────────────────────────────
+    /// Get a user's role on the repository
+    /// (`GET /repos/{owner}/{repo}/collaborators/{username}/permission`).
+    /// Used by command authorization (DESIGN §Command authorization): `stop`
+    /// requires admin/maintain when the commenter is not the PR author.
+    GetCollaboratorPermission { username: String },
+
     // ─── Repository Settings ──────────────────────────────────────────────────
     /// Get branch protection settings for a branch.
     GetBranchProtection { branch: String },
@@ -133,6 +140,7 @@ impl GitHubEffect {
             | GitHubEffect::GetMergeState { .. }
             | GitHubEffect::RefetchPr { .. }
             | GitHubEffect::ListComments { .. }
+            | GitHubEffect::GetCollaboratorPermission { .. }
             | GitHubEffect::GetBranchProtection { .. }
             | GitHubEffect::GetRulesets
             | GitHubEffect::GetRepoSettings => true,
@@ -219,6 +227,46 @@ pub struct RulesetData {
     pub exclude_patterns: Vec<String>,
 }
 
+/// A user's role on the repository, from the collaborator-permission API's
+/// `role_name` (the granular field — the legacy `permission` field collapses
+/// `maintain` into `write` and would make `stop` unauthorizable for
+/// maintainers).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollaboratorRole {
+    /// Full admin access.
+    Admin,
+    /// Maintainer.
+    Maintain,
+    /// Push access.
+    Write,
+    /// Triage access.
+    Triage,
+    /// Read-only access.
+    Read,
+    /// No access (GitHub reports `none` for users without any role).
+    None,
+    /// A custom repository role (or a role this build doesn't know). Never
+    /// treated as authorized — custom roles have no defined admin/maintain
+    /// semantics we can check.
+    Other(String),
+}
+
+impl CollaboratorRole {
+    /// Parses GitHub's `role_name` string.
+    pub fn from_role_name(role_name: &str) -> CollaboratorRole {
+        match role_name {
+            "admin" => CollaboratorRole::Admin,
+            "maintain" => CollaboratorRole::Maintain,
+            "write" => CollaboratorRole::Write,
+            "triage" => CollaboratorRole::Triage,
+            "read" => CollaboratorRole::Read,
+            "none" => CollaboratorRole::None,
+            other => CollaboratorRole::Other(other.to_owned()),
+        }
+    }
+}
+
 /// Repository settings related to merge methods.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoSettingsData {
@@ -292,6 +340,12 @@ pub enum GitHubResponse {
 
     /// Response to `ListComments`.
     Comments(Vec<CommentData>),
+
+    /// Response to `GetCollaboratorPermission`.
+    CollaboratorPermission {
+        /// The user's role on the repository.
+        role: CollaboratorRole,
+    },
 
     /// Response to `GetBranchProtection` when protection rules were successfully fetched.
     BranchProtection(BranchProtectionData),
