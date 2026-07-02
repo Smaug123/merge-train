@@ -508,6 +508,73 @@ leaves a dirty worktree, which `git::recovery::cleanup_worktree_on_restart`
 
 ## Stage M5 — Per-repo serial worker + server wiring
 
+> **Amendments (2026-07-02, applied during implementation).** The substrate
+> below (EventLog + filesystem spool + Dispatcher/queue) was superseded by
+> the SQLite migration before M5 started: the durable queue is the `Store`'s
+> `deliveries` table and the "worker" is S4's per-repo OS thread that owns
+> the `Store`. The actual files are `src/worker/mod.rs` (registry + thread
+> loop + executor dispatch), `src/worker/pipeline.rs` (`Processor`: the
+> per-delivery pipeline and the saga machine), `src/worker/executor.rs`
+> (`GitHubExec`, `execute_batch`, clone-on-first-use), and
+> `src/worker/authz.rs`. `dispatch.rs`/`queue.rs`/`worker.rs` were never
+> created. Decisions made during implementation:
+>
+> 1. **Off-thread sagas, one per repo.** The worker thread never blocks on
+>    effects: each `StepPlan`'s effects run on a spawned executor thread
+>    whose `EffectOutcome`s return through the worker's own mailbox
+>    (`WorkerMsg::SagaOutcomes`). Deliveries keep processing *mid-saga* —
+>    that is how stops and head-moved observations reach the engine — and
+>    the engine work they trigger queues (`PendingWork`, deduped) for the
+>    single saga slot. Queued **stops run at every observation boundary**,
+>    so a `stop` takes effect after at most one effect batch (DESIGN's
+>    bounded staleness) without any priority queue: `classify_priority`
+>    stays unwired and deliveries process strictly in arrival order.
+> 2. **Atomic close-first.** `Store::commit_delivery` (handler events +
+>    dedupe key + `done`, one transaction) runs *before* handler effects and
+>    engine work, keeping S2's exactly-once intake invariant; everything
+>    irreversible the engine does afterwards is guarded by its own
+>    intent/done ledger, not delivery accounting. Known window: a crash
+>    after the close but before the engine appends `TrainStarted` loses that
+>    start (the user re-issues it); it never double-runs anything.
+> 3. **Stop-during-preflight cancels the saga.** Found by the integration
+>    tests: a `stop` arriving while the start's preflight fetch was in
+>    flight saw no train yet (TrainStarted lands only after preflight),
+>    answered "no active train", and the train then started anyway. A
+>    queued stop whose PR matches the in-flight saga root with no train
+>    record now cancels the saga at the observation boundary.
+> 4. **Command authorization is a two-phase pure decision**
+>    (`worker::authz`): `authorize_by_author` (predecessor/start = PR author
+>    only; identity-only stops) then, only when needed, one
+>    `GetCollaboratorPermission` effect feeding `authorize_by_role` (stop =
+>    author or admin/maintain; `stop --force` = admin only, per DESIGN).
+> 5. **Dedupe collapsed into the Store.** `DedupeKey::for_event` (now
+>    `webhooks::dedupe`; the spool module is deleted) is checked against the
+>    `dedupe_keys` table inside the pipeline; the key commits atomically
+>    with the close. `done` deliveries and dedupe keys share a 7-day
+>    retention, pruned at worker startup and idle boundaries.
+> 6. **Default-branch discovery on first contact:** a fresh store has no
+>    default branch and M6 bootstrap doesn't exist, so the pipeline's first
+>    delivery for a repo emits `GetRepoSettings` and appends the new
+>    `DefaultBranchSet` state event.
+> 7. **Referenced-PR precache:** events referencing unknown PRs emit `GetPr`
+>    and append cache-fill observations (`PrOpened` + state + merge-state)
+>    before handling, so handlers never see an un-cached PR.
+> 8. **GitHub unavailability stalls intake** (correctness over
+>    availability): pre-close pipeline steps that need GitHub (discovery,
+>    authorization, precache) release the delivery back to `pending`
+>    (`Store::release_delivery`) and the worker waits for the next mailbox
+>    message — in-order processing pauses rather than guessing.
+>    `classify_github_error` maps API errors to `EffectError` (405
+>    not-mergeable → `Transient`, park → refetch-adopt).
+> 9. **Crash boundary (iv) as planned:** inherited non-Idle trains are
+>    refused loudly until M6 (`stop` still works). The crash-point oracle
+>    became a sweep that drops and reopens the `Store` at every pipeline
+>    boundary and asserts the final state equals the no-crash run
+>    (`src/worker/tests.rs`); the end-to-end oracle drives a real stacked
+>    train — real git repo, real Store, fake GitHub — to completion and
+>    checks the squash content on `origin/main` and an empty unmatched
+>    intent ledger.
+
 **Dependencies:** M2, M3, M4. **Implements:** DESIGN.md §Per-repo serial
 event processing worker loop, §Event processing flow, §Restart safety steps
 1–4.
