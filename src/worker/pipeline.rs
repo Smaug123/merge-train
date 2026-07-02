@@ -325,8 +325,27 @@ impl Processor {
                     error!(?other, "GetRepoSettings answered the wrong variant");
                     return self.release(&id);
                 }
-                Err(e) => {
+                Err(e @ EffectError::Transient { .. }) => {
                     warn!(error = ?e, "cannot discover default branch; releasing delivery");
+                    return self.release(&id);
+                }
+                // Permanent (token lacks access, repo deleted/renamed):
+                // release too — DELIBERATELY, unlike role lookups. There a
+                // denial is a safe answer; here there is none: without the
+                // default branch nothing can be processed, and closing the
+                // delivery would silently drop webhooks GitHub will never
+                // resend. The repo's queue pauses (retrying at the stall
+                // cadence, which also heals "permanent" auth errors the
+                // moment the operator fixes the token) and this error says
+                // so as loudly as we can.
+                Err(e) => {
+                    error!(
+                        error = ?e,
+                        "cannot discover the default branch and the failure is \
+                         permanent; the repo's queue is PAUSED until discovery \
+                         succeeds — operator action likely required (token \
+                         scopes? repo moved?)"
+                    );
                     return self.release(&id);
                 }
             }

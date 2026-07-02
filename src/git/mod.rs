@@ -176,9 +176,16 @@ pub struct GitConfig {
 }
 
 impl GitConfig {
-    /// Returns the path to the repo directory (owner-repo/).
+    /// Returns the path to the repo directory (`<base>/<owner>/<repo>/`).
+    ///
+    /// Nested, not `owner-repo`: the flat form collapsed distinct
+    /// repositories onto one clone (`a-b/c` and `a/b-c` both gave `a-b-c`),
+    /// letting one repo's worker run git against another's origin (Codex M5
+    /// round 9, P1). Owner and repo are validated path components at intake
+    /// (no separators), so nesting cannot collide; the layout also matches
+    /// the state DB's `<state_dir>/<owner>/<repo>`.
     pub fn repo_dir(&self) -> PathBuf {
-        self.base_dir.join(format!("{}-{}", self.owner, self.repo))
+        self.base_dir.join(&self.owner).join(&self.repo)
     }
 
     /// Returns the path to the shared bare clone.
@@ -435,6 +442,29 @@ pub(crate) fn worktree_path_str(path: &Path) -> GitResult<&str> {
 mod tests {
     use super::*;
 
+    /// `{owner}-{repo}` collapsed distinct repositories onto one clone
+    /// (`a-b/c` and `a/b-c` both gave `a-b-c`), so the second repo's worker
+    /// would fetch and push against the first's origin (Codex M5 round 9,
+    /// P1). Nested directories cannot collide — path separators are
+    /// rejected in owner/repo at intake — and match the state DB's
+    /// `<state_dir>/<owner>/<repo>` layout.
+    #[test]
+    fn repo_dirs_never_collide_across_the_owner_repo_boundary() {
+        let config = |owner: &str, repo: &str| GitConfig {
+            base_dir: PathBuf::from("/repos"),
+            owner: owner.to_owned(),
+            repo: repo.to_owned(),
+            default_branch: "main".to_owned(),
+            worktree_max_age: std::time::Duration::from_secs(1),
+            commit_identity: CommitIdentity {
+                name: "n".to_owned(),
+                email: "e".to_owned(),
+                signing_key: None,
+            },
+        };
+        assert_ne!(config("a-b", "c").repo_dir(), config("a", "b-c").repo_dir());
+    }
+
     /// The credential helper wired into clones (`worker::executor`) reads
     /// `${GITHUB_TOKEN}` at fetch/push time, so `git_command`'s env
     /// allowlist must pass it through to git subprocesses — without it,
@@ -509,19 +539,19 @@ mod tests {
 
         assert_eq!(
             config.repo_dir(),
-            PathBuf::from("/var/lib/merge-train/repos/owner-repo")
+            PathBuf::from("/var/lib/merge-train/repos/owner/repo")
         );
         assert_eq!(
             config.clone_dir(),
-            PathBuf::from("/var/lib/merge-train/repos/owner-repo/clone")
+            PathBuf::from("/var/lib/merge-train/repos/owner/repo/clone")
         );
         assert_eq!(
             config.worktrees_dir(),
-            PathBuf::from("/var/lib/merge-train/repos/owner-repo/worktrees")
+            PathBuf::from("/var/lib/merge-train/repos/owner/repo/worktrees")
         );
         assert_eq!(
             config.worktree_path(PrNumber(123)),
-            PathBuf::from("/var/lib/merge-train/repos/owner-repo/worktrees/stack-123")
+            PathBuf::from("/var/lib/merge-train/repos/owner/repo/worktrees/stack-123")
         );
     }
 
