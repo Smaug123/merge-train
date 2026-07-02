@@ -1534,6 +1534,132 @@ fn command_on_an_unfetchable_pr_is_denied_not_dropped() {
     );
 }
 
+/// A stop for the original root racing the *fan-out boundary* must retire
+/// the trains the fan-out spawns: integrated first, `FanOutCompleted`
+/// removes the old root, the stop resolves to "no active train", and the
+/// continuations the user refused run anyway (Codex M5 round 13). The sweep
+/// injects the stop at every boundary up to and including the fan-out.
+#[test]
+fn stop_on_the_root_retires_fanned_out_trains_at_every_boundary() {
+    // A fan-shaped stack: pr-2 and pr-3 both stack on pr-1, so completing
+    // pr-1 fans out into two new roots.
+    fn fan_world() -> (World, Processor) {
+        let (mut world, heads) = World::linear_stack(1);
+        let mut heads = heads;
+        for i in [2u64, 3] {
+            let head = create_branch_with_file(
+                &world.config,
+                &format!("pr-{i}"),
+                &format!("pr-{i}.txt"),
+                &format!("content {i}"),
+                "pr-1",
+            );
+            create_pr_ref(&world.config, i, &head);
+            world.github.lock().unwrap().prs.insert(
+                PrNumber(i),
+                FakePr {
+                    branch: format!("pr-{i}"),
+                    base_ref: "pr-1".to_owned(),
+                    state: FakePrState::Open,
+                },
+            );
+            heads.push(head);
+        }
+        let mut processor = world.processor();
+        for i in 1..=3u64 {
+            let base = if i == 1 { "main" } else { "pr-1" };
+            let body = pr_opened_body(
+                &world.config,
+                i,
+                &heads[(i - 1) as usize],
+                &format!("pr-{i}"),
+                base,
+            );
+            world.enqueue(&mut processor, "pull_request", body);
+        }
+        for i in [2u64, 3] {
+            let body = comment_body(
+                &world.config,
+                i,
+                "@merge-train predecessor #1",
+                AUTHOR,
+                "author",
+                i,
+            );
+            world.enqueue(&mut processor, "issue_comment", body);
+        }
+        start_command(&mut world, &mut processor, 1);
+        (world, processor)
+    }
+
+    /// Drives to quiescence, injecting a stop for pr-1 while the batch at
+    /// `stop_at` is in flight. Returns the first boundary index at which
+    /// `FanOutCompleted` had been integrated (`None` if never).
+    fn run(world: &mut World, processor: &mut Processor, stop_at: usize) -> Option<usize> {
+        while let Some(delivery) = processor.claim().unwrap() {
+            processor.process_claimed(delivery).unwrap();
+        }
+        let mut fan_boundary = None;
+        let mut boundary = 0;
+        let mut next = processor.pump().unwrap();
+        while let Some(batch) = next {
+            assert!(boundary < 200, "did not quiesce");
+            let outcomes = execute(processor, &batch);
+            if boundary == stop_at {
+                let body = comment_body(&world.config, 1, "@merge-train stop", AUTHOR, "author", 9);
+                world.enqueue(processor, "issue_comment", body);
+                while let Some(delivery) = processor.claim().unwrap() {
+                    processor.process_claimed(delivery).unwrap();
+                }
+            }
+            next = processor
+                .on_outcomes(batch.root, outcomes, batch.feedback)
+                .unwrap();
+            if fan_boundary.is_none() {
+                let events = processor.store_mut().events().unwrap();
+                if events.iter().any(|e| {
+                    matches!(
+                        e.payload,
+                        crate::persistence::event::StateEventPayload::FanOutCompleted { .. }
+                    )
+                }) {
+                    fan_boundary = Some(boundary);
+                }
+            }
+            boundary += 1;
+        }
+        fan_boundary
+    }
+
+    // Discover the fan-out boundary with no stop at all.
+    let (mut world, mut processor) = fan_world();
+    let fan_boundary = run(&mut world, &mut processor, usize::MAX)
+        .expect("the fan stack must fan out when undisturbed");
+
+    for stop_at in 0..=fan_boundary {
+        let (mut world, mut processor) = fan_world();
+        run(&mut world, &mut processor, stop_at);
+        drain(&mut processor);
+
+        assert!(
+            processor
+                .state()
+                .active_trains
+                .values()
+                .all(|t| !t.state.is_active()),
+            "active trains survived a stop at boundary {stop_at}"
+        );
+        let github = world.github.lock().unwrap();
+        for pr in [2u64, 3] {
+            assert_eq!(
+                github.squash_count.get(&PrNumber(pr)).copied().unwrap_or(0),
+                0,
+                "PR #{pr} squashed despite the stop at boundary {stop_at}"
+            );
+        }
+    }
+}
+
 // ─── Referenced-PR precache ───
 
 #[test]

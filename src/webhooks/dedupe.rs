@@ -9,7 +9,7 @@
 //! - `issue_comment.created`: `issue_comment:<pr>:<comment_id>:created`
 //! - `issue_comment.edited`: `issue_comment:<pr>:<comment_id>:edited:<updated_at>:<body-digest>`
 //! - `issue_comment.deleted`: `issue_comment:<pr>:<comment_id>:deleted`
-//! - `pull_request.<action>`: `pull_request:<pr>:<action>:<head_sha>:<updated_at>`
+//! - `pull_request.<action>`: `pull_request:<pr>:<action>:<head_sha>:<merge>:<updated_at>`
 //! - `pull_request.edited`: `pull_request:<pr>:edited:<base>:<updated_at>`
 //! - `check_suite.<action>`: `check_suite:<suite_id>:<action>:<updated_at>`
 //! - `status`: `status:<sha>:<context>:<state>:<updated_at>`
@@ -30,7 +30,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::types::{CommentId, PrNumber, Sha};
-use crate::webhooks::events::{CommentAction, GitHubEvent, PrAction};
+use crate::webhooks::events::{CommentAction, GitHubEvent, MergeStatus, PrAction};
 
 /// A deduplication key that identifies a logical webhook event.
 ///
@@ -78,18 +78,31 @@ impl DedupeKey {
     /// Creates a dedupe key for a `pull_request` event (non-edited).
     ///
     /// The head SHA alone cannot distinguish legitimate repeats (e.g. close →
-    /// reopen → close of the same head), so `updated_at` is part of the key.
+    /// reopen → close of the same head), so `updated_at` is part of the key —
+    /// and because GitHub timestamps are second-resolution, so is the merge
+    /// status: a close → reopen → squash-merge of one head within a second
+    /// must not drop the *merged* close as a duplicate of the unmerged one,
+    /// or the cache never records the merge (Codex M5 round 13). A
+    /// same-second unmerged close → reopen → unmerged close still collapses —
+    /// content-identical events are indistinguishable at this resolution;
+    /// the cache self-heals on the PR's next event.
     pub fn pull_request(
         pr: PrNumber,
         action: &str,
         head_sha: &Sha,
+        merge_status: &MergeStatus,
         updated_at: &DateTime<Utc>,
     ) -> Self {
+        let merged = match merge_status {
+            MergeStatus::Merged { merge_commit_sha } => merge_commit_sha.as_str(),
+            MergeStatus::NotMerged => "unmerged",
+        };
         DedupeKey(format!(
-            "pull_request:{}:{}:{}:{}",
+            "pull_request:{}:{}:{}:{}:{}",
             pr.0,
             action,
             head_sha.as_str(),
+            merged,
             updated_at.to_rfc3339()
         ))
     }
@@ -181,6 +194,7 @@ impl DedupeKey {
                     e.pr_number,
                     action.as_str(),
                     &e.head_sha,
+                    &e.merge_status,
                     &e.updated_at,
                 ),
             }),
@@ -411,8 +425,10 @@ mod tests {
             updated_at2 in arb_datetime(),
         ) {
             prop_assume!(updated_at1 != updated_at2);
-            let key1 = DedupeKey::pull_request(pr, &action, &head_sha, &updated_at1);
-            let key2 = DedupeKey::pull_request(pr, &action, &head_sha, &updated_at2);
+            let key1 =
+                DedupeKey::pull_request(pr, &action, &head_sha, &MergeStatus::NotMerged, &updated_at1);
+            let key2 =
+                DedupeKey::pull_request(pr, &action, &head_sha, &MergeStatus::NotMerged, &updated_at2);
             prop_assert_ne!(key1, key2);
         }
 
@@ -470,8 +486,36 @@ mod tests {
             let event = pr_event(PrAction::Synchronize, pr, head_sha.clone(), updated_at);
             prop_assert_eq!(
                 DedupeKey::for_event(&GitHubEvent::PullRequest(event)),
-                Some(DedupeKey::pull_request(pr, "synchronize", &head_sha, &updated_at))
+                Some(DedupeKey::pull_request(
+                    pr,
+                    "synchronize",
+                    &head_sha,
+                    &MergeStatus::NotMerged,
+                    &updated_at
+                ))
             );
+        }
+
+        /// A close → reopen → squash-merge of one head within one second:
+        /// the merged close must not dedupe against the unmerged one, or
+        /// the cache never records the merge (Codex M5 round 13).
+        #[test]
+        fn same_second_merged_and_unmerged_closes_differ(
+            pr in arb_pr_number(),
+            head in arb_sha(),
+            merge_sha in arb_sha(),
+            updated_at in arb_datetime(),
+        ) {
+            let unmerged =
+                DedupeKey::pull_request(pr, "closed", &head, &MergeStatus::NotMerged, &updated_at);
+            let merged = DedupeKey::pull_request(
+                pr,
+                "closed",
+                &head,
+                &MergeStatus::Merged { merge_commit_sha: merge_sha },
+                &updated_at,
+            );
+            prop_assert_ne!(unmerged, merged);
         }
 
         /// GitHub timestamps are second-resolution, so a title edit followed
@@ -720,12 +764,13 @@ mod tests {
             PrNumber(42),
             "opened",
             &Sha::parse("a".repeat(40)).unwrap(),
+            &MergeStatus::NotMerged,
             &updated_at,
         );
         assert_eq!(
             key.as_str(),
             format!(
-                "pull_request:42:opened:{}:{}",
+                "pull_request:42:opened:{}:unmerged:{}",
                 "a".repeat(40),
                 updated_at.to_rfc3339()
             )

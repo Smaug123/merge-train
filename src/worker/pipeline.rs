@@ -893,9 +893,29 @@ impl Processor {
         // observations, and the store would diverge from reality (Codex M5
         // review, P1). Stops then suppress the *continuation*, which has not
         // run yet and is therefore safe to drop.
+        let mut fanned_into: Vec<PrNumber> = Vec::new();
         let planned = match observe(&outcomes) {
             Ok(obs) => match cascade::advance(self.store.state(), root, obs, Utc::now()) {
-                Ok(plan) => self.integrate_plan(root, plan)?,
+                Ok(plan) => {
+                    // A fan-out retires `root` and spawns new roots; a stop
+                    // for `root` queued during this batch must retire those
+                    // too (below), or it resolves to "no active train" and
+                    // the continuation the user refused runs anyway (Codex
+                    // M5 round 13).
+                    fanned_into = plan
+                        .events
+                        .iter()
+                        .find_map(|e| match e {
+                            StateEventPayload::FanOutCompleted {
+                                old_root,
+                                new_roots,
+                                ..
+                            } if *old_root == root => Some(new_roots.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    self.integrate_plan(root, plan)?
+                }
                 Err(e) => {
                     error!(%root, error = %e, "engine rejected an observation; abandoning step");
                     None
@@ -906,6 +926,29 @@ impl Processor {
                 None
             }
         };
+
+        // Expand a stop naming the just-fanned-out root into stops for every
+        // train the fan-out spawned: the user stopped the cascade before its
+        // continuations existed. (The durable row is shared; deleting it once
+        // per expansion is an idempotent DELETE.)
+        let stops: Vec<QueuedStop> = stops
+            .into_iter()
+            .flat_map(|stop| {
+                if stop.pr == root && !fanned_into.is_empty() {
+                    fanned_into
+                        .iter()
+                        .map(|&new_root| QueuedStop {
+                            id: stop.id,
+                            pr: new_root,
+                            force: stop.force,
+                            cancelled_queued_start: false,
+                        })
+                        .collect()
+                } else {
+                    vec![stop]
+                }
+            })
+            .collect();
 
         let (mut cleanup, mut retired) = self.apply_stops(stops)?;
         let (mut abort_cleanup, aborted) = self.apply_deferred_aborts(aborts)?;
