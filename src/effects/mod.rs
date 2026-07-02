@@ -49,7 +49,7 @@ mod tests {
     #[test]
     fn effect_tag_values() {
         // Git variant
-        let git_effect = Effect::Git(GitEffect::MergeAbort);
+        let git_effect = Effect::Git(GitEffect::CleanupWorktree);
         let json = serde_json::to_string(&git_effect).unwrap();
         assert!(
             json.contains(r#""effect_type":"git""#),

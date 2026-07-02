@@ -10,6 +10,7 @@
 //! that a branch can only be checked out in one worktree at a time. Pushes use
 //! `HEAD:refs/heads/<branch>` refspecs.
 
+pub mod interpreter;
 pub mod merge;
 pub mod push;
 pub mod recovery;
@@ -21,7 +22,7 @@ mod property_tests;
 pub(crate) mod test_support;
 
 // Re-export commonly used types from submodules
-pub use push::{PushIntent, PushResult, is_push_completed};
+pub use push::{PushCompletion, PushIntent, PushResult, is_push_completed};
 
 use std::path::{Path, PathBuf};
 use std::process::Output;
@@ -73,6 +74,27 @@ pub enum GitError {
         descendant_branch: String,
         predecessor_head: Sha,
         descendant_head: Sha,
+    },
+
+    /// The push destination branch no longer exists on the remote: it was
+    /// deleted between the merge and the push. Distinct from an ordinary
+    /// lease rejection (foreign advance) because the cascade's response
+    /// differs — a deleted descendant branch is *skipped*, while a foreign
+    /// advance during reconciliation aborts the train.
+    #[error("push destination refs/heads/{branch} no longer exists on the remote")]
+    PushDestinationGone { branch: String },
+
+    /// A compare-and-swap push was requested whose lease base is not an
+    /// ancestor of HEAD: pushing would discard the base's history if the
+    /// remote still matched it. The push contract requires the lease to be
+    /// the base the pushed merge was computed on — this is a caller bug.
+    #[error(
+        "push lease for {branch} is not an ancestor of HEAD: lease {expected_remote},          HEAD {head}"
+    )]
+    LeaseBaseNotAncestor {
+        branch: String,
+        expected_remote: Sha,
+        head: Sha,
     },
 
     /// Reconciliation refused: the head that was actually squash-merged (per
@@ -353,8 +375,28 @@ pub fn get_parents(workdir: &Path, commit: &str) -> GitResult<Vec<Sha>> {
 pub fn fetch(workdir: &Path, refspecs: &[&str]) -> GitResult<()> {
     let mut args = vec!["fetch", "origin", "--"];
     args.extend(refspecs);
-    run_git_sync(workdir, &args)?;
-    Ok(())
+    match run_git_sync(workdir, &args) {
+        Ok(_) => Ok(()),
+        // A missing remote ref (branch deleted mid-cascade, PR ref GC'd) is a
+        // structured condition the cascade branches on (skip the descendant),
+        // not an opaque command failure. String-matching git's output is only
+        // sound because git_command pins LC_ALL=C.
+        Err(GitError::CommandFailed { stderr, .. })
+            if stderr.contains("couldn't find remote ref") =>
+        {
+            let missing = stderr
+                .lines()
+                .find_map(|l| l.strip_prefix("fatal: couldn't find remote ref "))
+                .unwrap_or("<unknown>")
+                .trim()
+                .to_string();
+            Err(GitError::FetchFailed {
+                refspec: missing,
+                details: stderr,
+            })
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Checkout a target in detached HEAD mode.

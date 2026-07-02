@@ -418,6 +418,52 @@ cleanly via M1 `apply_event`; stop on existing train *always* contains
 
 ## Stage M4 — Git effect interpreter (shell bridge)
 
+> **Amendments (2026-07-02, applied during implementation).**
+>
+> 1. **`interpret` is synchronous** (no `async`, no internal
+>    `spawn_blocking`): the per-repo worker is a dedicated OS thread (the S4
+>    spine), so where blocking git work runs is M5's executor decision. The
+>    "single-threaded tokio does not deadlock" test moves to M5 with the
+>    bridging itself.
+> 2. **Vocabulary honed to the emitted set.** The never-emitted M1-era
+>    variants (`Checkout`, plain `Merge`, `IsAncestor`, `MergeAbort`,
+>    `ResetHard`, `Clean`) and the producer-less `GitResponse::Merge` are
+>    deleted, so the interpreter's match is exhaustive with no wildcard.
+>    `GitEffect::Push` is a **compare-and-swap**: it carries `branch` +
+>    `expected_remote` (the push point's `pre_push_sha`) and the interpreter
+>    pushes with `--force-with-lease=<branch>:<expected>`. A plain push would
+>    silently *re-create* a branch deleted in the merge→push window,
+>    resurrecting a dead descendant (Codex M4 review); the lease makes
+>    deletion and foreign advance both reject as the domain outcome
+>    `Rejected`. Lease soundness (Codex M4 round 2, P1): the lease value is
+>    the **fetched base the merge descends from** (the local
+>    `refs/remotes/origin/<branch>` tracking ref, never a live remote query —
+>    a live query races with concurrent pushes and would lease against a
+>    foreign head, authorizing its clobbering), and `push_head_to_branch`
+>    additionally refuses any lease base that is not an ancestor of HEAD
+>    (`GitError::LeaseBaseNotAncestor` → internal-invariant abort), so the
+>    no-clobber property is machine-enforced, not by-convention. A rejection
+>    whose destination ref no longer exists is diagnosed as the structured
+>    `GitError::PushDestinationGone` → `BranchGone` (Codex M4 round 3):
+>    deletion must take the descendant-skip path, while an ordinary lease
+>    rejection during reconcile/catch-up aborts the train. `is_push_completed` returns
+>    `PushCompletion { completed, remote_head }` to feed the engine's
+>    `PushCheck` response.
+> 3. **`classify_git_error`** (same file) is the fixed `GitError` →
+>    `EffectError` table: missing remote refs → `BranchGone` (`fetch()` now
+>    maps "couldn't find remote ref" to the structured `FetchFailed`); guard
+>    refusals → their exact `Permanent` kinds; malformed inputs/outputs →
+>    `Permanent(InternalInvariantViolation)`; everything uncharacterizable →
+>    `Transient` (park and re-derive; bounded per event).
+> 4. **The oracle is engine ↔ real-git conformance**
+>    (`src/cascade/conformance_tests.rs`): the actual M2 engine loop driven
+>    against real repositories via the real interpreter, with only GitHub
+>    faked (squashes are real squash commits on the bare remote, `RefetchPr`
+>    reads real refs, PR refs mirrored after every effect). This validates
+>    the fidelity of `model_tests`' symbolic world — which properties 1–7
+>    otherwise assume — plus real-git ancestry assertions per descendant.
+>    The squash simulator moved to `git::test_support` for reuse.
+
 **Dependencies:** M1 (parallel with M2/M3). **Implements:** DESIGN.md §Local
 git workflow, interpreter validation requirements documented on
 `GitEffect::MergeReconcile`.
