@@ -282,6 +282,20 @@ fn handle_predecessor_command(
         return HandlerOutput::default();
     }
 
+    // Re-stating the current declaration from a *new* comment transfers
+    // ownership to it — the topology is unchanged, so nothing to validate.
+    // This is also the recovery path after a refused unauthorized
+    // retraction (Codex M5 round 3): if the owning comment was deleted on
+    // GitHub but the bot kept the declaration, the author re-states it in a
+    // live comment and can then edit or delete *that* one.
+    if !declared_by_this_comment && cached.predecessor == Some(predecessor) {
+        return HandlerOutput::event(StateEventPayload::PredecessorDeclared {
+            pr,
+            predecessor,
+            comment_id,
+        });
+    }
+
     // Validate first. If this comment already owns the declaration, an edit
     // *updates* it (the update validator tolerates an existing predecessor);
     // otherwise it's a fresh declaration, which rejects if a predecessor already

@@ -60,7 +60,9 @@ use crate::webhooks::events::CommentAction;
 use crate::webhooks::handlers::{HandlerCtx, Trigger, handle_event};
 use crate::webhooks::{GitHubEvent, parse_webhook};
 
-use super::authz::{AuthorDecision, RoleDecision, authorize_by_author, authorize_by_role};
+use super::authz::{
+    AuthorDecision, RoleDecision, authorize_by_author, authorize_by_role, authorize_retraction,
+};
 use super::executor::{GitHubExec, SagaBatch};
 
 /// Per-repo dependencies the processor needs beyond the `Store`.
@@ -317,6 +319,25 @@ impl Processor {
             if let Err(ReleaseDelivery) = self.precache(&referenced) {
                 return self.release(&id);
             }
+        }
+
+        // Predecessor *retractions* — an edit that no longer declares, or a
+        // deletion of the declaring comment — are topology changes and are
+        // author-only, exactly like declarations (Codex M5 round 3, P1).
+        // Unauthorized: close the delivery without running the handler, so
+        // the declaration stands.
+        if let Some(owner_pr) = retraction_in(&event, self.store.state(), &self.deps)
+            && let GitHubEvent::IssueComment(comment) = &event
+            && let AuthorDecision::Denied { reason } =
+                authorize_retraction(comment.sender_id, comment.pr_author_id)
+        {
+            self.store
+                .commit_delivery(&id, &[], key.as_ref(), &[], Utc::now())?;
+            self.best_effort_github(GitHubEffect::PostComment {
+                pr: owner_pr,
+                body: reason,
+            });
+            return Ok(PipelineOutcome::Processed);
         }
 
         // The pure handler, then the atomic close: events + dedupe key +
@@ -951,6 +972,45 @@ fn command_in(event: &GitHubEvent, deps: &WorkerDeps) -> Option<(PrNumber, Comma
             matches!(command, Command::Predecessor(_)).then_some((pr, command))
         }
         CommentAction::Deleted => None,
+    }
+}
+
+/// The PR whose predecessor declaration this event would *retract*, if any:
+/// a deletion of the declaring comment, or an edit whose new body no longer
+/// declares a predecessor. Mirrors the handler's retraction conditions
+/// exactly (`handle_issue_comment`), so authorization gates precisely what
+/// the handler would do.
+fn retraction_in(
+    event: &GitHubEvent,
+    state: &crate::state::RepoState,
+    deps: &WorkerDeps,
+) -> Option<PrNumber> {
+    let GitHubEvent::IssueComment(comment) = event else {
+        return None;
+    };
+    if comment.sender_id == deps.bot_user_id {
+        return None;
+    }
+    match comment.action {
+        CommentAction::Created => None,
+        // The handler retracts when the *owning* comment's body no longer
+        // parses as a predecessor declaration.
+        CommentAction::Edited => {
+            let pr = comment.pr_number?;
+            let owns = state
+                .prs
+                .get(&pr)
+                .is_some_and(|c| c.predecessor_comment_id == Some(comment.comment_id));
+            let still_declares = matches!(
+                parse_command(&comment.body, &deps.bot_name),
+                Some(Command::Predecessor(_))
+            );
+            (owns && !still_declares).then_some(pr)
+        }
+        // The handler looks the owning PR up by comment id.
+        CommentAction::Deleted => state.prs.iter().find_map(|(pr, cached)| {
+            (cached.predecessor_comment_id == Some(comment.comment_id)).then_some(*pr)
+        }),
     }
 }
 

@@ -75,7 +75,8 @@ pub enum ParseError {
 ///     "repository": {
 ///         "owner": { "login": "owner" },
 ///         "name": "repo"
-///     }
+///     },
+///     "sender": { "id": 456, "login": "octocat" }
 /// }"#;
 ///
 /// let result = parse_webhook("issue_comment", payload);

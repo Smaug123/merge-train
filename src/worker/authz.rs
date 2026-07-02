@@ -116,6 +116,24 @@ pub fn authorize_by_role(command: &Command, role: &CollaboratorRole) -> RoleDeci
     }
 }
 
+/// Decides a predecessor *retraction* — editing the declaring comment so it
+/// no longer declares, or deleting it outright. A retraction changes the
+/// stack topology exactly like a declaration, so it is author-only too, and
+/// no role overrides it (Codex M5 round 3, P1: without this gate, anyone
+/// with comment edit/delete rights could reshape the stack and abort an
+/// active train).
+pub fn authorize_retraction(sender_id: u64, pr_author_id: u64) -> AuthorDecision {
+    if sender_id == pr_author_id {
+        AuthorDecision::Allowed
+    } else {
+        AuthorDecision::Denied {
+            reason: "Only the PR author can retract a predecessor declaration; \
+                     the declaration stands."
+                .to_owned(),
+        }
+    }
+}
+
 /// The command's user-facing spelling, for rejection comments.
 fn command_name(command: &Command) -> &'static str {
     match command {

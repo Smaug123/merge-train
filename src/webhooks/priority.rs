@@ -63,6 +63,8 @@ pub enum EventPriority {
 ///     body: "@merge-train stop".to_string(),
 ///     author_id: 1,
 ///     author_login: "user".to_string(),
+///     sender_id: 1,
+///     sender_login: "user".to_string(),
 ///     pr_author_id: 7,
 ///     updated_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
 /// };

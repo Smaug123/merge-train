@@ -549,6 +549,94 @@ fn edited_predecessor_authorizes_the_editor_not_the_comment_author() {
     );
 }
 
+/// Retracting a predecessor declaration — editing it away or deleting the
+/// declaring comment — is a topology change and is author-only, exactly like
+/// declaring one. Without authorization, anyone with comment edit/delete
+/// rights could reshape the stack and abort an active train (Codex M5
+/// round 3, P1).
+#[test]
+fn stranger_cannot_retract_a_predecessor_declaration() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    drain(&mut processor);
+    // enqueue_stack_setup declared #1 as #2's predecessor via comment id 0
+    // (its ids are taken mod 10).
+    let declared = |p: &Processor| p.state().prs[&PrNumber(2)].predecessor;
+    assert_eq!(declared(&processor), Some(PrNumber(1)));
+
+    // A stranger deletes the author's declaring comment. (A comment can only
+    // be deleted once on real GitHub, so each scenario uses its own comment.)
+    let repo = repo_json(&world.config);
+    let delete_body = move |comment_id: u64, sender_id: u64, sender_login: &str| {
+        format!(
+            r#"{{
+                "action": "deleted",
+                "comment": {{
+                    "id": {comment_id},
+                    "body": null,
+                    "user": {{ "id": {AUTHOR}, "login": "author" }},
+                    "updated_at": "2026-07-01T13:00:00Z"
+                }},
+                "issue": {{
+                    "number": 2,
+                    "pull_request": {{ "url": "..." }},
+                    "user": {{ "id": {AUTHOR}, "login": "author" }}
+                }},
+                "repository": {repo},
+                "sender": {{ "id": {sender_id}, "login": "{sender_login}" }}
+            }}"#,
+        )
+        .into_bytes()
+    };
+    world.enqueue(
+        &mut processor,
+        "issue_comment",
+        delete_body(0, STRANGER, "stranger"),
+    );
+    drain(&mut processor);
+
+    assert_eq!(
+        declared(&processor),
+        Some(PrNumber(1)),
+        "a stranger's deletion must not retract the declaration"
+    );
+    assert!(
+        world
+            .github
+            .lock()
+            .unwrap()
+            .posted_comments
+            .iter()
+            .any(|(pr, text)| *pr == PrNumber(2) && text.contains("Only the PR author")),
+        "expected a denial comment"
+    );
+
+    // The author re-declares in a fresh comment (id 5), then deletes it:
+    // their own retraction proceeds.
+    let body = comment_body(
+        &world.config,
+        2,
+        "@merge-train predecessor #1",
+        AUTHOR,
+        "author",
+        5,
+    );
+    world.enqueue(&mut processor, "issue_comment", body);
+    drain(&mut processor);
+    world.enqueue(
+        &mut processor,
+        "issue_comment",
+        delete_body(5, AUTHOR, "author"),
+    );
+    drain(&mut processor);
+    assert_eq!(
+        declared(&processor),
+        None,
+        "the author's own deletion must retract the declaration"
+    );
+}
+
 #[test]
 fn maintainer_stop_is_authorized_via_role_lookup() {
     let (mut world, heads) = World::linear_stack(2);
