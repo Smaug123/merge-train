@@ -1157,6 +1157,46 @@ fn active_train_is_evaluated_at_startup_without_new_traffic() {
     );
 }
 
+/// The worker loop blocks on its mailbox when a turn does no work — but a
+/// turn whose `claim` came up empty may have just queued the owed startup
+/// evaluations, and with no saga in flight nothing else will ever pump them
+/// (Codex M5 round 7, P1: an active train on a traffic-less repo was never
+/// recovered). `has_queued_work` is the loop's don't-block signal.
+#[test]
+fn startup_evaluation_is_not_stranded_without_traffic() {
+    let (mut world, heads) = World::linear_stack(1);
+    {
+        let mut processor = world.processor();
+        world.enqueue_stack_setup(&mut processor, 1, &heads);
+        drain(&mut processor);
+        processor
+            .store_mut()
+            .append_batch(
+                &[crate::persistence::event::StateEventPayload::TrainStarted {
+                    root_pr: PrNumber(1),
+                    current_pr: PrNumber(1),
+                }],
+                chrono::Utc::now(),
+            )
+            .unwrap();
+    } // crash; no deliveries pending
+
+    // The worker loop's exact turn: pump (nothing queued yet), claim
+    // (empty backlog — queues the owed evaluations)...
+    let mut processor = world.processor();
+    assert!(processor.pump().unwrap().is_none());
+    assert!(processor.claim().unwrap().is_none());
+    // ...and now it must NOT block: the owed work must be visible.
+    assert!(
+        !processor.saga_in_flight() && processor.has_queued_work(),
+        "the loop would block forever despite owing a startup evaluation"
+    );
+    assert!(
+        processor.pump().unwrap().is_some(),
+        "the next pump must start the evaluation"
+    );
+}
+
 /// Startup evaluations must not overtake the durable backlog: a pending
 /// (already-acked) delivery may carry a train-terminating fact — here a
 /// review dismissal — and evaluating first would plan (and possibly execute

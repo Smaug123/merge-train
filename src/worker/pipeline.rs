@@ -248,6 +248,15 @@ impl Processor {
         self.in_flight.is_some()
     }
 
+    /// Whether queued engine work is waiting for the saga slot. The worker
+    /// loop must not block on its mailbox while this is true and the slot is
+    /// free: a turn whose empty `claim` just queued the startup evaluations
+    /// would otherwise strand them until unrelated traffic arrives (Codex M5
+    /// round 7, P1).
+    pub fn has_queued_work(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
     /// Claims the next pending delivery, if any.
     ///
     /// The first time the backlog turns up empty, the startup evaluations

@@ -447,7 +447,7 @@ fn run(
                 Ok(msg) => {
                     serviced += 1;
                     stalled = false;
-                    match handle_msg(&mut processor, msg) {
+                    match handle_msg(&mut processor, msg, &tx, &mut stalled) {
                         Ok(Some(batch)) => {
                             if !dispatch(&processor, batch, tx.clone()) {
                                 return fatal_spawn();
@@ -500,15 +500,21 @@ fn run(
         }
 
         // (4) Nothing to do: prune expired intake bookkeeping, then block
-        // until the next message (or shutdown).
-        if serviced == 0 && !processed {
+        // until the next message (or shutdown). Never block while queued
+        // engine work could pump into a free saga slot — an empty `claim`
+        // may have just queued the owed startup evaluations, and nothing
+        // else would ever run them (Codex M5 round 7, P1).
+        if serviced == 0
+            && !processed
+            && (processor.saga_in_flight() || !processor.has_queued_work())
+        {
             if let Err(e) = prune_expired_intake(&mut processor) {
                 return fatal(e);
             }
             match rx.blocking_recv() {
                 Some(msg) => {
                     stalled = false;
-                    match handle_msg(&mut processor, msg) {
+                    match handle_msg(&mut processor, msg, &tx, &mut stalled) {
                         Ok(Some(batch)) => {
                             if !dispatch(&processor, batch, tx.clone()) {
                                 return fatal_spawn();
@@ -568,7 +574,19 @@ fn fatal(e: StoreError) {
 
 /// Handles one mailbox message; a saga-outcome message may yield the next
 /// batch to execute.
-fn handle_msg(processor: &mut Processor, msg: WorkerMsg) -> Result<Option<SagaBatch>, StoreError> {
+///
+/// A `SagaOutcomes` message first drains the delivery backlog: a stop acked
+/// while the batch executed is still a raw delivery row at this point, and
+/// feeding the outcomes first would run the boundary without it — letting
+/// one more effect batch (possibly a squash) start under an acknowledged
+/// stop (Codex M5 round 7, P1). A drain that hits GitHub-unavailable sets
+/// `stalled` (and arms the retry timer) exactly like the main loop's claim.
+fn handle_msg(
+    processor: &mut Processor,
+    msg: WorkerMsg,
+    tx: &mpsc::Sender<WorkerMsg>,
+    stalled: &mut bool,
+) -> Result<Option<SagaBatch>, StoreError> {
     match msg {
         // `_permit` is held until this arm returns — i.e. until after the
         // enqueue and the `delivery` body have been consumed — then dropped,
@@ -611,7 +629,21 @@ fn handle_msg(processor: &mut Processor, msg: WorkerMsg) -> Result<Option<SagaBa
             root,
             outcomes,
             feedback,
-        } => processor.on_outcomes(root, outcomes, feedback),
+        } => {
+            while !*stalled {
+                match processor.claim()? {
+                    Some(delivery) => match processor.process_claimed(delivery)? {
+                        PipelineOutcome::Processed => {}
+                        PipelineOutcome::Released => {
+                            *stalled = true;
+                            schedule_stall_retry(processor.stall_retry_delay(), tx.clone());
+                        }
+                    },
+                    None => break,
+                }
+            }
+            processor.on_outcomes(root, outcomes, feedback)
+        }
         // Receiving any message clears the stall in `run`; the timer message
         // exists purely to guarantee one arrives.
         WorkerMsg::RetryStalled => Ok(None),
