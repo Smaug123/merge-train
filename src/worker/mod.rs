@@ -27,6 +27,8 @@
 //! it drops in (see `CASCADE_ENGINE_PLAN.md` M5). Until then the worker is the
 //! durable, deduplicated *intake substrate* and nothing more.
 
+pub mod authz;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
