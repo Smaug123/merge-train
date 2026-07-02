@@ -431,6 +431,12 @@ fn run(
         Err(e) => return fatal(e),
     };
     let mut stalled = false;
+    // Outcomes whose observation boundary is waiting out a stall: the
+    // backlog drain before the boundary hit GitHub-unavailable, and
+    // advancing would dispatch effects past an unprocessed acked delivery
+    // (Codex M5 round 8). Fed back once the stall clears and the backlog
+    // drains. At most one saga runs per repo, so one slot suffices.
+    let mut parked: Option<(PrNumber, Vec<EffectOutcome>, bool)> = None;
 
     // Prune once at startup, then again at every idle boundary below, so the
     // intake bookkeeping stays bounded however long the process lives.
@@ -447,7 +453,7 @@ fn run(
                 Ok(msg) => {
                     serviced += 1;
                     stalled = false;
-                    match handle_msg(&mut processor, msg, &tx, &mut stalled) {
+                    match handle_msg(&mut processor, msg, &tx, &mut stalled, &mut parked) {
                         Ok(Some(batch)) => {
                             if !dispatch(&processor, batch, tx.clone()) {
                                 return fatal_spawn();
@@ -494,7 +500,22 @@ fn run(
                         Err(e) => return fatal(e),
                     }
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    // Backlog drained with no stall: a parked observation
+                    // boundary can now run against fully-applied state.
+                    if let Some((root, outcomes, feedback)) = parked.take() {
+                        processed = true;
+                        match processor.on_outcomes(root, outcomes, feedback) {
+                            Ok(Some(batch)) => {
+                                if !dispatch(&processor, batch, tx.clone()) {
+                                    return fatal_spawn();
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(e) => return fatal(e),
+                        }
+                    }
+                }
                 Err(e) => return fatal(e),
             }
         }
@@ -514,7 +535,7 @@ fn run(
             match rx.blocking_recv() {
                 Some(msg) => {
                     stalled = false;
-                    match handle_msg(&mut processor, msg, &tx, &mut stalled) {
+                    match handle_msg(&mut processor, msg, &tx, &mut stalled, &mut parked) {
                         Ok(Some(batch)) => {
                             if !dispatch(&processor, batch, tx.clone()) {
                                 return fatal_spawn();
@@ -586,6 +607,7 @@ fn handle_msg(
     msg: WorkerMsg,
     tx: &mpsc::Sender<WorkerMsg>,
     stalled: &mut bool,
+    parked: &mut Option<(PrNumber, Vec<EffectOutcome>, bool)>,
 ) -> Result<Option<SagaBatch>, StoreError> {
     match msg {
         // `_permit` is held until this arm returns — i.e. until after the
@@ -641,6 +663,17 @@ fn handle_msg(
                     },
                     None => break,
                 }
+            }
+            if *stalled {
+                // The drain hit GitHub-unavailable with acked deliveries
+                // still pending; advancing now would run effects past them
+                // (Codex M5 round 8). Park the outcomes — the loop resumes
+                // them once the stall clears and the backlog drains. The
+                // saga slot stays occupied meanwhile, which is exactly the
+                // in-order pause we want.
+                debug_assert!(parked.is_none(), "one saga, one parked slot");
+                *parked = Some((root, outcomes, feedback));
+                return Ok(None);
             }
             processor.on_outcomes(root, outcomes, feedback)
         }

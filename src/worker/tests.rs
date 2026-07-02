@@ -1381,6 +1381,136 @@ fn stop_cancels_a_queued_not_yet_started_start() {
     );
 }
 
+/// Command sequences must respect utterance order: `start → stop → start`
+/// issued while another saga holds the slot means the stop cancels the
+/// *first* start only, and the final start runs. Two former bugs collapsed
+/// this (Codex M5 round 8): `queue()` deduped the second identical start
+/// away, and stop-cancellation removed queued starts regardless of whether
+/// they were queued before or after the stop.
+#[test]
+fn start_stop_start_sequence_runs_the_final_start() {
+    let (mut world, heads) = World::linear_stack(2);
+    world
+        .github
+        .lock()
+        .unwrap()
+        .prs
+        .get_mut(&PrNumber(2))
+        .unwrap()
+        .base_ref = "main".to_owned();
+    let mut processor = world.processor();
+    for i in 1..=2u64 {
+        let body = pr_opened_body(
+            &world.config,
+            i,
+            &heads[(i - 1) as usize],
+            &format!("pr-{i}"),
+            "main",
+        );
+        world.enqueue(&mut processor, "pull_request", body);
+    }
+    start_command(&mut world, &mut processor, 1);
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+
+    // Train 1's preflight saga occupies the slot.
+    let batch = processor.pump().unwrap().expect("start 1 plans preflight");
+    let outcomes = execute(&processor, &batch);
+
+    // While it runs: start 2, stop 2, start 2 again. (Distinct single-digit
+    // comment ids: comment_body takes them mod 10, and a collision would
+    // dedupe the later comment away.)
+    for (text, id) in [
+        ("@merge-train start", 4),
+        ("@merge-train stop", 5),
+        ("@merge-train start", 6),
+    ] {
+        let body = comment_body(&world.config, 2, text, AUTHOR, "author", id);
+        world.enqueue(&mut processor, "issue_comment", body);
+    }
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+
+    // Feed train 1's outcomes and run everything to quiescence.
+    let mut next = processor
+        .on_outcomes(batch.root, outcomes, batch.feedback)
+        .unwrap();
+    while let Some(batch) = next {
+        let outcomes = execute(&processor, &batch);
+        next = processor
+            .on_outcomes(batch.root, outcomes, batch.feedback)
+            .unwrap();
+    }
+    drive_to_completion(&mut world, &mut processor);
+
+    // The final start ran: PR 2 merged.
+    assert!(
+        processor.state().prs[&PrNumber(2)].state.is_merged(),
+        "the user's final start was lost; trains: {:?}",
+        processor.state().active_trains
+    );
+}
+
+/// When the pre-boundary backlog drain stalls (GitHub down while an acked
+/// delivery needs it), the saga outcomes must PARK rather than advance: the
+/// unprocessed delivery may be a stop or topology change, and dispatching
+/// the next batch would run effects past it (Codex M5 round 8). The worker
+/// loop resumes the parked boundary once the stall clears.
+#[test]
+fn stalled_boundary_drain_parks_the_outcomes() {
+    let (mut world, heads) = World::linear_stack(1);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 1, &heads);
+    start_command(&mut world, &mut processor, 1);
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+    let batch = processor.pump().unwrap().expect("start plans preflight");
+    let outcomes = execute(&processor, &batch);
+
+    // A stranger's stop needs a role lookup; GitHub goes down before the
+    // boundary, so the drain releases it.
+    let body = comment_body(
+        &world.config,
+        1,
+        "@merge-train stop",
+        STRANGER,
+        "stranger",
+        7,
+    );
+    world.enqueue(&mut processor, "issue_comment", body);
+    world.github.lock().unwrap().unavailable = true;
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let mut stalled = false;
+    let mut parked = None;
+    let next = super::handle_msg(
+        &mut processor,
+        WorkerMsg::SagaOutcomes {
+            root: batch.root,
+            outcomes,
+            feedback: batch.feedback,
+        },
+        &tx,
+        &mut stalled,
+        &mut parked,
+    )
+    .unwrap();
+
+    assert!(
+        next.is_none(),
+        "no batch may dispatch past the stalled acked delivery"
+    );
+    assert!(stalled, "the drain must adopt the stall");
+    assert!(parked.is_some(), "the boundary must wait for the delivery");
+    assert!(
+        processor.saga_in_flight(),
+        "the saga slot stays occupied while the boundary is parked"
+    );
+}
+
 // ─── Referenced-PR precache ───
 
 #[test]

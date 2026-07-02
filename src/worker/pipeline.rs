@@ -135,6 +135,15 @@ enum PendingWork {
     },
 }
 
+/// A stop extracted at an observation boundary, with the durable row id and
+/// whether it consumed a start that was still queued (never started).
+struct QueuedStop {
+    id: i64,
+    pr: PrNumber,
+    force: bool,
+    cancelled_queued_start: bool,
+}
+
 /// The per-repo decision core: the Store, the pending-work queue, and the
 /// in-flight saga marker. Execution of effects happens outside.
 pub(crate) struct Processor {
@@ -642,9 +651,21 @@ impl Processor {
 
     /// Queues engine work, coalescing duplicates.
     fn queue(&mut self, work: PendingWork) {
-        if !self.pending.contains(&work) {
-            self.pending.push_back(work);
+        // Coalesce only *idempotent* work (re-evaluating or re-cleaning the
+        // same root twice is one evaluation). User commands are utterances:
+        // deduping a second `start` while an earlier identical one is queued
+        // collapses `start -> stop -> start` into `start -> stop`, silently
+        // losing the final start (Codex M5 round 8).
+        let idempotent = matches!(
+            work,
+            PendingWork::Trigger(Trigger::EvaluateTrain { .. })
+                | PendingWork::AbortCleanup { .. }
+                | PendingWork::DeferredAbort { .. }
+        );
+        if idempotent && self.pending.contains(&work) {
+            return;
         }
+        self.pending.push_back(work);
     }
 
     /// Inherited-marker upkeep: a root stays refused only while the inherited
@@ -805,17 +826,15 @@ impl Processor {
         // cannot be resolved to the stack — there is no train record yet —
         // and takes the normal path's "no active train" answer; the
         // commenter re-issues once the status comment appears.)
-        if stops.iter().any(|(_, pr, _)| *pr == root)
-            && self.store.state().train_involving(root).is_none()
+        if stops.iter().any(|s| s.pr == root) && self.store.state().train_involving(root).is_none()
         {
-            let (cancels, others): (Vec<_>, Vec<_>) =
-                stops.into_iter().partition(|(_, pr, _)| *pr == root);
+            let (cancels, others): (Vec<_>, Vec<_>) = stops.into_iter().partition(|s| s.pr == root);
             let (mut cleanup, _) = self.apply_stops(others)?;
             let (mut abort_cleanup, _) = self.apply_deferred_aborts(aborts)?;
             cleanup.append(&mut abort_cleanup);
             // Cancelling the start IS these stops' application.
-            for (id, _, _) in cancels {
-                self.store.delete_pending_stop(id)?;
+            for stop in cancels {
+                self.store.delete_pending_stop(stop.id)?;
             }
             cleanup.push(Effect::GitHub(GitHubEffect::PostComment {
                 pr: root,
@@ -887,16 +906,33 @@ impl Processor {
     }
 
     /// Extracts every queued stop, preserving other pending work in order.
-    fn take_queued_stops(&mut self) -> Vec<(i64, PrNumber, bool)> {
-        let mut stops = Vec::new();
-        let mut remaining = VecDeque::new();
-        while let Some(work) = self.pending.pop_front() {
+    ///
+    /// Each stop also consumes any not-yet-started `StartTrain` for its PR
+    /// queued *before* it — the stop arrived after that start and must
+    /// suppress it, or the train starts anyway once the slot frees (Codex M5
+    /// round 6). Starts queued *after* a stop are the user starting anew and
+    /// survive (Codex M5 round 8).
+    fn take_queued_stops(&mut self) -> Vec<QueuedStop> {
+        let mut stops: Vec<QueuedStop> = Vec::new();
+        let mut kept: VecDeque<PendingWork> = VecDeque::new();
+        for work in std::mem::take(&mut self.pending) {
             match work {
-                PendingWork::Stop { id, pr, force } => stops.push((id, pr, force)),
-                other => remaining.push_back(other),
+                PendingWork::Stop { id, pr, force } => {
+                    let before = kept.len();
+                    kept.retain(|w| {
+                        !matches!(w, PendingWork::Trigger(Trigger::StartTrain { pr: p }) if *p == pr)
+                    });
+                    stops.push(QueuedStop {
+                        id,
+                        pr,
+                        force,
+                        cancelled_queued_start: kept.len() != before,
+                    });
+                }
+                other => kept.push_back(other),
             }
         }
-        self.pending = remaining;
+        self.pending = kept;
         stops
     }
 
@@ -951,24 +987,23 @@ impl Processor {
     /// deleted after its append (a crash in between replays it harmlessly).
     fn apply_stops(
         &mut self,
-        stops: Vec<(i64, PrNumber, bool)>,
+        stops: Vec<QueuedStop>,
     ) -> Result<(Vec<Effect>, HashSet<PrNumber>), StoreError> {
         let mut cleanup = Vec::new();
         let mut stopped_roots = HashSet::new();
-        for (id, pr, force) in stops {
-            // A start for this PR still queued behind the saga slot has no
-            // train record yet; the stop suppresses the queued start itself,
-            // or it would answer "no active train" and the train would then
-            // start anyway (Codex M5 round 6 — the stop-during-preflight
-            // race, one step earlier in the queue).
-            let before = self.pending.len();
-            self.pending.retain(
-                |w| !matches!(w, PendingWork::Trigger(Trigger::StartTrain { pr: p }) if *p == pr),
-            );
-            if self.pending.len() != before && self.store.state().train_involving(pr).is_none() {
+        for QueuedStop {
+            id,
+            pr,
+            force,
+            cancelled_queued_start,
+        } in stops
+        {
+            // A stop that consumed a queued (not-yet-started) start for a PR
+            // with no train record is fully answered by that cancellation.
+            if cancelled_queued_start && self.store.state().train_involving(pr).is_none() {
                 cleanup.push(Effect::GitHub(GitHubEffect::PostComment {
                     pr,
-                    body: "🛑 Merge train start cancelled.".to_owned(),
+                    body: "\u{1f6d1} Merge train start cancelled.".to_owned(),
                 }));
                 self.store.delete_pending_stop(id)?;
                 continue;
