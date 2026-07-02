@@ -8,6 +8,20 @@ use octocrab::Octocrab;
 
 use crate::types::RepoId;
 
+/// Builds the bare octocrab client the bot uses everywhere: token auth with
+/// octocrab's HTTP-layer retry **disabled**. That retry re-sends requests on
+/// 5xx/transport errors, which duplicates non-idempotent operations
+/// (`PostComment`, `SquashMerge`) underneath the interpreter's per-effect
+/// retry policy — every production client must come from here so the
+/// invariant lives in one place (Codex M5 round 4, P1: `main.rs` built its
+/// own client and left the default `RetryConfig::Simple(3)` on).
+pub fn build_octocrab(token: impl Into<String>) -> Result<Octocrab, octocrab::Error> {
+    Octocrab::builder()
+        .personal_token(token.into())
+        .add_retry_config(octocrab::service::middleware::retry::RetryConfig::None)
+        .build()
+}
+
 /// A GitHub API client scoped to a specific repository.
 ///
 /// All operations performed through this client target the same repository,
@@ -36,11 +50,7 @@ impl OctocrabClient {
     ///
     /// This is a convenience method for creating a client with token authentication.
     pub fn from_token(token: impl Into<String>, repo: RepoId) -> Result<Self, octocrab::Error> {
-        let client = Octocrab::builder()
-            .personal_token(token.into())
-            .add_retry_config(octocrab::service::middleware::retry::RetryConfig::None)
-            .build()?;
-        Ok(Self::new(client, repo))
+        Ok(Self::new(build_octocrab(token)?, repo))
     }
 
     /// Returns a reference to the underlying octocrab client.

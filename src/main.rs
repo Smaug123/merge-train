@@ -141,10 +141,10 @@ async fn main() {
         }
     };
 
-    let octocrab = match octocrab::Octocrab::builder()
-        .personal_token(config.github_token.clone())
-        .build()
-    {
+    // build_octocrab disables octocrab's HTTP-layer retry — required, or
+    // 5xx/transport errors replay non-idempotent effects (squash merges!)
+    // underneath the interpreter's per-effect retry policy.
+    let octocrab = match merge_train::github::build_octocrab(config.github_token.clone()) {
         Ok(client) => client,
         Err(e) => {
             eprintln!("fatal: cannot build the GitHub client: {e}");

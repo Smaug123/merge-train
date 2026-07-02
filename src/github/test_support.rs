@@ -49,6 +49,9 @@ pub struct FakeGitHub {
     pub posted_comments: Vec<(PrNumber, String)>,
     /// Outage injection: while set, every effect fails `Transient`.
     pub unavailable: bool,
+    /// While set, `GetCollaboratorPermission` fails `Permanent` (e.g. the
+    /// token lacks the scope for the collaborators API).
+    pub permission_lookup_broken: bool,
     /// `GetRepoSettings` attempts (including failed ones), for asserting the
     /// worker's stall-retry behaviour.
     pub settings_fetches: u32,
@@ -64,6 +67,7 @@ impl FakeGitHub {
             roles: HashMap::new(),
             posted_comments: Vec::new(),
             unavailable: false,
+            permission_lookup_broken: false,
             settings_fetches: 0,
         }
     }
@@ -196,6 +200,12 @@ impl FakeGitHub {
             GitHubEffect::GetPr { pr } => Ok(GitHubResponse::Pr(self.pr_data(*pr).0)),
 
             GitHubEffect::GetCollaboratorPermission { username } => {
+                if self.permission_lookup_broken {
+                    return Err(EffectError::Permanent {
+                        kind: TrainErrorKind::ApiError,
+                        detail: "permission lookup broken (test-injected)".to_owned(),
+                    });
+                }
                 Ok(GitHubResponse::CollaboratorPermission {
                     role: self
                         .roles

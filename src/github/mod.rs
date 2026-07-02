@@ -16,7 +16,7 @@ mod retry;
 #[cfg(test)]
 pub mod test_support;
 
-pub use client::OctocrabClient;
+pub use client::{OctocrabClient, build_octocrab};
 pub use error::{GitHubApiError, GitHubErrorKind};
 pub use interpreter::{
     classify_github_error, interpret_github_effect, is_sha_mismatch_error, resolve_merge_state,

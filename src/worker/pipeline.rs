@@ -480,15 +480,37 @@ impl Processor {
                             RoleDecision::Denied { reason } => Ok(Some(reason)),
                         }
                     }
-                    Ok(other) => {
-                        error!(?other, "permission lookup answered the wrong variant");
-                        Err(ReleaseDelivery)
-                    }
-                    Err(e) => {
-                        // Fail closed but retriable: an outage must neither
-                        // grant admin rights nor permanently swallow a stop.
+                    // Transient (outage): release for the stall-retry loop —
+                    // an outage must neither grant admin rights nor
+                    // permanently swallow a stop.
+                    Err(e @ EffectError::Transient { .. }) => {
                         warn!(error = ?e, "cannot verify commenter role; releasing delivery");
                         Err(ReleaseDelivery)
+                    }
+                    // Permanent (bad token scope, API change) or a wrong
+                    // response variant: retrying cannot help, and a released
+                    // delivery would retry at the front of the queue forever,
+                    // wedging the repo (Codex M5 round 4). Fail closed: deny
+                    // the command.
+                    Err(e) => {
+                        error!(error = ?e, "permission lookup failed permanently; denying");
+                        Ok(Some(
+                            "The bot cannot verify your repository permissions \
+                             (permission lookup failed permanently — check the bot \
+                             token's scopes); refusing the command."
+                                .to_owned(),
+                        ))
+                    }
+                    Ok(other) => {
+                        error!(
+                            ?other,
+                            "permission lookup answered the wrong variant; denying"
+                        );
+                        Ok(Some(
+                            "The bot cannot verify your repository permissions; \
+                             refusing the command."
+                                .to_owned(),
+                        ))
                     }
                 }
             }
@@ -554,10 +576,32 @@ impl Processor {
         Ok(())
     }
 
-    /// Executes a GitHub effect, logging (never propagating) failures.
+    /// Executes a fire-and-forget GitHub effect (ack reactions, rejection
+    /// comments) on a detached thread: nothing reads the response, and a
+    /// slow or unavailable GitHub must not stall the worker loop — intake
+    /// acks and observation boundaries run on this thread (Codex M5
+    /// round 4). Failures are logged, never propagated.
+    ///
+    /// The fake runs inline: it is in-memory (nothing to block on), and the
+    /// synchronous test harness asserts on its state right after the call.
     fn best_effort_github(&self, effect: GitHubEffect) {
-        if let Err(e) = self.deps.github.execute(effect) {
-            warn!(error = ?e, "best-effort GitHub effect failed (ignored)");
+        let github = self.deps.github.clone();
+        #[cfg(test)]
+        if matches!(github, GitHubExec::Fake(_)) {
+            if let Err(e) = github.execute(effect) {
+                warn!(error = ?e, "best-effort GitHub effect failed (ignored)");
+            }
+            return;
+        }
+        let spawned = std::thread::Builder::new()
+            .name("best-effort-github".to_owned())
+            .spawn(move || {
+                if let Err(e) = github.execute(effect) {
+                    warn!(error = ?e, "best-effort GitHub effect failed (ignored)");
+                }
+            });
+        if spawned.is_err() {
+            warn!("failed to spawn the best-effort effect thread; effect dropped");
         }
     }
 

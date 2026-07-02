@@ -722,6 +722,47 @@ fn stranger_without_role_cannot_stop() {
     );
 }
 
+/// A *permanent* permission-lookup failure (bad token scope, API changes)
+/// must fail closed — deny the command and close the delivery — not release
+/// it: a released delivery goes back to the front of the queue and retries
+/// forever, wedging every later delivery for the repo (Codex M5 round 4).
+/// Transient failures still release (the stall-retry loop covers them).
+#[test]
+fn permanent_permission_lookup_failure_fails_closed() {
+    let (mut world, heads) = World::linear_stack(2);
+    world.github.lock().unwrap().permission_lookup_broken = true;
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+
+    // A stranger's stop needs a role lookup, which fails Permanent.
+    let body = comment_body(
+        &world.config,
+        1,
+        "@merge-train stop",
+        STRANGER,
+        "stranger",
+        98,
+    );
+    world.enqueue(&mut processor, "issue_comment", body);
+    while let Some(delivery) = processor.claim().unwrap() {
+        assert_eq!(
+            processor.process_claimed(delivery).unwrap(),
+            PipelineOutcome::Processed,
+            "a permanent lookup failure must close the delivery, not release it"
+        );
+    }
+
+    let github = world.github.lock().unwrap();
+    assert!(
+        github
+            .posted_comments
+            .iter()
+            .any(|(_, text)| text.contains("cannot verify")),
+        "expected a fail-closed denial, got {:?}",
+        github.posted_comments
+    );
+}
+
 // ─── Stop honored at an observation boundary ───
 
 #[test]
