@@ -430,6 +430,11 @@ impl RepoState {
             | StateEventPayload::DonePushCatchup { .. }
             | StateEventPayload::IntentRetarget { .. } => {}
 
+            // ─── Repo facts ───
+            StateEventPayload::DefaultBranchSet { branch } => {
+                self.default_branch = branch.clone();
+            }
+
             // ─── Engine observations: CI / review / descendant-skip events
             // drive the planner's decisions (M2+) and the train's progress
             // (carried wholesale on `PhaseTransition`), not the materialized PR

@@ -21,6 +21,7 @@ mod conformance_tests;
 mod model_tests;
 
 pub use engine::{MAX_TRAIN_SIZE, advance, recover_train, start_train, stop_train};
+pub(crate) use engine::handler_abort_cleanup;
 pub use observe::{ObserveError, observe};
 pub use plan::{
     CascadeError, Control, EffectError, EffectOutcome, EffectResponse, IntentFact, Observation,

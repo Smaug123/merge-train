@@ -745,6 +745,7 @@ mod tests {
             // the pure handlers assume authorization already happened (M5's
             // job) and must not read this field.
             pr_author_id: 999_999,
+            updated_at: ts(),
         })
     }
 
@@ -759,6 +760,7 @@ mod tests {
             head_branch: format!("feature-{number}"),
             is_draft: false,
             author_id: 1,
+            updated_at: ts(),
         })
     }
 
@@ -771,6 +773,7 @@ mod tests {
             reviewer_id: 1,
             reviewer_login: "bob".to_owned(),
             body: String::new(),
+            review_id: 11,
         })
     }
 
@@ -1119,6 +1122,7 @@ mod tests {
                 context: "ci/test".to_owned(),
                 description: None,
                 target_url: None,
+                updated_at: ts(),
             }),
             &state,
             &ctx(),
@@ -1209,6 +1213,8 @@ mod tests {
                 head_sha: sha(),
                 conclusion: Some(CheckSuiteConclusion::Success),
                 pull_requests: vec![],
+                suite_id: 5,
+                updated_at: ts(),
             })
         };
         assert!(
@@ -1305,6 +1311,7 @@ mod tests {
                 context: "ci".to_owned(),
                 description: None,
                 target_url: None,
+                updated_at: ts(),
             }),
             &state,
             &ctx(),
@@ -1323,6 +1330,8 @@ mod tests {
                 head_sha: sha(),
                 conclusion: Some(CheckSuiteConclusion::TimedOut),
                 pull_requests: vec![],
+                suite_id: 5,
+                updated_at: ts(),
             }),
             &state,
             &ctx(),
@@ -1436,6 +1445,8 @@ mod tests {
                 head_sha: sha(),
                 conclusion: Some(CheckSuiteConclusion::Success),
                 pull_requests: vec![],
+                suite_id: 5,
+                updated_at: ts(),
             }),
             &state,
             &ctx(),
@@ -1512,6 +1523,7 @@ mod tests {
                 context: "ci".to_owned(),
                 description: None,
                 target_url: None,
+                updated_at: ts(),
             })
         };
 
@@ -1581,6 +1593,8 @@ mod tests {
                 head_sha: other_head,
                 conclusion: Some(CheckSuiteConclusion::Success),
                 pull_requests: vec![PrNumber(1)],
+                suite_id: 5,
+                updated_at: ts(),
             }),
             &state,
             &ctx(),
@@ -1665,6 +1679,7 @@ mod tests {
             head_branch: "feature-1".to_owned(),
             is_draft: true,
             author_id: 1,
+            updated_at: ts(),
         });
         let out = handle_event(&event, &state, &ctx());
         assert!(

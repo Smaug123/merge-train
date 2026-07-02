@@ -2246,6 +2246,36 @@ fn abort_too_large(ctx: &Ctx<'_>) -> StepPlan {
     }
 }
 
+/// Best-effort cleanup for a train the *handlers* terminated directly — M3
+/// emits `TrainAborted` itself on review dismissal or a topology change, so
+/// no engine plan carries the cleanup tail `abort_plan` would attach. The
+/// worker calls this after applying such events, with the aborted record
+/// already in the state, and runs the result as a best-effort batch.
+pub(crate) fn handler_abort_cleanup(state: &RepoState, root: PrNumber) -> Vec<Effect> {
+    let Some(record) = state.active_trains.get(&root) else {
+        return Vec::new();
+    };
+    let TrainState::Aborted { error, .. } = &record.state else {
+        return Vec::new();
+    };
+
+    let mut effects = vec![
+        Effect::Git(GitEffect::CleanupWorktree),
+        comment(
+            record.current_pr,
+            format!(
+                "🛑 Merge train aborted: {}\n\nFix the issue and re-issue \
+                 `@merge-train start` on #{root} to retry.",
+                error.message
+            ),
+        ),
+    ];
+    if let Ok(Some(update)) = status_effect(record, &format!("🛑 Aborted: {}", error.message)) {
+        effects.push(update);
+    }
+    effects
+}
+
 /// The status-comment update effect for a record, if the train has a comment.
 fn status_effect(
     record: &TrainRecord,

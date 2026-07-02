@@ -450,6 +450,18 @@ pub enum StateEventPayload {
         reason: String,
     },
 
+    // ─── Repo facts ───
+    /// The repository's default branch, as reported by repo settings. Emitted
+    /// by the worker's first-contact discovery (M5) — a fresh store has an
+    /// empty `default_branch`, and every root/base decision reads it — and by
+    /// bootstrap (M6). Re-emission is an idempotent overwrite, so a renamed
+    /// default branch is picked up by the next discovery.
+    #[serde(rename = "default_branch_set")]
+    DefaultBranchSet {
+        /// The default branch name (e.g. "main").
+        branch: String,
+    },
+
     // ─── CI/Review events (non-critical, for cache updates) ───
     /// A check suite has completed.
     #[serde(rename = "check_suite_completed")]
@@ -526,6 +538,10 @@ impl StateEventPayload {
 
             // Fan-out (atomic train record updates)
             StateEventPayload::FanOutCompleted { .. } => true,
+
+            // Repo facts: command interpretation and root detection read the
+            // default branch, so it must not be lost once acted upon.
+            StateEventPayload::DefaultBranchSet { .. } => true,
 
             // Observational events (not critical for recovery)
             StateEventPayload::StatusCommentPosted { .. }

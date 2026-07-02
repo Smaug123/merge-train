@@ -21,8 +21,8 @@
 //!
 //! # TTL-based Expiration
 //!
-//! Seen dedupe keys are stored in the snapshot with timestamps. Keys older than
-//! the retention period (default 24 hours) are pruned to prevent unbounded growth.
+//! Seen dedupe keys live in the Store's `dedupe_keys` table with the time
+//! first seen; `Store::prune_dedupe` removes keys past the retention period.
 
 use std::fmt;
 
@@ -30,6 +30,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::types::{CommentId, PrNumber, Sha};
+use crate::webhooks::events::{CommentAction, GitHubEvent, PrAction};
 
 /// A deduplication key that identifies a logical webhook event.
 ///
@@ -136,6 +137,51 @@ impl DedupeKey {
         ))
     }
 
+    /// The dedupe key for a parsed webhook event, or `None` for events with
+    /// no dedupe identity (a comment on a plain issue — the bot ignores it,
+    /// so duplicate handling is moot).
+    pub fn for_event(event: &GitHubEvent) -> Option<DedupeKey> {
+        match event {
+            GitHubEvent::IssueComment(e) => {
+                let pr = e.pr_number?;
+                Some(match e.action {
+                    CommentAction::Created => DedupeKey::issue_comment_created(pr, e.comment_id),
+                    CommentAction::Edited => {
+                        DedupeKey::issue_comment_edited(pr, e.comment_id, &e.updated_at)
+                    }
+                    CommentAction::Deleted => DedupeKey::issue_comment_deleted(pr, e.comment_id),
+                })
+            }
+            // Edits don't necessarily change the head SHA (base retarget,
+            // title change), so the edited key deliberately omits it.
+            GitHubEvent::PullRequest(e) => Some(match e.action {
+                PrAction::Edited => DedupeKey::pull_request_edited(e.pr_number, &e.updated_at),
+                action => DedupeKey::pull_request(
+                    e.pr_number,
+                    action.as_str(),
+                    &e.head_sha,
+                    &e.updated_at,
+                ),
+            }),
+            GitHubEvent::CheckSuite(e) => Some(DedupeKey::check_suite(
+                e.suite_id,
+                e.action.as_str(),
+                &e.updated_at,
+            )),
+            GitHubEvent::Status(e) => Some(DedupeKey::status(
+                &e.sha,
+                &e.context,
+                e.state.as_str(),
+                &e.updated_at,
+            )),
+            GitHubEvent::PullRequestReview(e) => Some(DedupeKey::pull_request_review(
+                e.pr_number,
+                e.review_id,
+                e.action.as_str(),
+            )),
+        }
+    }
+
     /// Returns the key as a string slice.
     pub fn as_str(&self) -> &str {
         &self.0
@@ -148,140 +194,59 @@ impl fmt::Display for DedupeKey {
     }
 }
 
-// ─── Dedupe tracking and TTL-based pruning ───
-
-use std::collections::HashMap;
-
-/// Default TTL for dedupe keys (24 hours).
-pub const DEFAULT_DEDUPE_TTL_HOURS: i64 = 24;
-
-/// Checks if a dedupe key has been seen.
-///
-/// Returns `true` if the key exists in the seen set, meaning this event
-/// is a duplicate and should be skipped.
-pub fn is_duplicate(seen_keys: &HashMap<String, DateTime<Utc>>, key: &DedupeKey) -> bool {
-    seen_keys.contains_key(key.as_str())
-}
-
-/// Records a dedupe key as seen with the current timestamp.
-///
-/// This should be called after successfully processing an event.
-pub fn mark_seen(seen_keys: &mut HashMap<String, DateTime<Utc>>, key: &DedupeKey) {
-    seen_keys.insert(key.as_str().to_string(), Utc::now());
-}
-
-/// Prunes dedupe keys older than the specified TTL.
-///
-/// Returns the number of keys pruned.
-pub fn prune_expired_keys(seen_keys: &mut HashMap<String, DateTime<Utc>>, ttl_hours: i64) -> usize {
-    let cutoff = Utc::now() - chrono::Duration::hours(ttl_hours);
-    let before_len = seen_keys.len();
-    seen_keys.retain(|_, timestamp| *timestamp > cutoff);
-    before_len - seen_keys.len()
-}
-
-/// Prunes dedupe keys using the default TTL (24 hours).
-///
-/// Returns the number of keys pruned.
-pub fn prune_expired_keys_default(seen_keys: &mut HashMap<String, DateTime<Utc>>) -> usize {
-    prune_expired_keys(seen_keys, DEFAULT_DEDUPE_TTL_HOURS)
-}
-
-/// Raw webhook payload data for dedupe key extraction.
-///
-/// This is a minimal representation of webhook fields needed for
-/// deduplication. It overlaps with the parsed event types in
-/// `crate::webhooks::events`; unifying the two is deferred until the engine
-/// wires parsing to deduplication.
-#[derive(Debug, Clone)]
-pub enum WebhookEventData {
-    IssueCommentCreated {
-        pr: PrNumber,
-        comment_id: CommentId,
-    },
-    IssueCommentEdited {
-        pr: PrNumber,
-        comment_id: CommentId,
-        updated_at: DateTime<Utc>,
-    },
-    IssueCommentDeleted {
-        pr: PrNumber,
-        comment_id: CommentId,
-    },
-    PullRequest {
-        pr: PrNumber,
-        action: String,
-        head_sha: Sha,
-        updated_at: DateTime<Utc>,
-    },
-    PullRequestEdited {
-        pr: PrNumber,
-        updated_at: DateTime<Utc>,
-    },
-    CheckSuite {
-        suite_id: u64,
-        action: String,
-        updated_at: DateTime<Utc>,
-    },
-    Status {
-        sha: Sha,
-        context: String,
-        state: String,
-        updated_at: DateTime<Utc>,
-    },
-    PullRequestReview {
-        pr: PrNumber,
-        review_id: u64,
-        action: String,
-    },
-}
-
-/// Extracts a dedupe key from webhook event data.
-pub fn extract_dedupe_key(event: &WebhookEventData) -> DedupeKey {
-    match event {
-        WebhookEventData::IssueCommentCreated { pr, comment_id } => {
-            DedupeKey::issue_comment_created(*pr, *comment_id)
-        }
-        WebhookEventData::IssueCommentEdited {
-            pr,
-            comment_id,
-            updated_at,
-        } => DedupeKey::issue_comment_edited(*pr, *comment_id, updated_at),
-        WebhookEventData::IssueCommentDeleted { pr, comment_id } => {
-            DedupeKey::issue_comment_deleted(*pr, *comment_id)
-        }
-        WebhookEventData::PullRequest {
-            pr,
-            action,
-            head_sha,
-            updated_at,
-        } => DedupeKey::pull_request(*pr, action, head_sha, updated_at),
-        WebhookEventData::PullRequestEdited { pr, updated_at } => {
-            DedupeKey::pull_request_edited(*pr, updated_at)
-        }
-        WebhookEventData::CheckSuite {
-            suite_id,
-            action,
-            updated_at,
-        } => DedupeKey::check_suite(*suite_id, action, updated_at),
-        WebhookEventData::Status {
-            sha,
-            context,
-            state,
-            updated_at,
-        } => DedupeKey::status(sha, context, state, updated_at),
-        WebhookEventData::PullRequestReview {
-            pr,
-            review_id,
-            action,
-        } => DedupeKey::pull_request_review(*pr, *review_id, action),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::RepoId;
+    use crate::webhooks::events::{
+        CheckSuiteAction, CheckSuiteEvent, IssueCommentEvent, PullRequestEvent,
+        PullRequestReviewEvent, ReviewAction, ReviewState, StatusEvent, StatusState,
+    };
+    use crate::webhooks::events::MergeStatus;
     use proptest::prelude::*;
+
+    fn repo() -> RepoId {
+        RepoId::new("owner", "repo")
+    }
+
+    fn comment_event(
+        action: CommentAction,
+        pr_number: Option<PrNumber>,
+        comment_id: u64,
+        updated_at: DateTime<Utc>,
+    ) -> IssueCommentEvent {
+        IssueCommentEvent {
+            repo: repo(),
+            action,
+            pr_number,
+            comment_id: CommentId(comment_id),
+            body: String::new(),
+            author_id: 1,
+            author_login: "a".to_owned(),
+            pr_author_id: 2,
+            updated_at,
+        }
+    }
+
+    fn pr_event(
+        action: PrAction,
+        pr_number: PrNumber,
+        head_sha: Sha,
+        updated_at: DateTime<Utc>,
+    ) -> PullRequestEvent {
+        PullRequestEvent {
+            repo: repo(),
+            action,
+            pr_number,
+            merge_status: MergeStatus::NotMerged,
+            head_sha,
+            base_branch: "main".to_owned(),
+            head_branch: "feature".to_owned(),
+            is_draft: false,
+            author_id: 1,
+            updated_at,
+        }
+    }
 
     fn arb_pr_number() -> impl Strategy<Value = PrNumber> {
         (1u64..100000).prop_map(PrNumber)
@@ -426,148 +391,176 @@ mod tests {
             prop_assert_eq!(key, parsed);
         }
 
-        /// extract_dedupe_key produces correct keys.
+        // ─── DedupeKey::for_event: the parsed-event → key mapping ───
+
+        /// Every keyed comment action maps through `for_event` to the same
+        /// key the dedicated constructor builds.
         #[test]
-        fn extract_issue_comment_created(
+        fn for_event_issue_comment_matches_constructors(
             pr in arb_pr_number(),
             comment_id in arb_comment_id(),
+            updated_at in arb_datetime(),
         ) {
-            let event = WebhookEventData::IssueCommentCreated { pr, comment_id };
-            let key = extract_dedupe_key(&event);
-            let expected = DedupeKey::issue_comment_created(pr, comment_id);
-            prop_assert_eq!(key, expected);
+            for (action, expected) in [
+                (CommentAction::Created, DedupeKey::issue_comment_created(pr, CommentId(comment_id.0))),
+                (CommentAction::Edited, DedupeKey::issue_comment_edited(pr, CommentId(comment_id.0), &updated_at)),
+                (CommentAction::Deleted, DedupeKey::issue_comment_deleted(pr, CommentId(comment_id.0))),
+            ] {
+                let event = GitHubEvent::IssueComment(comment_event(action, Some(pr), comment_id.0, updated_at));
+                prop_assert_eq!(DedupeKey::for_event(&event), Some(expected));
+            }
         }
 
+        /// A comment on a plain issue (no PR) has no dedupe identity.
         #[test]
-        fn extract_pull_request(
+        fn for_event_non_pr_comment_has_no_key(
+            comment_id in arb_comment_id(),
+            updated_at in arb_datetime(),
+        ) {
+            let event = GitHubEvent::IssueComment(comment_event(
+                CommentAction::Created, None, comment_id.0, updated_at,
+            ));
+            prop_assert_eq!(DedupeKey::for_event(&event), None);
+        }
+
+        /// Non-edited PR actions key on (pr, action, head, updated_at).
+        #[test]
+        fn for_event_pull_request_matches_constructor(
             pr in arb_pr_number(),
-            action in arb_action(),
             head_sha in arb_sha(),
             updated_at in arb_datetime(),
         ) {
-            let event = WebhookEventData::PullRequest {
-                pr,
-                action: action.clone(),
-                head_sha: head_sha.clone(),
-                updated_at,
-            };
-            let key = extract_dedupe_key(&event);
-            let expected = DedupeKey::pull_request(pr, &action, &head_sha, &updated_at);
-            prop_assert_eq!(key, expected);
+            let event = pr_event(PrAction::Synchronize, pr, head_sha.clone(), updated_at);
+            prop_assert_eq!(
+                DedupeKey::for_event(&GitHubEvent::PullRequest(event)),
+                Some(DedupeKey::pull_request(pr, "synchronize", &head_sha, &updated_at))
+            );
         }
 
-        // ─── Comprehensive extract_dedupe_key tests for all event types ───
-
+        /// The `edited` key deliberately ignores the head SHA: edits (title,
+        /// base retarget) don't change it, so including it would fail to
+        /// dedupe redeliveries whose payloads differ only in a racing head.
         #[test]
-        fn extract_issue_comment_edited(
+        fn for_event_edited_pr_ignores_head_sha(
             pr in arb_pr_number(),
-            comment_id in arb_comment_id(),
+            head_a in arb_sha(),
+            head_b in arb_sha(),
             updated_at in arb_datetime(),
         ) {
-            let event = WebhookEventData::IssueCommentEdited {
-                pr,
-                comment_id,
-                updated_at,
-            };
-            let key = extract_dedupe_key(&event);
-            let expected = DedupeKey::issue_comment_edited(pr, comment_id, &updated_at);
-            prop_assert_eq!(key, expected);
+            let a = pr_event(PrAction::Edited, pr, head_a, updated_at);
+            let b = pr_event(PrAction::Edited, pr, head_b, updated_at);
+            prop_assert_eq!(
+                DedupeKey::for_event(&GitHubEvent::PullRequest(a)),
+                DedupeKey::for_event(&GitHubEvent::PullRequest(b))
+            );
         }
 
         #[test]
-        fn extract_issue_comment_deleted(
-            pr in arb_pr_number(),
-            comment_id in arb_comment_id(),
-        ) {
-            let event = WebhookEventData::IssueCommentDeleted { pr, comment_id };
-            let key = extract_dedupe_key(&event);
-            let expected = DedupeKey::issue_comment_deleted(pr, comment_id);
-            prop_assert_eq!(key, expected);
-        }
-
-        #[test]
-        fn extract_pull_request_edited(
-            pr in arb_pr_number(),
-            updated_at in arb_datetime(),
-        ) {
-            let event = WebhookEventData::PullRequestEdited { pr, updated_at };
-            let key = extract_dedupe_key(&event);
-            let expected = DedupeKey::pull_request_edited(pr, &updated_at);
-            prop_assert_eq!(key, expected);
-        }
-
-        #[test]
-        fn extract_check_suite(
+        fn for_event_check_suite_matches_constructor(
             suite_id in 1u64..u64::MAX,
-            action in arb_action(),
+            head_sha in arb_sha(),
             updated_at in arb_datetime(),
         ) {
-            let event = WebhookEventData::CheckSuite {
+            let event = GitHubEvent::CheckSuite(CheckSuiteEvent {
+                repo: repo(),
+                action: CheckSuiteAction::Completed,
+                head_sha,
+                conclusion: None,
+                pull_requests: vec![],
                 suite_id,
-                action: action.clone(),
                 updated_at,
-            };
-            let key = extract_dedupe_key(&event);
-            let expected = DedupeKey::check_suite(suite_id, &action, &updated_at);
-            prop_assert_eq!(key, expected);
+            });
+            prop_assert_eq!(
+                DedupeKey::for_event(&event),
+                Some(DedupeKey::check_suite(suite_id, "completed", &updated_at))
+            );
         }
 
         #[test]
-        fn extract_status(
+        fn for_event_status_matches_constructor(
             sha in arb_sha(),
             context in arb_context(),
-            state in arb_state(),
             updated_at in arb_datetime(),
         ) {
-            let event = WebhookEventData::Status {
+            let event = GitHubEvent::Status(StatusEvent {
+                repo: repo(),
                 sha: sha.clone(),
+                state: StatusState::Success,
                 context: context.clone(),
-                state: state.clone(),
+                description: None,
+                target_url: None,
                 updated_at,
-            };
-            let key = extract_dedupe_key(&event);
-            let expected = DedupeKey::status(&sha, &context, &state, &updated_at);
-            prop_assert_eq!(key, expected);
+            });
+            prop_assert_eq!(
+                DedupeKey::for_event(&event),
+                Some(DedupeKey::status(&sha, &context, "success", &updated_at))
+            );
         }
 
         #[test]
-        fn extract_pull_request_review(
+        fn for_event_review_matches_constructor(
             pr in arb_pr_number(),
             review_id in 1u64..u64::MAX,
-            action in arb_action(),
         ) {
-            let event = WebhookEventData::PullRequestReview {
-                pr,
+            let event = GitHubEvent::PullRequestReview(PullRequestReviewEvent {
+                repo: repo(),
+                action: ReviewAction::Dismissed,
+                pr_number: pr,
+                state: ReviewState::Dismissed,
+                reviewer_id: 1,
+                reviewer_login: "r".to_owned(),
+                body: String::new(),
                 review_id,
-                action: action.clone(),
-            };
-            let key = extract_dedupe_key(&event);
-            let expected = DedupeKey::pull_request_review(pr, review_id, &action);
-            prop_assert_eq!(key, expected);
+            });
+            prop_assert_eq!(
+                DedupeKey::for_event(&event),
+                Some(DedupeKey::pull_request_review(pr, review_id, "dismissed"))
+            );
         }
 
-        /// Status events with colon-containing contexts still produce correct keys.
+        /// Totality: every event shape except a non-PR comment gets a key.
         #[test]
-        fn extract_status_with_colons_in_context(
+        fn for_event_total_over_keyed_shapes(
+            pr in arb_pr_number(),
+            comment_id in arb_comment_id(),
             sha in arb_sha(),
-            state in arb_state(),
             updated_at in arb_datetime(),
         ) {
-            // Use a context that contains colons (common in CI systems)
-            let context = "ci:build:test:lint";
-            let event = WebhookEventData::Status {
-                sha: sha.clone(),
-                context: context.to_string(),
-                state: state.clone(),
-                updated_at,
-            };
-            let key = extract_dedupe_key(&event);
-
-            // Verify the key contains escaped colons
-            prop_assert!(key.as_str().contains("ci\\:build\\:test\\:lint"));
-
-            let expected = DedupeKey::status(&sha, context, &state, &updated_at);
-            prop_assert_eq!(key, expected);
+            let keyed: Vec<GitHubEvent> = vec![
+                GitHubEvent::IssueComment(comment_event(CommentAction::Created, Some(pr), comment_id.0, updated_at)),
+                GitHubEvent::PullRequest(pr_event(PrAction::Opened, pr, sha.clone(), updated_at)),
+                GitHubEvent::CheckSuite(CheckSuiteEvent {
+                    repo: repo(),
+                    action: CheckSuiteAction::Completed,
+                    head_sha: sha.clone(),
+                    conclusion: None,
+                    pull_requests: vec![],
+                    suite_id: 7,
+                    updated_at,
+                }),
+                GitHubEvent::Status(StatusEvent {
+                    repo: repo(),
+                    sha: sha.clone(),
+                    state: StatusState::Failure,
+                    context: "ci".to_owned(),
+                    description: None,
+                    target_url: None,
+                    updated_at,
+                }),
+                GitHubEvent::PullRequestReview(PullRequestReviewEvent {
+                    repo: repo(),
+                    action: ReviewAction::Submitted,
+                    pr_number: pr,
+                    state: ReviewState::Approved,
+                    reviewer_id: 1,
+                    reviewer_login: "r".to_owned(),
+                    body: String::new(),
+                    review_id: 9,
+                }),
+            ];
+            for event in &keyed {
+                prop_assert!(DedupeKey::for_event(event).is_some());
+            }
         }
 
         // ─── Collision-free property tests ───
@@ -786,112 +779,4 @@ mod tests {
         );
     }
 
-    // ─── Dedupe tracking tests ───
-
-    proptest! {
-        /// Once a key is marked as seen, is_duplicate returns true.
-        #[test]
-        fn marked_key_is_duplicate(
-            pr in arb_pr_number(),
-            comment_id in arb_comment_id(),
-        ) {
-            let mut seen = HashMap::new();
-            let key = DedupeKey::issue_comment_created(pr, comment_id);
-
-            // Initially not a duplicate
-            prop_assert!(!is_duplicate(&seen, &key));
-
-            // Mark as seen
-            mark_seen(&mut seen, &key);
-
-            // Now it's a duplicate
-            prop_assert!(is_duplicate(&seen, &key));
-        }
-
-        /// Different keys are not duplicates of each other.
-        #[test]
-        fn different_keys_not_duplicate(
-            pr1 in arb_pr_number(),
-            pr2 in arb_pr_number(),
-            comment_id in arb_comment_id(),
-        ) {
-            prop_assume!(pr1 != pr2);
-
-            let mut seen = HashMap::new();
-            let key1 = DedupeKey::issue_comment_created(pr1, comment_id);
-            let key2 = DedupeKey::issue_comment_created(pr2, comment_id);
-
-            // Mark key1 as seen
-            mark_seen(&mut seen, &key1);
-
-            // key1 is duplicate, key2 is not
-            prop_assert!(is_duplicate(&seen, &key1));
-            prop_assert!(!is_duplicate(&seen, &key2));
-        }
-
-        /// Pruning removes only keys older than TTL.
-        #[test]
-        fn pruning_respects_ttl(
-            pr in arb_pr_number(),
-            comment_id in arb_comment_id(),
-        ) {
-            let mut seen = HashMap::new();
-            let key = DedupeKey::issue_comment_created(pr, comment_id);
-
-            // Add a key with current timestamp
-            mark_seen(&mut seen, &key);
-            prop_assert_eq!(seen.len(), 1);
-
-            // Pruning with 24 hour TTL should not remove it
-            let pruned = prune_expired_keys(&mut seen, 24);
-            prop_assert_eq!(pruned, 0);
-            prop_assert_eq!(seen.len(), 1);
-
-            // Manually set timestamp to 25 hours ago
-            let old_timestamp = Utc::now() - chrono::Duration::hours(25);
-            seen.insert(key.as_str().to_string(), old_timestamp);
-
-            // Now pruning should remove it
-            let pruned = prune_expired_keys(&mut seen, 24);
-            prop_assert_eq!(pruned, 1);
-            prop_assert_eq!(seen.len(), 0);
-        }
-    }
-
-    #[test]
-    fn prune_mixed_ages() {
-        let mut seen = HashMap::new();
-
-        // Add some fresh keys
-        let fresh_key = DedupeKey::issue_comment_created(PrNumber(1), CommentId(1));
-        mark_seen(&mut seen, &fresh_key);
-
-        // Add some old keys (manually set timestamp)
-        let old_key = DedupeKey::issue_comment_created(PrNumber(2), CommentId(2));
-        let old_timestamp = Utc::now() - chrono::Duration::hours(25);
-        seen.insert(old_key.as_str().to_string(), old_timestamp);
-
-        // Add another old key
-        let old_key2 = DedupeKey::issue_comment_created(PrNumber(3), CommentId(3));
-        seen.insert(old_key2.as_str().to_string(), old_timestamp);
-
-        assert_eq!(seen.len(), 3);
-
-        // Prune with 24 hour TTL
-        let pruned = prune_expired_keys_default(&mut seen);
-
-        // Should remove 2 old keys, keep 1 fresh
-        assert_eq!(pruned, 2);
-        assert_eq!(seen.len(), 1);
-        assert!(is_duplicate(&seen, &fresh_key));
-        assert!(!is_duplicate(&seen, &old_key));
-        assert!(!is_duplicate(&seen, &old_key2));
-    }
-
-    #[test]
-    fn empty_seen_set_not_duplicate() {
-        let seen = HashMap::new();
-        let key = DedupeKey::issue_comment_created(PrNumber(123), CommentId(456));
-        assert!(!is_duplicate(&seen, &key));
-    }
 }

@@ -64,6 +64,7 @@ pub enum EventPriority {
 ///     author_id: 1,
 ///     author_login: "user".to_string(),
 ///     pr_author_id: 7,
+///     updated_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
 /// };
 ///
 /// assert_eq!(
@@ -140,6 +141,7 @@ mod tests {
             author_id: 1,
             author_login: "user".to_string(),
             pr_author_id: 7,
+            updated_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
         })
     }
 
@@ -156,6 +158,7 @@ mod tests {
             head_branch: "feature".to_string(),
             is_draft: false,
             author_id: 1,
+            updated_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
         })
     }
 
@@ -166,6 +169,8 @@ mod tests {
             head_sha: Sha::parse("c".repeat(40)).unwrap(),
             conclusion: Some(CheckSuiteConclusion::Success),
             pull_requests: vec![PrNumber(42)],
+            suite_id: 5,
+            updated_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
         })
     }
 
@@ -177,6 +182,7 @@ mod tests {
             context: "ci/test".to_string(),
             description: None,
             target_url: None,
+            updated_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
         })
     }
 
@@ -189,6 +195,7 @@ mod tests {
             reviewer_id: 100,
             reviewer_login: "reviewer".to_string(),
             body: "LGTM".to_string(),
+            review_id: 11,
         })
     }
 
@@ -290,6 +297,7 @@ mod tests {
             author_id: 1,
             author_login: "user".to_string(),
             pr_author_id: 7,
+            updated_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
         });
         assert_eq!(classify_priority(&event), EventPriority::Normal);
     }
@@ -337,6 +345,7 @@ mod tests {
             author_id: 1,
             author_login: "user".to_string(),
             pr_author_id: 7,
+            updated_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
         });
         assert_eq!(
             classify_priority_with_bot_name(&event, "my-custom-bot"),

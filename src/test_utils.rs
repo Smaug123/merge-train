@@ -190,6 +190,8 @@ pub fn arb_branch_name() -> impl Strategy<Value = String> {
 
 pub fn arb_state_event_payload() -> impl Strategy<Value = StateEventPayload> {
     prop_oneof![
+        // Repo facts
+        arb_branch_name().prop_map(|branch| StateEventPayload::DefaultBranchSet { branch }),
         // Train lifecycle
         (arb_pr_number(), arb_pr_number()).prop_map(|(r, c)| StateEventPayload::TrainStarted {
             root_pr: r,

@@ -1,4 +1,5 @@
-//! The per-repo worker: the single writer that owns a repo's [`Store`].
+//! The per-repo worker: the single writer that owns a repo's [`Store`] and
+//! drives the cascade engine (M5).
 //!
 //! # Why a thread per repo
 //!
@@ -19,27 +20,42 @@
 //! `Store` ownership — including the `Store::open` that acquires the lock —
 //! happens *on the worker thread*, so the lock is born and dies with its owner.
 //!
-//! # The loop body is a stub
+//! # Where the work happens (M5)
 //!
-//! Processing currently parses the webhook and closes the delivery without
-//! emitting state events: the cascade engine that turns a [`GitHubEvent`] into
-//! `StateEventPayload`s does not exist yet. [`process_one`] marks the seam where
-//! it drops in (see `CASCADE_ENGINE_PLAN.md` M5). Until then the worker is the
-//! durable, deduplicated *intake substrate* and nothing more.
+//! Decisions live in [`pipeline::Processor`] (the per-delivery pipeline and
+//! the saga machine); effect execution lives in [`executor`]. The worker
+//! thread never blocks on effects: each engine plan's effects run on a
+//! spawned **executor thread** whose outcomes come back through this same
+//! mailbox ([`WorkerMsg::SagaOutcomes`]), so intake acks and delivery
+//! processing continue while a multi-minute git saga runs. One saga executes
+//! at a time per repo; deliveries keep processing mid-saga (that is how stop
+//! commands and head-moved observations reach the engine), and the engine
+//! work they trigger queues for the saga slot.
 
 pub mod authz;
+pub mod executor;
+mod pipeline;
+
+pub use pipeline::{GitSettings, PipelineOutcome, WorkerDeps};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::Utc;
-use thiserror::Error;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tracing::{error, info, warn};
 
-use crate::store::{Delivery, Store, StoreError};
-use crate::webhooks::parse_webhook;
+use crate::cascade::{EffectError, EffectOutcome};
+use crate::effects::Effect;
+use crate::git::CommitIdentity;
+use crate::git::interpreter::WorktreeGitInterpreter;
+use crate::github::OctocrabClient;
+use crate::store::{Store, StoreError};
+use crate::types::{PrNumber, RepoId};
+
+use executor::{GitHubExec, SagaBatch, execute_batch};
+use pipeline::Processor;
 
 /// Per-repo mailbox depth (message *count*). The byte budget
 /// ([`MAX_INFLIGHT_INTAKE_BYTES`]) — not this — bounds intake *memory*; this
@@ -84,18 +100,29 @@ pub enum EnqueueOutcome {
 pub enum WorkerMsg {
     /// Durably enqueue a delivery, then ack the result so the handler can reply.
     Enqueue {
+        /// The raw delivery.
         delivery: IntakeDelivery,
+        /// Where to report the enqueue outcome.
         ack: oneshot::Sender<Result<EnqueueOutcome, StoreError>>,
         /// Backpressure reservation for `delivery.body`'s bytes (see
         /// [`WorkerRegistry::reserve_intake`]); released when this message is
         /// dropped, i.e. after the durable enqueue.
         permit: OwnedSemaphorePermit,
     },
+    /// An executor thread finished a saga batch; feed the outcomes back.
+    SagaOutcomes {
+        /// The batch's train root.
+        root: PrNumber,
+        /// The observed effects' outcomes (empty for best-effort-only batches).
+        outcomes: Vec<EffectOutcome>,
+        /// Whether the outcomes feed `observe` → `advance`.
+        feedback: bool,
+    },
 }
 
 /// Why routing a delivery to a worker failed (distinct from a successful
 /// enqueue that returned [`EnqueueOutcome`]).
-#[derive(Debug, Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum WorkerError {
     /// Opening the repo's `Store` failed — most importantly
     /// [`StoreError::Locked`] (another process owns the repo), which the
@@ -107,6 +134,70 @@ pub enum WorkerError {
     /// answering). A liveness failure, not a request error.
     #[error("worker unavailable")]
     Unavailable,
+}
+
+/// How workers reach GitHub, shared process-wide.
+pub enum GitHubBackend {
+    /// The production octocrab client (repo-scoped per worker) plus the
+    /// server's runtime handle for `block_on` from worker/executor threads.
+    Octocrab {
+        /// The authenticated octocrab instance.
+        client: octocrab::Octocrab,
+        /// The async runtime that owns the client's connections.
+        handle: tokio::runtime::Handle,
+    },
+    /// The real-git-backed fake, shared across workers and the test.
+    #[cfg(test)]
+    Fake(std::sync::Arc<std::sync::Mutex<crate::github::test_support::FakeGitHub>>),
+}
+
+/// Process-wide worker dependencies; per-repo [`WorkerDeps`] derive from it.
+pub struct SharedDeps {
+    /// How to reach GitHub.
+    pub github: GitHubBackend,
+    /// Base directory for repo clones/worktrees.
+    pub repos_dir: PathBuf,
+    /// Identity for the cascade's merge commits.
+    pub commit_identity: CommitIdentity,
+    /// Maximum age for stale worktree cleanup.
+    pub worktree_max_age: std::time::Duration,
+    /// Base URL for clone-on-first-use, e.g.
+    /// `https://x-access-token:<token>@github.com`; the per-repo URL appends
+    /// `/{owner}/{repo}.git`. `None` means clones must already exist.
+    pub clone_url_base: Option<String>,
+    /// The bot's GitHub user id (fetched at startup, resolved question 3).
+    pub bot_user_id: u64,
+    /// The bot's mention name, without `@`.
+    pub bot_name: String,
+}
+
+impl SharedDeps {
+    /// Derives one repo's worker dependencies.
+    fn for_repo(&self, owner: &str, repo: &str) -> WorkerDeps {
+        WorkerDeps {
+            github: match &self.github {
+                GitHubBackend::Octocrab { client, handle } => GitHubExec::Real {
+                    client: OctocrabClient::new(client.clone(), RepoId::new(owner, repo)),
+                    handle: handle.clone(),
+                },
+                #[cfg(test)]
+                GitHubBackend::Fake(fake) => GitHubExec::Fake(fake.clone()),
+            },
+            git: GitSettings {
+                base_dir: self.repos_dir.clone(),
+                owner: owner.to_owned(),
+                repo: repo.to_owned(),
+                commit_identity: self.commit_identity.clone(),
+                worktree_max_age: self.worktree_max_age,
+                clone_url: self
+                    .clone_url_base
+                    .as_ref()
+                    .map(|base| format!("{base}/{owner}/{repo}.git")),
+            },
+            bot_user_id: self.bot_user_id,
+            bot_name: self.bot_name.clone(),
+        }
+    }
 }
 
 /// `(owner, repo)`.
@@ -121,6 +212,7 @@ type CreationGuards = HashMap<RepoKey, Arc<Mutex<()>>>;
 /// sender; it never holds a `Store`.
 pub struct WorkerRegistry {
     state_dir: PathBuf,
+    deps: Arc<SharedDeps>,
     /// Live per-repo mailbox senders. Guarded by a *sync* mutex held only for the
     /// brief get/insert — never across an `.await` — so a slow worker startup for
     /// one repo can't block routing to another (Codex review #53).
@@ -137,9 +229,10 @@ pub struct WorkerRegistry {
 impl WorkerRegistry {
     /// Creates a registry rooted at `state_dir`; each repo's DB lives at
     /// `<state_dir>/<owner>/<repo>/state.db`.
-    pub fn new(state_dir: impl Into<PathBuf>) -> Self {
+    pub fn new(state_dir: impl Into<PathBuf>, deps: SharedDeps) -> Self {
         WorkerRegistry {
             state_dir: state_dir.into(),
+            deps: Arc::new(deps),
             workers: std::sync::Mutex::new(HashMap::new()),
             creating: std::sync::Mutex::new(HashMap::new()),
             intake_permits: Arc::new(Semaphore::new(MAX_INFLIGHT_INTAKE_BYTES)),
@@ -271,6 +364,8 @@ impl WorkerRegistry {
         let db_path = self.state_dir.join(&key.0).join(&key.1).join("state.db");
         let (tx, rx) = mpsc::channel(MAILBOX_CAPACITY);
         let (ready_tx, ready_rx) = oneshot::channel();
+        let deps = self.deps.for_repo(&key.0, &key.1);
+        let saga_tx = tx.clone();
 
         std::thread::Builder::new()
             .name(format!("worker-{}-{}", key.0, key.1))
@@ -280,7 +375,7 @@ impl WorkerRegistry {
                     if ready_tx.send(Ok(())).is_err() {
                         return; // registrar gave up; drop the Store (unlocks).
                     }
-                    run(store, rx);
+                    run(store, deps, rx, saga_tx);
                 }
                 Err(e) => {
                     let _ = ready_tx.send(Err(e));
@@ -297,59 +392,109 @@ impl WorkerRegistry {
     }
 }
 
-/// The worker thread body. Returns when every sender has dropped (process
-/// shutdown), releasing the `Store` (and its lock).
+/// The worker thread body. Returns when every external sender has dropped
+/// (process shutdown) or on a fatal `Store` error, releasing the `Store` (and
+/// its lock).
 ///
-/// Intake is prioritized over processing: each iteration first durably enqueues
-/// and acks **every** delivery already waiting in the mailbox, then processes at
-/// most **one** backlog delivery before looking again. So a webhook's 200 waits
-/// at most one `process_one`, never the whole backlog — without this, a delivery
-/// arriving during a long drain could exceed GitHub's redelivery timeout even
-/// though its enqueue was trivial. (With the M5 engine a single saga may still
-/// be slow; running effects off-thread so intake never waits is M5's concern.)
-fn run(mut store: Store, mut rx: mpsc::Receiver<WorkerMsg>) {
+/// Each turn: service **every** waiting mailbox message (intake acks stay
+/// prompt; saga outcomes advance the engine), start the next queued saga if
+/// the slot is free, then process at most **one** backlog delivery before
+/// looking again. Effects never run on this thread — [`dispatch`] hands each
+/// [`SagaBatch`] to a spawned executor thread that reports back through the
+/// mailbox — so a webhook's 200 never waits on git.
+///
+/// A [`PipelineOutcome::Released`] delivery (GitHub unreachable) *stalls*
+/// backlog processing until the next mailbox message, preserving in-order
+/// processing without a hot claim/release loop.
+fn run(
+    store: Store,
+    deps: WorkerDeps,
+    mut rx: mpsc::Receiver<WorkerMsg>,
+    tx: mpsc::Sender<WorkerMsg>,
+) {
+    let mut processor = Processor::new(store, deps);
+    let mut stalled = false;
+
     loop {
-        // Service waiting intake first, but cap the batch at one mailbox's
-        // worth. The mailbox can be refilled faster than it drains, so an
-        // uncapped inner loop could keep accepting messages and never reach
-        // `process_next`, starving backlog processing under sustained intake
-        // (Codex review #53). The cap keeps intake prioritized — a normal burst
-        // (< capacity) still drains fully before processing — while guaranteeing
-        // processing gets a turn.
+        // (1) Service waiting messages, capped at one mailbox's worth so
+        // sustained intake cannot starve backlog processing (Codex review #53).
+        let mut serviced = 0;
         for _ in 0..MAILBOX_CAPACITY {
             match rx.try_recv() {
-                Ok(msg) => handle_msg(&mut store, msg),
+                Ok(msg) => {
+                    serviced += 1;
+                    stalled = false;
+                    match handle_msg(&mut processor, msg) {
+                        Ok(Some(batch)) => dispatch(&processor, batch, tx.clone()),
+                        Ok(None) => {}
+                        Err(e) => return fatal(e),
+                    }
+                }
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => return,
             }
         }
-        // Process one unit of backlog, then loop back to re-check intake.
-        match process_next(&mut store) {
-            // Did work: re-check intake, then process the next.
-            Ok(true) => {}
-            // Nothing to process: block until the next message (or shutdown).
-            Ok(false) => match rx.blocking_recv() {
-                Some(msg) => handle_msg(&mut store, msg),
+
+        // (2) Start the next queued saga if the slot is free.
+        if !processor.saga_in_flight() {
+            match processor.pump() {
+                Ok(Some(batch)) => dispatch(&processor, batch, tx.clone()),
+                Ok(None) => {}
+                Err(e) => return fatal(e),
+            }
+        }
+
+        // (3) Process one unit of backlog, then loop back to re-check intake.
+        let mut processed = false;
+        if !stalled {
+            match processor.claim() {
+                Ok(Some(delivery)) => {
+                    processed = true;
+                    match processor.process_claimed(delivery) {
+                        Ok(PipelineOutcome::Processed) => {}
+                        Ok(PipelineOutcome::Released) => stalled = true,
+                        Err(e) => return fatal(e),
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => return fatal(e),
+            }
+        }
+
+        // (4) Nothing to do: block until the next message (or shutdown).
+        if serviced == 0 && !processed {
+            match rx.blocking_recv() {
+                Some(msg) => {
+                    stalled = false;
+                    match handle_msg(&mut processor, msg) {
+                        Ok(Some(batch)) => dispatch(&processor, batch, tx.clone()),
+                        Ok(None) => {}
+                        Err(e) => return fatal(e),
+                    }
+                }
                 None => return,
-            },
-            // A Store error means we can no longer characterize this repo's
-            // state. Stop the worker: dropping the `Store` releases the lock, and
-            // the next delivery respawns a worker whose `Store::open` re-runs the
-            // `processing`->`pending` recovery, requeueing whatever was claimed
-            // (Codex review #53). Failing fast beats holding a wedged Store open
-            // for the process lifetime — which would strand the claimed delivery,
-            // since open-recovery never re-runs while this worker lives — and
-            // beats hot-looping a retry against a persistently broken store.
-            Err(e) => {
-                error!(error = %e, "fatal store error; stopping worker (it will respawn and recover)");
-                return;
             }
         }
     }
 }
 
-/// Durably enqueues a delivery and acks the outcome to the handler.
-fn handle_msg(store: &mut Store, msg: WorkerMsg) {
+/// A Store error means we can no longer characterize this repo's state. Stop
+/// the worker: dropping the `Store` releases the lock, and the next delivery
+/// respawns a worker whose `Store::open` re-runs `processing`→`pending`
+/// recovery, requeueing whatever was claimed (Codex review #53). Failing fast
+/// beats holding a wedged Store open for the process lifetime — which would
+/// strand the claimed delivery — and beats hot-looping a retry against a
+/// persistently broken store.
+fn fatal(e: StoreError) {
+    error!(error = %e, "fatal store error; stopping worker (it will respawn and recover)");
+}
+
+/// Handles one mailbox message; a saga-outcome message may yield the next
+/// batch to execute.
+fn handle_msg(
+    processor: &mut Processor,
+    msg: WorkerMsg,
+) -> Result<Option<SagaBatch>, StoreError> {
     match msg {
         // `_permit` is held until this arm returns — i.e. until after the
         // enqueue and the `delivery` body have been consumed — then dropped,
@@ -359,7 +504,8 @@ fn handle_msg(store: &mut Store, msg: WorkerMsg) {
             ack,
             permit: _permit,
         } => {
-            let outcome = store
+            let outcome = processor
+                .store_mut()
                 .enqueue(
                     &delivery.delivery_id,
                     &delivery.event_type,
@@ -374,54 +520,80 @@ fn handle_msg(store: &mut Store, msg: WorkerMsg) {
                         EnqueueOutcome::Duplicate
                     }
                 });
-            // The handler may have timed out and dropped the receiver; the
-            // delivery is durable regardless, so ignore a send failure.
+            // Store failures are fatal to the worker (see `run`), but the
+            // handler learns the outcome first (it maps the error to a 5xx so
+            // GitHub redelivers). The original error moves into the ack, so
+            // the fatal path carries its rendering.
+            let error_text = outcome.as_ref().err().map(ToString::to_string);
             let _ = ack.send(outcome);
+            match error_text {
+                Some(text) => Err(StoreError::Io(std::io::Error::other(format!(
+                    "durable enqueue failed: {text}"
+                )))),
+                None => Ok(None),
+            }
         }
+        WorkerMsg::SagaOutcomes {
+            root,
+            outcomes,
+            feedback,
+        } => processor.on_outcomes(root, outcomes, feedback),
     }
 }
 
-/// Claims and processes one pending delivery (oldest first). Returns `Ok(true)`
-/// if it did work, `Ok(false)` if the queue was empty, or `Err` if the Store
-/// failed (fatal — see [`run`]).
-fn process_next(store: &mut Store) -> Result<bool, StoreError> {
-    match store.claim_next_delivery()? {
-        Some(delivery) => {
-            process_one(store, delivery)?;
-            Ok(true)
-        }
-        None => Ok(false),
-    }
-}
+/// Hands a batch to a fresh executor thread. The thread ensures the clone
+/// exists (first git use), builds the per-saga interpreter, executes, and
+/// reports back through the worker's own mailbox.
+fn dispatch(processor: &Processor, batch: SagaBatch, tx: mpsc::Sender<WorkerMsg>) {
+    let github = processor.github().clone();
+    let config = processor.git_config();
+    let clone_url = processor.git_settings().clone_url.clone();
 
-/// Processes one claimed delivery and closes it.
-///
-/// ENGINE SEAM (M5): a parsed event currently produces **no** state events and
-/// **no** dedupe mark — the cascade engine that maps a [`crate::webhooks::GitHubEvent`]
-/// to `StateEventPayload`s does not exist yet. When it lands, the `Ok(Some)` arm
-/// becomes: compute the [`crate::spool::DedupeKey`]; skip if `store.is_duplicate`;
-/// else `handle_event` → `commit_delivery(id, events, Some(key))`. The other two
-/// arms (ignored type / malformed) stay as effect-free closes.
-fn process_one(store: &mut Store, delivery: Delivery) -> Result<(), StoreError> {
-    let id = delivery.delivery_id.clone();
-    match parse_webhook(&delivery.event_type, &delivery.body) {
-        // ENGINE SEAM: no events, no dedupe key yet — just close.
-        Ok(Some(_event)) => close(store, &id, "parsed"),
-        Ok(None) => close(store, &id, "ignored event type"),
-        Err(e) => {
-            warn!(delivery_id = %id, error = %e, "malformed webhook; closing");
-            close(store, &id, "malformed")
-        }
+    let spawned = std::thread::Builder::new()
+        .name(format!("saga-{}-{}", config.owner, config.repo))
+        .spawn(move || {
+            let needs_git = batch
+                .effects
+                .iter()
+                .chain(batch.best_effort.iter())
+                .any(|e| matches!(e, Effect::Git(_)));
+            if needs_git && let Err(e) = executor::ensure_clone(&config, clone_url.as_deref()) {
+                warn!(error = %e, "repo clone unavailable; failing the batch as transient");
+                // Fail the first observed effect so the engine parks and
+                // re-derives; a best-effort-only batch just reports empty.
+                let outcomes = batch
+                    .effects
+                    .first()
+                    .map(|first| {
+                        vec![EffectOutcome {
+                            effect: first.clone(),
+                            result: Err(EffectError::Transient {
+                                detail: format!("repo clone unavailable: {e}"),
+                            }),
+                        }]
+                    })
+                    .unwrap_or_default();
+                let _ = tx.blocking_send(WorkerMsg::SagaOutcomes {
+                    root: batch.root,
+                    outcomes,
+                    feedback: batch.feedback,
+                });
+                return;
+            }
+            let interpreter = WorktreeGitInterpreter::new(config, batch.root);
+            let outcomes = execute_batch(&interpreter, &github, &batch);
+            let _ = tx.blocking_send(WorkerMsg::SagaOutcomes {
+                root: batch.root,
+                outcomes,
+                feedback: batch.feedback,
+            });
+        });
+    if spawned.is_err() {
+        // Thread spawn failure: the saga slot stays occupied and the batch is
+        // lost until restart. Loud, and the fail-fast path will recover the
+        // repo on the next delivery.
+        error!("failed to spawn saga executor thread");
     }
-}
-
-/// Closes a delivery with no state events (the effect-free path). A failure here
-/// is fatal to the worker (see [`run`]): on respawn, `Store::open` requeues the
-/// still-`processing` row.
-fn close(store: &mut Store, delivery_id: &str, reason: &str) -> Result<(), StoreError> {
-    store.commit_delivery(delivery_id, &[], None, Utc::now())?;
-    info!(delivery_id, reason, "delivery closed");
-    Ok(())
 }
 
 /// Whether a directory entry is itself a directory (used to walk
@@ -431,257 +603,52 @@ fn is_dir(entry: &std::fs::DirEntry) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::tempdir;
+pub(crate) mod test_support {
+    //! Fake-backed dependency constructors for worker/server tests.
 
-    fn open_store(dir: &std::path::Path) -> Store {
-        Store::open(&dir.join("state.db")).unwrap()
-    }
+    use std::collections::HashMap;
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
 
-    // A minimal valid `pull_request` payload that `parse_webhook` accepts.
-    fn pull_request_body() -> Vec<u8> {
-        br#"{
-            "action": "synchronize",
-            "number": 7,
-            "pull_request": {
-                "number": 7,
-                "state": "open",
-                "draft": false,
-                "merged": false,
-                "head": { "sha": "deadbeef", "ref": "feature" },
-                "base": { "sha": "cafef00d", "ref": "main" }
-            }
-        }"#
-        .to_vec()
-    }
+    use crate::git::GitConfig;
+    use crate::git::test_support::test_identity;
+    use crate::github::test_support::{FakeGitHub, FakePr};
+    use crate::types::PrNumber;
 
-    #[test]
-    fn drain_closes_parsed_ignored_and_malformed_deliveries() {
-        let dir = tempdir().unwrap();
-        let mut store = open_store(dir.path());
-        let ts = Utc::now();
+    use super::{GitHubBackend, SharedDeps};
 
-        // A parseable event, an unknown (ignored) type, and a malformed body.
-        store
-            .enqueue("d-parsed", "pull_request", "{}", &pull_request_body(), ts)
-            .unwrap();
-        store
-            .enqueue("d-ignored", "membership", "{}", b"{}", ts)
-            .unwrap();
-        store
-            .enqueue("d-bad", "pull_request", "{}", b"not json", ts)
-            .unwrap();
+    /// The bot's user id in fake-backed tests.
+    pub(crate) const TEST_BOT_ID: u64 = 424_242;
 
-        while process_next(&mut store).unwrap() {}
-
-        // All three are closed: nothing remains claimable.
-        assert!(store.claim_next_delivery().unwrap().is_none());
-    }
-
-    #[test]
-    fn process_next_is_false_on_empty_queue() {
-        let dir = tempdir().unwrap();
-        let mut store = open_store(dir.path());
-        assert!(!process_next(&mut store).unwrap());
-        assert!(store.claim_next_delivery().unwrap().is_none());
-    }
-
-    #[test]
-    fn delivery_left_processing_is_recovered_on_reopen() {
-        // The recovery the fatal-error path relies on (Codex review #53): a
-        // delivery claimed but never closed (a worker that stopped mid-process)
-        // is requeued by the next `Store::open` and then drained.
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("state.db");
-        {
-            let mut store = Store::open(&path).unwrap();
-            store
-                .enqueue("d1", "pull_request", "{}", &pull_request_body(), Utc::now())
-                .unwrap();
-            // Claim (-> processing), then drop without closing (the worker died).
-            assert!(store.claim_next_delivery().unwrap().is_some());
+    /// A `GitConfig` rooted under `dir` for the canonical test repo `o/r`.
+    pub(crate) fn test_git_config(dir: &Path) -> GitConfig {
+        GitConfig {
+            base_dir: dir.join("repos"),
+            owner: "o".to_owned(),
+            repo: "r".to_owned(),
+            default_branch: "main".to_owned(),
+            worktree_max_age: std::time::Duration::from_secs(24 * 60 * 60),
+            commit_identity: test_identity(),
         }
-
-        // A fresh worker: open requeues the stranded row, the loop drains it.
-        let mut store = Store::open(&path).unwrap();
-        while process_next(&mut store).unwrap() {}
-        assert!(
-            store.claim_next_delivery().unwrap().is_none(),
-            "the stranded delivery was recovered and closed"
-        );
     }
 
-    #[test]
-    fn enqueued_body_is_stored_verbatim() {
-        // The exact signed bytes must survive for the worker's `parse_webhook`:
-        // no serde round-trip that would collapse duplicate keys or whitespace.
-        let dir = tempdir().unwrap();
-        let mut store = open_store(dir.path());
-        let raw: &[u8] = br#"{ "action": "opened",  "action": "closed",
-            "repository": { "name": "r", "owner": { "login": "o" } } }"#;
-
-        store
-            .enqueue("d1", "pull_request", "{}", raw, Utc::now())
-            .unwrap();
-        let claimed = store.claim_next_delivery().unwrap().unwrap();
-        assert_eq!(claimed.body, raw, "stored body must be byte-identical");
-    }
-
-    #[tokio::test]
-    async fn registry_routes_enqueue_and_processes() {
-        let dir = tempdir().unwrap();
-        let registry = WorkerRegistry::new(dir.path());
-
-        let sender = registry.sender_for("octocat", "hello").await.unwrap();
-        let (ack_tx, ack_rx) = oneshot::channel();
-        sender
-            .send(WorkerMsg::Enqueue {
-                delivery: IntakeDelivery {
-                    delivery_id: "d1".into(),
-                    event_type: "pull_request".into(),
-                    headers: "{}".into(),
-                    body: pull_request_body(),
-                },
-                ack: ack_tx,
-                permit: registry.reserve_intake(pull_request_body().len()).await,
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(ack_rx.await.unwrap().unwrap(), EnqueueOutcome::Enqueued);
-
-        // Redelivery of the same id is reported as a duplicate.
-        let (ack_tx, ack_rx) = oneshot::channel();
-        sender
-            .send(WorkerMsg::Enqueue {
-                delivery: IntakeDelivery {
-                    delivery_id: "d1".into(),
-                    event_type: "pull_request".into(),
-                    headers: "{}".into(),
-                    body: pull_request_body(),
-                },
-                ack: ack_tx,
-                permit: registry.reserve_intake(pull_request_body().len()).await,
-            })
-            .await
-            .unwrap();
-        assert_eq!(ack_rx.await.unwrap().unwrap(), EnqueueOutcome::Duplicate);
-    }
-
-    #[tokio::test]
-    async fn services_new_intake_with_backlog_present() {
-        let dir = tempdir().unwrap();
-        let db_dir = dir.path().join("o").join("r");
-        std::fs::create_dir_all(&db_dir).unwrap();
-        // Pre-seed a backlog of pending deliveries, then release the lock so the
-        // worker can open the DB and find them waiting.
-        {
-            let mut store = Store::open(&db_dir.join("state.db")).unwrap();
-            for i in 0..50 {
-                store
-                    .enqueue(
-                        &format!("backlog-{i}"),
-                        "pull_request",
-                        "{}",
-                        &pull_request_body(),
-                        Utc::now(),
-                    )
-                    .unwrap();
-            }
-        }
-
-        let registry = WorkerRegistry::new(dir.path());
-        let sender = registry.sender_for("o", "r").await.unwrap();
-
-        // A fresh delivery is still durably enqueued and acked despite the
-        // backlog: intake is serviced ahead of backlog draining, so this ack
-        // does not wait for all 50 to process.
-        let (ack_tx, ack_rx) = oneshot::channel();
-        sender
-            .send(WorkerMsg::Enqueue {
-                delivery: IntakeDelivery {
-                    delivery_id: "fresh".into(),
-                    event_type: "pull_request".into(),
-                    headers: "{}".into(),
-                    body: pull_request_body(),
-                },
-                ack: ack_tx,
-                permit: registry.reserve_intake(pull_request_body().len()).await,
-            })
-            .await
-            .unwrap();
-        assert_eq!(ack_rx.await.unwrap().unwrap(), EnqueueOutcome::Enqueued);
-    }
-
-    #[tokio::test]
-    async fn recover_existing_spawns_workers_for_queued_repos() {
-        // A delivery enqueued by a previous run, then the process "crashes".
-        let dir = tempdir().unwrap();
-        let db_dir = dir.path().join("o").join("r");
-        std::fs::create_dir_all(&db_dir).unwrap();
-        {
-            let mut store = Store::open(&db_dir.join("state.db")).unwrap();
-            store
-                .enqueue("d1", "pull_request", "{}", &pull_request_body(), Utc::now())
-                .unwrap();
-        }
-
-        // Startup recovery spawns a worker for the existing repo DB (no webhook
-        // for it has arrived this run).
-        let registry = WorkerRegistry::new(dir.path());
-        registry.recover_existing().await;
-
-        // That worker now owns the repo's Store: re-enqueuing the same id is seen
-        // as a duplicate (proving the recovered worker opened the pre-existing
-        // DB), and sender_for returns the already-spawned worker.
-        let sender = registry.sender_for("o", "r").await.unwrap();
-        let (ack_tx, ack_rx) = oneshot::channel();
-        sender
-            .send(WorkerMsg::Enqueue {
-                delivery: IntakeDelivery {
-                    delivery_id: "d1".into(),
-                    event_type: "pull_request".into(),
-                    headers: "{}".into(),
-                    body: pull_request_body(),
-                },
-                ack: ack_tx,
-                permit: registry.reserve_intake(pull_request_body().len()).await,
-            })
-            .await
-            .unwrap();
-        assert_eq!(ack_rx.await.unwrap().unwrap(), EnqueueOutcome::Duplicate);
-    }
-
-    #[tokio::test]
-    async fn recover_existing_is_a_noop_without_state_dir() {
-        let dir = tempdir().unwrap();
-        let registry = WorkerRegistry::new(dir.path().join("does-not-exist"));
-        registry.recover_existing().await; // must not panic
-    }
-
-    #[tokio::test]
-    async fn registry_returns_same_sender_for_same_repo() {
-        let dir = tempdir().unwrap();
-        let registry = WorkerRegistry::new(dir.path());
-        let a = registry.sender_for("o", "r").await.unwrap();
-        let b = registry.sender_for("o", "r").await.unwrap();
-        assert!(a.same_channel(&b), "one worker (one Store) per repo");
-    }
-
-    #[tokio::test]
-    async fn open_failure_surfaces_as_open_error() {
-        // Hold the repo lock with a Store, then a worker open must fail Locked.
-        let dir = tempdir().unwrap();
-        let db_dir = dir.path().join("o").join("r");
-        std::fs::create_dir_all(&db_dir).unwrap();
-        let _held = Store::open(&db_dir.join("state.db")).unwrap();
-
-        let registry = WorkerRegistry::new(dir.path());
-        let err = registry.sender_for("o", "r").await.unwrap_err();
-        assert!(
-            matches!(err, WorkerError::Open(StoreError::Locked(_))),
-            "expected Open(Locked), got {err:?}"
-        );
+    /// `SharedDeps` backed by a [`FakeGitHub`] (returned for seeding and
+    /// inspection). The fake serves *all* repos the registry spawns.
+    pub(crate) fn fake_shared_deps(
+        dir: &Path,
+        prs: HashMap<PrNumber, FakePr>,
+    ) -> (SharedDeps, Arc<Mutex<FakeGitHub>>) {
+        let config = test_git_config(dir);
+        let fake = Arc::new(Mutex::new(FakeGitHub::new(config, prs)));
+        let deps = SharedDeps {
+            github: GitHubBackend::Fake(fake.clone()),
+            repos_dir: dir.join("repos"),
+            commit_identity: test_identity(),
+            worktree_max_age: std::time::Duration::from_secs(24 * 60 * 60),
+            clone_url_base: None,
+            bot_user_id: TEST_BOT_ID,
+            bot_name: "merge-train".to_owned(),
+        };
+        (deps, fake)
     }
 }

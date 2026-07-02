@@ -108,10 +108,16 @@ impl AppState {
     ///
     /// * `state_dir` - Root for per-repo state DBs (`<state_dir>/<owner>/<repo>/state.db`)
     /// * `webhook_secret` - Secret for verifying webhook signatures
-    pub fn new(state_dir: impl Into<PathBuf>, webhook_secret: impl Into<Vec<u8>>) -> Self {
+    /// * `deps` - Process-wide worker dependencies (GitHub access, git
+    ///   settings, bot identity)
+    pub fn new(
+        state_dir: impl Into<PathBuf>,
+        webhook_secret: impl Into<Vec<u8>>,
+        deps: crate::worker::SharedDeps,
+    ) -> Self {
         AppState {
             inner: Arc::new(AppStateInner {
-                workers: WorkerRegistry::new(state_dir),
+                workers: WorkerRegistry::new(state_dir, deps),
                 webhook_secret: webhook_secret.into(),
             }),
         }
@@ -244,10 +250,13 @@ mod integration_tests {
     use crate::persistence::snapshot::PersistedRepoSnapshot;
     use crate::webhooks::{compute_signature, format_signature_header};
 
-    /// Creates a test app state rooted at a temporary state directory.
+    /// Creates a test app state rooted at a temporary state directory, with a
+    /// fake GitHub backend (these tests exercise intake, not processing).
     fn test_app_state(secret: &[u8]) -> (AppState, tempfile::TempDir) {
         let state_dir = tempdir().unwrap();
-        let state = AppState::new(state_dir.path(), secret.to_vec());
+        let (deps, _fake) =
+            crate::worker::test_support::fake_shared_deps(state_dir.path(), Default::default());
+        let state = AppState::new(state_dir.path(), secret.to_vec(), deps);
         (state, state_dir)
     }
 

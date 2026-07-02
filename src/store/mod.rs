@@ -416,6 +416,20 @@ impl Store {
         Ok(())
     }
 
+    /// Releases a claimed delivery back to `pending` — used when processing
+    /// cannot proceed for an *external* reason (GitHub unreachable) and must
+    /// be retried later without losing the delivery or killing the worker.
+    /// Only a `processing` row is touched; releasing an unclaimed or closed
+    /// delivery is a no-op.
+    pub fn release_delivery(&mut self, delivery_id: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE deliveries SET status = 'pending'
+             WHERE delivery_id = ?1 AND status = 'processing'",
+            rusqlite::params![delivery_id],
+        )?;
+        Ok(())
+    }
+
     /// Whether `key` has already been seen (a duplicate to skip).
     pub fn is_duplicate(&self, key: &DedupeKey) -> Result<bool, StoreError> {
         let exists: bool = self.conn.query_row(
@@ -768,6 +782,26 @@ mod tests {
             Ok(_) => panic!("expected CachedStateSchemaMismatch, got a store"),
             Err(e) => panic!("expected CachedStateSchemaMismatch, got {e:?}"),
         }
+    }
+
+    #[test]
+    fn released_delivery_is_reclaimable() {
+        let dir = tempdir().unwrap();
+        let mut store = open_temp(&dir);
+        let ts = test_timestamp();
+        store.enqueue("d1", "pull_request", "{}", b"{}", ts).unwrap();
+
+        let claimed = store.claim_next_delivery().unwrap().unwrap();
+        assert!(store.claim_next_delivery().unwrap().is_none());
+
+        store.release_delivery(&claimed.delivery_id).unwrap();
+        let reclaimed = store.claim_next_delivery().unwrap().unwrap();
+        assert_eq!(reclaimed.delivery_id, "d1");
+
+        // Releasing a closed delivery is a no-op — it must not reopen.
+        store.commit_delivery("d1", &[], None, ts).unwrap();
+        store.release_delivery("d1").unwrap();
+        assert!(store.claim_next_delivery().unwrap().is_none());
     }
 
     #[test]

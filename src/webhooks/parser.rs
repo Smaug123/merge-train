@@ -17,6 +17,7 @@
 //! - `X-GitHub-Delivery` - Unique delivery ID
 //! - `X-Hub-Signature-256` - HMAC-SHA256 signature (verified elsewhere)
 
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -63,7 +64,8 @@ pub enum ParseError {
 ///     "comment": {
 ///         "id": 123,
 ///         "body": "@merge-train start",
-///         "user": { "id": 456, "login": "octocat" }
+///         "user": { "id": 456, "login": "octocat" },
+///         "updated_at": "2024-01-15T10:00:00Z"
 ///     },
 ///     "issue": {
 ///         "number": 42,
@@ -136,6 +138,7 @@ struct RawComment {
     id: u64,
     body: Option<String>,
     user: RawUser,
+    updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -182,6 +185,7 @@ fn parse_issue_comment(payload: &[u8]) -> Result<IssueCommentEvent, ParseError> 
         author_id: raw.comment.user.id,
         author_login: raw.comment.user.login,
         pr_author_id: raw.issue.user.id,
+        updated_at: raw.comment.updated_at,
     })
 }
 
@@ -205,6 +209,7 @@ struct RawPullRequest {
     base: RawRef,
     draft: Option<bool>,
     user: RawUser,
+    updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -266,6 +271,7 @@ fn parse_pull_request(payload: &[u8]) -> Result<Option<PullRequestEvent>, ParseE
         head_branch: raw.pull_request.head.ref_name,
         is_draft: raw.pull_request.draft.unwrap_or(false),
         author_id: raw.pull_request.user.id,
+        updated_at: raw.pull_request.updated_at,
     }))
 }
 
@@ -282,9 +288,11 @@ struct RawCheckSuitePayload {
 
 #[derive(Debug, Deserialize)]
 struct RawCheckSuite {
+    id: u64,
     head_sha: String,
     conclusion: Option<String>,
     pull_requests: Vec<RawCheckSuitePr>,
+    updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -328,6 +336,8 @@ fn parse_check_suite(payload: &[u8]) -> Result<CheckSuiteEvent, ParseError> {
             .into_iter()
             .map(|pr| PrNumber(pr.number))
             .collect(),
+        suite_id: raw.check_suite.id,
+        updated_at: raw.check_suite.updated_at,
     })
 }
 
@@ -343,6 +353,7 @@ struct RawStatusPayload {
     description: Option<String>,
     target_url: Option<String>,
     repository: RawRepository,
+    updated_at: DateTime<Utc>,
 }
 
 fn parse_status(payload: &[u8]) -> Result<StatusEvent, ParseError> {
@@ -373,6 +384,7 @@ fn parse_status(payload: &[u8]) -> Result<StatusEvent, ParseError> {
         context: raw.context,
         description: raw.description,
         target_url: raw.target_url,
+        updated_at: raw.updated_at,
     })
 }
 
@@ -390,6 +402,7 @@ struct RawPullRequestReviewPayload {
 
 #[derive(Debug, Deserialize)]
 struct RawReview {
+    id: u64,
     user: RawUser,
     state: String,
     body: Option<String>,
@@ -439,6 +452,7 @@ fn parse_pull_request_review(payload: &[u8]) -> Result<PullRequestReviewEvent, P
         reviewer_id: raw.review.user.id,
         reviewer_login: raw.review.user.login,
         body: raw.review.body.unwrap_or_default(),
+        review_id: raw.review.id,
     })
 }
 
@@ -457,7 +471,8 @@ mod tests {
             "comment": {
                 "id": 12345,
                 "body": "@merge-train start",
-                "user": { "id": 100, "login": "octocat" }
+                "user": { "id": 100, "login": "octocat" },
+                "updated_at": "2024-01-15T10:00:00Z"
             },
             "issue": {
                 "number": 42,
@@ -497,7 +512,8 @@ mod tests {
             "comment": {
                 "id": 999,
                 "body": "test comment",
-                "user": { "id": 1, "login": "user" }
+                "user": { "id": 1, "login": "user" },
+                "updated_at": "2024-01-15T10:00:00Z"
             },
             "issue": {
                 "number": 10,
@@ -527,7 +543,8 @@ mod tests {
             "action": "deleted",
             "comment": {
                 "id": 999,
-                "user": { "id": 1, "login": "user" }
+                "user": { "id": 1, "login": "user" },
+                "updated_at": "2024-01-15T10:00:00Z"
             },
             "issue": {
                 "number": 10,
@@ -563,7 +580,8 @@ mod tests {
             "comment": {
                 "id": 999,
                 "body": "This was the original comment text",
-                "user": { "id": 1, "login": "user" }
+                "user": { "id": 1, "login": "user" },
+                "updated_at": "2024-01-15T10:00:00Z"
             },
             "issue": {
                 "number": 10,
@@ -604,7 +622,8 @@ mod tests {
                     "ref": "main"
                 },
                 "draft": false,
-                "user": { "id": 42, "login": "dev" }
+                "user": { "id": 42, "login": "dev" },
+                "updated_at": "2024-01-15T10:00:00Z"
             },
             "repository": {
                 "owner": { "login": "org" },
@@ -648,7 +667,8 @@ mod tests {
                     "sha": "0000000000000000000000000000000000000000",
                     "ref": "main"
                 },
-                "user": { "id": 1, "login": "author" }
+                "user": { "id": 1, "login": "author" },
+                "updated_at": "2024-01-15T10:00:00Z"
             },
             "repository": {
                 "owner": { "login": "org" },
@@ -691,7 +711,8 @@ mod tests {
                     "sha": "0000000000000000000000000000000000000000",
                     "ref": "main"
                 },
-                "user": { "id": 1, "login": "author" }
+                "user": { "id": 1, "login": "author" },
+                "updated_at": "2024-01-15T10:00:00Z"
             },
             "repository": {
                 "owner": { "login": "org" },
@@ -719,7 +740,8 @@ mod tests {
                     "sha": "0000000000000000000000000000000000000000",
                     "ref": "main"
                 },
-                "user": { "id": 1, "login": "author" }
+                "user": { "id": 1, "login": "author" },
+                "updated_at": "2024-01-15T10:00:00Z"
             },
             "repository": {
                 "owner": { "login": "org" },
@@ -750,7 +772,8 @@ mod tests {
                     "sha": "0000000000000000000000000000000000000000",
                     "ref": "main"
                 },
-                "user": { "id": 1, "login": "author" }
+                "user": { "id": 1, "login": "author" },
+                "updated_at": "2024-01-15T10:00:00Z"
             },
             "repository": {
                 "owner": { "login": "org" },
@@ -782,7 +805,8 @@ mod tests {
                     "sha": "1234567890abcdef1234567890abcdef12345678",
                     "ref": "main"
                 },
-                "user": { "id": 1, "login": "user" }
+                "user": { "id": 1, "login": "user" },
+                "updated_at": "2024-01-15T10:00:00Z"
             },
             "repository": {
                 "owner": { "login": "org" },
@@ -811,7 +835,9 @@ mod tests {
                 "pull_requests": [
                     { "number": 10 },
                     { "number": 20 }
-                ]
+                ],
+                "id": 555,
+    "updated_at": "2024-01-15T10:00:00Z"
             },
             "repository": {
                 "owner": { "login": "org" },
@@ -842,7 +868,9 @@ mod tests {
             "action": "requested",
             "check_suite": {
                 "head_sha": "1111111111111111111111111111111111111111",
-                "pull_requests": []
+                "pull_requests": [],
+                "id": 555,
+    "updated_at": "2024-01-15T10:00:00Z"
             },
             "repository": {
                 "owner": { "login": "org" },
@@ -872,7 +900,9 @@ mod tests {
             "check_suite": {
                 "head_sha": "deadbeef1234567890abcdef1234567890abcdef",
                 "conclusion": "startup_failure",
-                "pull_requests": []
+                "pull_requests": [],
+                "id": 555,
+    "updated_at": "2024-01-15T10:00:00Z"
             },
             "repository": {
                 "owner": { "login": "org" },
@@ -902,6 +932,7 @@ mod tests {
             "context": "ci/jenkins",
             "description": "Build passed",
             "target_url": "https://ci.example.com/build/123",
+            "updated_at": "2024-01-15T10:00:00Z",
             "repository": {
                 "owner": { "login": "org" },
                 "name": "repo"
@@ -935,6 +966,7 @@ mod tests {
             "sha": "0000000000000000000000000000000000000000",
             "state": "pending",
             "context": "continuous-integration",
+            "updated_at": "2024-01-15T10:00:00Z",
             "repository": {
                 "owner": { "login": "org" },
                 "name": "repo"
@@ -959,6 +991,7 @@ mod tests {
         let payload = r#"{
             "action": "submitted",
             "review": {
+                "id": 777,
                 "user": { "id": 555, "login": "reviewer" },
                 "state": "approved",
                 "body": "LGTM!"
@@ -993,6 +1026,7 @@ mod tests {
         let payload = r#"{
             "action": "dismissed",
             "review": {
+                "id": 777,
                 "user": { "id": 1, "login": "admin" },
                 "state": "dismissed"
             },
@@ -1023,6 +1057,7 @@ mod tests {
         let payload = r#"{
             "action": "submitted",
             "review": {
+                "id": 777,
                 "user": { "id": 1, "login": "reviewer" },
                 "state": "changes_requested",
                 "body": "Please fix the bug"
@@ -1079,6 +1114,8 @@ mod tests {
         // Missing repository
         let payload = r#"{
             "action": "created",
+            "comment": { "id": 1, "body": "test", "user": { "id": 1, "login": "u" },
+            "comment": { "id": 1, "body": "test", "user": { "id": 1, "login": "u" }     "updated_at": "2024-01-15T10:00:00Z"
             "comment": { "id": 1, "body": "test", "user": { "id": 1, "login": "u" } },
             "issue": { "number": 1, "user": { "id": 2, "login": "a" } }
         }"#;
@@ -1090,7 +1127,7 @@ mod tests {
     fn invalid_action_returns_error() {
         let payload = r#"{
             "action": "invalid_action",
-            "comment": { "id": 1, "body": "test", "user": { "id": 1, "login": "u" } },
+            "comment": { "id": 1, "body": "test", "user": { "id": 1, "login": "u" }, "updated_at": "2024-01-15T10:00:00Z" },
             "issue": { "number": 1, "user": { "id": 2, "login": "a" } },
             "repository": { "owner": { "login": "o" }, "name": "r" }
         }"#;
@@ -1110,6 +1147,7 @@ mod tests {
             "sha": "not-a-valid-sha",
             "state": "success",
             "context": "ci",
+            "updated_at": "2024-01-15T10:00:00Z",
             "repository": { "owner": { "login": "o" }, "name": "r" }
         }"#;
         let result = parse_webhook("status", payload.as_bytes());
@@ -1128,7 +1166,8 @@ mod tests {
                 "number": 1,
                 "head": { "sha": "1234567890abcdef1234567890abcdef12345678", "ref": "b" },
                 "base": { "sha": "abcdef1234567890abcdef1234567890abcdef12", "ref": "main" },
-                "user": { "id": 1, "login": "u" }
+                "user": { "id": 1, "login": "u" },
+                "updated_at": "2024-01-15T10:00:00Z"
             },
             "repository": { "owner": { "login": "o" }, "name": "r" }
         }"#;
@@ -1153,7 +1192,8 @@ mod tests {
                     "number": 1,
                     "head": {{ "sha": "1234567890abcdef1234567890abcdef12345678", "ref": "b" }},
                     "base": {{ "sha": "abcdef1234567890abcdef1234567890abcdef12", "ref": "main" }},
-                    "user": {{ "id": 1, "login": "u" }}
+                    "user": {{ "id": 1, "login": "u" }},
+                    "updated_at": "2024-01-15T10:00:00Z"
                 }},
                 "repository": {{ "owner": {{ "login": "o" }}, "name": "r" }}
             }}"#,
@@ -1180,6 +1220,7 @@ mod tests {
                 r#"{{
                 "action": "submitted",
                 "review": {{
+                    "id": 777,
                     "user": {{ "id": 1, "login": "u" }},
                     "state": "{}"
                 }},
