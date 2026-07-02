@@ -40,6 +40,20 @@ struct Config {
     git_signing_key: Option<String>,
 }
 
+/// Anchors a possibly-relative path to the process's working directory at
+/// startup, so paths later handed to subprocesses (git receives the repos
+/// tree as path arguments while running with a different cwd) mean the same
+/// place everywhere.
+fn absolutize(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .expect("cannot read the current directory at startup")
+            .join(path)
+    }
+}
+
 /// Validates the webhook secret read from the environment.
 ///
 /// A missing or empty secret is refused: HMAC with an empty key verifies
@@ -81,9 +95,16 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("./data/state"));
 
-        let repos_dir = std::env::var("REPOS_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("./data/repos"));
+        // Absolute, or git misresolves it: clone/worktree commands receive
+        // this as a path *argument* while their cwd is already inside the
+        // repos tree, and git resolves arguments against the subprocess cwd
+        // (Codex M5 round 11, P1 — the relative default nested a second
+        // repos tree inside the first).
+        let repos_dir = absolutize(
+            std::env::var("REPOS_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("./data/repos")),
+        );
 
         let webhook_secret = webhook_secret_from(std::env::var("WEBHOOK_SECRET").ok())?;
         let github_token = github_token_from(std::env::var("GITHUB_TOKEN").ok())?;
@@ -223,6 +244,21 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Git resolves path *arguments* against the subprocess cwd, which for
+    /// clone/worktree commands is already inside the repos tree — a relative
+    /// `REPOS_DIR` (including the old default `./data/repos`) made
+    /// `git clone <url> ./data/repos/o/r/clone` nest a second tree under the
+    /// first and the worker never saw `clone_dir()` (Codex M5 round 11, P1).
+    #[test]
+    fn repos_dir_is_absolutized() {
+        let abs = absolutize(PathBuf::from("data/repos"));
+        assert!(abs.is_absolute(), "got {}", abs.display());
+        assert!(abs.ends_with("data/repos"));
+
+        let already = PathBuf::from("/var/lib/merge-train/repos");
+        assert_eq!(absolutize(already.clone()), already);
+    }
 
     #[test]
     fn missing_webhook_secret_is_refused() {
