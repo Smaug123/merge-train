@@ -993,6 +993,45 @@ mod registry {
     }
 
     #[tokio::test]
+    async fn startup_prunes_expired_intake_bookkeeping() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_dir = dir.path().join("o").join("r");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        // Seed a delivery fully processed well past the retention window,
+        // with its dedupe key, then release the lock.
+        let old = chrono::Utc::now() - chrono::Duration::days(30);
+        let key = crate::webhooks::dedupe::DedupeKey::issue_comment_created(
+            PrNumber(7),
+            crate::types::CommentId(1),
+        );
+        {
+            let mut store = Store::open(&db_dir.join("state.db")).unwrap();
+            store
+                .enqueue("ancient", "pull_request", "{}", &pull_request_body(), old)
+                .unwrap();
+            let claimed = store.claim_next_delivery().unwrap().unwrap();
+            assert_eq!(claimed.delivery_id, "ancient");
+            store
+                .commit_delivery("ancient", &[], Some(&key), old)
+                .unwrap();
+            assert!(store.is_duplicate(&key).unwrap());
+        }
+
+        // Spawning the worker prunes at startup, so redelivering the ancient
+        // id is accepted as new (the idempotency row expired with the window).
+        let (deps, _fake) = fake_shared_deps(dir.path(), Default::default());
+        let registry = WorkerRegistry::new(dir.path(), deps);
+        let sender = registry.sender_for("o", "r").await.unwrap();
+        assert_eq!(
+            send_delivery(&registry, &sender, "ancient", pull_request_body())
+                .await
+                .unwrap(),
+            EnqueueOutcome::Enqueued,
+            "the expired done-delivery row should have been pruned at startup"
+        );
+    }
+
+    #[tokio::test]
     async fn open_failure_surfaces_as_open_error() {
         // Hold the repo lock with a Store; a worker open must fail Locked.
         let dir = tempfile::tempdir().unwrap();

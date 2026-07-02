@@ -417,6 +417,12 @@ fn run(
     let mut processor = Processor::new(store, deps);
     let mut stalled = false;
 
+    // Prune once at startup, then again at every idle boundary below, so the
+    // intake bookkeeping stays bounded however long the process lives.
+    if let Err(e) = prune_expired_intake(&mut processor) {
+        return fatal(e);
+    }
+
     loop {
         // (1) Service waiting messages, capped at one mailbox's worth so
         // sustained intake cannot starve backlog processing (Codex review #53).
@@ -463,8 +469,12 @@ fn run(
             }
         }
 
-        // (4) Nothing to do: block until the next message (or shutdown).
+        // (4) Nothing to do: prune expired intake bookkeeping, then block
+        // until the next message (or shutdown).
         if serviced == 0 && !processed {
+            if let Err(e) = prune_expired_intake(&mut processor) {
+                return fatal(e);
+            }
             match rx.blocking_recv() {
                 Some(msg) => {
                     stalled = false;
@@ -478,6 +488,29 @@ fn run(
             }
         }
     }
+}
+
+/// Retention for intake bookkeeping: `done` delivery rows (the delivery-id
+/// idempotency guard) and dedupe keys (the logical-event guard) expire
+/// together after this window, so both duplicate defences agree on how far
+/// back they reach. GitHub's redeliveries (automatic or one-click manual)
+/// happen well within a week; a manual redelivery of something older is
+/// treated as a fresh event.
+const INTAKE_RETENTION_DAYS: i64 = 7;
+
+/// Prunes `done` deliveries and dedupe keys older than
+/// [`INTAKE_RETENTION_DAYS`]. Called at startup and at every idle boundary;
+/// both deletes are over tables bounded by the retention window, so this is
+/// cheap enough to run often.
+fn prune_expired_intake(processor: &mut Processor) -> Result<(), StoreError> {
+    let cutoff = Utc::now() - chrono::Duration::days(INTAKE_RETENTION_DAYS);
+    let store = processor.store_mut();
+    let keys = store.prune_dedupe(cutoff)?;
+    let deliveries = store.prune_deliveries(cutoff)?;
+    if keys > 0 || deliveries > 0 {
+        info!(keys, deliveries, "pruned expired intake bookkeeping");
+    }
+    Ok(())
 }
 
 /// A Store error means we can no longer characterize this repo's state. Stop

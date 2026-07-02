@@ -30,8 +30,8 @@ use thiserror::Error;
 
 use crate::persistence::event::{StateEvent, StateEventPayload};
 use crate::persistence::snapshot::{PersistedRepoSnapshot, SCHEMA_VERSION};
-use crate::spool::DedupeKey;
 use crate::state::RepoState;
+use crate::webhooks::dedupe::DedupeKey;
 
 /// Schema version for the SQLite store. Bump on a breaking schema change; a DB
 /// at a different version is rejected loudly rather than mis-read.
@@ -808,8 +808,8 @@ mod tests {
 
     #[test]
     fn enqueue_claim_commit_flow() {
-        use crate::spool::DedupeKey;
         use crate::types::{CommentId, PrNumber};
+        use crate::webhooks::dedupe::DedupeKey;
 
         let dir = tempdir().unwrap();
         let mut store = Store::open(&dir.path().join("state.db")).unwrap();
@@ -891,8 +891,8 @@ mod tests {
 
     #[test]
     fn prune_drops_old_dedupe_and_done_deliveries() {
-        use crate::spool::DedupeKey;
         use crate::types::{CommentId, PrNumber};
+        use crate::webhooks::dedupe::DedupeKey;
 
         let dir = tempdir().unwrap();
         let mut store = Store::open(&dir.path().join("state.db")).unwrap();

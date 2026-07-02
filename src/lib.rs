@@ -13,7 +13,6 @@ pub mod github;
 pub mod persistence;
 pub mod preflight;
 pub mod server;
-pub mod spool;
 pub mod state;
 pub mod status;
 pub mod store;

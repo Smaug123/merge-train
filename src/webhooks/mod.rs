@@ -1,36 +1,21 @@
 //! Webhook handling for GitHub events.
 //!
 //! This module provides:
-//! - Signature verification for webhook payloads (HMAC-SHA256)
-//! - Event parsing from raw JSON payloads
-//! - Priority classification for event processing
+//! - Signature verification for webhook payloads (HMAC-SHA256), used at
+//!   intake by the server before a delivery is accepted
+//! - Event parsing from raw JSON payloads (`parser`), run by the per-repo
+//!   worker at drain time
+//! - Logical-event deduplication keys (`dedupe`), checked against the Store's
+//!   `dedupe_keys` table so redeliveries under new delivery IDs are skipped
+//! - Pure event handlers (`handlers`), which turn a parsed event plus current
+//!   state into state events, effects, and engine triggers
 //!
-//! # Processing Pipeline
-//!
-//! 1. **Signature verification** (`signature` module): Validate HMAC-SHA256
-//! 2. **Event parsing** (`parser` module): Parse JSON into typed events
-//! 3. **Priority classification** (`priority` module): Determine processing order
-//!
-//! # Example
-//!
-//! ```ignore
-//! use merge_train::webhooks::{verify_signature, parse_webhook, classify_priority};
-//!
-//! // 1. Verify signature
-//! if !verify_signature(payload, signature_header, secret) {
-//!     return Err("invalid signature");
-//! }
-//!
-//! // 2. Parse event
-//! let event = parse_webhook(event_type, payload)?;
-//!
-//! // 3. Classify priority
-//! if let Some(event) = event {
-//!     let priority = classify_priority(&event);
-//!     // ... enqueue with priority
-//! }
-//! ```
+//! The `priority` module (classification for a priority queue) is currently
+//! unwired: the worker processes deliveries strictly in arrival order, and
+//! stop commands reach the engine at observation boundaries instead of by
+//! jumping the queue. It is kept for the deferred priority-scheduling work.
 
+pub mod dedupe;
 pub mod events;
 pub mod handlers;
 pub mod parser;
