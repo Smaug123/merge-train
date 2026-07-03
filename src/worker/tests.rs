@@ -287,6 +287,7 @@ impl World {
             bot_user_id: TEST_BOT_ID,
             bot_name: "merge-train".to_owned(),
             stall_retry_delay: std::time::Duration::from_millis(25),
+            poll_interval: std::time::Duration::ZERO,
         }
     }
 
@@ -3074,6 +3075,113 @@ fn bootstrap_outage_releases_and_retries() {
         PipelineOutcome::Processed
     );
     assert_eq!(processor.state().default_branch, "main");
+}
+
+// ─── Polling fallback: missed-webhook recovery ───
+
+/// The headline: a train parked `WaitingCi` because its frontier PR is not
+/// mergeable will resume when readiness changes — even if the webhook that
+/// would have announced it (a `check_suite`/`status`) is never delivered.
+/// The poll re-evaluates, the engine re-fetches merge state, and progress
+/// is made. (Before polling, a missed webhook stranded the train forever.)
+#[test]
+fn poll_recovers_a_train_stranded_by_a_missed_ci_webhook() {
+    let (mut world, _heads) = World::linear_stack(1);
+    world.github.lock().unwrap().blocked.insert(PrNumber(1));
+    let mut processor = world.processor();
+    start_command(&mut world, &mut processor, 1);
+    drain(&mut processor);
+
+    // The frontier PR is blocked, so the train parked without merging.
+    assert!(
+        processor
+            .state()
+            .active_trains
+            .values()
+            .any(|t| t.state.is_active()),
+        "the train must be parked (active, WaitingCi), not gone"
+    );
+    assert!(
+        !processor.state().prs[&PrNumber(1)].state.is_merged(),
+        "a blocked frontier PR must not have merged"
+    );
+
+    // A poll while still blocked re-evaluates but makes no progress.
+    processor.poll_active_trains();
+    drain(&mut processor);
+    assert_eq!(
+        world
+            .github
+            .lock()
+            .unwrap()
+            .squash_count
+            .values()
+            .sum::<u32>(),
+        0,
+        "a poll while still blocked must not merge anything"
+    );
+
+    // Readiness flips with NO webhook delivered; the next poll recovers it.
+    // `drain` (not `drive_to_completion`) makes NO CI nudge, so only the
+    // poll's re-evaluation can complete the train.
+    world.github.lock().unwrap().blocked.clear();
+    processor.poll_active_trains();
+    drain(&mut processor);
+    assert!(
+        processor.state().prs[&PrNumber(1)].state.is_merged(),
+        "the poll alone (no webhook) must recover the stranded train"
+    );
+}
+
+/// A poll must not evaluate ahead of the acked backlog: its evaluations
+/// route through the same backlog-drain gate as the startup ones, so a
+/// pending stop/topology delivery is applied first (the round-6 rule).
+#[test]
+fn poll_does_not_overtake_the_acked_backlog() {
+    let (mut world, heads) = World::linear_stack(1);
+    // Block #1 so the train stays parked (active) after start.
+    world.github.lock().unwrap().blocked.insert(PrNumber(1));
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 1, &heads);
+    start_command(&mut world, &mut processor, 1);
+    drain(&mut processor);
+    assert!(
+        processor
+            .state()
+            .active_trains
+            .values()
+            .any(|t| t.state.is_active())
+    );
+
+    // A delivery is waiting in the backlog; a poll now must not jump it.
+    let head = {
+        let github = world.github.lock().unwrap();
+        github.branch_head("pr-1")
+    };
+    let body = check_suite_green_body(&world.config, &head, &[1], 800);
+    world.enqueue(&mut processor, "check_suite", body);
+    processor.poll_active_trains();
+    assert!(
+        processor.pump().unwrap().is_none(),
+        "poll evaluations must wait behind the pending delivery"
+    );
+    assert!(
+        !processor.has_queued_work(),
+        "nothing is queued until the backlog drains"
+    );
+}
+
+/// A poll with no active trains queues nothing — pure overhead avoidance.
+#[test]
+fn poll_with_no_active_trains_is_a_noop() {
+    let (world, _heads) = World::linear_stack(1);
+    let mut processor = world.processor();
+    processor.poll_active_trains();
+    assert!(processor.claim().unwrap().is_none());
+    assert!(
+        !processor.has_queued_work(),
+        "a poll with no active trains queues no work"
+    );
 }
 
 // ─── cache_fill_events: the unknown-PR upsert oracle ───
