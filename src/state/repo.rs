@@ -191,6 +191,11 @@ impl RepoState {
                 }
             }
 
+            // ─── Recovery adoption (DESIGN §Recovery precedence) ───
+            StateEventPayload::TrainRecordAdopted { root_pr, record } => {
+                self.active_trains.insert(*root_pr, record.clone());
+            }
+
             // A completed train is fully done — it leaves the active set.
             // (Stopped/Aborted are retained, their state reflecting the
             // terminal condition for status display and `@merge-train start`.)

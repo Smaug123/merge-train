@@ -72,6 +72,36 @@ fn pr_opened_body(
     .into_bytes()
 }
 
+fn pr_merged_body(
+    config: &GitConfig,
+    number: u64,
+    head: &Sha,
+    branch: &str,
+    base: &str,
+    merge_sha: &Sha,
+) -> Vec<u8> {
+    format!(
+        r#"{{
+            "action": "closed",
+            "pull_request": {{
+                "number": {number},
+                "state": "closed",
+                "draft": false,
+                "merged": true,
+                "merge_commit_sha": "{merge_sha}",
+                "head": {{ "sha": "{head}", "ref": "{branch}" }},
+                "base": {{ "sha": "{base_sha}", "ref": "{base}" }},
+                "user": {{ "id": {AUTHOR}, "login": "author" }},
+                "updated_at": "2026-07-01T12:00:00Z"
+            }},
+            "repository": {repo}
+        }}"#,
+        base_sha = "0".repeat(40),
+        repo = repo_json(config),
+    )
+    .into_bytes()
+}
+
 fn comment_body(
     config: &GitConfig,
     pr: u64,
@@ -197,7 +227,9 @@ impl World {
             create_pr_ref(&config, 1, &head);
             heads[0] = head;
         }
-        let github = Arc::new(Mutex::new(FakeGitHub::new(config.clone(), fake_prs)));
+        let mut fake = FakeGitHub::new(config.clone(), fake_prs);
+        fake.comment_author = TEST_BOT_ID;
+        let github = Arc::new(Mutex::new(fake));
         let world = World {
             _temp: temp,
             state_dir: TempDir::new().unwrap(),
@@ -2071,72 +2103,155 @@ fn crash_at_every_pipeline_boundary_loses_nothing() {
     }
 }
 
-// ─── Inherited mid-flight trains are refused until M6 ───
+// ─── M6: inherited mid-flight trains recover and resume ───
 
+/// Advances the world until exactly `depth` saga batches have *executed*
+/// (their effects hit reality), nudging CI whenever the train parks, then
+/// crashes WITHOUT observing the final batch's outcomes — reality is ahead
+/// of the store by up to one batch, the widest recovery window. Returns
+/// early if the train completes in fewer batches.
+fn run_batches_then_crash(world: &mut World, processor: Processor, depth: usize) {
+    let mut processor = processor;
+    let mut executed = 0;
+    'outer: while executed < depth {
+        while let Some(delivery) = processor.claim().unwrap() {
+            processor.process_claimed(delivery).unwrap();
+        }
+        match processor.pump().unwrap() {
+            Some(first) => {
+                let mut batch = first;
+                loop {
+                    let outcomes = execute(&processor, &batch);
+                    executed += 1;
+                    if executed >= depth {
+                        break 'outer; // crash: outcomes never observed
+                    }
+                    match processor
+                        .on_outcomes(batch.root, outcomes, batch.feedback)
+                        .unwrap()
+                    {
+                        Some(next) => batch = next,
+                        None => break,
+                    }
+                }
+            }
+            None => {
+                let waiting: Vec<PrNumber> = processor
+                    .state()
+                    .active_trains
+                    .values()
+                    .filter(|t| t.state.is_active())
+                    .map(|t| t.current_pr)
+                    .collect();
+                if waiting.is_empty() {
+                    break; // completed before `depth` batches
+                }
+                for pr in waiting {
+                    let (head, suite) = {
+                        let github = world.github.lock().unwrap();
+                        let branch = github.prs[&pr].branch.clone();
+                        (github.branch_head(&branch), world.next_delivery + 900)
+                    };
+                    let body = check_suite_green_body(&world.config, &head, &[pr.0], suite);
+                    world.enqueue(&mut processor, "check_suite", body);
+                }
+            }
+        }
+    }
+    drop(processor); // the crash
+}
+
+/// The M6 recovery invariants, asserted at quiescence after a
+/// crash-restart-recover run of a 2-PR train.
+fn assert_recovered_exactly_once(world: &World, processor: &mut Processor, context: &str) {
+    let github = world.github.lock().unwrap();
+    for (pr, count) in &github.squash_count {
+        assert!(*count <= 1, "{context}: PR #{pr} squashed {count} times");
+    }
+    for i in 1..=2u64 {
+        let real_merged = matches!(
+            github.prs.get(&PrNumber(i)).map(|f| &f.state),
+            Some(FakePrState::Merged { .. })
+        );
+        assert!(real_merged, "{context}: PR #{i} not merged on GitHub");
+    }
+    drop(github);
+    for i in 1..=2u64 {
+        assert!(
+            processor.state().prs[&PrNumber(i)].state.is_merged(),
+            "{context}: store does not believe PR #{i} merged"
+        );
+    }
+    let events = processor.store_mut().events().unwrap();
+    let completed: Vec<PrNumber> = events
+        .iter()
+        .filter_map(|e| match e.payload {
+            crate::persistence::event::StateEventPayload::TrainCompleted { root_pr } => {
+                Some(root_pr)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(!completed.is_empty(), "{context}: no train completed");
+    for root in completed {
+        let facts = ReplayFacts::for_train(&events, root);
+        assert_eq!(
+            facts.unmatched().count(),
+            0,
+            "{context}: completed train #{root} has unmatched intents"
+        );
+    }
+}
+
+/// The M6 headline: a train inherited mid-cascade from a dead process
+/// RESUMES — worktree cleaned, state recovered via the evaluate path — and
+/// completes with every PR squashed exactly once. (Before M6 the worker
+/// refused these trains and demanded a stop-and-restart.)
 #[test]
-fn inherited_mid_flight_train_refuses_evaluation_but_stops_cleanly() {
+fn inherited_mid_flight_train_recovers_and_completes() {
     let (mut world, heads) = World::linear_stack(2);
     let mut processor = world.processor();
     world.enqueue_stack_setup(&mut processor, 2, &heads);
     start_command(&mut world, &mut processor, 1);
+    run_batches_then_crash(&mut world, processor, 4);
 
-    // Run the saga a few steps in (train active, mid-cascade), then "crash".
-    while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
-    }
-    let mut batch = processor.pump().unwrap().expect("start plans a saga");
-    for _ in 0..4 {
-        let outcomes = execute(&processor, &batch);
-        match processor
-            .on_outcomes(batch.root, outcomes, batch.feedback)
-            .unwrap()
-        {
-            Some(next) => batch = next,
-            None => break,
-        }
-    }
-    assert!(
-        processor
-            .state()
-            .active_trains
-            .values()
-            .any(|t| t.state.is_active()),
-        "precondition: the train is mid-flight"
-    );
-    drop(processor);
-
-    // A fresh process inherits the mid-flight train.
+    // A fresh process inherits the mid-flight train and must resume it —
+    // no stop, no re-issued start; drive_to_completion supplies only CI.
     let mut processor = world.processor();
+    drive_to_completion(&mut world, &mut processor);
+    assert_recovered_exactly_once(&world, &mut processor, "depth 4");
+}
 
-    // CI webhooks would normally re-drive it; the worker must refuse.
-    let head = {
-        let github = world.github.lock().unwrap();
-        github.branch_head("pr-1")
-    };
-    let body = check_suite_green_body(&world.config, &head, &[1], 800);
-    world.enqueue(&mut processor, "check_suite", body);
-    drain(&mut processor);
-    assert!(
-        processor
-            .state()
-            .active_trains
-            .values()
-            .any(|t| t.state.is_active()),
-        "an inherited mid-flight train must not advance before M6"
-    );
-    assert_eq!(
-        world
-            .github
-            .lock()
-            .unwrap()
-            .squash_count
-            .values()
-            .sum::<u32>(),
-        0
-    );
+/// The class oracle: the same recovery must hold with the crash at EVERY
+/// saga depth — each depth leaves a different phase mid-flight, and the
+/// final batch's effects have always run unobserved (reality ahead of the
+/// store by one batch).
+#[test]
+fn crash_at_every_saga_depth_recovers_to_exactly_once_completion() {
+    for depth in 1..=12usize {
+        let (mut world, heads) = World::linear_stack(2);
+        let mut processor = world.processor();
+        world.enqueue_stack_setup(&mut processor, 2, &heads);
+        start_command(&mut world, &mut processor, 1);
+        run_batches_then_crash(&mut world, processor, depth);
 
-    // But a stop works: terminal event + cleanup.
-    assert!(!processor.inherited_markers().is_empty());
+        let mut processor = world.processor();
+        drive_to_completion(&mut world, &mut processor);
+        assert_recovered_exactly_once(&world, &mut processor, &format!("depth {depth}"));
+    }
+}
+
+/// `stop` on an inherited mid-flight train still works — recovery must not
+/// have cost the emergency brake.
+#[test]
+fn inherited_mid_flight_train_still_stops() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    start_command(&mut world, &mut processor, 1);
+    run_batches_then_crash(&mut world, processor, 2);
+
+    let mut processor = world.processor();
     let body = comment_body(&world.config, 1, "@merge-train stop", AUTHOR, "author", 44);
     world.enqueue(&mut processor, "issue_comment", body);
     drain(&mut processor);
@@ -2145,29 +2260,145 @@ fn inherited_mid_flight_train_refuses_evaluation_but_stops_cleanly() {
             .state()
             .active_trains
             .values()
-            .all(|t| !t.state.is_active())
+            .all(|t| !t.state.is_active()),
+        "the stop must retire the inherited train"
     );
-    // Stopping the inherited train must clear its refuse-evaluation marker,
-    // or a restarted train that parks (e.g. waiting on CI in production,
-    // where mergeability starts Unknown) is refused every evaluation until
-    // the process restarts (Codex M5 review).
+}
+
+/// GitHub down at recovery time: the train stays active and UNADVANCED
+/// (correctness over availability — resuming unverified risks the exact
+/// double-squash supplementary recovery exists to prevent), the worker asks
+/// for the stall-retry timer, and the timer's re-queue recovers the train
+/// once GitHub returns.
+#[test]
+fn recovery_parks_and_retries_when_github_is_unavailable() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    start_command(&mut world, &mut processor, 1);
+    run_batches_then_crash(&mut world, processor, 4);
+
+    world.github.lock().unwrap().unavailable = true;
+    let mut processor = world.processor();
+    drain(&mut processor);
     assert!(
-        processor.inherited_markers().is_empty(),
-        "the stop must clear the inherited marker"
+        processor.take_retry_request(),
+        "a parked recovery must arm the stall-retry timer"
+    );
+    assert!(
+        processor
+            .state()
+            .active_trains
+            .values()
+            .any(|t| t.state.is_active()),
+        "the unrecovered train must stay active"
+    );
+    assert!(
+        !processor.has_queued_work(),
+        "the parked evaluation must not spin the worker loop"
     );
 
-    // The documented recovery path continues: re-issuing `start` must yield
-    // a train that actually advances.
-    // (A fresh comment id: re-using the first start's would dedupe.)
-    let body = comment_body(&world.config, 1, "@merge-train start", AUTHOR, "author", 99);
-    world.enqueue(&mut processor, "issue_comment", body);
+    // The outage lifts and the timer fires (`WorkerMsg::RetryStalled`).
+    world.github.lock().unwrap().unavailable = false;
+    processor.requeue_marked_recoveries();
     drive_to_completion(&mut world, &mut processor);
-    for i in 1..=2u64 {
-        assert!(
-            processor.state().prs[&PrNumber(i)].state.is_merged(),
-            "PR #{i} did not merge after the stop-and-restart recovery"
-        );
+    assert_recovered_exactly_once(&world, &mut processor, "outage-then-retry");
+}
+
+/// Restore-from-backup (DESIGN §Recovery precedence): the status comment's
+/// `recovery_seq` is ahead of the local record — the ONLY way that happens
+/// under SQLite is local state regressing — so the comment's record is
+/// adopted wholesale, id repaired to the comment it was found in.
+#[test]
+fn a_status_comment_ahead_of_the_store_is_adopted() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    start_command(&mut world, &mut processor, 1);
+    // Depth 4: the crash lands mid-`Preparing` (batches 1–3 are the
+    // Idle-phase preflight/comment/refetch steps).
+    run_batches_then_crash(&mut world, processor, 4);
+
+    // Simulate the backup restore: doctor the status comment to carry the
+    // same train at a recovery_seq the (restored) store has never reached.
+    let doctored_seq = {
+        let processor = world.processor();
+        let local = processor
+            .state()
+            .active_trains
+            .values()
+            .find(|t| t.state.is_active())
+            .expect("the mid-flight train survives the crash")
+            .clone();
+        drop(processor);
+        let mut ahead = local.clone();
+        ahead.recovery_seq += 10;
+        let body =
+            crate::status::format::format_status_comment(&ahead, "doctored (backup restore)")
+                .unwrap();
+        let mut github = world.github.lock().unwrap();
+        let id = local
+            .status_comment_id
+            .expect("mid-flight train has a status comment");
+        github.comments.get_mut(&id).expect("comment exists").body = body;
+        ahead.recovery_seq
+    };
+
+    let mut processor = world.processor();
+    drive_to_completion(&mut world, &mut processor);
+    let events = processor.store_mut().events().unwrap();
+    let adopted_seq = events.iter().find_map(|e| match &e.payload {
+        crate::persistence::event::StateEventPayload::TrainRecordAdopted { record, .. } => {
+            Some(record.recovery_seq)
+        }
+        _ => None,
+    });
+    assert_eq!(
+        adopted_seq,
+        Some(doctored_seq),
+        "the ahead comment record must be adopted"
+    );
+    assert_recovered_exactly_once(&world, &mut processor, "comment-ahead");
+}
+
+/// A deleted status comment must not strand recovery: the dangling id is
+/// cleared and the engine re-posts its off-disk backup as it resumes.
+#[test]
+fn a_deleted_status_comment_is_reposted_during_recovery() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    start_command(&mut world, &mut processor, 1);
+    // Depth 4: mid-`Preparing`, so recovery (not the engine's idle-phase
+    // self-heal) must be the thing that re-establishes the backup.
+    run_batches_then_crash(&mut world, processor, 4);
+
+    // The user deletes the bot's status comment while the process is down.
+    {
+        let processor = world.processor();
+        let id = processor
+            .state()
+            .active_trains
+            .values()
+            .find(|t| t.state.is_active())
+            .and_then(|t| t.status_comment_id)
+            .expect("mid-flight train has a status comment");
+        drop(processor);
+        world.github.lock().unwrap().comments.remove(&id);
     }
+
+    let mut processor = world.processor();
+    drive_to_completion(&mut world, &mut processor);
+    assert_recovered_exactly_once(&world, &mut processor, "comment-deleted");
+    // The off-disk backup was re-established at some point post-recovery.
+    let github = world.github.lock().unwrap();
+    assert!(
+        github
+            .comments
+            .values()
+            .any(|c| c.pr == PrNumber(1) && c.body.contains("merge-train-state")),
+        "the status comment must be re-posted after deletion"
+    );
 }
 
 // ─── cache_fill_events: the unknown-PR upsert oracle ───
@@ -2530,11 +2761,11 @@ mod registry {
 ///   is merged on (fake) GitHub;
 /// - **every acknowledged command is answered** — `pending_commands` is
 ///   empty at quiescence and no train is left active;
-/// - *(no-crash schedules only)* store and GitHub agree exactly, and every
-///   completed train's intent ledger is fully matched. (Under a crash,
-///   reality can be ahead of the store until M6's recovery lands — the
-///   inherited-mid-flight refusal — so equality is deliberately not
-///   asserted there.)
+/// - **store and GitHub agree exactly, and every completed train's intent
+///   ledger is fully matched** — for crash schedules too: M6's recovery
+///   (worktree cleanup + supplementary GitHub recovery + the evaluate
+///   path) plus reality's merged-close webhooks must reconcile every
+///   crash window the schedule can produce.
 ///
 /// Each case does real git work, so the case counts are deliberately small;
 /// raise them locally (`PROPTEST_CASES`) when touching worker ordering.
@@ -2694,9 +2925,13 @@ mod interleaving {
         }
 
         /// Runs the deterministic tail to quiescence: settle everything,
-        /// nudge CI while trains progress, stop whatever refuses to finish
-        /// (pre-M6, a crash mid-cascade leaves a train only a stop can
-        /// retire). Panics if the system will not go quiet.
+        /// then play reality's parts — CI goes green for whatever is
+        /// waiting, and GitHub delivers the merged-close webhook for every
+        /// squash the store has not yet heard about (that webhook, not
+        /// recovery, is how a train stopped after an unobserved squash
+        /// reconciles). M6: trains inherited mid-cascade recover and finish
+        /// on their own — no stop crutch. Panics if the system will not go
+        /// quiet.
         fn finish(&mut self) {
             for round in 0..40 {
                 // Settle: boundaries, deliveries, pumps, until a fixpoint.
@@ -2710,6 +2945,10 @@ mod interleaving {
                         self.processor().process_claimed(delivery).unwrap();
                         progressed = true;
                     }
+                    // A recovery parked on an outage cannot happen here
+                    // (the fake is up), but a recovery dropped by a crash
+                    // needs its timer path: re-queue before pumping.
+                    self.processor().requeue_marked_recoveries();
                     if self.held.is_none()
                         && let Some(batch) = self.processor().pump().unwrap()
                     {
@@ -2720,52 +2959,63 @@ mod interleaving {
                         break;
                     }
                 }
+                let delivered = self.deliver_unseen_merges();
                 let any_active = self
                     .processor()
                     .state()
                     .active_trains
                     .values()
                     .any(|t| t.state.is_active());
-                if !any_active {
+                if !any_active && delivered == 0 {
                     return;
                 }
                 if round < 20 {
                     self.nudge_ci();
-                }
-                if round >= 10 && self.next_stop_comment <= 9 {
-                    // Stop every active train's root (inherited-refused
-                    // trains never finish on CI alone before M6).
-                    let roots: Vec<u64> = self
-                        .processor()
-                        .state()
-                        .active_trains
-                        .values()
-                        .filter(|t| t.state.is_active())
-                        .map(|t| t.original_root_pr.0)
-                        .collect();
-                    for root in roots {
-                        if self.next_stop_comment > 9 {
-                            break;
-                        }
-                        let id = self.next_stop_comment;
-                        self.next_stop_comment += 1;
-                        let body = comment_body(
-                            &self.world.config,
-                            root,
-                            "@merge-train stop",
-                            AUTHOR,
-                            "author",
-                            id,
-                        );
-                        let processor = self.processor.as_mut().unwrap();
-                        self.world.enqueue(processor, "issue_comment", body);
-                    }
                 }
             }
             panic!(
                 "did not quiesce: {:?}",
                 self.processor().state().active_trains
             );
+        }
+
+        /// Reality's merged-close webhooks: GitHub always announces a
+        /// merged PR, which is how the store hears about a squash whose
+        /// observation died with the process on a train that was then
+        /// stopped (recovery never evaluates a retired train). Returns how
+        /// many it enqueued.
+        fn deliver_unseen_merges(&mut self) -> usize {
+            let unseen: Vec<(PrNumber, Sha, Sha, String, String)> = {
+                let github = self.world.github.lock().unwrap();
+                let state = self.processor.as_ref().unwrap().state();
+                github
+                    .prs
+                    .iter()
+                    .filter_map(|(pr, fake)| {
+                        let FakePrState::Merged { squash_sha } = &fake.state else {
+                            return None;
+                        };
+                        let store_merged = state.prs.get(pr).is_some_and(|c| c.state.is_merged());
+                        (!store_merged).then(|| {
+                            (
+                                *pr,
+                                squash_sha.clone(),
+                                github.branch_head(&fake.branch),
+                                fake.branch.clone(),
+                                fake.base_ref.clone(),
+                            )
+                        })
+                    })
+                    .collect()
+            };
+            let delivered = unseen.len();
+            for (pr, merge_sha, head, branch, base) in unseen {
+                let body =
+                    pr_merged_body(&self.world.config, pr.0, &head, &branch, &base, &merge_sha);
+                let processor = self.processor.as_mut().unwrap();
+                self.world.enqueue(processor, "pull_request", body);
+            }
+            delivered
         }
 
         /// The invariants every schedule must preserve.
@@ -2880,6 +3130,10 @@ mod interleaving {
             run.apply(Step::Crash);
             run.finish();
             run.assert_safety();
+            // M6: recovery closes the reality-ahead windows, so crash
+            // schedules must reach the same exact store/GitHub agreement
+            // no-crash schedules do.
+            run.assert_full_consistency();
         }
     }
 }

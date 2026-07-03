@@ -54,7 +54,7 @@ use crate::effects::{Effect, GitHubResponse, PrData};
 use crate::git::{CommitIdentity, GitConfig};
 use crate::persistence::event::StateEventPayload;
 use crate::store::{Delivery, Store, StoreError};
-use crate::types::{MergeStateStatus, PhaseKind, PrNumber, PrState};
+use crate::types::{MergeStateStatus, PrNumber, PrState};
 use crate::webhooks::dedupe::DedupeKey;
 use crate::webhooks::events::CommentAction;
 use crate::webhooks::handlers::{HandlerCtx, Trigger, handle_event};
@@ -64,6 +64,7 @@ use super::authz::{
     AuthorDecision, RoleDecision, authorize_by_author, authorize_by_role, authorize_retraction,
 };
 use super::executor::{GitHubExec, SagaBatch};
+use super::recovery::{CommentRecovery, decide_comment_recovery};
 
 /// Per-repo dependencies the processor needs beyond the `Store`.
 pub struct WorkerDeps {
@@ -136,7 +137,7 @@ enum PendingWork {
     /// effects that already ran (Codex M5 round 2, P1 — the same ordering
     /// queued stops get). Volatile until applied; a crash loses it, and the
     /// train is then recovered like any inherited active train (the abort's
-    /// *cause* events are durable, so evaluation re-derives it under M6).
+    /// *cause* events are durable, so the startup evaluation re-derives it).
     DeferredAbort {
         root: PrNumber,
         error: crate::types::TrainError,
@@ -160,11 +161,22 @@ pub(crate) struct Processor {
     pending: VecDeque<PendingWork>,
     /// The root whose plan's effects are currently executing off-thread.
     in_flight: Option<PrNumber>,
-    /// Active non-`Idle` trains inherited from a previous process: resuming
-    /// them needs M6's recovery (worktree restart cleanup + supplementary
-    /// GitHub recovery), so evaluation is refused loudly until then. `stop`
-    /// still works.
+    /// Active non-`Idle` trains inherited from a previous process, awaiting
+    /// recovery (DESIGN §Restart safety): supplementary GitHub recovery
+    /// runs at the root's first evaluation, worktree restart cleanup with
+    /// its first effect batch. Roots leave the set when recovery succeeds
+    /// or a lifecycle event ends the train (a stop needs no recovery).
     inherited_mid_flight: HashSet<PrNumber>,
+    /// Recovered roots whose worktree still needs the one-time restart
+    /// cleanup (`cleanup_worktree_on_restart`, run on the executor thread
+    /// with the root's next batch — a mid-git-op crash leaves in-progress
+    /// merges and dirt no later operation may see).
+    needs_restart_cleanup: HashSet<PrNumber>,
+    /// Set when supplementary recovery found GitHub unavailable: the worker
+    /// loop arms the stall-retry timer, whose firing re-queues evaluations
+    /// for the still-marked roots (nothing else may wake a traffic-less
+    /// repo).
+    retry_requested: bool,
     /// Active-train evaluations owed at startup, queued when the durable
     /// backlog first drains (`Some` until then; see [`Processor::claim`]).
     startup_evaluates: Option<Vec<PrNumber>>,
@@ -175,20 +187,24 @@ pub(crate) struct Processor {
 
 impl Processor {
     pub fn new(store: Store, deps: WorkerDeps) -> Result<Processor, StoreError> {
+        // Every inherited active train runs recovery at its first
+        // evaluation (DESIGN §Restart safety: worktree cleanup +
+        // supplementary GitHub recovery) — including Idle-phase trains: no
+        // git operation was mid-flight for those, but their status comment
+        // may still be ahead of a restored-from-backup store, or may have
+        // been deleted while the process was down.
         let inherited_mid_flight: HashSet<PrNumber> = store
             .state()
             .active_trains
             .values()
-            .filter(|t| t.state.is_active() && t.cascade_phase.kind() != PhaseKind::Idle)
+            .filter(|t| t.state.is_active())
             .map(|t| t.original_root_pr)
             .collect();
         for root in &inherited_mid_flight {
-            error!(
+            info!(
                 %root,
-                "train was mid-cascade when the previous process died; \
-                 resuming it requires recovery (M6), which is not implemented \
-                 yet — the train will not advance. `@merge-train stop` it and \
-                 re-issue `start`."
+                "train was active when the previous process died; it will \
+                 be recovered at its first evaluation"
             );
         }
 
@@ -238,6 +254,8 @@ impl Processor {
             pending,
             in_flight: None,
             inherited_mid_flight,
+            needs_restart_cleanup: HashSet::new(),
+            retry_requested: false,
             startup_evaluates: Some(startup_evaluates),
             active_start: None,
         })
@@ -251,12 +269,6 @@ impl Processor {
     #[cfg(test)]
     pub fn state(&self) -> &crate::state::RepoState {
         self.store.state()
-    }
-
-    /// The roots still refused evaluation as inherited-mid-cascade.
-    #[cfg(test)]
-    pub fn inherited_markers(&self) -> &HashSet<PrNumber> {
-        &self.inherited_mid_flight
     }
 
     pub fn github(&self) -> &GitHubExec {
@@ -766,11 +778,177 @@ impl Processor {
         self.pending.push_back(work);
     }
 
-    /// Inherited-marker upkeep: a root stays refused only while the inherited
-    /// mid-cascade record is the live one. Any train-lifecycle event for the
-    /// root supersedes that record — most importantly the documented recovery
-    /// path, stop → fresh `start` (Codex M5 review: without this, the marker
-    /// refused the restarted train's evaluation until the process restarted).
+    /// Supplementary GitHub recovery for a train inherited mid-cascade
+    /// (DESIGN §Recovery precedence, §Supplementary GitHub recovery), run
+    /// once at the root's first post-restart evaluation. Fetches the root
+    /// PR's comments and lets [`decide_comment_recovery`] rule:
+    ///
+    /// - the bot's status comment is AHEAD (`recovery_seq`) — only possible
+    ///   when local durable state regressed, i.e. the DB was restored from
+    ///   a backup — its record is adopted (`TrainRecordAdopted`), which is
+    ///   what stops the cascade re-running a squash the world already saw;
+    /// - the comment is gone — the dangling id is cleared (same event) so
+    ///   the engine re-posts its off-disk backup;
+    /// - otherwise local state stands.
+    ///
+    /// On success the root is unmarked and flagged for the one-time
+    /// worktree restart cleanup (executed with its next batch). Returns
+    /// `false` when GitHub was unavailable: the root stays marked, the
+    /// caller parks the evaluation, and `retry_requested` asks the worker
+    /// loop to arm the stall-retry timer. A *permanent* failure is treated
+    /// the same way, deliberately: proceeding unverified risks exactly the
+    /// double-squash this check exists to prevent, and the stall cadence
+    /// heals "permanent" auth errors the moment the operator fixes the
+    /// token (`stop` remains available throughout).
+    fn recover_inherited(&mut self, root: PrNumber) -> Result<bool, StoreError> {
+        let local = self
+            .store
+            .state()
+            .active_trains
+            .get(&root)
+            .expect("caller checked the train is active")
+            .clone();
+        let comments = match self
+            .deps
+            .github
+            .execute(GitHubEffect::ListComments { pr: root })
+        {
+            Ok(GitHubResponse::Comments(comments)) => comments,
+            Ok(other) => {
+                error!(?other, "ListComments answered the wrong variant");
+                self.retry_requested = true;
+                return Ok(false);
+            }
+            Err(e @ EffectError::Transient { .. }) => {
+                warn!(%root, error = ?e, "cannot fetch status comments; recovery parked");
+                self.retry_requested = true;
+                return Ok(false);
+            }
+            Err(e) => {
+                error!(
+                    %root, error = ?e,
+                    "cannot fetch status comments and the failure is permanent; \
+                     recovery is PARKED at the stall cadence — operator action \
+                     likely required (token scopes?). `@merge-train stop` still \
+                     works."
+                );
+                self.retry_requested = true;
+                return Ok(false);
+            }
+        };
+        match decide_comment_recovery(&local, &comments, self.deps.bot_user_id) {
+            CommentRecovery::Adopt(record) => {
+                info!(
+                    %root,
+                    local_seq = local.recovery_seq,
+                    remote_seq = record.recovery_seq,
+                    "status comment is ahead of the store (restored from \
+                     backup?); adopting its record"
+                );
+                self.store.append_batch(
+                    &[StateEventPayload::TrainRecordAdopted {
+                        root_pr: root,
+                        record: *record,
+                    }],
+                    Utc::now(),
+                )?;
+            }
+            CommentRecovery::RepairCommentId(comment_id) => {
+                info!(%root, %comment_id, "status comment moved; repairing the id");
+                self.store.append_batch(
+                    &[StateEventPayload::StatusCommentPosted {
+                        root_pr: root,
+                        comment_id,
+                    }],
+                    Utc::now(),
+                )?;
+            }
+            CommentRecovery::ClearCommentId => {
+                // Re-establish the off-disk backup NOW, not merely clear
+                // the id: the engine's own self-heal runs only at idle
+                // evaluations, and a cascade resumed mid-phase may chain
+                // to completion without passing one.
+                info!(%root, "status comment is gone; re-posting the backup");
+                let mut record = local;
+                record.status_comment_id = None;
+                match crate::status::format::format_status_comment(
+                    &record,
+                    "🚂 Merge train recovered after a restart.",
+                ) {
+                    Ok(body) => {
+                        match self
+                            .deps
+                            .github
+                            .execute(GitHubEffect::PostComment { pr: root, body })
+                        {
+                            Ok(GitHubResponse::CommentPosted { id }) => {
+                                record.status_comment_id = Some(id);
+                            }
+                            Err(e @ EffectError::Transient { .. }) => {
+                                // Nothing durable happened yet: park the
+                                // whole recovery and retry from ListComments.
+                                warn!(%root, error = ?e, "cannot re-post the status comment; \
+                                       recovery parked");
+                                self.retry_requested = true;
+                                return Ok(false);
+                            }
+                            // Permanent (or a wrong variant): proceed with
+                            // the id cleared — local state is intact and
+                            // authoritative; the backup stays missing, loudly.
+                            other => {
+                                error!(
+                                    %root, ?other,
+                                    "cannot re-post the status comment; resuming \
+                                     WITHOUT the off-disk backup"
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!(
+                            %root, error = %e,
+                            "recovered record cannot be formatted as a status \
+                             comment; resuming WITHOUT the off-disk backup"
+                        );
+                    }
+                }
+                self.store.append_batch(
+                    &[StateEventPayload::TrainRecordAdopted {
+                        root_pr: root,
+                        record,
+                    }],
+                    Utc::now(),
+                )?;
+            }
+            CommentRecovery::KeepLocal => {}
+        }
+        self.inherited_mid_flight.remove(&root);
+        self.needs_restart_cleanup.insert(root);
+        info!(%root, "recovered an inherited mid-cascade train; resuming");
+        Ok(true)
+    }
+
+    /// Whether the worker loop should arm the stall-retry timer (set when
+    /// supplementary recovery found GitHub unavailable). Clears on read.
+    pub fn take_retry_request(&mut self) -> bool {
+        std::mem::take(&mut self.retry_requested)
+    }
+
+    /// Re-queues an evaluation for every root still awaiting recovery —
+    /// called when the stall-retry timer fires, so a parked recovery is
+    /// retried even on a repo with no other traffic.
+    pub fn requeue_marked_recoveries(&mut self) {
+        for root in self.inherited_mid_flight.clone() {
+            self.queue(PendingWork::Trigger(Trigger::EvaluateTrain { root }));
+        }
+    }
+
+    /// Inherited-marker upkeep: a root stays marked for recovery only while
+    /// the inherited mid-cascade record is the live one. Any train-lifecycle
+    /// event for the root supersedes that record — most importantly a stop
+    /// (a stopped train needs no recovery, and before M6 the stale marker
+    /// refused the restarted train's evaluation until the process
+    /// restarted; Codex M5 review).
     fn clear_inherited_markers(&mut self, events: &[StateEventPayload]) {
         if self.inherited_mid_flight.is_empty() {
             return;
@@ -861,18 +1039,27 @@ impl Processor {
                     {
                         continue;
                     }
-                    if self.inherited_mid_flight.contains(&root) {
-                        error!(
-                            %root,
-                            "refusing to advance a train inherited mid-cascade from a \
-                             previous process (recovery lands in M6); stop and restart it"
-                        );
+                    // An inherited train recovers at its first evaluation:
+                    // supplementary GitHub recovery now (the status comment
+                    // may be AHEAD of a restored-from-backup store),
+                    // worktree restart cleanup with its next batch. GitHub
+                    // unavailable: the evaluation is deliberately DROPPED —
+                    // the root stays marked and the stall-retry timer
+                    // re-queues it (`requeue_marked_recoveries`); keeping
+                    // it queued would spin the idle check into a hot loop
+                    // against a down GitHub.
+                    if self.inherited_mid_flight.contains(&root) && !self.recover_inherited(root)? {
                         continue;
                     }
                     let facts = ReplayFacts::for_train(&self.store.events()?, root);
                     (
                         root,
-                        cascade::advance(state, root, Observation::Evaluate { facts }, now),
+                        cascade::advance(
+                            self.store.state(),
+                            root,
+                            Observation::Evaluate { facts },
+                            now,
+                        ),
                     )
                 }
                 PendingWork::Trigger(Trigger::LateAddition { .. }) => {
@@ -889,6 +1076,7 @@ impl Processor {
                         effects: Vec::new(),
                         best_effort: effects,
                         feedback: false,
+                        restart_cleanup: self.needs_restart_cleanup.remove(&root),
                     }));
                 }
                 // A deferred abort whose saga boundary never consumed it
@@ -905,6 +1093,7 @@ impl Processor {
                         effects: Vec::new(),
                         best_effort: cleanup,
                         feedback: false,
+                        restart_cleanup: self.needs_restart_cleanup.remove(&root),
                     }));
                 }
             };
@@ -1112,6 +1301,7 @@ impl Processor {
             effects: Vec::new(),
             best_effort: cleanup,
             feedback: false,
+            restart_cleanup: self.needs_restart_cleanup.remove(&root),
         }))
     }
 
@@ -1306,6 +1496,7 @@ impl Processor {
             effects,
             best_effort,
             feedback,
+            restart_cleanup: self.needs_restart_cleanup.remove(&root),
         }))
     }
 }

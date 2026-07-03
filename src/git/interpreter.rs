@@ -50,6 +50,11 @@ pub struct WorktreeGitInterpreter {
 }
 
 impl WorktreeGitInterpreter {
+    /// The git configuration this interpreter operates under.
+    pub fn config(&self) -> &GitConfig {
+        &self.config
+    }
+
     /// An interpreter for the train rooted at `root`. The commit identity
     /// comes from the config (`GitConfig.commit_identity`).
     pub fn new(config: GitConfig, root: PrNumber) -> Self {
