@@ -362,8 +362,19 @@ impl Processor {
         // resend — the repo's queue pauses at the stall cadence (which
         // also heals "permanent" auth errors the moment the operator fixes
         // the token).
+        //
+        // The crawl must NOT consume THIS delivery's own comment as a
+        // historical declaration: it is live input the command handler
+        // below is about to process, and pre-recording it (round 9 keeps
+        // merged-predecessor edges) would let the handler see it as
+        // already-owned and skip the `LateAddition` answer a genuine
+        // late-addition command deserves (Codex crawl review round 10).
+        let own_comment = match &event {
+            GitHubEvent::IssueComment(c) => Some(c.comment_id),
+            _ => None,
+        };
         if self.store.state().default_branch.is_empty()
-            && !self.bootstrap_crawl(&event.referenced_prs())?
+            && !self.bootstrap_crawl(&event.referenced_prs(), own_comment)?
         {
             return self.release(&id);
         }
@@ -762,7 +773,11 @@ impl Processor {
     /// unavailable (any failure: transient, permanent, or a wrong
     /// variant): the caller releases the delivery and the queue pauses at
     /// the stall cadence — there is no safe degraded answer at bootstrap.
-    fn bootstrap_crawl(&mut self, seed_prs: &[PrNumber]) -> Result<bool, StoreError> {
+    fn bootstrap_crawl(
+        &mut self,
+        seed_prs: &[PrNumber],
+        skip_comment: Option<crate::types::CommentId>,
+    ) -> Result<bool, StoreError> {
         /// How many days of merged PRs the crawl considers: predecessor
         /// targets and mid-cascade roots older than this are treated as
         /// history (DESIGN bounds the resurrection window the same way).
@@ -859,6 +874,7 @@ impl Processor {
                 &comments,
                 &self.deps.bot_name,
                 self.deps.bot_user_id,
+                skip_comment,
                 Utc::now(),
             );
             let fresh: Vec<PrNumber> = outcome

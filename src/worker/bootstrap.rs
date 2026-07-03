@@ -138,6 +138,7 @@ pub(crate) fn crawl_events(
     comments: &[(PrNumber, Vec<CommentData>)],
     bot_name: &str,
     bot_user_id: u64,
+    skip_comment: Option<crate::types::CommentId>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> CrawlOutcome {
     let mut events = vec![StateEventPayload::DefaultBranchSet {
@@ -176,6 +177,17 @@ pub(crate) fn crawl_events(
         };
         for comment in pr_comments {
             if comment.author_id != author || comment.author_id == bot_user_id {
+                continue;
+            }
+            // The triggering delivery's own comment is live input the
+            // command handler will process; the crawl must not pre-record
+            // it as history and suppress the handler's late-addition answer
+            // (Codex crawl review round 10).
+            // The triggering delivery's own comment is live input the
+            // command handler will process; the crawl must not pre-record
+            // it as history and suppress the handler's late-addition answer
+            // (Codex crawl review round 10).
+            if skip_comment == Some(comment.id) {
                 continue;
             }
             let Some(Command::Predecessor(target)) = parse_command(&comment.body, bot_name) else {
@@ -458,7 +470,15 @@ mod tests {
                 comment(3, AUTHOR, "@merge-train predecessor #9"),
             ],
         )];
-        let outcome = crawl_events("main", &open, &comments, "merge-train", BOT, test_now());
+        let outcome = crawl_events(
+            "main",
+            &open,
+            &comments,
+            "merge-train",
+            BOT,
+            None,
+            test_now(),
+        );
         assert_eq!(
             declared(&outcome.events),
             vec![(PrNumber(2), PrNumber(1))],
@@ -492,11 +512,48 @@ mod tests {
                 vec![comment(2, AUTHOR, "@merge-train predecessor #4")],
             ),
         ];
-        let outcome = crawl_events("main", &crawled, &comments, "merge-train", BOT, test_now());
+        let outcome = crawl_events(
+            "main",
+            &crawled,
+            &comments,
+            "merge-train",
+            BOT,
+            None,
+            test_now(),
+        );
         assert!(
             declared(&outcome.events).is_empty(),
             "every rejected declaration is dropped, got {:?}",
             declared(&outcome.events)
+        );
+    }
+
+    /// The triggering delivery's own comment is skipped by the crawl, so
+    /// the live command handler (which runs next in the same delivery) can
+    /// answer it — e.g. emit `LateAddition` for a merged predecessor —
+    /// instead of finding it already recorded (Codex crawl review round 10).
+    #[test]
+    fn the_triggering_comment_is_not_consumed_by_the_crawl() {
+        let crawled = vec![
+            pr(1, AUTHOR, PrState::Open),
+            child(2, AUTHOR, 1, PrState::Open),
+        ];
+        let comments = vec![(
+            PrNumber(2),
+            vec![comment(7, AUTHOR, "@merge-train predecessor #1")],
+        )];
+        let outcome = crawl_events(
+            "main",
+            &crawled,
+            &comments,
+            "merge-train",
+            BOT,
+            Some(CommentId(7)),
+            test_now(),
+        );
+        assert!(
+            declared(&outcome.events).is_empty(),
+            "the delivery's own comment is left for the live handler"
         );
     }
 
@@ -522,7 +579,15 @@ mod tests {
             PrNumber(2),
             vec![comment(1, AUTHOR, "@merge-train predecessor #1")],
         )];
-        let outcome = crawl_events("main", &crawled, &comments, "merge-train", BOT, test_now());
+        let outcome = crawl_events(
+            "main",
+            &crawled,
+            &comments,
+            "merge-train",
+            BOT,
+            None,
+            test_now(),
+        );
         assert_eq!(
             declared(&outcome.events),
             vec![(PrNumber(2), PrNumber(1))],
@@ -547,7 +612,15 @@ mod tests {
                 comment(9, AUTHOR, "@merge-train predecessor #1"),
             ],
         )];
-        let outcome = crawl_events("main", &crawled, &comments, "merge-train", BOT, test_now());
+        let outcome = crawl_events(
+            "main",
+            &crawled,
+            &comments,
+            "merge-train",
+            BOT,
+            None,
+            test_now(),
+        );
         let owning = outcome.events.iter().rev().find_map(|e| match e {
             StateEventPayload::PredecessorDeclared {
                 pr: PrNumber(2),
@@ -574,7 +647,15 @@ mod tests {
         let open = vec![pr(1, AUTHOR, PrState::Open)];
         let comments = vec![(PrNumber(1), vec![comment(8, BOT, &body)])];
 
-        let outcome = crawl_events("main", &open, &comments, "merge-train", BOT, test_now());
+        let outcome = crawl_events(
+            "main",
+            &open,
+            &comments,
+            "merge-train",
+            BOT,
+            None,
+            test_now(),
+        );
         assert_eq!(outcome.recovered_roots, vec![PrNumber(1)]);
         let adopted = outcome
             .events
@@ -600,7 +681,15 @@ mod tests {
             (PrNumber(1), vec![comment(1, STRANGER, &body)]),
             (PrNumber(2), vec![comment(2, BOT, &body)]),
         ];
-        let outcome = crawl_events("main", &open, &comments, "merge-train", BOT, test_now());
+        let outcome = crawl_events(
+            "main",
+            &open,
+            &comments,
+            "merge-train",
+            BOT,
+            None,
+            test_now(),
+        );
         assert!(outcome.recovered_roots.is_empty());
         assert!(
             !outcome
@@ -631,7 +720,15 @@ mod tests {
                 comment(2, BOT, &format_status_comment(&newer, "new").unwrap()),
             ],
         )];
-        let outcome = crawl_events("main", &open, &comments, "merge-train", BOT, test_now());
+        let outcome = crawl_events(
+            "main",
+            &open,
+            &comments,
+            "merge-train",
+            BOT,
+            None,
+            test_now(),
+        );
         assert!(outcome.recovered_roots.is_empty(), "completed: no recovery");
         let adopted = outcome
             .events
@@ -658,7 +755,15 @@ mod tests {
         let mut edited = comment(1, AUTHOR, "@merge-train predecessor #1");
         edited.edited = true;
         let comments = vec![(PrNumber(2), vec![edited])];
-        let outcome = crawl_events("main", &open, &comments, "merge-train", BOT, test_now());
+        let outcome = crawl_events(
+            "main",
+            &open,
+            &comments,
+            "merge-train",
+            BOT,
+            None,
+            test_now(),
+        );
         assert!(
             declared(&outcome.events).is_empty(),
             "an edited body has an unknowable author; fail closed"
@@ -677,7 +782,15 @@ mod tests {
             PrNumber(2),
             vec![comment(1, AUTHOR, "@merge-train predecessor #77")],
         )];
-        let outcome = crawl_events("main", &open, &comments, "merge-train", BOT, test_now());
+        let outcome = crawl_events(
+            "main",
+            &open,
+            &comments,
+            "merge-train",
+            BOT,
+            None,
+            test_now(),
+        );
         assert!(
             declared(&outcome.events).is_empty(),
             "a declaration to an uncrawled predecessor is dropped (unvalidated)"
@@ -722,7 +835,7 @@ mod tests {
             ),
         ];
         let comments = vec![(PrNumber(1), vec![comment(1, BOT, &body)])];
-        let outcome = crawl_events("main", &merged, &comments, "merge-train", BOT, ts);
+        let outcome = crawl_events("main", &merged, &comments, "merge-train", BOT, None, ts);
         assert!(outcome.recovered_roots.is_empty(), "no zombie");
         let adopted = outcome
             .events
@@ -791,7 +904,7 @@ mod tests {
                 )],
             ),
         ];
-        let outcome = crawl_events("main", &open, &comments, "merge-train", BOT, t1);
+        let outcome = crawl_events("main", &open, &comments, "merge-train", BOT, None, t1);
         assert_eq!(
             outcome.recovered_roots,
             vec![PrNumber(2), PrNumber(3)],
@@ -830,7 +943,7 @@ mod tests {
         // crawl's lists never see it.
         let open = vec![pr(1, AUTHOR, PrState::Open), pr(2, AUTHOR, PrState::Open)];
         let comments = vec![(PrNumber(1), vec![comment(1, BOT, &body)])];
-        let outcome = crawl_events("main", &open, &comments, "merge-train", BOT, ts);
+        let outcome = crawl_events("main", &open, &comments, "merge-train", BOT, None, ts);
         assert_eq!(outcome.recovered_roots, vec![PrNumber(1)]);
         assert_eq!(outcome.referenced_uncrawled, vec![PrNumber(3)]);
     }
@@ -868,7 +981,7 @@ mod tests {
                 vec![comment(3, AUTHOR, "@merge-train predecessor #2")],
             ),
         ];
-        let outcome = crawl_events("main", &open, &comments, "merge-train", BOT, ts);
+        let outcome = crawl_events("main", &open, &comments, "merge-train", BOT, None, ts);
         assert!(
             outcome.recovered_roots.is_empty(),
             "an extended stack must not silently resume"
@@ -907,7 +1020,7 @@ mod tests {
                 vec![comment(2, AUTHOR, "@merge-train predecessor #1")],
             ),
         ];
-        let outcome = crawl_events("main", &open, &comments, "merge-train", BOT, ts);
+        let outcome = crawl_events("main", &open, &comments, "merge-train", BOT, None, ts);
         assert_eq!(
             declared(&outcome.events),
             vec![(PrNumber(2), PrNumber(1))],
@@ -940,7 +1053,15 @@ mod tests {
                 vec![comment(2, AUTHOR, "@merge-train predecessor #1")],
             ),
         ];
-        let outcome = crawl_events("main", &open, &comments, "merge-train", BOT, test_now());
+        let outcome = crawl_events(
+            "main",
+            &open,
+            &comments,
+            "merge-train",
+            BOT,
+            None,
+            test_now(),
+        );
         let first_fill = outcome
             .events
             .iter()
