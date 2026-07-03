@@ -255,6 +255,7 @@ async fn get_pr(client: &OctocrabClient, pr: PrNumber) -> Result<GitHubResponse,
                 base_ref: pull.base.ref_field,
                 state,
                 is_draft: pull.draft.unwrap_or(false),
+                author_id: pull.user.as_ref().map(|u| u.id.0).unwrap_or(0),
             }))
         }
         Err(e) => Err(GitHubApiError::from_octocrab(e)),
@@ -292,6 +293,7 @@ async fn list_open_prs(client: &OctocrabClient) -> Result<GitHubResponse, GitHub
             base_ref: pull.base.ref_field,
             state: PrState::Open,
             is_draft: pull.draft.unwrap_or(false),
+            author_id: pull.user.as_ref().map(|u| u.id.0).unwrap_or(0),
         });
     }
 
@@ -380,6 +382,7 @@ async fn list_recently_merged_prs(
                 base_ref: pull.base.ref_field,
                 state: PrState::Merged { merge_commit_sha },
                 is_draft: pull.draft.unwrap_or(false),
+                author_id: pull.user.as_ref().map(|u| u.id.0).unwrap_or(0),
             });
         }
 

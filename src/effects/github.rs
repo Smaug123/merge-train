@@ -180,6 +180,11 @@ pub struct PrData {
     pub state: PrState,
     /// Whether the PR is a draft.
     pub is_draft: bool,
+    /// The PR author's GitHub user id. `0` when GitHub omitted the user
+    /// (deleted account): it matches no real commenter, so author-gated
+    /// decisions (crawl-time predecessor declarations) fail closed.
+    #[serde(default)]
+    pub author_id: u64,
 }
 
 /// Comment data returned from the GitHub API.
@@ -459,6 +464,7 @@ mod tests {
                     base_ref,
                     state,
                     is_draft,
+                    author_id: 7,
                 },
             )
     }

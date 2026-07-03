@@ -513,6 +513,7 @@ impl ModelWorld {
                 });
                 Ok(GitHubResponse::PrRefetched {
                     pr: PrData {
+                        author_id: 7,
                         number: *pr,
                         head_sha,
                         head_ref: model_pr.branch.clone(),

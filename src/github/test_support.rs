@@ -33,6 +33,8 @@ pub struct FakePr {
     pub branch: String,
     pub base_ref: String,
     pub state: FakePrState,
+    /// The PR author's user id (author-gated decisions read it).
+    pub author_id: u64,
 }
 
 /// A comment as the fake GitHub stores it (the live, mutable copy that
@@ -148,6 +150,7 @@ impl FakeGitHub {
                 base_ref: fake.base_ref.clone(),
                 state,
                 is_draft: false,
+                author_id: fake.author_id,
             },
             merge_state,
         )
@@ -278,6 +281,31 @@ impl FakeGitHub {
                         detail: format!("no such comment {comment_id} (fake 404)"),
                     }),
                 }
+            }
+            GitHubEffect::ListOpenPrs => {
+                let mut numbers: Vec<PrNumber> = self
+                    .prs
+                    .iter()
+                    .filter(|(_, p)| matches!(p.state, FakePrState::Open))
+                    .map(|(n, _)| *n)
+                    .collect();
+                numbers.sort_unstable();
+                Ok(GitHubResponse::PrList(
+                    numbers.into_iter().map(|n| self.pr_data(n).0).collect(),
+                ))
+            }
+            GitHubEffect::ListRecentlyMergedPrs { .. } => {
+                let mut numbers: Vec<PrNumber> = self
+                    .prs
+                    .iter()
+                    .filter(|(_, p)| matches!(p.state, FakePrState::Merged { .. }))
+                    .map(|(n, _)| *n)
+                    .collect();
+                numbers.sort_unstable();
+                Ok(GitHubResponse::RecentlyMergedPrList {
+                    prs: numbers.into_iter().map(|n| self.pr_data(n).0).collect(),
+                    may_be_incomplete: false,
+                })
             }
             GitHubEffect::ListComments { pr } => Ok(GitHubResponse::Comments(
                 self.comments

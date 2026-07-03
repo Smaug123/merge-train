@@ -786,12 +786,26 @@ stage shippable).
 >    rule again). Permanent `ListComments`/re-post failures park
 >    identically (proceeding unverified risks the exact double-squash
 >    the check prevents; `stop` works throughout).
-> 5. **Deliberately NOT here**: the full GitHub crawl fallback
->    (ListOpenPrs/ListRecentlyMergedPrs/comment scan rebuilding a LOST
->    db, DESIGN's inference-based recovery + `needs_manual_review`) — a
->    fresh DB today re-learns topology from webhook traffic and refuses
->    nothing irreversibly; the crawl is additive and rides with the
->    polling/PeriodicSync stage. Events-table compaction — **landed
+> 5. **Deliberately NOT in M6, landed separately (2026-07-03)**: the
+>    first-contact crawl (`worker/bootstrap.rs`, pure `crawl_events` +
+>    pipeline glue). A fresh store — new repo OR lost DB — crawls
+>    settings, open + recently-merged (30d) PRs, and their comments at
+>    the first delivery: PR cache fills, author-gated predecessor
+>    declarations (last wins), and train adoption from bot status
+>    comments (bot-authored, parseable, posted on their own root; per
+>    root the latest `started_at` at the highest `recovery_seq` wins) via
+>    `TrainRecordAdopted`; adopted ACTIVE trains take the normal M6
+>    recovery path, deferred behind the backlog drain. One atomic append;
+>    any fetch failure releases the delivery (queue pauses at the stall
+>    cadence — no safe degraded answer at bootstrap). `PrData` gained
+>    `author_id` (0 when GitHub omits the user — deny-safe). ENVELOPE:
+>    a train whose comment was deleted AND whose DB was lost is not
+>    resurrected (nothing sound to resurrect from); the cache still
+>    carries the merged PRs, so a fresh `start` gets the loud
+>    validations. DESIGN's `needs_manual_review` inference recovery is
+>    NOT implemented: with a lost DB it cannot be soundly distinguished
+>    from a user-merged stack, and the failure mode without it is loud,
+>    not silent. Events-table compaction — **landed
 >    2026-07-03** (post-M6 stage): `Store::compact` replaces the log
 >    with one `Checkpoint { snapshot }` EVENT, so the from-empty
 >    `replay()` oracle survives verbatim (a checkpoint replays by

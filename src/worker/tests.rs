@@ -18,10 +18,10 @@ use crate::git::test_support::{
     create_branch_with_file, create_pr_ref, create_test_repo_with_origin,
 };
 use crate::git::{GitConfig, run_git_stdout};
-use crate::github::test_support::{FakeGitHub, FakePr, FakePrState};
+use crate::github::test_support::{FakeComment, FakeGitHub, FakePr, FakePrState};
 use crate::state::RepoState;
 use crate::store::Store;
-use crate::types::{PrNumber, Sha};
+use crate::types::{CommentId, PrNumber, Sha};
 
 use super::executor::{GitHubExec, SagaBatch, execute_batch};
 use super::pipeline::{PipelineOutcome, Processor, WorkerDeps};
@@ -217,6 +217,7 @@ impl World {
                     branch,
                     base_ref: base,
                     state: FakePrState::Open,
+                    author_id: AUTHOR,
                 },
             );
             heads.push(head);
@@ -1897,6 +1898,7 @@ fn stop_on_the_root_retires_fanned_out_trains_at_every_boundary() {
             world.github.lock().unwrap().prs.insert(
                 PrNumber(i),
                 FakePr {
+                    author_id: AUTHOR,
                     branch: format!("pr-{i}"),
                     base_ref: "pr-1".to_owned(),
                     state: FakePrState::Open,
@@ -2597,6 +2599,7 @@ fn a_second_train_runs_over_a_compacted_log() {
     world.github.lock().unwrap().prs.insert(
         PrNumber(3),
         FakePr {
+            author_id: AUTHOR,
             branch: "pr-3".to_owned(),
             base_ref: "main".to_owned(),
             state: FakePrState::Open,
@@ -2616,6 +2619,113 @@ fn a_second_train_runs_over_a_compacted_log() {
     assert_eq!(facts.unmatched().count(), 0, "matched intent ledger");
     let replayed = processor.store_mut().replay().unwrap();
     assert_eq!(processor.state(), &replayed);
+}
+
+// ─── First-contact bootstrap: the crawl ───
+
+/// Onboarding: a stack that predates the bot — its predecessor declaration
+/// exists only as a comment on GitHub, never delivered as a webhook — is
+/// learned by the first-contact crawl, and a single `start` runs it to
+/// completion.
+#[test]
+fn onboarding_crawl_learns_an_existing_stack() {
+    let (mut world, _heads) = World::linear_stack(2);
+    world.github.lock().unwrap().comments.insert(
+        CommentId(1000),
+        FakeComment {
+            pr: PrNumber(2),
+            author_id: AUTHOR,
+            body: "@merge-train predecessor #1".to_owned(),
+        },
+    );
+    let mut processor = world.processor();
+    // The first thing the bot ever hears about this repo is the start.
+    start_command(&mut world, &mut processor, 1);
+    drive_to_completion(&mut world, &mut processor);
+    for i in 1..=2u64 {
+        assert!(
+            processor.state().prs[&PrNumber(i)].state.is_merged(),
+            "PR #{i} must merge off crawl-learned topology"
+        );
+    }
+}
+
+/// The disaster the crawl exists for: the state DB is DESTROYED while a
+/// train is mid-cascade. The next webhook triggers the crawl, which
+/// rebuilds the cache and topology and adopts the train from the bot's
+/// status comment; M6 recovery then resumes it to exactly-once completion.
+#[test]
+fn a_lost_state_db_is_rebuilt_by_the_crawl_and_the_train_resumes() {
+    let (mut world, heads) = World::linear_stack(2);
+    // The declaration comment exists on (fake) GitHub, as it would in
+    // reality — the crawl must rebuild topology from it.
+    world.github.lock().unwrap().comments.insert(
+        CommentId(1000),
+        FakeComment {
+            pr: PrNumber(2),
+            author_id: AUTHOR,
+            body: "@merge-train predecessor #1".to_owned(),
+        },
+    );
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    start_command(&mut world, &mut processor, 1);
+    // Mid-`Preparing`, with the status comment live on the fake.
+    run_batches_then_crash(&mut world, processor, 4);
+
+    // The disaster: the state DB (and its WAL) is gone; the clone survives.
+    let db = world.db_path();
+    for path in [
+        db.clone(),
+        db.with_extension("db-wal"),
+        db.with_extension("db-shm"),
+        db.with_extension("lock"),
+    ] {
+        let _ = std::fs::remove_file(path);
+    }
+
+    let mut processor = world.processor();
+    assert!(
+        processor.state().default_branch.is_empty(),
+        "precondition: the store really is fresh"
+    );
+    // Any webhook wakes the repo; the crawl rebuilds everything first.
+    let head = {
+        let github = world.github.lock().unwrap();
+        github.branch_head("pr-1")
+    };
+    let body = check_suite_green_body(&world.config, &head, &[1], world.next_delivery + 900);
+    world.enqueue(&mut processor, "check_suite", body);
+    drive_to_completion(&mut world, &mut processor);
+    assert_recovered_exactly_once(&world, &mut processor, "lost-db");
+}
+
+/// GitHub down at first contact: the delivery releases (nothing can be
+/// processed without the bootstrap) and succeeds when retried.
+#[test]
+fn bootstrap_outage_releases_and_retries() {
+    let (mut world, heads) = World::linear_stack(1);
+    world.github.lock().unwrap().unavailable = true;
+    let mut processor = world.processor();
+    let body = pr_opened_body(&world.config, 1, &heads[0], "pr-1", "main");
+    world.enqueue(&mut processor, "pull_request", body);
+    let delivery = processor.claim().unwrap().expect("queued");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Released
+    );
+    assert!(processor.state().default_branch.is_empty());
+
+    world.github.lock().unwrap().unavailable = false;
+    let delivery = processor
+        .claim()
+        .unwrap()
+        .expect("released back to pending");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Processed
+    );
+    assert_eq!(processor.state().default_branch, "main");
 }
 
 // ─── cache_fill_events: the unknown-PR upsert oracle ───
@@ -2659,6 +2769,7 @@ mod cache_fill {
                 base_ref: "main".to_owned(),
                 state: state.clone(),
                 is_draft,
+                author_id: 7,
             };
             let mut repo = RepoState::from_snapshot(PersistedRepoSnapshot::new("main"));
             for (i, payload) in cache_fill_events(pr, &data, MergeStateStatus::Clean)
