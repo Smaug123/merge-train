@@ -863,11 +863,13 @@ impl Processor {
                     Utc::now(),
                 )?;
             }
-            CommentRecovery::ClearCommentId => {
-                // Re-establish the off-disk backup NOW, not merely clear
-                // the id: the engine's own self-heal runs only at idle
-                // evaluations, and a cascade resumed mid-phase may chain
-                // to completion without passing one.
+            CommentRecovery::RepostBackup => {
+                // Re-establish the off-disk backup NOW: the engine's own
+                // self-heal runs only at idle evaluations, and a cascade
+                // resumed mid-phase may chain to completion without passing
+                // one. The fresh id lands via `StatusCommentPosted` — NOT
+                // `TrainRecordAdopted`, which is a ledger boundary: here
+                // the local intent ledger is genuine and recovery needs it.
                 info!(%root, "status comment is gone; re-posting the backup");
                 let mut record = local;
                 record.status_comment_id = None;
@@ -882,29 +884,41 @@ impl Processor {
                             .execute(GitHubEffect::PostComment { pr: root, body })
                         {
                             Ok(GitHubResponse::CommentPosted { id }) => {
-                                record.status_comment_id = Some(id);
+                                self.store.append_batch(
+                                    &[StateEventPayload::StatusCommentPosted {
+                                        root_pr: root,
+                                        comment_id: id,
+                                    }],
+                                    Utc::now(),
+                                )?;
                             }
-                            Err(e @ EffectError::Transient { .. }) => {
-                                // Nothing durable happened yet: park the
-                                // whole recovery and retry from ListComments.
+                            // Transient AND permanent park identically:
+                            // nothing durable happened yet, and resuming
+                            // without the disaster-recovery backup when
+                            // GitHub already refuses writes only means the
+                            // cascade's own effects fail next. The stall
+                            // cadence heals "permanent" auth errors the
+                            // moment the operator fixes the token; `stop`
+                            // works throughout.
+                            Err(e) => {
                                 warn!(%root, error = ?e, "cannot re-post the status comment; \
                                        recovery parked");
                                 self.retry_requested = true;
                                 return Ok(false);
                             }
-                            // Permanent (or a wrong variant): proceed with
-                            // the id cleared — local state is intact and
-                            // authoritative; the backup stays missing, loudly.
-                            other => {
-                                error!(
-                                    %root, ?other,
-                                    "cannot re-post the status comment; resuming \
-                                     WITHOUT the off-disk backup"
-                                );
+                            Ok(other) => {
+                                error!(?other, "PostComment answered the wrong variant");
+                                self.retry_requested = true;
+                                return Ok(false);
                             }
                         }
                     }
                     Err(e) => {
+                        // Unreachable in practice (a record that formatted
+                        // before fits now — truncation keeps it bounded):
+                        // resume on local state, loudly and without the
+                        // backup, rather than wedge recovery forever on a
+                        // record no retry can fix.
                         error!(
                             %root, error = %e,
                             "recovered record cannot be formatted as a status \
@@ -912,13 +926,6 @@ impl Processor {
                         );
                     }
                 }
-                self.store.append_batch(
-                    &[StateEventPayload::TrainRecordAdopted {
-                        root_pr: root,
-                        record,
-                    }],
-                    Utc::now(),
-                )?;
             }
             CommentRecovery::KeepLocal => {}
         }
@@ -934,12 +941,26 @@ impl Processor {
         std::mem::take(&mut self.retry_requested)
     }
 
-    /// Re-queues an evaluation for every root still awaiting recovery —
+    /// Re-owes an evaluation for every root still awaiting recovery —
     /// called when the stall-retry timer fires, so a parked recovery is
     /// retried even on a repo with no other traffic.
+    ///
+    /// The retry routes through the SAME backlog-drain gate as the startup
+    /// evaluations ([`Processor::claim`]): the timer may have been armed
+    /// for a *released delivery* (the same outage), and the worker loop
+    /// pumps before it claims — queueing the evaluation directly would let
+    /// recovery act (and push) ahead of an acked stop or topology change
+    /// still sitting in the backlog (Codex M6 review, P1; the round-6 rule
+    /// again).
     pub fn requeue_marked_recoveries(&mut self) {
-        for root in self.inherited_mid_flight.clone() {
-            self.queue(PendingWork::Trigger(Trigger::EvaluateTrain { root }));
+        if self.inherited_mid_flight.is_empty() {
+            return;
+        }
+        let owed = self.startup_evaluates.get_or_insert_with(Vec::new);
+        for root in &self.inherited_mid_flight {
+            if !owed.contains(root) {
+                owed.push(*root);
+            }
         }
     }
 

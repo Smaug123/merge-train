@@ -2305,6 +2305,73 @@ fn recovery_parks_and_retries_when_github_is_unavailable() {
     assert_recovered_exactly_once(&world, &mut processor, "outage-then-retry");
 }
 
+/// A timer-driven recovery retry must not overtake the acked backlog: the
+/// worker loop pumps before it claims, and the backlog may hold a released
+/// delivery carrying exactly the command recovery must not outrun — here a
+/// maintainer's stop whose role lookup released during the outage. The
+/// retry therefore routes through the same backlog-drain gate as the
+/// startup evaluations (Codex M6 review, P1; the round-6 rule again).
+#[test]
+fn recovery_retry_does_not_overtake_the_acked_backlog() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    start_command(&mut world, &mut processor, 1);
+    run_batches_then_crash(&mut world, processor, 4);
+
+    // Restart mid-outage. A maintainer (not the author: the role lookup is
+    // what needs GitHub) says stop; the delivery releases.
+    {
+        let mut github = world.github.lock().unwrap();
+        github.roles.insert(
+            "maintainer".to_owned(),
+            crate::effects::github::CollaboratorRole::Maintain,
+        );
+        github.unavailable = true;
+    }
+    let mut processor = world.processor();
+    let body = comment_body(&world.config, 1, "@merge-train stop", 999, "maintainer", 66);
+    world.enqueue(&mut processor, "issue_comment", body);
+    assert!(processor.pump().unwrap().is_none(), "nothing owed yet");
+    let delivery = processor.claim().unwrap().expect("the stop is queued");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Released
+    );
+
+    // GitHub returns; the stall-retry timer fires.
+    world.github.lock().unwrap().unavailable = false;
+    processor.requeue_marked_recoveries();
+
+    // The worker loop pumps BEFORE it re-claims the released delivery: the
+    // retried recovery must not produce work ahead of the acked stop.
+    assert!(
+        processor.pump().unwrap().is_none(),
+        "recovery must not overtake the acked backlog"
+    );
+
+    drain(&mut processor);
+    assert!(
+        processor
+            .state()
+            .active_trains
+            .values()
+            .all(|t| !t.state.is_active()),
+        "the acked stop must retire the train"
+    );
+    assert_eq!(
+        world
+            .github
+            .lock()
+            .unwrap()
+            .squash_count
+            .values()
+            .sum::<u32>(),
+        0,
+        "nothing may squash after the acked stop"
+    );
+}
+
 /// Restore-from-backup (DESIGN §Recovery precedence): the status comment's
 /// `recovery_seq` is ahead of the local record — the ONLY way that happens
 /// under SQLite is local state regressing — so the comment's record is
@@ -2945,10 +3012,6 @@ mod interleaving {
                         self.processor().process_claimed(delivery).unwrap();
                         progressed = true;
                     }
-                    // A recovery parked on an outage cannot happen here
-                    // (the fake is up), but a recovery dropped by a crash
-                    // needs its timer path: re-queue before pumping.
-                    self.processor().requeue_marked_recoveries();
                     if self.held.is_none()
                         && let Some(batch) = self.processor().pump().unwrap()
                     {

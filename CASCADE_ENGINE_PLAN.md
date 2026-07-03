@@ -745,11 +745,17 @@ stage shippable).
 >    (strictly higher seq; the new `TrainRecordAdopted` event replaces
 >    the record wholesale — under SQLite the remote can be ahead ONLY
 >    when local durable state regressed, i.e. restore-from-backup, and
->    adoption is what prevents re-running an already-landed squash),
->    RepairCommentId (comment moved), ClearCommentId (comment gone: the
+>    adoption is what prevents re-running an already-landed squash;
+>    the event is an INTENT-LEDGER BOUNDARY in `ReplayFacts::for_train` —
+>    the restored log's stale unmatched intents were settled in a world
+>    that log never saw, and acting on them runs the wrong idempotency
+>    path against the adopted record [Codex M6 review, P2]),
+>    RepairCommentId (comment moved), RepostBackup (comment gone: the
 >    worker re-posts the backup DURING recovery — the engine's self-heal
 >    runs only at idle evaluations, which a mid-phase resume may never
->    pass), KeepLocal.
+>    pass — and records the fresh id via `StatusCommentPosted`, NOT via
+>    adoption: the local ledger is genuine there and must survive),
+>    KeepLocal.
 > 3. **Worktree restart cleanup on the executor thread**: recovery flags
 >    the root; its next `SagaBatch` carries `restart_cleanup` and
 >    `execute_batch` runs `cleanup_worktree_on_restart` before any
@@ -759,10 +765,15 @@ stage shippable).
 >    subsequent git ops fail loudly too.
 > 4. **GitHub-unavailable recovery parks at the stall cadence**: the
 >    evaluation is dropped (re-queuing would hot-spin the idle check),
->    the root stays marked, and the stall-retry timer's message
->    re-queues evaluations for marked roots. Permanent `ListComments`
->    failures park identically (proceeding unverified risks the exact
->    double-squash the check prevents; `stop` works throughout).
+>    the root stays marked, and the stall-retry timer's message re-owes
+>    the evaluations — through the SAME backlog-drain gate as the
+>    startup evaluations, because the timer may have been armed for a
+>    *released delivery* and the loop pumps before it claims: queued
+>    directly, recovery would act (and push) ahead of an acked stop
+>    still sitting in the backlog (Codex M6 review, P1; the round-6
+>    rule again). Permanent `ListComments`/re-post failures park
+>    identically (proceeding unverified risks the exact double-squash
+>    the check prevents; `stop` works throughout).
 > 5. **Deliberately NOT here**: the full GitHub crawl fallback
 >    (ListOpenPrs/ListRecentlyMergedPrs/comment scan rebuilding a LOST
 >    db, DESIGN's inference-based recovery + `needs_manual_review`) — a

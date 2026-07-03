@@ -44,10 +44,13 @@ pub enum CommentRecovery {
     /// taken before a user deleted and the bot re-posted the comment):
     /// repair the id so updates reach the live comment.
     RepairCommentId(CommentId),
-    /// The status comment is gone entirely: keep local state but clear the
-    /// dangling `status_comment_id` so the engine re-posts its off-disk
-    /// backup at the next idle evaluation.
-    ClearCommentId,
+    /// The status comment is gone entirely: local state stands, but the
+    /// worker must re-post the off-disk backup and record the fresh id
+    /// (`StatusCommentPosted`) before resuming — the engine's own self-heal
+    /// runs only at idle evaluations, which a cascade resumed mid-phase may
+    /// never pass. (NOT via `TrainRecordAdopted`: that event is a ledger
+    /// boundary, and here the local intent ledger is genuine and needed.)
+    RepostBackup,
 }
 
 /// Decides recovery for `local` given the root PR's comments.
@@ -87,8 +90,8 @@ pub fn decide_comment_recovery(
         Some(_) if best.is_some() => {
             CommentRecovery::RepairCommentId(best.expect("checked is_some").0)
         }
-        // Gone without replacement: clear, so the engine re-posts.
-        Some(_) => CommentRecovery::ClearCommentId,
+        // Gone without replacement: the worker re-posts the backup.
+        Some(_) => CommentRecovery::RepostBackup,
         // Never posted (crash before the preflight's comment landed): the
         // engine's self-healing posts it; nothing to decide here.
         None => CommentRecovery::KeepLocal,
@@ -229,11 +232,11 @@ mod tests {
     }
 
     #[test]
-    fn deleted_comment_without_replacement_clears_the_id() {
+    fn deleted_comment_without_replacement_reposts_the_backup() {
         let local = local_at(5, Some(3));
         assert_eq!(
             decide_comment_recovery(&local, &[], BOT),
-            CommentRecovery::ClearCommentId
+            CommentRecovery::RepostBackup
         );
     }
 
