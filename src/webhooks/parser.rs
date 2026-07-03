@@ -202,6 +202,23 @@ struct RawPullRequestPayload {
     action: String,
     pull_request: RawPullRequest,
     repository: RawRepository,
+    changes: Option<RawChanges>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawChanges {
+    base: Option<RawBaseChange>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawBaseChange {
+    #[serde(rename = "ref")]
+    ref_change: RawFrom,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawFrom {
+    from: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -276,6 +293,7 @@ fn parse_pull_request(payload: &[u8]) -> Result<Option<PullRequestEvent>, ParseE
         is_draft: raw.pull_request.draft.unwrap_or(false),
         author_id: raw.pull_request.user.id,
         updated_at: raw.pull_request.updated_at,
+        base_change_from: raw.changes.and_then(|c| c.base).map(|b| b.ref_change.from),
     }))
 }
 

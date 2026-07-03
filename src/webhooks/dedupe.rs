@@ -10,7 +10,7 @@
 //! - `issue_comment.edited`: `issue_comment:<pr>:<comment_id>:edited:<updated_at>:<body-digest>:<sender>`
 //! - `issue_comment.deleted`: `issue_comment:<pr>:<comment_id>:deleted`
 //! - `pull_request.<action>`: `pull_request:<pr>:<action>:<head_sha>:<merge>:<updated_at>`
-//! - `pull_request.edited`: `pull_request:<pr>:edited:<base>:<updated_at>`
+//! - `pull_request.edited`: `pull_request:<pr>:edited:<base-from>:<base>:<updated_at>`
 //! - `check_suite.<action>`: `check_suite:<suite_id>:<action>:<updated_at>`
 //! - `status`: `status:<sha>:<context>:<state>:<status_id>:<updated_at>`
 //!
@@ -114,20 +114,25 @@ impl DedupeKey {
     /// Creates a dedupe key for a `pull_request.edited` event.
     ///
     /// Edits don't necessarily change the head SHA (e.g., base retarget,
-    /// title change), so the key uses `updated_at` — plus the base branch:
-    /// GitHub timestamps are second-resolution, and a title edit followed
-    /// immediately by a base retarget can share `updated_at`; without the
-    /// base in the key the retarget would be dropped as a duplicate and the
-    /// cached topology would never learn it (Codex M5 round 11). The base
-    /// is the only edit the bot acts on, so it is the disambiguator.
+    /// title change), so the key uses `updated_at` — plus the base-branch
+    /// *transition*: GitHub timestamps are second-resolution, and a title
+    /// edit followed immediately by a base retarget can share `updated_at`;
+    /// without the base in the key the retarget would be dropped as a
+    /// duplicate and the cached topology would never learn it (Codex M5
+    /// round 11). The `from` side ("-" when the edit did not change the
+    /// base) distinguishes a retarget from a same-second edit that merely
+    /// *lands on* the same base (Codex M5 round 18); the base is the only
+    /// edit the bot acts on, so the transition is the full disambiguator.
     pub fn pull_request_edited(
         pr: PrNumber,
+        base_change_from: Option<&str>,
         base_branch: &str,
         updated_at: &DateTime<Utc>,
     ) -> Self {
         DedupeKey(format!(
-            "pull_request:{}:edited:{}:{}",
+            "pull_request:{}:edited:{}:{}:{}",
             pr.0,
+            base_change_from.unwrap_or("-"),
             base_branch,
             updated_at.to_rfc3339()
         ))
@@ -206,9 +211,12 @@ impl DedupeKey {
             // Edits don't necessarily change the head SHA (base retarget,
             // title change), so the edited key deliberately omits it.
             GitHubEvent::PullRequest(e) => Some(match e.action {
-                PrAction::Edited => {
-                    DedupeKey::pull_request_edited(e.pr_number, &e.base_branch, &e.updated_at)
-                }
+                PrAction::Edited => DedupeKey::pull_request_edited(
+                    e.pr_number,
+                    e.base_change_from.as_deref(),
+                    &e.base_branch,
+                    &e.updated_at,
+                ),
                 action => DedupeKey::pull_request(
                     e.pr_number,
                     action.as_str(),
@@ -292,6 +300,7 @@ mod tests {
         updated_at: DateTime<Utc>,
     ) -> PullRequestEvent {
         PullRequestEvent {
+            base_change_from: None,
             repo: repo(),
             action,
             pr_number,
@@ -550,6 +559,22 @@ mod tests {
                 &updated_at,
             );
             prop_assert_ne!(unmerged, merged);
+        }
+
+        /// A retarget A→B and a later same-second retarget back B→A (or a
+        /// plain edit already sitting on B) must not collide: the key is
+        /// keyed on the *transition*, not just the destination (Codex M5
+        /// round 18).
+        #[test]
+        fn same_second_retarget_transitions_differ(
+            pr in arb_pr_number(),
+            updated_at in arb_datetime(),
+        ) {
+            // Retarget main→pr-1 vs a non-base edit that already sits on pr-1.
+            let retarget =
+                DedupeKey::pull_request_edited(pr, Some("main"), "pr-1", &updated_at);
+            let title_edit = DedupeKey::pull_request_edited(pr, None, "pr-1", &updated_at);
+            prop_assert_ne!(retarget, title_edit);
         }
 
         /// GitHub timestamps are second-resolution, so a title edit followed

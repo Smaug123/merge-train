@@ -385,6 +385,19 @@ impl Processor {
             }
         }
 
+        // Any comment event *performed by the bot* is the bot's own action
+        // (its own comments have author == bot and the handler ignores them,
+        // but an edit/deletion the bot performs on a USER's comment carries
+        // author == user, sender == bot — and the handler's self-guard keys
+        // off the author). The bot never issues commands, so close before
+        // handling: otherwise a bot-actor edit could declare or retract a
+        // predecessor with no authorization gate (Codex M5 round 18).
+        if let GitHubEvent::IssueComment(comment) = &event
+            && comment.sender_id == self.deps.bot_user_id
+        {
+            return self.close(&id, key.as_ref(), "bot-actor comment event");
+        }
+
         // Predecessor *retractions* — an edit that no longer declares, or a
         // deletion of the declaring comment — are topology changes and are
         // author-only, exactly like declarations (Codex M5 round 3, P1).

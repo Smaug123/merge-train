@@ -637,6 +637,53 @@ fn stranger_cannot_retract_a_predecessor_declaration() {
     );
 }
 
+/// A comment event *performed by the bot* (sender == bot) must not reach
+/// the handler at all: the handler's self-guard keys off the comment
+/// author, so a bot-performed edit of a USER's comment (author == user)
+/// would run predecessor declaration/retraction with no authorization gate
+/// (Codex M5 round 18).
+#[test]
+fn bot_performed_comment_edits_are_closed_without_handling() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    drain(&mut processor);
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor,
+        Some(PrNumber(1))
+    );
+
+    // The bot "edits" the author's declaring comment (id 0) away:
+    // author stays the user, sender is the bot.
+    let body = format!(
+        r#"{{
+            "action": "edited",
+            "comment": {{
+                "id": 0,
+                "body": "nothing here now",
+                "user": {{ "id": {AUTHOR}, "login": "author" }},
+                "updated_at": "2026-07-01T14:00:00Z"
+            }},
+            "issue": {{
+                "number": 2,
+                "pull_request": {{ "url": "..." }},
+                "user": {{ "id": {AUTHOR}, "login": "author" }}
+            }},
+            "repository": {repo},
+            "sender": {{ "id": {TEST_BOT_ID}, "login": "merge-train" }}
+        }}"#,
+        repo = repo_json(&world.config),
+    );
+    world.enqueue(&mut processor, "issue_comment", body.into_bytes());
+    drain(&mut processor);
+
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor,
+        Some(PrNumber(1)),
+        "a bot-performed edit must not retract the declaration"
+    );
+}
+
 #[test]
 fn maintainer_stop_is_authorized_via_role_lookup() {
     let (mut world, heads) = World::linear_stack(2);

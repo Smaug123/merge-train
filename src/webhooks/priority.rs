@@ -151,6 +151,7 @@ mod tests {
 
     fn make_pr_event() -> GitHubEvent {
         GitHubEvent::PullRequest(PullRequestEvent {
+            base_change_from: None,
             repo: RepoId::new("owner", "repo"),
             action: PrAction::Closed,
             pr_number: PrNumber(42),

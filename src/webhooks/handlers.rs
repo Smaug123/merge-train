@@ -780,6 +780,7 @@ mod tests {
 
     fn pr_event(action: PrAction, number: u64, base: &str, merge: MergeStatus) -> GitHubEvent {
         GitHubEvent::PullRequest(PullRequestEvent {
+            base_change_from: None,
             repo: repo(),
             action,
             pr_number: PrNumber(number),
@@ -1702,6 +1703,7 @@ mod tests {
         let state = state_with(vec![open_pr(1, "main", None)]);
         let new_head = Sha::parse("c".repeat(40)).unwrap();
         let event = GitHubEvent::PullRequest(PullRequestEvent {
+            base_change_from: None,
             repo: repo(),
             action: PrAction::Reopened,
             pr_number: PrNumber(1),

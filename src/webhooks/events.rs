@@ -233,6 +233,14 @@ pub struct PullRequestEvent {
     /// When the PR was last updated (`pull_request.updated_at`) — dedupe keys
     /// need it because the same (action, head) pair can legitimately repeat.
     pub updated_at: DateTime<Utc>,
+
+    /// For `edited` events, the base branch this edit retargeted *from*
+    /// (`changes.base.ref.from`), if the edit changed the base. The dedupe
+    /// key needs the transition: with second-resolution timestamps, a
+    /// retarget whose *destination* matches an earlier same-second edit's
+    /// base would otherwise dedupe away and leave the cached topology stale
+    /// (Codex M5 round 18).
+    pub base_change_from: Option<String>,
 }
 
 /// A check suite event (GitHub Checks API).
@@ -661,6 +669,7 @@ mod tests {
                         is_draft,
                         author_id,
                         updated_at,
+                        base_change_from: None,
                     }
                 },
             )
