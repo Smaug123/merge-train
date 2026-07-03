@@ -897,7 +897,26 @@ stage shippable).
 >    stack-extension scratch as POSSIBLE extensions (applied after the
 >    recording loop, only where the PR has no recorded edge — no shadow,
 >    no overwrite), so `stack_extended` aborts on an edited extension too.
->    **Crawl review ran 14 rounds** — lost-DB
+>    Round 15 (P2, fixed): the edited-extension collection was gated on
+>    the PR AUTHOR, but an edited body is authorized live by the EDITOR
+>    (`sender_id`, which the crawl lacks), so an author editing someone
+>    else's comment was missed — the edited-extension check now ignores
+>    the original author (recording still requires the PR author).
+>    Round 15 (P2, RULED bounded residual, no fix): a lost-DB first
+>    contact triggered by an OLD redelivery of `predecessor #1`, with a
+>    LATER comment restating `#1`, lets the crawl persist the later
+>    comment as owner, then the handler's same-predecessor ownership
+>    transfer moves ownership back to the older trigger comment — so a
+>    later edit/delete of the true-latest declaration no longer retracts
+>    it. This is the LIVE handler's unconditional
+>    ownership-transfer-to-any-restatement (not crawl-specific — a
+>    redelivered old comment moves ownership in live operation too),
+>    surfaced by the crawl; the consequence is `predecessor_comment_id`
+>    mis-attribution (retraction targets the wrong comment), recoverable
+>    by re-declaring, and reachable only with two same-predecessor
+>    declarations + a redelivery + DB loss. Not fixable in the crawl
+>    without changing live ownership semantics.
+>    **Crawl review ran 15 rounds** — lost-DB
 >    reconstruction is the most adversarial recovery surface; every
 >    finding was a real divergence from live-operation guarantees, each
 >    pinned by a mutation-checked test. Round 6

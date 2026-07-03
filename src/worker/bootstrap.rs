@@ -184,23 +184,30 @@ pub(crate) fn crawl_events(
     // enrich the stack-extension scratch below, never to persist an edge.
     let mut edited_edges: Vec<(PrNumber, PrNumber)> = Vec::new();
     for (pr, pr_comments) in comments {
-        let Some(&author) = authors.get(pr) else {
-            continue;
-        };
         for comment in pr_comments {
-            if comment.author_id != author || comment.author_id == bot_user_id {
+            // The bot never declares.
+            if comment.author_id == bot_user_id {
                 continue;
             }
             let Some(Command::Predecessor(target)) = parse_command(&comment.body, bot_name) else {
                 continue;
             };
             if comment.edited {
+                // An edited body could have been added by ANY editor with
+                // rights (live authorizes the editor via `sender_id`, which
+                // the crawl lacks), so the ORIGINAL author is irrelevant:
+                // count it as a possible extension regardless (Codex crawl
+                // review round 15). Never recorded (round 2).
                 tracing::warn!(
                     %pr, comment = %comment.id,
                     "not recording an EDITED predecessor declaration (the editor \
                      cannot be verified); it still counts as a possible extension"
                 );
                 edited_edges.push((*pr, target));
+                continue;
+            }
+            // A recorded (non-edited) declaration must be the PR author's.
+            if authors.get(pr) != Some(&comment.author_id) {
                 continue;
             }
             candidates.push((comment.id, *pr, target));
@@ -703,6 +710,60 @@ mod tests {
         assert!(
             !declared(&outcome.events).contains(&(PrNumber(3), PrNumber(2))),
             "the edited declaration is not persisted"
+        );
+    }
+
+    /// An edited extension counts even when the comment was ORIGINALLY
+    /// written by someone other than the PR author: edited bodies are
+    /// authorized live by the editor (`sender_id`), which the crawl cannot
+    /// see, so the original author is irrelevant to the conservative
+    /// extension check (Codex crawl review round 15, P2).
+    #[test]
+    fn an_edited_extension_by_a_non_author_editor_aborts() {
+        use crate::types::{CascadePhase, DescendantProgress};
+        let ts = test_now();
+        let mut record = TrainRecord::new(PrNumber(1), ts);
+        record.cascade_phase = CascadePhase::Preparing {
+            progress: DescendantProgress::new(vec![PrNumber(2)]),
+        };
+        let body = format_status_comment(&record, "mid").unwrap();
+        let crawled = vec![
+            pr(1, AUTHOR, PrState::Open),
+            child(2, AUTHOR, 1, PrState::Open),
+            child(3, AUTHOR, 2, PrState::Open),
+        ];
+        // #3's extension comment was originally authored by STRANGER but
+        // edited (by whoever has rights) to declare #2.
+        let mut edited = comment(9, STRANGER, "@merge-train predecessor #2");
+        edited.edited = true;
+        let comments = vec![
+            (PrNumber(1), vec![comment(1, BOT, &body)]),
+            (
+                PrNumber(2),
+                vec![comment(2, AUTHOR, "@merge-train predecessor #1")],
+            ),
+            (PrNumber(3), vec![edited]),
+        ];
+        let outcome = crawl_events(
+            "main",
+            &crawled,
+            &comments,
+            "merge-train",
+            BOT,
+            None,
+            &HashSet::new(),
+            ts,
+        );
+        assert!(
+            outcome.recovered_roots.is_empty()
+                && outcome.events.iter().any(|e| matches!(
+                    e,
+                    StateEventPayload::TrainAborted {
+                        root_pr: PrNumber(1),
+                        ..
+                    }
+                )),
+            "an edited extension aborts regardless of the comment's original author"
         );
     }
 
