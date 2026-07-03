@@ -179,17 +179,6 @@ pub(crate) fn crawl_events(
             if comment.author_id != author || comment.author_id == bot_user_id {
                 continue;
             }
-            // The triggering delivery's own comment is live input the
-            // command handler will process; the crawl must not pre-record
-            // it as history and suppress the handler's late-addition answer
-            // (Codex crawl review round 10).
-            // The triggering delivery's own comment is live input the
-            // command handler will process; the crawl must not pre-record
-            // it as history and suppress the handler's late-addition answer
-            // (Codex crawl review round 10).
-            if skip_comment == Some(comment.id) {
-                continue;
-            }
             let Some(Command::Predecessor(target)) = parse_command(&comment.body, bot_name) else {
                 continue;
             };
@@ -270,12 +259,23 @@ pub(crate) fn crawl_events(
             predecessor,
             comment_id,
         };
+        // Always apply to the topology scratch — the stack-extension check
+        // and validation of later candidates must see this edge.
         topology.apply_event(&StateEvent {
             seq: events.len() as u64,
             ts: now,
             payload: decl.clone(),
         });
-        events.push(decl);
+        // But do NOT persist the TRIGGERING delivery's own comment: it is
+        // live input the command handler processes next in the same
+        // delivery, and pre-recording it would suppress the handler's
+        // late-addition answer (Codex crawl review round 10). It still
+        // shaped the topology above, so a triggering comment that extends
+        // an active train is caught by `stack_extended` and aborted (round
+        // 11) — the abort, not the edge, is what recovery owes.
+        if skip_comment != Some(comment_id) {
+            events.push(decl);
+        }
     }
 
     // Train recovery from the bot's status comments. Trust gates: authored
@@ -528,12 +528,12 @@ mod tests {
         );
     }
 
-    /// The triggering delivery's own comment is skipped by the crawl, so
-    /// the live command handler (which runs next in the same delivery) can
-    /// answer it — e.g. emit `LateAddition` for a merged predecessor —
+    /// The triggering delivery's own comment is not RECORDED by the crawl,
+    /// so the live command handler (which runs next in the same delivery)
+    /// can answer it — e.g. emit `LateAddition` for a merged predecessor —
     /// instead of finding it already recorded (Codex crawl review round 10).
     #[test]
-    fn the_triggering_comment_is_not_consumed_by_the_crawl() {
+    fn the_triggering_comment_is_not_recorded_by_the_crawl() {
         let crawled = vec![
             pr(1, AUTHOR, PrState::Open),
             child(2, AUTHOR, 1, PrState::Open),
@@ -553,7 +553,69 @@ mod tests {
         );
         assert!(
             declared(&outcome.events).is_empty(),
-            "the delivery's own comment is left for the live handler"
+            "the delivery's own comment is left for the live handler to record"
+        );
+    }
+
+    /// But the triggering comment must still be SEEN for topology analysis:
+    /// if it extends an active recovered train (new PR #3 declares frozen
+    /// #2), the crawl's stack-extension check must fire and abort the train,
+    /// even though the edge itself is left for the handler to record. The
+    /// round-10 skip must not defeat the round-4 abort (Codex crawl review
+    /// round 11, P1).
+    #[test]
+    fn a_triggering_extension_comment_still_aborts_the_train() {
+        use crate::types::{CascadePhase, DescendantProgress};
+        let ts = test_now();
+        let mut record = TrainRecord::new(PrNumber(1), ts);
+        record.cascade_phase = CascadePhase::Preparing {
+            progress: DescendantProgress::new(vec![PrNumber(2)]),
+        };
+        let body = format_status_comment(&record, "mid").unwrap();
+        // #3 is a new PR declaring frozen #2 — the triggering comment (id 7).
+        let crawled = vec![
+            pr(1, AUTHOR, PrState::Open),
+            child(2, AUTHOR, 1, PrState::Open),
+            child(3, AUTHOR, 2, PrState::Open),
+        ];
+        let comments = vec![
+            (PrNumber(1), vec![comment(1, BOT, &body)]),
+            (
+                PrNumber(2),
+                vec![comment(2, AUTHOR, "@merge-train predecessor #1")],
+            ),
+            (
+                PrNumber(3),
+                vec![comment(7, AUTHOR, "@merge-train predecessor #2")],
+            ),
+        ];
+        let outcome = crawl_events(
+            "main",
+            &crawled,
+            &comments,
+            "merge-train",
+            BOT,
+            Some(CommentId(7)),
+            ts,
+        );
+        assert!(
+            outcome.recovered_roots.is_empty(),
+            "the extended train must not silently resume"
+        );
+        assert!(
+            outcome.events.iter().any(|e| matches!(
+                e,
+                StateEventPayload::TrainAborted {
+                    root_pr: PrNumber(1),
+                    ..
+                }
+            )),
+            "the extension via the triggering comment must still abort the train"
+        );
+        // The edge itself is NOT recorded by the crawl — the handler owns it.
+        assert!(
+            !declared(&outcome.events).contains(&(PrNumber(3), PrNumber(2))),
+            "the triggering edge is left for the handler to record"
         );
     }
 

@@ -832,18 +832,26 @@ stage shippable).
 >    the command handler processes next in the same delivery, and
 >    pre-recording it would suppress the `LateAddition` answer a genuine
 >    late-addition command deserves; `crawl_events` takes a `skip_comment`
->    for it. RESIDUAL (documented, bounded): a late-addition command that
->    is a *backlog* delivery (a different delivery triggered the crawl)
->    is still pre-recorded — the crawl cannot know which already-listed
->    comments have pending deliveries. The outcome is SAFE (the edge to a
->    merged predecessor leaves `is_root` false without a reconciliation
->    marker, so the PR stays non-startable); the only loss is the specific
->    "late addition — rebase or restart" message, and a `start` still gets
->    a "not a stack root" rejection. **Crawl review converged after 10
->    rounds** (2,1,1,1,1,1,1,1,2,1 findings) — lost-DB reconstruction is
->    the most adversarial recovery surface; every finding was a real
->    divergence from live-operation guarantees, each pinned by a
->    mutation-checked test. Round 6
+>    for it. Round 11 (P1): the round-10 skip must exclude the triggering
+>    comment ONLY from being *persisted*, not from the topology scratch —
+>    a triggering comment that EXTENDS an active recovered train (new PR
+>    #3 declares frozen #2) must still be seen by `stack_extended` so the
+>    train aborts (round 4). So the triggering comment is now applied to
+>    the topology scratch and collected into `referenced_uncrawled` like
+>    any other, and only its `PredecessorDeclared` event is withheld
+>    (the handler records it, and by then the train — if extended — is
+>    already aborted). RESIDUAL (documented, bounded): a late-addition
+>    command that is a *backlog* delivery (a different delivery triggered
+>    the crawl) is still pre-recorded — the crawl cannot know which
+>    already-listed comments have pending deliveries. The outcome is SAFE
+>    (the edge to a merged predecessor leaves `is_root` false without a
+>    reconciliation marker, so the PR stays non-startable); the only loss
+>    is the specific "late addition — rebase or restart" message, and a
+>    `start` still gets a "not a stack root" rejection. **Crawl review
+>    ran 11 rounds** (2,1,1,1,1,1,1,1,2,1,1 findings) — lost-DB
+>    reconstruction is the most adversarial recovery surface; every
+>    finding was a real divergence from live-operation guarantees, each
+>    pinned by a mutation-checked test. Round 6
 >    (P2): a train's root closed UNMERGED during the gap is in neither
 >    list endpoint, so PR discovery runs to a FIXPOINT — the wake-up
 >    webhook's `referenced_prs()` seed the crawl, and `crawl_events`
