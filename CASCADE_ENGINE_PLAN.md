@@ -805,7 +805,23 @@ stage shippable).
 >    validations. DESIGN's `needs_manual_review` inference recovery is
 >    NOT implemented: with a lost DB it cannot be soundly distinguished
 >    from a user-merged stack, and the failure mode without it is loud,
->    not silent. Events-table compaction — **landed
+>    not silent. Crawl-review notes: edited comments are refused in the
+>    declaration scan (the API names only the original author, so an
+>    edited body is unattributable — the live path's sender check has no
+>    crawl equivalent); declaration targets and adopted-train members
+>    outside the crawl are fetched individually before the atomic append;
+>    a finished train's stale ACTIVE comment adopts as completed (an
+>    unfinished train necessarily has unmerged members); fan-out replay
+>    never clobbers a child record born during-or-after the parent train
+>    (protecting both progress and a user's stop), while prior-incarnation
+>    records are replaced. REBUTTED (round 3, P1): a handler-emitted
+>    EvaluateTrain for a crawl-adopted train legitimately bypasses the
+>    startup deferral — it has an in-order cause (the wake-up delivery
+>    itself), so a stop queued behind it applies at the next observation
+>    boundary: the same one-batch bounded staleness live operation has
+>    always had, and the same shape M6's converged review accepted for
+>    CI-triggered first evaluations of marked roots. The deferral gate
+>    exists for evaluates with NO delivery cause (startup, timers). Events-table compaction — **landed
 >    2026-07-03** (post-M6 stage): `Store::compact` replaces the log
 >    with one `Checkpoint { snapshot }` EVENT, so the from-empty
 >    `replay()` oracle survives verbatim (a checkpoint replays by
