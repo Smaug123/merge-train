@@ -840,7 +840,15 @@ stage shippable).
 >    the topology scratch and collected into `referenced_uncrawled` like
 >    any other, and only its `PredecessorDeclared` event is withheld
 >    (the handler records it, and by then the train — if extended — is
->    already aborted). RESIDUAL (documented, bounded): a late-addition
+>    already aborted). **RULED (owner, 2026-07-03):** the crawl's
+>    stack-extension abort is deliberately STRICTER than the live
+>    handler. Live `topology_change_abort` (handlers.rs:348) reads state
+>    before applying the new declaration, so a brand-new PR extending an
+>    active train does NOT abort in live operation — only changing or
+>    removing an EXISTING member does. After a DB loss the frozen set
+>    cannot be fully trusted, so a RECOVERED train aborts on ANY
+>    extension and requires a fresh `@merge-train start` (human
+>    intervention). This divergence is intended. RESIDUAL (documented, bounded): a late-addition
 >    command that is a *backlog* delivery (a different delivery triggered
 >    the crawl) is still pre-recorded — the crawl cannot know which
 >    already-listed comments have pending deliveries. The outcome is SAFE
