@@ -2901,6 +2901,77 @@ fn a_stack_extended_during_a_db_loss_gap_aborts_on_recovery() {
     );
 }
 
+/// A train's root closed UNMERGED during a DB-loss gap is invisible to
+/// both crawl list endpoints, so its status comment would never be seen —
+/// leaving the train orphaned with no abort, cleanup, or final status. The
+/// wake-up webhook that names it (its own `pull_request.closed`) seeds the
+/// crawl, so the train is adopted and then aborted by the close (Codex
+/// crawl review round 6, P2).
+#[test]
+fn a_root_closed_unmerged_during_the_gap_is_seeded_and_aborted() {
+    let (mut world, heads) = World::linear_stack(2);
+    world.github.lock().unwrap().comments.insert(
+        CommentId(1000),
+        FakeComment {
+            pr: PrNumber(2),
+            author_id: AUTHOR,
+            body: "@merge-train predecessor #1".to_owned(),
+            edited: false,
+        },
+    );
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    start_command(&mut world, &mut processor, 1);
+    run_batches_then_crash(&mut world, processor, 4);
+
+    // The DB dies AND the root #1 is closed unmerged.
+    let db = world.db_path();
+    for path in [
+        db.clone(),
+        db.with_extension("db-wal"),
+        db.with_extension("db-shm"),
+        db.with_extension("lock"),
+    ] {
+        let _ = std::fs::remove_file(path);
+    }
+    let head1 = {
+        let mut github = world.github.lock().unwrap();
+        github.prs.get_mut(&PrNumber(1)).unwrap().state = FakePrState::Closed;
+        github.branch_head("pr-1")
+    };
+
+    // The wake-up IS the close webhook for the root: it seeds the crawl
+    // with #1, whose status comment is then found.
+    let mut processor = world.processor();
+    let body = pr_closed_body(&world.config, 1, &head1, "pr-1", "main");
+    world.enqueue(&mut processor, "pull_request", body);
+    drain(&mut processor);
+
+    assert!(
+        matches!(
+            processor
+                .state()
+                .active_trains
+                .get(&PrNumber(1))
+                .map(|t| &t.state),
+            Some(crate::types::TrainState::Aborted { .. })
+        ),
+        "the train whose root closed must be adopted and aborted, not orphaned: {:?}",
+        processor.state().active_trains
+    );
+    assert_eq!(
+        world
+            .github
+            .lock()
+            .unwrap()
+            .squash_count
+            .values()
+            .sum::<u32>(),
+        0,
+        "a train aborted on a closed root must not squash"
+    );
+}
+
 /// GitHub down at first contact: the delivery releases (nothing can be
 /// processed without the bootstrap) and succeeds when retried.
 #[test]

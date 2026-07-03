@@ -362,7 +362,9 @@ impl Processor {
         // resend — the repo's queue pauses at the stall cadence (which
         // also heals "permanent" auth errors the moment the operator fixes
         // the token).
-        if self.store.state().default_branch.is_empty() && !self.bootstrap_crawl()? {
+        if self.store.state().default_branch.is_empty()
+            && !self.bootstrap_crawl(&event.referenced_prs())?
+        {
             return self.release(&id);
         }
 
@@ -760,7 +762,7 @@ impl Processor {
     /// unavailable (any failure: transient, permanent, or a wrong
     /// variant): the caller releases the delivery and the queue pauses at
     /// the stall cadence — there is no safe degraded answer at bootstrap.
-    fn bootstrap_crawl(&mut self) -> Result<bool, StoreError> {
+    fn bootstrap_crawl(&mut self, seed_prs: &[PrNumber]) -> Result<bool, StoreError> {
         /// How many days of merged PRs the crawl considers: predecessor
         /// targets and mid-cascade roots older than this are treated as
         /// history (DESIGN bounds the resurrection window the same way).
@@ -802,8 +804,32 @@ impl Processor {
                  rooted at older merged PRs will not be recovered"
             );
         }
-        let mut comments = Vec::with_capacity(open.len() + merged.len());
-        for pr in open.iter().chain(merged.iter()).map(|p| p.number) {
+        // The list endpoints miss a PR closed *unmerged* during the gap; if
+        // the wake-up webhook names one (e.g. its own `pull_request.closed`
+        // for a train's root), fetch it so its status comment is seen and
+        // its train adopted+aborted rather than orphaned (Codex crawl
+        // review round 6). A permanent 404 (the PR never existed) is
+        // skipped; a transient failure pauses the whole crawl.
+        let mut crawled: Vec<PrData> = open;
+        crawled.extend(merged);
+        let listed: HashSet<PrNumber> = crawled.iter().map(|p| p.number).collect();
+        for &pr in seed_prs {
+            if listed.contains(&pr) {
+                continue;
+            }
+            match self.deps.github.execute(GitHubEffect::GetPr { pr }) {
+                Ok(GitHubResponse::Pr(data)) => crawled.push(data),
+                Err(e @ EffectError::Transient { .. }) => {
+                    warn!(%pr, error = ?e, "cannot fetch a seed PR; bootstrap crawl paused");
+                    return Ok(false);
+                }
+                other => {
+                    warn!(%pr, ?other, "seed PR unfetchable; skipping it in the crawl");
+                }
+            }
+        }
+        let mut comments = Vec::with_capacity(crawled.len());
+        for pr in crawled.iter().map(|p| p.number) {
             let pr_comments = fetch!(
                 GitHubEffect::ListComments { pr },
                 GitHubResponse::Comments(c) => c
@@ -813,8 +839,7 @@ impl Processor {
 
         let mut outcome = super::bootstrap::crawl_events(
             &settings.default_branch,
-            &open,
-            &merged,
+            &crawled,
             &comments,
             &self.deps.bot_name,
             self.deps.bot_user_id,
@@ -853,8 +878,7 @@ impl Processor {
         }
         info!(
             default_branch = %settings.default_branch,
-            open = open.len(),
-            merged = merged.len(),
+            crawled_prs = crawled.len(),
             recovered_trains = outcome.recovered_roots.len(),
             "bootstrapped the repo from a crawl"
         );

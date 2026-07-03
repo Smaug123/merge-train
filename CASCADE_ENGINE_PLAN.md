@@ -820,7 +820,12 @@ stage shippable).
 >    targets" answer: `ListOpenPrs` returns every open PR, so an
 >    unrecorded predecessor is necessarily closed/merged and never a
 >    valid edge; only adopted-train frozen members absent from the crawl
->    are still fetched individually before the atomic append. A finished
+>    are still fetched individually before the atomic append. Round 6
+>    (P2): a train's root closed UNMERGED during the gap is in neither
+>    list endpoint, so the wake-up webhook's `referenced_prs()` SEED the
+>    crawl — the caller fetches any named PR the lists miss, its status
+>    comment is found, and the train is adopted then aborted by the close
+>    rather than orphaned with no cleanup or final status. A finished
 >    train's stale ACTIVE comment adopts as completed (an
 >    unfinished train necessarily has unmerged members); fan-out replay
 >    never clobbers a child record born during-or-after the parent train
