@@ -916,7 +916,7 @@ stage shippable).
 >    by re-declaring, and reachable only with two same-predecessor
 >    declarations + a redelivery + DB loss. Not fixable in the crawl
 >    without changing live ownership semantics.
->    **Crawl review ran 15 rounds** — lost-DB
+>    **Crawl review CONVERGED at 16 rounds** (round 16 clean) — lost-DB
 >    reconstruction is the most adversarial recovery surface; every
 >    finding was a real divergence from live-operation guarantees, each
 >    pinned by a mutation-checked test. Round 6
