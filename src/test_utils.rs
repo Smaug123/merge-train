@@ -219,6 +219,22 @@ pub fn arb_state_event_payload() -> impl Strategy<Value = StateEventPayload> {
         (arb_pr_number(), arb_train_record()).prop_map(|(r, record)| {
             StateEventPayload::TrainRecordAdopted { root_pr: r, record }
         }),
+        // Compaction checkpoint (a whole-state replacement; `prs` stays
+        // empty here — CachedPr has no shared generator — which still
+        // exercises the replace semantics and serde round-trip).
+        (
+            arb_branch_name(),
+            arb_datetime(),
+            any::<u64>(),
+            prop::collection::vec((arb_pr_number(), arb_train_record()), 0..3),
+        )
+            .prop_map(|(branch, snapshot_at, next_seq, trains)| {
+                let mut snapshot = crate::persistence::snapshot::PersistedRepoSnapshot::new(branch);
+                snapshot.snapshot_at = snapshot_at;
+                snapshot.next_seq = next_seq;
+                snapshot.active_trains = trains.into_iter().collect();
+                StateEventPayload::Checkpoint { snapshot }
+            }),
         // Phase transitions
         (
             arb_pr_number(),

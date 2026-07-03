@@ -16,9 +16,49 @@ pub struct InvalidSha {
 }
 
 /// A pull request number within a repository.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct PrNumber(pub u64);
+
+/// Manual `Deserialize`: a number, or a numeric STRING. The string form is
+/// how JSON represents `PrNumber` map keys (`HashMap<PrNumber, _>` in the
+/// state snapshot), and while plain `serde_json` coerces such keys back to
+/// numbers itself, deserializing through an internally-tagged enum (the
+/// event payload's `#[serde(tag = "type")]`, which buffers via serde's
+/// `Content`) does not — a `Checkpoint` event embedding the snapshot would
+/// fail on its own keys without this.
+impl<'de> serde::Deserialize<'de> for PrNumber {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = PrNumber;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a PR number (u64, or a numeric string map key)")
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<PrNumber, E> {
+                Ok(PrNumber(v))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<PrNumber, E> {
+                u64::try_from(v)
+                    .map(PrNumber)
+                    .map_err(|_| E::custom(format!("negative PR number {v}")))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<PrNumber, E> {
+                v.parse::<u64>()
+                    .map(PrNumber)
+                    .map_err(|_| E::custom(format!("non-numeric PR number {v:?}")))
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
 
 impl fmt::Display for PrNumber {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

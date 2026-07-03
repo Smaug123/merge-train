@@ -791,10 +791,20 @@ stage shippable).
 >    db, DESIGN's inference-based recovery + `needs_manual_review`) — a
 >    fresh DB today re-learns topology from webhook traffic and refuses
 >    nothing irreversibly; the crawl is additive and rides with the
->    polling/PeriodicSync stage. Events-table pruning/compaction — the
->    log is still unbounded; its contract (preserve `replay()`'s
->    from-empty oracle + active trains' intent history) is its own
->    stage. `miss_count`/re-bootstrap stays deferred as planned.
+>    polling/PeriodicSync stage. Events-table compaction — **landed
+>    2026-07-03** (post-M6 stage): `Store::compact` replaces the log
+>    with one `Checkpoint { snapshot }` EVENT, so the from-empty
+>    `replay()` oracle survives verbatim (a checkpoint replays by
+>    replacing the state wholesale); it refuses while any train is
+>    ACTIVE — the store's own invariant, not caller discipline — which
+>    preserves active trains' intent history by construction; the
+>    worker triggers it in idle maintenance above a 1024-event
+>    threshold. Numeric-map-key gotcha: `HashMap<PrNumber, _>` keys
+>    serialize as JSON strings, and internally-tagged enums buffer
+>    through serde's `Content`, which does NOT coerce them back —
+>    `PrNumber` gained a manual `Deserialize` accepting numeric strings
+>    so the embedded snapshot round-trips inside the event payload.
+>    `miss_count`/re-bootstrap stays deferred as planned.
 > 6. **Oracles**: the crash-at-every-saga-depth sweep (each depth leaves
 >    a different phase mid-flight with the final batch's effects
 >    executed-but-unobserved; restart must complete with ≤1 squash/PR,
@@ -875,9 +885,10 @@ but `SquashCommitted` lost — is closed here by supplementary GitHub recovery
   timeouts**: M2 parks (`Control::Park`) and M3 re-triggers on
   `check_suite`/`status`/`review` events; the timer half rides in with
   polling.
-- **`miss_count >= 5` re-bootstrap, state pruning wiring, compaction
-  scheduling, status-export endpoint reading live worker state** (it
-  currently serves the last on-disk snapshot — eventually consistent).
+- **`miss_count >= 5` re-bootstrap, state pruning wiring, status-export
+  endpoint reading live worker state** (it currently serves the last
+  on-disk snapshot — eventually consistent). *(Events-table compaction
+  landed 2026-07-03 — see the M6 amendment.)*
 - **`stop --force` admin actions beyond stop + worktree cleanup** (Open
   Question 2). **Abort notifications on downstream PRs** (comment on the
   failing PR ships in M2; fanning comments to descendants is additive).
