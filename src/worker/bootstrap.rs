@@ -53,14 +53,17 @@ use crate::types::{MergeStateStatus, PrNumber, TrainError, TrainErrorKind, Train
 use super::pipeline::cache_fill_events;
 
 /// The crawl's decision: events to append, the roots of adopted ACTIVE
-/// trains (the caller marks them for M6 recovery), and adopted-train
-/// members absent from the crawl (closed-unmerged PRs — the caller fetches
-/// and caches them BEFORE appending, or the resumed train's evaluation
-/// errors on a member it cannot see).
+/// trains (the caller marks them for M6 recovery), and every PR the crawl
+/// *referenced* but did not fetch — declaration targets and adopted-train
+/// members absent from the crawl. The caller fetches those, lists their
+/// comments, and RE-RUNS the crawl to a fixpoint: a closed-unmerged root
+/// is absent from both list endpoints but named by its descendants'
+/// declarations, and only by pulling it in can its status comment be found
+/// and its train adopted/aborted (Codex crawl review rounds 6–7).
 pub(crate) struct CrawlOutcome {
     pub events: Vec<StateEventPayload>,
     pub recovered_roots: Vec<PrNumber>,
-    pub missing_members: Vec<PrNumber>,
+    pub referenced_uncrawled: Vec<PrNumber>,
 }
 
 /// The PRs a train record involves: its root, current PR, and the frozen
@@ -190,6 +193,21 @@ pub(crate) fn crawl_events(
     }
     candidates.sort_by_key(|(id, _, _)| *id);
 
+    // Every declaration target not in the crawl is referenced-but-uncrawled:
+    // the caller fetches it and re-runs, because a target that is a
+    // closed-unmerged train root (invisible to both list endpoints) carries
+    // a status comment the crawl must see to adopt+abort its train (Codex
+    // crawl review round 7). The declaration edge itself may still be
+    // dropped once fetched (a closed predecessor fails validation) — the
+    // fetch is for train discovery, not the edge.
+    let crawled_numbers: HashSet<PrNumber> = all_prs.iter().map(|p| p.number).collect();
+    let mut referenced_uncrawled: Vec<PrNumber> = Vec::new();
+    for (_, _, target) in &candidates {
+        if !crawled_numbers.contains(target) && !referenced_uncrawled.contains(target) {
+            referenced_uncrawled.push(*target);
+        }
+    }
+
     // Record only VALID, non-late-addition declarations (Codex crawl review
     // round 5): the crawl bypasses the live command path, so an unvalidated
     // edge — a closed/missing/mismatched predecessor, a cycle — would wedge
@@ -266,20 +284,16 @@ pub(crate) fn crawl_events(
             }
         }
     }
-    let merged_numbers: std::collections::HashSet<PrNumber> = all_prs
+    let merged_numbers: HashSet<PrNumber> = all_prs
         .iter()
         .filter(|p| p.state.is_merged())
         .map(|p| p.number)
         .collect();
-    let crawled_numbers: std::collections::HashSet<PrNumber> =
-        all_prs.iter().map(|p| p.number).collect();
 
     let mut recovered_roots = Vec::new();
-    // Adopted-train members absent from the crawl (a frozen descendant
-    // closed during the gap — neither open nor recently merged) are fetched
-    // individually so the resumed train's evaluation sees them (below).
-    let mut missing_members: Vec<PrNumber> = Vec::new();
-
+    // Adopted-train members absent from the crawl (a frozen descendant, or
+    // a closed root, that neither list endpoint returned) join the
+    // referenced-uncrawled set so the caller fetches them and re-crawls.
     let mut roots: Vec<PrNumber> = best.keys().copied().collect();
     roots.sort_unstable();
     for root in roots {
@@ -307,8 +321,8 @@ pub(crate) fn crawl_events(
         if record.state.is_active() && !extended {
             recovered_roots.push(root);
             for member in members(&record) {
-                if !crawled_numbers.contains(&member) && !missing_members.contains(&member) {
-                    missing_members.push(member);
+                if !crawled_numbers.contains(&member) && !referenced_uncrawled.contains(&member) {
+                    referenced_uncrawled.push(member);
                 }
             }
         }
@@ -330,13 +344,13 @@ pub(crate) fn crawl_events(
             });
         }
     }
-    missing_members.sort_unstable();
-    missing_members.dedup();
+    referenced_uncrawled.sort_unstable();
+    referenced_uncrawled.dedup();
 
     CrawlOutcome {
         events,
         recovered_roots,
-        missing_members,
+        referenced_uncrawled,
     }
 }
 
@@ -587,7 +601,7 @@ mod tests {
     /// validation rejects it, exactly as the live path would (Codex crawl
     /// review round 5; supersedes the earlier "fetch the target" answer).
     #[test]
-    fn a_declaration_to_an_uncrawled_predecessor_is_dropped() {
+    fn a_declaration_to_an_uncrawled_predecessor_is_dropped_but_reported() {
         let open = vec![child(2, AUTHOR, 77, PrState::Open)];
         let comments = vec![(
             PrNumber(2),
@@ -596,11 +610,12 @@ mod tests {
         let outcome = crawl_events("main", &open, &comments, "merge-train", BOT, test_now());
         assert!(
             declared(&outcome.events).is_empty(),
-            "a declaration to an uncrawled (closed/merged) predecessor is dropped"
+            "a declaration to an uncrawled predecessor is dropped (unvalidated)"
         );
-        assert!(
-            outcome.missing_members.is_empty(),
-            "and needs no follow-up fetch"
+        assert_eq!(
+            outcome.referenced_uncrawled,
+            vec![PrNumber(77)],
+            "but #77 is still fetched — it may be a closed root carrying a train"
         );
     }
 
@@ -671,7 +686,7 @@ mod tests {
         let comments = vec![(PrNumber(1), vec![comment(1, BOT, &body)])];
         let outcome = crawl_events("main", &open, &comments, "merge-train", BOT, ts);
         assert_eq!(outcome.recovered_roots, vec![PrNumber(1)]);
-        assert_eq!(outcome.missing_members, vec![PrNumber(3)]);
+        assert_eq!(outcome.referenced_uncrawled, vec![PrNumber(3)]);
     }
 
     /// A stack EXTENDED during the DB-loss gap — a new PR declaring a stack

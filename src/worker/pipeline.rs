@@ -49,7 +49,7 @@ use tracing::{error, info, warn};
 
 use crate::cascade::{self, Control, EffectError, Observation, ReplayFacts, StepPlan, observe};
 use crate::commands::{Command, parse_command};
-use crate::effects::github::GitHubEffect;
+use crate::effects::github::{CommentData, GitHubEffect};
 use crate::effects::{Effect, GitHubResponse, PrData};
 use crate::git::{CommitIdentity, GitConfig};
 use crate::persistence::event::StateEventPayload;
@@ -804,78 +804,74 @@ impl Processor {
                  rooted at older merged PRs will not be recovered"
             );
         }
-        // The list endpoints miss a PR closed *unmerged* during the gap; if
-        // the wake-up webhook names one (e.g. its own `pull_request.closed`
-        // for a train's root), fetch it so its status comment is seen and
-        // its train adopted+aborted rather than orphaned (Codex crawl
-        // review round 6). A permanent 404 (the PR never existed) is
-        // skipped; a transient failure pauses the whole crawl.
+        // Discover PRs to a fixpoint. The list endpoints miss a PR closed
+        // *unmerged* during the gap, but the wake-up webhook names some PRs
+        // (`seed_prs`) and the crawl surfaces more — declaration targets and
+        // adopted-train members it referenced but did not fetch. A closed
+        // root reachable only through its descendants' declarations is found
+        // this way: fetch the referenced PRs, list their comments, re-crawl,
+        // repeat until nothing new is referenced (Codex crawl review rounds
+        // 6–7). `attempted` bounds it — every PR is fetched at most once
+        // (a 404 counts), and the PR universe is finite — so it terminates.
         let mut crawled: Vec<PrData> = open;
         crawled.extend(merged);
-        let listed: HashSet<PrNumber> = crawled.iter().map(|p| p.number).collect();
-        for &pr in seed_prs {
-            if listed.contains(&pr) {
-                continue;
-            }
-            match self.deps.github.execute(GitHubEffect::GetPr { pr }) {
-                Ok(GitHubResponse::Pr(data)) => crawled.push(data),
-                Err(e @ EffectError::Transient { .. }) => {
-                    warn!(%pr, error = ?e, "cannot fetch a seed PR; bootstrap crawl paused");
-                    return Ok(false);
-                }
-                other => {
-                    warn!(%pr, ?other, "seed PR unfetchable; skipping it in the crawl");
-                }
-            }
-        }
-        let mut comments = Vec::with_capacity(crawled.len());
-        for pr in crawled.iter().map(|p| p.number) {
-            let pr_comments = fetch!(
-                GitHubEffect::ListComments { pr },
-                GitHubResponse::Comments(c) => c
-            );
-            comments.push((pr, pr_comments));
-        }
+        let mut attempted: HashSet<PrNumber> = crawled.iter().map(|p| p.number).collect();
+        let mut comments: Vec<(PrNumber, Vec<CommentData>)> = Vec::new();
+        let mut listed: HashSet<PrNumber> = HashSet::new();
+        let mut pending: Vec<PrNumber> = seed_prs
+            .iter()
+            .copied()
+            .filter(|pr| !attempted.contains(pr))
+            .collect();
 
-        let mut outcome = super::bootstrap::crawl_events(
-            &settings.default_branch,
-            &crawled,
-            &comments,
-            &self.deps.bot_name,
-            self.deps.bot_user_id,
-            Utc::now(),
-        );
-        // Adopted-train members absent from the crawl — closed-unmerged
-        // PRs (e.g. a frozen descendant closed during the DB-loss gap) —
-        // are fetched individually so the resumed train's evaluation sees
-        // them and aborts CLEANLY on the topology instead of erroring on a
-        // PR it cannot see (Codex crawl review, P2). A 404 stays missing
-        // (nothing to cache), loudly. Fetched BEFORE the atomic append, so
-        // a released retry still re-crawls from nothing.
-        for member in std::mem::take(&mut outcome.missing_members) {
-            match self.deps.github.execute(GitHubEffect::GetPr { pr: member }) {
-                Ok(GitHubResponse::Pr(data)) => {
-                    outcome.events.extend(cache_fill_events(
-                        member,
-                        &data,
-                        MergeStateStatus::Unknown,
-                    ));
+        let outcome = loop {
+            for pr in std::mem::take(&mut pending) {
+                if !attempted.insert(pr) {
+                    continue;
                 }
-                Err(e @ EffectError::Transient { .. }) => {
-                    warn!(%member, error = ?e, "bootstrap member fetch failed; the \
-                           repo's queue pauses until the crawl succeeds");
-                    return Ok(false);
-                }
-                other => {
-                    warn!(
-                        %member,
-                        ?other,
-                        "an adopted train references a PR the crawl cannot \
-                         fetch; its evaluation may abort the train"
-                    );
+                match self.deps.github.execute(GitHubEffect::GetPr { pr }) {
+                    Ok(GitHubResponse::Pr(data)) => crawled.push(data),
+                    Err(e @ EffectError::Transient { .. }) => {
+                        warn!(%pr, error = ?e, "cannot fetch a referenced PR; bootstrap paused");
+                        return Ok(false);
+                    }
+                    other => {
+                        warn!(%pr, ?other, "referenced PR unfetchable; skipping it in the crawl");
+                    }
                 }
             }
-        }
+            let unlisted: Vec<PrNumber> = crawled
+                .iter()
+                .map(|p| p.number)
+                .filter(|pr| !listed.contains(pr))
+                .collect();
+            for pr in unlisted {
+                listed.insert(pr);
+                let pr_comments = fetch!(
+                    GitHubEffect::ListComments { pr },
+                    GitHubResponse::Comments(c) => c
+                );
+                comments.push((pr, pr_comments));
+            }
+            let outcome = super::bootstrap::crawl_events(
+                &settings.default_branch,
+                &crawled,
+                &comments,
+                &self.deps.bot_name,
+                self.deps.bot_user_id,
+                Utc::now(),
+            );
+            let fresh: Vec<PrNumber> = outcome
+                .referenced_uncrawled
+                .iter()
+                .copied()
+                .filter(|pr| !attempted.contains(pr))
+                .collect();
+            if fresh.is_empty() {
+                break outcome;
+            }
+            pending = fresh;
+        };
         info!(
             default_branch = %settings.default_branch,
             crawled_prs = crawled.len(),

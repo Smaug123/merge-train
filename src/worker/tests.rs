@@ -2972,6 +2972,82 @@ fn a_root_closed_unmerged_during_the_gap_is_seeded_and_aborted() {
     );
 }
 
+/// The general closed-root case: the root is closed unmerged and the
+/// wake-up webhook does NOT name it — only its open descendant's
+/// predecessor declaration does. The crawl must follow that declaration to
+/// the closed root, find its status comment, and adopt+abort the train
+/// (Codex crawl review round 7, P2 — the fixpoint expansion).
+#[test]
+fn a_closed_root_reached_only_via_a_descendant_declaration_is_recovered() {
+    let (mut world, heads) = World::linear_stack(2);
+    world.github.lock().unwrap().comments.insert(
+        CommentId(1000),
+        FakeComment {
+            pr: PrNumber(2),
+            author_id: AUTHOR,
+            body: "@merge-train predecessor #1".to_owned(),
+            edited: false,
+        },
+    );
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    start_command(&mut world, &mut processor, 1);
+    run_batches_then_crash(&mut world, processor, 4);
+
+    let db = world.db_path();
+    for path in [
+        db.clone(),
+        db.with_extension("db-wal"),
+        db.with_extension("db-shm"),
+        db.with_extension("lock"),
+    ] {
+        let _ = std::fs::remove_file(path);
+    }
+    world
+        .github
+        .lock()
+        .unwrap()
+        .prs
+        .get_mut(&PrNumber(1))
+        .unwrap()
+        .state = FakePrState::Closed;
+
+    // The wake-up is a check_suite on the OPEN descendant #2 — it names #2,
+    // not the closed root #1. Only #2's declaration reaches #1.
+    let mut processor = world.processor();
+    let head2 = {
+        let github = world.github.lock().unwrap();
+        github.branch_head("pr-2")
+    };
+    let body = check_suite_green_body(&world.config, &head2, &[2], world.next_delivery + 900);
+    world.enqueue(&mut processor, "check_suite", body);
+    drain(&mut processor);
+
+    assert!(
+        matches!(
+            processor
+                .state()
+                .active_trains
+                .get(&PrNumber(1))
+                .map(|t| &t.state),
+            Some(crate::types::TrainState::Aborted { .. })
+        ),
+        "the crawl must follow the descendant's declaration to the closed root \
+         and abort its train: {:?}",
+        processor.state().active_trains
+    );
+    assert_eq!(
+        world
+            .github
+            .lock()
+            .unwrap()
+            .squash_count
+            .values()
+            .sum::<u32>(),
+        0
+    );
+}
+
 /// GitHub down at first contact: the delivery releases (nothing can be
 /// processed without the bootstrap) and succeeds when retried.
 #[test]
