@@ -127,6 +127,39 @@ fn stack_extended(topology: &RepoState, record: &TrainRecord) -> bool {
         .any(|d| !frozen.contains(&d))
 }
 
+/// Whether any EDITED declaration extends `record`'s stack: a non-member PR
+/// declaring a stack member as its predecessor. Edited edges cannot be
+/// recorded (their editor is unattributable — round 2) and a single-value
+/// `RepoState` predecessor cannot hold more than one edited edge per PR, so
+/// they are checked DIRECTLY here rather than folded into `topology`: EVERY
+/// edited edge is tested, not just the first per PR (Codex crawl review
+/// round 18). The train's known stack is its frozen set + primaries + the
+/// RECORDED descendant closure; an edited edge whose target is inside it and
+/// whose source is outside it is a possible extension, and recovery aborts
+/// on any extension (owner ruling).
+fn edited_extends(
+    topology: &RepoState,
+    record: &TrainRecord,
+    edited_edges: &[(PrNumber, PrNumber)],
+) -> bool {
+    let Some(progress) = record.cascade_phase.progress() else {
+        return false;
+    };
+    let mut stack: HashSet<PrNumber> = progress.frozen_descendants().iter().copied().collect();
+    stack.insert(record.original_root_pr);
+    stack.insert(record.current_pr);
+    for anchor in [record.original_root_pr, record.current_pr] {
+        stack.extend(collect_all_descendants(
+            anchor,
+            &topology.descendants,
+            &topology.prs,
+        ));
+    }
+    edited_edges
+        .iter()
+        .any(|(source, target)| stack.contains(target) && !stack.contains(source))
+}
+
 /// Turns crawled facts into state events. Pure: fetching is the caller's;
 /// `now` stamps the completion of stale records (see below).
 ///
@@ -323,32 +356,6 @@ pub(crate) fn crawl_events(
         }
     }
 
-    // Now that recording is done, fold EDITED declarations into the scratch
-    // ONLY for the stack-extension check (never persisted): an edited
-    // comment declaring a frozen member extends a recovered train, and
-    // recovery aborts on any extension. Applied after the recording loop so
-    // they cannot shadow a real declaration's validation (round 12), and
-    // only where the PR has no recorded edge, so they never overwrite a
-    // recorded one (Codex crawl review — edited-extension recovery).
-    for (pr, target) in edited_edges {
-        if topology
-            .prs
-            .get(&pr)
-            .is_some_and(|c| c.predecessor.is_some())
-        {
-            continue;
-        }
-        topology.apply_event(&StateEvent {
-            seq: events.len() as u64,
-            ts: now,
-            payload: StateEventPayload::PredecessorDeclared {
-                pr,
-                predecessor: target,
-                comment_id: crate::types::CommentId(0),
-            },
-        });
-    }
-
     // Train recovery from the bot's status comments. Trust gates: authored
     // by the bot, parseable, and posted on its own root PR. Per root, the
     // latest incarnation at its highest recovery_seq (ties to the later
@@ -427,7 +434,9 @@ pub(crate) fn crawl_events(
         }
         // A stack extended during the gap aborts, matching the live
         // topology-change abort (Codex crawl review round 4).
-        let extended = record.state.is_active() && stack_extended(&topology, &record);
+        let extended = record.state.is_active()
+            && (stack_extended(&topology, &record)
+                || edited_extends(&topology, &record, &edited_edges));
         // A member the caller could not fetch (a permanent `GetPr` 404 —
         // deleted, or the token lost access) means the train references a
         // PR the crawl cannot see. Recovering it would let its first
@@ -717,6 +726,61 @@ mod tests {
         assert!(
             !declared(&outcome.events).contains(&(PrNumber(3), PrNumber(2))),
             "the edited declaration is not persisted"
+        );
+    }
+
+    /// Every edited declaration is checked for an extension, not just the
+    /// first per PR: if #3 has an earlier edited comment pointing elsewhere
+    /// and a LATER one declaring frozen #2, the extension must still abort
+    /// the recovered train (Codex crawl review round 18, P2).
+    #[test]
+    fn a_later_edited_extension_after_another_edit_still_aborts() {
+        use crate::types::{CascadePhase, DescendantProgress};
+        let ts = test_now();
+        let mut record = TrainRecord::new(PrNumber(1), ts);
+        record.cascade_phase = CascadePhase::Preparing {
+            progress: DescendantProgress::new(vec![PrNumber(2)]),
+        };
+        let body = format_status_comment(&record, "mid").unwrap();
+        let crawled = vec![
+            pr(1, AUTHOR, PrState::Open),
+            child(2, AUTHOR, 1, PrState::Open),
+            pr(3, AUTHOR, PrState::Open),
+        ];
+        // #3's FIRST edited comment points at #99 (not a member); the LATER
+        // one declares frozen #2 (the extension).
+        let mut first = comment(8, AUTHOR, "@merge-train predecessor #99");
+        first.edited = true;
+        let mut second = comment(9, AUTHOR, "@merge-train predecessor #2");
+        second.edited = true;
+        let comments = vec![
+            (PrNumber(1), vec![comment(1, BOT, &body)]),
+            (
+                PrNumber(2),
+                vec![comment(2, AUTHOR, "@merge-train predecessor #1")],
+            ),
+            (PrNumber(3), vec![first, second]),
+        ];
+        let outcome = crawl_events(
+            "main",
+            &crawled,
+            &comments,
+            "merge-train",
+            BOT,
+            None,
+            &HashSet::new(),
+            ts,
+        );
+        assert!(
+            outcome.recovered_roots.is_empty()
+                && outcome.events.iter().any(|e| matches!(
+                    e,
+                    StateEventPayload::TrainAborted {
+                        root_pr: PrNumber(1),
+                        ..
+                    }
+                )),
+            "a later edited extension must abort even after an earlier edit"
         );
     }
 

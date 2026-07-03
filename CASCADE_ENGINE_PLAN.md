@@ -922,7 +922,15 @@ stage shippable).
 >    descendant declaration was never fetched and its train orphaned;
 >    edited targets now join `referenced_uncrawled` (the EDGE stays
 >    untrusted/unrecorded — only the target is fetched, for train
->    discovery, like round 7). **Crawl review CONVERGED at 17 rounds** — lost-DB
+>    discovery, like round 7). Round 18 (P2): rounds 14–15 folded edited
+>    edges into the `RepoState` scratch to feed `stack_extended`, but a
+>    single-value predecessor holds only ONE edge per PR, so a second
+>    edited comment on the same PR declaring a frozen member was silently
+>    dropped and its extension missed. The fold is gone; a dedicated
+>    `edited_extends` now tests EVERY edited edge directly against the
+>    train's known stack (frozen ∪ primaries ∪ recorded closure) — an edge
+>    into the stack from outside it aborts, matching the round-4 extension
+>    ruling regardless of how many edits a PR carries. **Crawl review CONVERGED at 18 rounds** — lost-DB
 >    reconstruction is the most adversarial recovery surface; every
 >    finding was a real divergence from live-operation guarantees, each
 >    pinned by a mutation-checked test. Round 6
