@@ -597,6 +597,20 @@ leaves a dirty worktree, which `git::recovery::cleanup_worktree_on_restart`
 >    `GITHUB_TOKEN` must be a *user-scoped* token: startup identity is
 >    `GET /user` (resolved question 3), which App installation tokens
 >    cannot call; App-auth support is deferred.
+> 11. **Reloaded commands queue immediately at startup, in id order**
+>    (2026-07-03, self-review round 20). A `pending_commands` row's
+>    delivery closed before every backlog delivery arrived, so
+>    front-of-queue is the user's utterance order — among the reloaded
+>    commands *and* against any command the backlog still carries.
+>    Round 19's first shape deferred them behind the backlog drain
+>    (symmetry with the round-6 evaluate deferral), which inverted
+>    command order across a restart: a post-restart `stop` was answered
+>    "no active merge train" and the older reloaded start then started
+>    the train the user had just refused. The round-6 hazard does not
+>    apply to commands: a start's plan is read-only preflight whose
+>    `TrainStarted` lands only at the observation boundary (run against
+>    the drained backlog), and a stop appends terminal events valid at
+>    any staleness. Startup *evaluations* stay deferred.
 
 **Dependencies:** M2, M3, M4. **Implements:** DESIGN.md §Per-repo serial
 event processing worker loop, §Event processing flow, §Restart safety steps
@@ -674,7 +688,11 @@ stage shippable).
 > evaluations are derived (re-queued for every active train at startup),
 > and fan-out stop expansion rewrites rows mid-flight (round 15). Nine of
 > the nineteen review rounds were ordering/durability bugs in exactly this
-> machinery. The candidate simplification: ONE ordered, durable
+> machinery — and round 20 (self-review, amendment 11) found a tenth: the
+> command-reload deferral inverted utterance order across a restart. The
+> interleaving harness could not see that class either; its invariants
+> check answers exist, not that answers respect utterance order — a
+> command-order invariant becomes natural once the queue is unified. The candidate simplification: ONE ordered, durable
 > engine-work queue (a `pending_work` table subsuming `pending_commands`)
 > that every queued item flows through, with "answered" as the single
 > deletion contract — collapsing the per-kind special cases and making the

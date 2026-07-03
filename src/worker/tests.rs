@@ -1286,6 +1286,65 @@ fn acknowledged_start_survives_a_crash_while_queued() {
     );
 }
 
+/// Command order must survive a restart: a reloaded command was uttered
+/// before every command the backlog can still deliver, so it must APPLY
+/// before them too. Deferring reloaded commands behind the backlog drain
+/// (round 19's first shape) inverted this: a post-restart `stop` — a fresh
+/// backlog delivery — was answered "no active merge train" first, and the
+/// older reloaded start then started (and merged!) the train the user had
+/// just refused.
+#[test]
+fn post_restart_stop_cancels_a_reloaded_start() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    start_command(&mut world, &mut processor, 1);
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+    // The start is acked and durable but never pumped: crash.
+    drop(processor);
+
+    // Restart. The user (having watched the start do nothing) refuses it
+    // before the reloaded command gets to run.
+    let mut processor = world.processor();
+    let body = comment_body(&world.config, 1, "@merge-train stop", AUTHOR, "author", 63);
+    world.enqueue(&mut processor, "issue_comment", body);
+    drain(&mut processor);
+
+    let events = processor.store_mut().events().unwrap();
+    assert!(
+        !events.iter().any(|e| matches!(
+            e.payload,
+            crate::persistence::event::StateEventPayload::TrainStarted {
+                root_pr: PrNumber(1),
+                ..
+            }
+        )),
+        "the reloaded start outran the fresh stop and started the train"
+    );
+    let github = world.github.lock().unwrap();
+    assert!(
+        github
+            .posted_comments
+            .iter()
+            .any(|(pr, text)| *pr == PrNumber(1) && text.contains("start cancelled")),
+        "expected a start-cancelled answer"
+    );
+    assert!(
+        !github
+            .posted_comments
+            .iter()
+            .any(|(pr, text)| *pr == PrNumber(1) && text.contains("No active merge train")),
+        "the stop must consume the pending start, not deny a train exists"
+    );
+    drop(github);
+    assert!(
+        processor.store_mut().pending_commands().unwrap().is_empty(),
+        "both commands must be answered"
+    );
+}
+
 /// The evaluate half of trigger-work recovery: an active train whose pending
 /// evaluation died with the process (e.g. an acknowledged CI success whose
 /// trigger was queued but not yet run) must be re-evaluated at startup, not

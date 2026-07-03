@@ -171,11 +171,6 @@ pub(crate) struct Processor {
     /// The durable row of the start whose preflight saga is in flight; the
     /// row is deleted when the start is answered (see [`PendingWork::Start`]).
     active_start: Option<(i64, PrNumber)>,
-    /// Reloaded not-yet-answered commands, queued (in command order, ahead
-    /// of the startup evaluations) when the backlog first drains — the same
-    /// deferral evaluates get, and for the same reason: they must act on
-    /// state that includes every already-acked delivery (Codex M5 round 6).
-    startup_commands: Option<Vec<PendingWork>>,
 }
 
 impl Processor {
@@ -197,16 +192,22 @@ impl Processor {
             );
         }
 
-        // Startup work (Codex M5 round 2): persisted stops that never
-        // reached their observation boundary apply first. Startup
-        // *evaluations* of active trains (so an acknowledged CI success
-        // whose trigger died with the process still resumes a parked train)
-        // are computed here but queue only once the durable backlog first
-        // drains — see [`Processor::claim`] — or their effects would run
-        // against state that predates already-acked deliveries (Codex M5
-        // round 6, P1: e.g. a queued topology-change abort overtaken by a
-        // squash).
-        let startup_commands: Vec<PendingWork> = store
+        // Reloaded not-yet-answered commands (Codex M5 rounds 2 and 19)
+        // queue immediately, in `pending_commands` id order: a reloaded
+        // command's delivery closed before every backlog delivery arrived,
+        // so front-of-queue IS the user's utterance order — both among the
+        // reloaded commands and against any command the backlog still
+        // carries. Deferring them behind the backlog drain (round 19's
+        // first shape) inverted that order: a post-restart `stop` was
+        // answered "no active merge train" and the older reloaded start
+        // then started the train the user had just refused (round 20).
+        // Unlike the startup *evaluations* below, immediate application
+        // cannot outrun acked train-terminating deliveries: a start's plan
+        // is read-only preflight whose TrainStarted lands only at the
+        // observation boundary (which the worker runs against the drained
+        // backlog), and a stop appends terminal events valid at any
+        // staleness.
+        let pending: VecDeque<PendingWork> = store
             .pending_commands()?
             .into_iter()
             .map(|(id, command)| match command {
@@ -216,6 +217,13 @@ impl Processor {
                 }
             })
             .collect();
+        // Startup *evaluations* of active trains (so an acknowledged CI
+        // success whose trigger died with the process still resumes a
+        // parked train) are computed here but queue only once the durable
+        // backlog first drains — see [`Processor::claim`] — or their
+        // effects would run against state that predates already-acked
+        // deliveries (Codex M5 round 6, P1: e.g. a queued topology-change
+        // abort overtaken by a squash).
         let startup_evaluates = store
             .state()
             .active_trains
@@ -227,12 +235,11 @@ impl Processor {
         Ok(Processor {
             store,
             deps,
-            pending: VecDeque::new(),
+            pending,
             in_flight: None,
             inherited_mid_flight,
             startup_evaluates: Some(startup_evaluates),
             active_start: None,
-            startup_commands: Some(startup_commands),
         })
     }
 
@@ -298,18 +305,11 @@ impl Processor {
     /// backlog (Codex M5 round 6, P1).
     pub fn claim(&mut self) -> Result<Option<Delivery>, StoreError> {
         let claimed = self.store.claim_next_delivery()?;
-        if claimed.is_none() {
-            // Reloaded commands first (in the user's order — a reloaded
-            // `start → stop` must stay that way), then the evaluations.
-            if let Some(commands) = self.startup_commands.take() {
-                for work in commands {
-                    self.queue(work);
-                }
-            }
-            if let Some(roots) = self.startup_evaluates.take() {
-                for root in roots {
-                    self.queue(PendingWork::Trigger(Trigger::EvaluateTrain { root }));
-                }
+        if claimed.is_none()
+            && let Some(roots) = self.startup_evaluates.take()
+        {
+            for root in roots {
+                self.queue(PendingWork::Trigger(Trigger::EvaluateTrain { root }));
             }
         }
         Ok(claimed)
