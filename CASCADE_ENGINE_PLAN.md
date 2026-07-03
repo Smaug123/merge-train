@@ -886,7 +886,18 @@ stage shippable).
 >    and (b) is directly wedged against round-3's "don't undo a user's
 >    stop"; not worth destabilizing the converged heuristics for these
 >    corners (owner tolerates conservative, recoverable recovery).
->    **Crawl review ran 13 rounds** — lost-DB
+>    Round 14 (P1): the round-2 edited-comment skip kept an EDITED
+>    predecessor declaration out of the stack-extension scratch entirely,
+>    so an edited comment adding a descendant to a recovered train was
+>    caught by neither the crawl (edited skipped) nor the later live
+>    `topology_change_abort` (reads pre-declaration state) — the train
+>    resumed over an extended stack, against the round-11 abort-on-any-
+>    extension ruling. Fix: edited declarations are STILL not recorded
+>    (their editor is unattributable — round 2), but they now enrich the
+>    stack-extension scratch as POSSIBLE extensions (applied after the
+>    recording loop, only where the PR has no recorded edge — no shadow,
+>    no overwrite), so `stack_extended` aborts on an edited extension too.
+>    **Crawl review ran 14 rounds** — lost-DB
 >    reconstruction is the most adversarial recovery surface; every
 >    finding was a real divergence from live-operation guarantees, each
 >    pinned by a mutation-checked test. Round 6

@@ -176,6 +176,13 @@ pub(crate) fn crawl_events(
     // each is validated against the edges accepted before it — giving
     // first-declaration-wins exactly as the live handler does over time.
     let mut candidates: Vec<(crate::types::CommentId, PrNumber, PrNumber)> = Vec::new();
+    // Edited predecessor declarations are NOT recorded (their editor cannot
+    // be attributed — round 2), but they are still a POSSIBLE topology
+    // change: an edited comment that declares a frozen member as its
+    // predecessor extends a recovered train, and the crawl aborts on any
+    // extension (owner ruling, round 11). So they are kept here only to
+    // enrich the stack-extension scratch below, never to persist an edge.
+    let mut edited_edges: Vec<(PrNumber, PrNumber)> = Vec::new();
     for (pr, pr_comments) in comments {
         let Some(&author) = authors.get(pr) else {
             continue;
@@ -190,10 +197,10 @@ pub(crate) fn crawl_events(
             if comment.edited {
                 tracing::warn!(
                     %pr, comment = %comment.id,
-                    "ignoring an EDITED predecessor declaration during the \
-                     crawl (the editor cannot be verified); the author can \
-                     re-declare in a fresh comment"
+                    "not recording an EDITED predecessor declaration (the editor \
+                     cannot be verified); it still counts as a possible extension"
                 );
+                edited_edges.push((*pr, target));
                 continue;
             }
             candidates.push((comment.id, *pr, target));
@@ -300,6 +307,32 @@ pub(crate) fn crawl_events(
         if !is_trigger {
             events.push(decl);
         }
+    }
+
+    // Now that recording is done, fold EDITED declarations into the scratch
+    // ONLY for the stack-extension check (never persisted): an edited
+    // comment declaring a frozen member extends a recovered train, and
+    // recovery aborts on any extension. Applied after the recording loop so
+    // they cannot shadow a real declaration's validation (round 12), and
+    // only where the PR has no recorded edge, so they never overwrite a
+    // recorded one (Codex crawl review — edited-extension recovery).
+    for (pr, target) in edited_edges {
+        if topology
+            .prs
+            .get(&pr)
+            .is_some_and(|c| c.predecessor.is_some())
+        {
+            continue;
+        }
+        topology.apply_event(&StateEvent {
+            seq: events.len() as u64,
+            ts: now,
+            payload: StateEventPayload::PredecessorDeclared {
+                pr,
+                predecessor: target,
+                comment_id: crate::types::CommentId(0),
+            },
+        });
     }
 
     // Train recovery from the bot's status comments. Trust gates: authored
@@ -607,6 +640,69 @@ mod tests {
         assert!(
             declared(&outcome.events).is_empty(),
             "the delivery's own comment is left for the live handler to record"
+        );
+    }
+
+    /// An EDITED extension declaration must also abort a recovered train.
+    /// The edge is not recorded (its editor cannot be attributed — round
+    /// 2), but it is a possible topology change, and recovery aborts on any
+    /// extension (owner ruling). Without this, neither the crawl (edited
+    /// comments skipped) nor the later `topology_change_abort` (reads
+    /// pre-declaration state) catches it (Codex crawl review, P1).
+    #[test]
+    fn an_edited_extension_declaration_aborts_the_recovered_train() {
+        use crate::types::{CascadePhase, DescendantProgress};
+        let ts = test_now();
+        let mut record = TrainRecord::new(PrNumber(1), ts);
+        record.cascade_phase = CascadePhase::Preparing {
+            progress: DescendantProgress::new(vec![PrNumber(2)]),
+        };
+        let body = format_status_comment(&record, "mid").unwrap();
+        let crawled = vec![
+            pr(1, AUTHOR, PrState::Open),
+            child(2, AUTHOR, 1, PrState::Open),
+            child(3, AUTHOR, 2, PrState::Open),
+        ];
+        // #2 -> #1 recorded (the existing frozen stack); #3 -> #2 via an
+        // EDITED comment (the extension) — not recorded, but must abort.
+        let mut edited = comment(9, AUTHOR, "@merge-train predecessor #2");
+        edited.edited = true;
+        let comments = vec![
+            (PrNumber(1), vec![comment(1, BOT, &body)]),
+            (
+                PrNumber(2),
+                vec![comment(2, AUTHOR, "@merge-train predecessor #1")],
+            ),
+            (PrNumber(3), vec![edited]),
+        ];
+        let outcome = crawl_events(
+            "main",
+            &crawled,
+            &comments,
+            "merge-train",
+            BOT,
+            None,
+            &HashSet::new(),
+            ts,
+        );
+        assert!(
+            outcome.recovered_roots.is_empty(),
+            "the edited extension must not silently resume"
+        );
+        assert!(
+            outcome.events.iter().any(|e| matches!(
+                e,
+                StateEventPayload::TrainAborted {
+                    root_pr: PrNumber(1),
+                    ..
+                }
+            )),
+            "an edited extension must abort the recovered train"
+        );
+        // The edited edge itself is never recorded.
+        assert!(
+            !declared(&outcome.events).contains(&(PrNumber(3), PrNumber(2))),
+            "the edited declaration is not persisted"
         );
     }
 
