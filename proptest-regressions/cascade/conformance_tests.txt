@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 4afb29a13b9d700fd1b518ea455d5831cc79c08976fb91f544e38a47d9f5d282 # shrinks to choices = [Index(6379519358496778297), Index(10826102482269387972), Index(15506780254007302673)], advanced_bits = [false, true, false, true]

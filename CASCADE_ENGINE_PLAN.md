@@ -834,7 +834,19 @@ stage shippable).
 >    comment, and adopts+aborts the train rather than orphaning it. A
 >    finished
 >    train's stale ACTIVE comment adopts as completed (an
->    unfinished train necessarily has unmerged members); fan-out replay
+>    unfinished train necessarily has unmerged members). Round 8 (P2): a
+>    stale FAN-OUT parent — fan-out's best-effort completion update to
+>    the old root's comment failed, leaving it ACTIVE with still-open
+>    children so the all-members-merged check misses it — is completed
+>    too, detected by a frozen descendant carrying its own adopted ROOT
+>    record born after the parent (each fan-out child is a fresh root at
+>    fan-out time); otherwise the parent resurrects in parallel with its
+>    children over the same PRs, risking a double squash. RESIDUAL
+>    (documented, bounded): detection needs the stale parent comment to
+>    carry a frozen set (`progress().is_some()`), which the fan-out phase
+>    always has; the narrow case where the last *successful* update
+>    predated the fan-out phase and was `Idle` is not detected — a stop
+>    (`@merge-train stop`) still retires such a parent. Fan-out replay
 >    never clobbers a child record born during-or-after the parent train
 >    (protecting both progress and a user's stop), while prior-incarnation
 >    records are replaced. Round 4 (P1): a stack EXTENDED during the gap
