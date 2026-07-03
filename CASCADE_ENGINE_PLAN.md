@@ -750,12 +750,24 @@ stage shippable).
 >    the restored log's stale unmatched intents were settled in a world
 >    that log never saw, and acting on them runs the wrong idempotency
 >    path against the adopted record [Codex M6 review, P2]),
->    RepairCommentId (comment moved), RepostBackup (comment gone: the
->    worker re-posts the backup DURING recovery — the engine's self-heal
->    runs only at idle evaluations, which a mid-phase resume may never
->    pass — and records the fresh id via `StatusCommentPosted`, NOT via
->    adoption: the local ledger is genuine there and must survive),
->    KeepLocal.
+>    RepairCommentId (comment moved or posted-but-unrecorded — the id is
+>    recorded, then the body refreshed), RefreshComment (the live comment
+>    is behind the store — the COMMON crash shape, events commit before
+>    the best-effort update runs — or mangled; rewritten BEFORE the train
+>    resumes, or the backup cannot cover a DB loss in the resume window
+>    [Codex M6 round 3]), RepostBackup (comment gone: the worker re-posts
+>    the backup DURING recovery — the engine's self-heal runs only at
+>    idle evaluations, which a mid-phase resume may never pass — and
+>    records the fresh id via `StatusCommentPosted`, NOT via adoption:
+>    the local ledger is genuine there and must survive), KeepLocal
+>    (only when the live comment embeds the local record exactly).
+>    KeepLocal freshness requires ONE clock read per decision:
+>    `integrate_plan` takes the planner's `now`, so the comment's
+>    embedded `started_at` equals the event stamp by construction
+>    (Codex M6 round 2 — two reads made recovery reject the bot's own
+>    initial comment). Adopting a `Completed` record removes it from
+>    `active_trains`, mirroring the normal completion path (round 2).
+>    Codex round 4: converged, no actionable findings.
 > 3. **Worktree restart cleanup on the executor thread**: recovery flags
 >    the root; its next `SagaBatch` carries `restart_cleanup` and
 >    `execute_batch` runs `cleanup_worktree_on_restart` before any
