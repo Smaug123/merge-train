@@ -416,19 +416,24 @@ impl RepoState {
                 new_roots,
                 ..
             } => {
+                let parent_started = self.active_trains.get(old_root).map(|t| t.started_at);
                 self.active_trains.remove(old_root);
                 for root in new_roots {
-                    // Never clobber an existing ACTIVE record: unreachable in
-                    // normal operation (a fan-out's new roots were members of
-                    // the parent train, and members cannot have trains), but a
-                    // crawl-resurrected stale parent replaying its fan-out
-                    // must not reset children adopted from their own — strictly
-                    // newer — status comments (Codex crawl review, P2).
-                    if self
-                        .active_trains
-                        .get(root)
-                        .is_some_and(|t| t.state.is_active())
-                    {
+                    // Never clobber a record born during-or-after the parent
+                    // train: unreachable in normal operation (a fan-out's new
+                    // roots were members, and members cannot have trains), but
+                    // a crawl-resurrected stale parent replaying its fan-out
+                    // must not reset children adopted from their own strictly
+                    // newer comments — active ones (their progress) OR
+                    // terminal ones (resurrecting a stopped child undoes the
+                    // user's stop). Records that PREDATE the parent train are
+                    // previous incarnations — stale history, replaced as
+                    // usual. A parentless replay (no record to compare)
+                    // conservatively protects whatever exists (Codex crawl
+                    // review rounds 2–3).
+                    if self.active_trains.get(root).is_some_and(|t| {
+                        parent_started.is_none_or(|started| t.started_at >= started)
+                    }) {
                         continue;
                     }
                     self.active_trains
@@ -1406,6 +1411,60 @@ mod tests {
         assert!(
             state.active_trains.contains_key(&PrNumber(3)),
             "roots without a live record are created as usual"
+        );
+    }
+
+    /// The clobber guard distinguishes THIS cascade's children from stale
+    /// history by birth time: a child record born during-or-after the
+    /// parent train (an adopted STOPPED child included — resurrecting it
+    /// would undo the user's stop) survives the replayed fan-out, while a
+    /// previous incarnation's terminal record on a new root is replaced as
+    /// usual (Codex crawl review round 3, P2).
+    #[test]
+    fn fan_out_preserves_this_cascades_children_but_replaces_history() {
+        let ts = crate::test_utils::test_timestamp();
+        let mut state = RepoState::from_snapshot(PersistedRepoSnapshot::new("main".to_string()));
+
+        // The parent train, started at ts.
+        let mut parent = TrainRecord::new(PrNumber(1), ts);
+        parent.recovery_seq = 3;
+        state.apply_event(&event(StateEventPayload::TrainRecordAdopted {
+            root_pr: PrNumber(1),
+            record: parent,
+        }));
+        // Child 2: STOPPED after the parent started — this cascade's own
+        // child, adopted from its newer comment.
+        let mut stopped_child = TrainRecord::new(PrNumber(2), ts + chrono::Duration::hours(1));
+        stopped_child.state = crate::types::TrainState::Stopped {
+            ended_at: ts + chrono::Duration::hours(2),
+        };
+        state.apply_event(&event(StateEventPayload::TrainRecordAdopted {
+            root_pr: PrNumber(2),
+            record: stopped_child,
+        }));
+        // Child 3: a terminal record from a train long BEFORE the parent —
+        // stale history.
+        let mut old_incarnation = TrainRecord::new(PrNumber(3), ts - chrono::Duration::days(30));
+        old_incarnation.state = crate::types::TrainState::Stopped {
+            ended_at: ts - chrono::Duration::days(29),
+        };
+        state.apply_event(&event(StateEventPayload::TrainRecordAdopted {
+            root_pr: PrNumber(3),
+            record: old_incarnation,
+        }));
+
+        state.apply_event(&event(StateEventPayload::FanOutCompleted {
+            old_root: PrNumber(1),
+            new_roots: vec![PrNumber(2), PrNumber(3)],
+            original_root_pr: PrNumber(1),
+        }));
+        assert!(
+            !state.active_trains[&PrNumber(2)].state.is_active(),
+            "the user's stop stands: the stopped child is not resurrected"
+        );
+        assert!(
+            state.active_trains[&PrNumber(3)].state.is_active(),
+            "a previous incarnation's stale record is replaced as usual"
         );
     }
 
