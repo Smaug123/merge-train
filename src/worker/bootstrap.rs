@@ -16,11 +16,13 @@
 //!   root, fetched individually by the caller).
 //! - **Predecessor topology** — `@bot predecessor #N` comments, replayed in
 //!   comment-id order through the SAME `validate_predecessor_declaration`
-//!   the live command path runs: only the PR author's non-edited
-//!   declarations count, the first VALID one on a PR wins, and an invalid
-//!   or late-addition (merged-predecessor) edge is dropped exactly as the
-//!   handler would drop it — so the crawl persists only edges the live path
-//!   would have.
+//!   the live command path runs, so the crawl reconstructs the edges the
+//!   live STATE holds: only the PR author's non-edited declarations count,
+//!   the first VALID one on a PR wins, a new comment restating the current
+//!   predecessor transfers ownership, an invalid edge
+//!   (closed/missing/mismatched/cycle) is dropped, and a MERGED-predecessor
+//!   edge is KEPT (it was recorded while the predecessor was open and still
+//!   gates `is_root`'s reconciliation proof).
 //! - **Trains** — the bot's own status comments (`merge-train-state`
 //!   blocks), the designed off-disk backup: bot-authored, parseable, and
 //!   sitting on their own `original_root_pr` (a record posted anywhere
@@ -208,25 +210,29 @@ pub(crate) fn crawl_events(
         }
     }
 
-    // Record only VALID, non-late-addition declarations (Codex crawl review
-    // round 5): the crawl bypasses the live command path, so an unvalidated
-    // edge — a closed/missing/mismatched predecessor, a cycle — would wedge
-    // `is_root` or fabricate a bogus stack extension, and the redelivered
-    // webhook would treat the already-owned declaration as idempotent and
-    // never reject it. A MERGED predecessor is a late addition the live
-    // handler records nothing for (it answers `LateAddition` instead), so
-    // it is skipped here too. This also subsumes round 2's uncrawled-target
-    // fetch: `ListOpenPrs` returns every open PR, so an unrecorded
-    // predecessor is necessarily closed or merged — either way not a valid
-    // edge — and never needs a follow-up fetch.
+    // Reconstruct predecessor edges as the LIVE STATE holds them (Codex
+    // crawl review rounds 5, 9), running each candidate through the same
+    // `validate_predecessor_declaration` the live command path does:
+    //
+    // - an invalid edge (closed/missing/mismatched predecessor, cycle) is
+    //   dropped — recording it would wedge `is_root` or fabricate a bogus
+    //   stack extension (round 5);
+    // - a re-statement of a PR's CURRENT predecessor from a new comment
+    //   transfers ownership (the live handler does this unconditionally):
+    //   record it so `predecessor_comment_id` tracks the latest comment,
+    //   or a later retraction targets the wrong one (round 9);
+    // - a MERGED predecessor is KEPT, not treated as a late addition: the
+    //   edge was recorded while the predecessor was open and still lives in
+    //   the state, and `is_root`'s reconciliation-proof gate depends on it
+    //   — dropping it would let a mid-cascade descendant merge as a plain
+    //   root, bypassing that proof (round 9, P1).
     for (comment_id, pr, predecessor) in candidates {
-        let recordable = topology.prs.contains_key(&pr)
-            && !topology
-                .prs
-                .get(&predecessor)
-                .is_some_and(|p| p.state.is_merged())
-            && {
-                let cached = topology.prs.get(&pr).expect("checked contains_key");
+        let recordable = match topology.prs.get(&pr) {
+            None => false,
+            // Same predecessor already declared: a new comment restating it
+            // is an ownership transfer; the topology is unchanged.
+            Some(cached) if cached.predecessor == Some(predecessor) => true,
+            Some(cached) => {
                 match validate_predecessor_declaration(
                     cached,
                     predecessor,
@@ -242,7 +248,8 @@ pub(crate) fn crawl_events(
                         false
                     }
                 }
-            };
+            }
+        };
         if !recordable {
             continue;
         }
@@ -459,36 +466,22 @@ mod tests {
         );
     }
 
-    /// The crawl runs the SAME validation the live command path does, and
-    /// records only edges the handler would have persisted: a closed
-    /// predecessor rejects, a merged one is a late addition (nothing
-    /// recorded), a base mismatch rejects. Recording any of these would
-    /// wedge `is_root` or fabricate a bogus stack extension (Codex crawl
-    /// review round 5).
+    /// The crawl runs the SAME validation the live command path does and
+    /// drops the edges the handler would reject: a closed predecessor, a
+    /// base mismatch (recording either would wedge `is_root` or fabricate a
+    /// bogus stack extension — Codex crawl review round 5).
     #[test]
     fn invalid_declarations_are_dropped() {
-        let open = vec![
-            pr(1, AUTHOR, PrState::Open),
-            child(2, AUTHOR, 1, PrState::Open), // #2 -> #1 (closed): rejected
-            child(3, AUTHOR, 4, PrState::Open), // #3 -> #4 (merged): late addition
-            pr(5, AUTHOR, PrState::Open),       // #6 -> #5 but base is main: mismatch
-            pr(6, AUTHOR, PrState::Open),
-        ];
-        // #1 closed, #4 merged.
+        // #1 closed; #2 -> #1 rejected. #3 -> #4 with base "main" != #4 head
+        // (mismatch) rejected.
         let mut closed_one = pr(1, AUTHOR, PrState::Closed);
         closed_one.head_ref = "pr-1".to_owned();
-        let open = {
-            let mut v = open;
-            v[0] = closed_one;
-            v
-        };
-        let merged = vec![pr(
-            4,
-            AUTHOR,
-            PrState::Merged {
-                merge_commit_sha: Sha::parse("b".repeat(40)).unwrap(),
-            },
-        )];
+        let crawled = vec![
+            closed_one,
+            child(2, AUTHOR, 1, PrState::Open),
+            pr(3, AUTHOR, PrState::Open), // base "main", not #4's head → mismatch
+            pr(4, AUTHOR, PrState::Open),
+        ];
         let comments = vec![
             (
                 PrNumber(2),
@@ -498,18 +491,75 @@ mod tests {
                 PrNumber(3),
                 vec![comment(2, AUTHOR, "@merge-train predecessor #4")],
             ),
-            (
-                PrNumber(6),
-                vec![comment(3, AUTHOR, "@merge-train predecessor #5")],
-            ),
         ];
-        let mut crawled = open;
-        crawled.extend(merged);
         let outcome = crawl_events("main", &crawled, &comments, "merge-train", BOT, test_now());
         assert!(
             declared(&outcome.events).is_empty(),
-            "every invalid/late-addition declaration is dropped, got {:?}",
+            "every rejected declaration is dropped, got {:?}",
             declared(&outcome.events)
+        );
+    }
+
+    /// A declaration to a MERGED predecessor is KEPT, not treated as a late
+    /// addition: the edge was recorded while the predecessor was open and
+    /// still lives in the state, and `is_root`'s reconciliation-proof gate
+    /// depends on it — dropping it lets a mid-cascade descendant merge as a
+    /// plain root, bypassing that proof (Codex crawl review round 9, P1).
+    #[test]
+    fn a_declaration_to_a_merged_predecessor_is_kept() {
+        let crawled = vec![
+            pr(
+                1,
+                AUTHOR,
+                PrState::Merged {
+                    merge_commit_sha: Sha::parse("b".repeat(40)).unwrap(),
+                },
+            ),
+            // #2 retargeted to main after #1 merged, still declaring #1.
+            pr(2, AUTHOR, PrState::Open),
+        ];
+        let comments = vec![(
+            PrNumber(2),
+            vec![comment(1, AUTHOR, "@merge-train predecessor #1")],
+        )];
+        let outcome = crawl_events("main", &crawled, &comments, "merge-train", BOT, test_now());
+        assert_eq!(
+            declared(&outcome.events),
+            vec![(PrNumber(2), PrNumber(1))],
+            "the historical edge to the merged predecessor is preserved"
+        );
+    }
+
+    /// A new comment restating a PR's CURRENT predecessor transfers
+    /// ownership (the live handler does this): the recorded declaration
+    /// carries the LATER comment id, so a later retract/edit targets the
+    /// right comment (Codex crawl review round 9, P2).
+    #[test]
+    fn a_same_predecessor_restatement_transfers_ownership() {
+        let crawled = vec![
+            pr(1, AUTHOR, PrState::Open),
+            child(2, AUTHOR, 1, PrState::Open),
+        ];
+        let comments = vec![(
+            PrNumber(2),
+            vec![
+                comment(5, AUTHOR, "@merge-train predecessor #1"),
+                comment(9, AUTHOR, "@merge-train predecessor #1"),
+            ],
+        )];
+        let outcome = crawl_events("main", &crawled, &comments, "merge-train", BOT, test_now());
+        let owning = outcome.events.iter().rev().find_map(|e| match e {
+            StateEventPayload::PredecessorDeclared {
+                pr: PrNumber(2),
+                comment_id,
+                ..
+            } => Some(*comment_id),
+            _ => None,
+        });
+        assert_eq!(
+            owning,
+            Some(CommentId(9)),
+            "the later comment owns the declaration"
         );
     }
 

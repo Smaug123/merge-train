@@ -816,11 +816,17 @@ stage shippable).
 >    unvalidated edge would wedge `is_root` or fabricate a bogus stack
 >    extension, and the redelivered webhook treats the already-owned
 >    declaration as idempotent and never rejects it (round 5, P2). That
->    validation SUBSUMES the earlier "fetch uncrawled declaration
->    targets" answer: `ListOpenPrs` returns every open PR, so an
->    unrecorded predecessor is necessarily closed/merged and never a
->    valid edge; only adopted-train frozen members absent from the crawl
->    are still fetched individually before the atomic append. Round 6
+>    validation reconstructs the edges the live STATE holds. Round 9
+>    (P1): a MERGED-predecessor edge is KEPT, not dropped as a late
+>    addition — it was recorded while the predecessor was open and still
+>    gates `is_root`'s reconciliation proof; dropping it let a
+>    mid-cascade descendant merge as a plain root, bypassing that proof.
+>    Round 9 (P2): a new comment restating a PR's CURRENT predecessor
+>    transfers ownership (records with the later comment id), matching
+>    the live handler, so a later retract/edit targets the right comment.
+>    Uncrawled predecessor targets (merged beyond the 30-day window) join
+>    the round-6/7 fixpoint fetch; adopted-train frozen members absent
+>    from the crawl are fetched the same way. Round 6
 >    (P2): a train's root closed UNMERGED during the gap is in neither
 >    list endpoint, so PR discovery runs to a FIXPOINT — the wake-up
 >    webhook's `referenced_prs()` seed the crawl, and `crawl_events`
