@@ -102,6 +102,34 @@ fn pr_merged_body(
     .into_bytes()
 }
 
+fn pr_closed_body(
+    config: &GitConfig,
+    number: u64,
+    head: &Sha,
+    branch: &str,
+    base: &str,
+) -> Vec<u8> {
+    format!(
+        r#"{{
+            "action": "closed",
+            "pull_request": {{
+                "number": {number},
+                "state": "closed",
+                "draft": false,
+                "merged": false,
+                "head": {{ "sha": "{head}", "ref": "{branch}" }},
+                "base": {{ "sha": "{base_sha}", "ref": "{base}" }},
+                "user": {{ "id": {AUTHOR}, "login": "author" }},
+                "updated_at": "2026-07-01T12:30:00Z"
+            }},
+            "repository": {repo}
+        }}"#,
+        base_sha = "0".repeat(40),
+        repo = repo_json(config),
+    )
+    .into_bytes()
+}
+
 fn comment_body(
     config: &GitConfig,
     pr: u64,
@@ -2698,6 +2726,75 @@ fn a_lost_state_db_is_rebuilt_by_the_crawl_and_the_train_resumes() {
     world.enqueue(&mut processor, "check_suite", body);
     drive_to_completion(&mut world, &mut processor);
     assert_recovered_exactly_once(&world, &mut processor, "lost-db");
+}
+
+/// A frozen descendant CLOSED (unmerged) during the DB-loss gap is neither
+/// open nor recently merged — the crawl fetches it individually so the
+/// resumed train sees the topology and aborts CLEANLY instead of erroring
+/// on a PR it cannot see (Codex crawl review, P2).
+#[test]
+fn a_member_closed_during_the_db_loss_gap_aborts_the_train_cleanly() {
+    let (mut world, heads) = World::linear_stack(2);
+    world.github.lock().unwrap().comments.insert(
+        CommentId(1000),
+        FakeComment {
+            pr: PrNumber(2),
+            author_id: AUTHOR,
+            body: "@merge-train predecessor #1".to_owned(),
+        },
+    );
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    start_command(&mut world, &mut processor, 1);
+    run_batches_then_crash(&mut world, processor, 4);
+
+    // The gap: the DB dies AND the frozen descendant is closed unmerged.
+    let db = world.db_path();
+    for path in [
+        db.clone(),
+        db.with_extension("db-wal"),
+        db.with_extension("db-shm"),
+        db.with_extension("lock"),
+    ] {
+        let _ = std::fs::remove_file(path);
+    }
+    world
+        .github
+        .lock()
+        .unwrap()
+        .prs
+        .get_mut(&PrNumber(2))
+        .unwrap()
+        .state = FakePrState::Closed;
+
+    // The wake-up IS the close webhook for the descendant.
+    let mut processor = world.processor();
+    let head = {
+        let github = world.github.lock().unwrap();
+        github.branch_head("pr-2")
+    };
+    let body = pr_closed_body(&world.config, 2, &head, "pr-2", "pr-1");
+    world.enqueue(&mut processor, "pull_request", body);
+    drain(&mut processor);
+    // Give recovery its evaluation rounds (CI nudges are irrelevant here).
+    for _ in 0..5 {
+        drain(&mut processor);
+    }
+
+    assert!(
+        processor
+            .state()
+            .active_trains
+            .values()
+            .all(|t| !t.state.is_active()),
+        "the train must end cleanly (aborted on the closed member), not sit \
+         stuck active: {:?}",
+        processor.state().active_trains
+    );
+    assert!(
+        processor.state().prs.contains_key(&PrNumber(2)),
+        "the closed member was fetched into the cache"
+    );
 }
 
 /// GitHub down at first contact: the delivery releases (nothing can be

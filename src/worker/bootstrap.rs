@@ -43,14 +43,29 @@ use crate::types::{MergeStateStatus, PrNumber, TrainRecord};
 
 use super::pipeline::cache_fill_events;
 
-/// The crawl's decision: events to append, and the roots of adopted ACTIVE
-/// trains, which the caller marks for M6 recovery.
+/// The crawl's decision: events to append, the roots of adopted ACTIVE
+/// trains (the caller marks them for M6 recovery), and adopted-train
+/// members absent from the crawl (closed-unmerged PRs — the caller fetches
+/// and caches them BEFORE appending, or the resumed train's evaluation
+/// errors on a member it cannot see).
 pub(crate) struct CrawlOutcome {
     pub events: Vec<StateEventPayload>,
     pub recovered_roots: Vec<PrNumber>,
+    pub missing_members: Vec<PrNumber>,
 }
 
-/// Turns crawled facts into state events. Pure: fetching is the caller's.
+/// The PRs a train record involves: its root, current PR, and the frozen
+/// descendant set its phase carries.
+fn members(record: &TrainRecord) -> Vec<PrNumber> {
+    let mut members = vec![record.original_root_pr, record.current_pr];
+    if let Some(progress) = record.cascade_phase.progress() {
+        members.extend_from_slice(progress.frozen_descendants());
+    }
+    members
+}
+
+/// Turns crawled facts into state events. Pure: fetching is the caller's;
+/// `now` stamps the completion of stale records (see below).
 ///
 /// `comments` pairs each crawled PR with its comments (id-ordered); PRs
 /// missing from it simply contribute no declarations or records.
@@ -61,6 +76,7 @@ pub(crate) fn crawl_events(
     comments: &[(PrNumber, Vec<CommentData>)],
     bot_name: &str,
     bot_user_id: u64,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> CrawlOutcome {
     let mut events = vec![StateEventPayload::DefaultBranchSet {
         branch: default_branch.to_owned(),
@@ -123,24 +139,56 @@ pub(crate) fn crawl_events(
             }
         }
     }
+    let merged_numbers: std::collections::HashSet<PrNumber> = all_prs
+        .iter()
+        .filter(|p| p.state.is_merged())
+        .map(|p| p.number)
+        .collect();
+    let crawled_numbers: std::collections::HashSet<PrNumber> =
+        all_prs.iter().map(|p| p.number).collect();
+
     let mut recovered_roots = Vec::new();
+    let mut missing_members = Vec::new();
     let mut roots: Vec<PrNumber> = best.keys().copied().collect();
     roots.sort_unstable();
     for root in roots {
         let (mut record, comment_id) = best.remove(&root).expect("keyed by best");
         record.status_comment_id = Some(comment_id);
+        // Staleness (Codex crawl review, P2): status updates are
+        // best-effort, so a train that FINISHED can leave an ACTIVE
+        // comment behind (the final update failed) — and an unfinished
+        // train necessarily has unmerged members. A mid-phase record whose
+        // current PR and every frozen descendant are all merged has
+        // nothing left to do: adopt it as completed (removal semantics)
+        // rather than resurrect a zombie that would redo pushes against
+        // branches users have since moved.
+        let all_members_merged = record.cascade_phase.progress().is_some()
+            && members(&record)
+                .iter()
+                .skip(1) // the root legitimately merges early in the cascade
+                .all(|m| merged_numbers.contains(m));
+        if record.state.is_active() && all_members_merged {
+            record.state = crate::types::TrainState::Completed { ended_at: now };
+        }
         if record.state.is_active() {
             recovered_roots.push(root);
+            for member in members(&record) {
+                if !crawled_numbers.contains(&member) && !missing_members.contains(&member) {
+                    missing_members.push(member);
+                }
+            }
         }
         events.push(StateEventPayload::TrainRecordAdopted {
             root_pr: root,
             record,
         });
     }
+    missing_members.sort_unstable();
 
     CrawlOutcome {
         events,
         recovered_roots,
+        missing_members,
     }
 }
 
@@ -155,6 +203,10 @@ mod tests {
     const BOT: u64 = 424_242;
     const AUTHOR: u64 = 100;
     const STRANGER: u64 = 200;
+
+    fn test_now() -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 7, 3, 0, 0, 0).unwrap()
+    }
 
     fn pr(number: u64, author_id: u64, state: PrState) -> PrData {
         PrData {
@@ -201,7 +253,15 @@ mod tests {
                 comment(3, AUTHOR, "@merge-train predecessor #1"),
             ],
         )];
-        let outcome = crawl_events("main", &open, &[], &comments, "merge-train", BOT);
+        let outcome = crawl_events(
+            "main",
+            &open,
+            &[],
+            &comments,
+            "merge-train",
+            BOT,
+            test_now(),
+        );
         assert_eq!(declared(&outcome.events), vec![(PrNumber(2), PrNumber(1))]);
     }
 
@@ -216,7 +276,15 @@ mod tests {
         let open = vec![pr(1, AUTHOR, PrState::Open)];
         let comments = vec![(PrNumber(1), vec![comment(8, BOT, &body)])];
 
-        let outcome = crawl_events("main", &open, &[], &comments, "merge-train", BOT);
+        let outcome = crawl_events(
+            "main",
+            &open,
+            &[],
+            &comments,
+            "merge-train",
+            BOT,
+            test_now(),
+        );
         assert_eq!(outcome.recovered_roots, vec![PrNumber(1)]);
         let adopted = outcome
             .events
@@ -242,7 +310,15 @@ mod tests {
             (PrNumber(1), vec![comment(1, STRANGER, &body)]),
             (PrNumber(2), vec![comment(2, BOT, &body)]),
         ];
-        let outcome = crawl_events("main", &open, &[], &comments, "merge-train", BOT);
+        let outcome = crawl_events(
+            "main",
+            &open,
+            &[],
+            &comments,
+            "merge-train",
+            BOT,
+            test_now(),
+        );
         assert!(outcome.recovered_roots.is_empty());
         assert!(
             !outcome
@@ -273,7 +349,15 @@ mod tests {
                 comment(2, BOT, &format_status_comment(&newer, "new").unwrap()),
             ],
         )];
-        let outcome = crawl_events("main", &open, &[], &comments, "merge-train", BOT);
+        let outcome = crawl_events(
+            "main",
+            &open,
+            &[],
+            &comments,
+            "merge-train",
+            BOT,
+            test_now(),
+        );
         assert!(outcome.recovered_roots.is_empty(), "completed: no recovery");
         let adopted = outcome
             .events
@@ -284,6 +368,76 @@ mod tests {
             })
             .expect("adopted");
         assert_eq!(adopted.started_at, t1, "the newer incarnation wins");
+    }
+
+    /// Staleness: an ACTIVE record whose current PR and every frozen
+    /// descendant are merged is a train that FINISHED but whose final
+    /// (best-effort) comment update failed. It adopts as completed —
+    /// no zombie resurrection redoing pushes (Codex crawl review, P2).
+    #[test]
+    fn a_finished_trains_stale_active_comment_is_not_resurrected() {
+        use crate::types::{CascadePhase, DescendantProgress, PrState};
+        let ts = test_now();
+        let mut record = TrainRecord::new(PrNumber(1), ts);
+        record.current_pr = PrNumber(2);
+        record.cascade_phase = CascadePhase::Retargeting {
+            progress: DescendantProgress::new(vec![PrNumber(2)]),
+            squash_sha: Sha::parse("b".repeat(40)).unwrap(),
+        };
+        let body = format_status_comment(&record, "stale").unwrap();
+        // Everything merged: the train has nothing left to do.
+        let merged = vec![
+            pr(
+                1,
+                AUTHOR,
+                PrState::Merged {
+                    merge_commit_sha: Sha::parse("c".repeat(40)).unwrap(),
+                },
+            ),
+            pr(
+                2,
+                AUTHOR,
+                PrState::Merged {
+                    merge_commit_sha: Sha::parse("d".repeat(40)).unwrap(),
+                },
+            ),
+        ];
+        let comments = vec![(PrNumber(1), vec![comment(1, BOT, &body)])];
+        let outcome = crawl_events("main", &[], &merged, &comments, "merge-train", BOT, ts);
+        assert!(outcome.recovered_roots.is_empty(), "no zombie");
+        let adopted = outcome
+            .events
+            .iter()
+            .find_map(|e| match e {
+                StateEventPayload::TrainRecordAdopted { record, .. } => Some(record),
+                _ => None,
+            })
+            .expect("adopted (as completed)");
+        assert!(
+            matches!(adopted.state, crate::types::TrainState::Completed { .. }),
+            "adopted as completed, so application removes it"
+        );
+    }
+
+    /// A genuinely unfinished train — an unmerged member — IS recovered,
+    /// and members the crawl did not see (closed-unmerged PRs) are handed
+    /// back for individual fetching.
+    #[test]
+    fn unfinished_trains_recover_and_report_uncrawled_members() {
+        use crate::types::{CascadePhase, DescendantProgress, PrState};
+        let ts = test_now();
+        let mut record = TrainRecord::new(PrNumber(1), ts);
+        record.cascade_phase = CascadePhase::Preparing {
+            progress: DescendantProgress::new(vec![PrNumber(2), PrNumber(3)]),
+        };
+        let body = format_status_comment(&record, "mid").unwrap();
+        // PR 2 is open; PR 3 was closed unmerged during the outage — the
+        // crawl's lists never see it.
+        let open = vec![pr(1, AUTHOR, PrState::Open), pr(2, AUTHOR, PrState::Open)];
+        let comments = vec![(PrNumber(1), vec![comment(1, BOT, &body)])];
+        let outcome = crawl_events("main", &open, &[], &comments, "merge-train", BOT, ts);
+        assert_eq!(outcome.recovered_roots, vec![PrNumber(1)]);
+        assert_eq!(outcome.missing_members, vec![PrNumber(3)]);
     }
 
     /// Cache fills precede declarations and adoptions, so `apply_event`
@@ -301,7 +455,15 @@ mod tests {
                 vec![comment(2, AUTHOR, "@merge-train predecessor #1")],
             ),
         ];
-        let outcome = crawl_events("main", &open, &[], &comments, "merge-train", BOT);
+        let outcome = crawl_events(
+            "main",
+            &open,
+            &[],
+            &comments,
+            "merge-train",
+            BOT,
+            test_now(),
+        );
         let first_fill = outcome
             .events
             .iter()

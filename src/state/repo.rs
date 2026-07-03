@@ -418,6 +418,19 @@ impl RepoState {
             } => {
                 self.active_trains.remove(old_root);
                 for root in new_roots {
+                    // Never clobber an existing ACTIVE record: unreachable in
+                    // normal operation (a fan-out's new roots were members of
+                    // the parent train, and members cannot have trains), but a
+                    // crawl-resurrected stale parent replaying its fan-out
+                    // must not reset children adopted from their own — strictly
+                    // newer — status comments (Codex crawl review, P2).
+                    if self
+                        .active_trains
+                        .get(root)
+                        .is_some_and(|t| t.state.is_active())
+                    {
+                        continue;
+                    }
                     self.active_trains
                         .insert(*root, TrainRecord::new(*root, event.ts));
                 }
@@ -1359,6 +1372,40 @@ mod tests {
         assert!(
             !state.active_trains.contains_key(&PrNumber(1)),
             "a completed record must never sit in active_trains"
+        );
+    }
+
+    /// A fan-out never clobbers an existing ACTIVE record for a new root:
+    /// unreachable in normal operation, but a crawl-resurrected stale
+    /// parent replaying its fan-out must not reset children adopted from
+    /// their own — strictly newer — status comments (Codex crawl review).
+    #[test]
+    fn fan_out_does_not_clobber_an_active_new_root() {
+        let mut state = RepoState::from_snapshot(PersistedRepoSnapshot::new("main".to_string()));
+        state.apply_event(&event(StateEventPayload::TrainStarted {
+            root_pr: PrNumber(2),
+            current_pr: PrNumber(2),
+        }));
+        let mut adopted = state.active_trains[&PrNumber(2)].clone();
+        adopted.recovery_seq = 9;
+        state.apply_event(&event(StateEventPayload::TrainRecordAdopted {
+            root_pr: PrNumber(2),
+            record: adopted,
+        }));
+
+        state.apply_event(&event(StateEventPayload::FanOutCompleted {
+            old_root: PrNumber(1),
+            new_roots: vec![PrNumber(2), PrNumber(3)],
+            original_root_pr: PrNumber(1),
+        }));
+        assert_eq!(
+            state.active_trains[&PrNumber(2)].recovery_seq,
+            9,
+            "the child's own adopted record survives the replayed fan-out"
+        );
+        assert!(
+            state.active_trains.contains_key(&PrNumber(3)),
+            "roots without a live record are created as usual"
         );
     }
 

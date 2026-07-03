@@ -811,14 +811,46 @@ impl Processor {
             comments.push((pr, pr_comments));
         }
 
-        let outcome = super::bootstrap::crawl_events(
+        let mut outcome = super::bootstrap::crawl_events(
             &settings.default_branch,
             &open,
             &merged,
             &comments,
             &self.deps.bot_name,
             self.deps.bot_user_id,
+            Utc::now(),
         );
+        // Adopted-train members absent from the crawl — closed-unmerged
+        // PRs (e.g. a frozen descendant closed during the DB-loss gap) —
+        // are fetched individually so the resumed train's evaluation sees
+        // them and aborts CLEANLY on the topology instead of erroring on a
+        // PR it cannot see (Codex crawl review, P2). A 404 stays missing
+        // (nothing to cache), loudly. Fetched BEFORE the atomic append, so
+        // a released retry still re-crawls from nothing.
+        for member in std::mem::take(&mut outcome.missing_members) {
+            match self.deps.github.execute(GitHubEffect::GetPr { pr: member }) {
+                Ok(GitHubResponse::Pr(data)) => {
+                    outcome.events.extend(cache_fill_events(
+                        member,
+                        &data,
+                        MergeStateStatus::Unknown,
+                    ));
+                }
+                Err(e @ EffectError::Transient { .. }) => {
+                    warn!(%member, error = ?e, "bootstrap member fetch failed; the \
+                           repo's queue pauses until the crawl succeeds");
+                    return Ok(false);
+                }
+                other => {
+                    warn!(
+                        %member,
+                        ?other,
+                        "an adopted train references a PR the crawl cannot \
+                         fetch; its evaluation may abort the train"
+                    );
+                }
+            }
+        }
         info!(
             default_branch = %settings.default_branch,
             open = open.len(),

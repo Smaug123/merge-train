@@ -24,7 +24,11 @@ use crate::types::{CommentId, MergeStateStatus, PrNumber, PrState, Sha, TrainErr
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FakePrState {
     Open,
-    Merged { squash_sha: Sha },
+    /// Closed without merging.
+    Closed,
+    Merged {
+        squash_sha: Sha,
+    },
 }
 
 /// A PR as the fake GitHub tracks it.
@@ -125,6 +129,11 @@ impl FakeGitHub {
                 PrState::Open,
                 self.branch_head(&fake.branch),
                 MergeStateStatus::Clean,
+            ),
+            FakePrState::Closed => (
+                PrState::Closed,
+                self.branch_head(&fake.branch),
+                MergeStateStatus::Unknown,
             ),
             FakePrState::Merged { squash_sha } => {
                 // The frozen PR ref names the squashed head.
