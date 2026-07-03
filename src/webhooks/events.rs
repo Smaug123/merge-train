@@ -14,6 +14,7 @@
 //! - `status` - CI completion (legacy Status API)
 //! - `pull_request_review` - Review submitted/dismissed
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::types::{CommentId, PrNumber, RepoId, Sha};
@@ -105,6 +106,27 @@ pub struct IssueCommentEvent {
 
     /// The comment author's login name.
     pub author_login: String,
+
+    /// The *actor's* user ID (`sender.id`): who performed this action. On
+    /// `created` this equals `author_id`; on `edited` it is the editor, who
+    /// may be someone else with edit rights — authorization MUST use the
+    /// sender, or an editor impersonates the original author (Codex M5
+    /// round 2, P1).
+    pub sender_id: u64,
+
+    /// The actor's login name (`sender.login`), for role lookups.
+    pub sender_login: String,
+
+    /// The *issue's* author's user ID (`issue.user.id`). When the comment is
+    /// on a PR (`pr_number` is `Some`), this is the PR author — the identity
+    /// DESIGN §Command authorization compares the commenter against for
+    /// author-only commands, present in every payload so authorization needs
+    /// no extra API call.
+    pub pr_author_id: u64,
+
+    /// When the comment was last updated (`comment.updated_at`) — dedupe keys
+    /// for edits need it to distinguish successive edits.
+    pub updated_at: DateTime<Utc>,
 }
 
 /// Action performed on a pull request.
@@ -125,6 +147,22 @@ pub enum PrAction {
     ConvertedToDraft,
     /// PR was marked ready for review.
     ReadyForReview,
+}
+
+impl PrAction {
+    /// The action's GitHub wire string (pinned to the serde encoding by a
+    /// property test) — dedupe keys embed it.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PrAction::Opened => "opened",
+            PrAction::Closed => "closed",
+            PrAction::Edited => "edited",
+            PrAction::Synchronize => "synchronize",
+            PrAction::Reopened => "reopened",
+            PrAction::ConvertedToDraft => "converted_to_draft",
+            PrAction::ReadyForReview => "ready_for_review",
+        }
+    }
 }
 
 /// Merge outcome reported by a pull request event.
@@ -192,6 +230,17 @@ pub struct PullRequestEvent {
 
     /// The PR author's user ID.
     pub author_id: u64,
+    /// When the PR was last updated (`pull_request.updated_at`) — dedupe keys
+    /// need it because the same (action, head) pair can legitimately repeat.
+    pub updated_at: DateTime<Utc>,
+
+    /// For `edited` events, the base branch this edit retargeted *from*
+    /// (`changes.base.ref.from`), if the edit changed the base. The dedupe
+    /// key needs the transition: with second-resolution timestamps, a
+    /// retarget whose *destination* matches an earlier same-second edit's
+    /// base would otherwise dedupe away and leave the cached topology stale
+    /// (Codex M5 round 18).
+    pub base_change_from: Option<String>,
 }
 
 /// A check suite event (GitHub Checks API).
@@ -217,6 +266,12 @@ pub struct CheckSuiteEvent {
     /// A check suite can be associated with multiple PRs if the same commit
     /// is the head of multiple PRs.
     pub pull_requests: Vec<PrNumber>,
+    /// The check suite's id (`check_suite.id`) — reruns reuse it, so dedupe
+    /// keys pair it with `updated_at`.
+    pub suite_id: u64,
+
+    /// When the suite was last updated (`check_suite.updated_at`).
+    pub updated_at: DateTime<Utc>,
 }
 
 /// Action for check suite events.
@@ -231,6 +286,19 @@ pub enum CheckSuiteAction {
     Rerequested,
     /// Check suite completed.
     Completed,
+}
+
+impl CheckSuiteAction {
+    /// The action's GitHub wire string (pinned to the serde encoding by a
+    /// property test) — dedupe keys embed it.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CheckSuiteAction::Created => "created",
+            CheckSuiteAction::Requested => "requested",
+            CheckSuiteAction::Rerequested => "rerequested",
+            CheckSuiteAction::Completed => "completed",
+        }
+    }
 }
 
 /// Conclusion of a completed check suite.
@@ -316,6 +384,17 @@ pub enum StatusState {
 }
 
 impl StatusState {
+    /// The state's GitHub wire string (pinned to the serde encoding by a
+    /// property test) — dedupe keys embed it.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            StatusState::Pending => "pending",
+            StatusState::Success => "success",
+            StatusState::Failure => "failure",
+            StatusState::Error => "error",
+        }
+    }
+
     /// Returns true if this is a terminal state (not pending).
     pub fn is_terminal(&self) -> bool {
         matches!(
@@ -350,6 +429,16 @@ pub struct StatusEvent {
 
     /// Optional target URL for details.
     pub target_url: Option<String>,
+    /// When the status was created/updated (top-level `updated_at`) — dedupe
+    /// keys need it because the same (sha, context, state) triple can
+    /// legitimately repeat (success → failure → success).
+    pub updated_at: DateTime<Utc>,
+
+    /// The status's unique id (top-level `id`). The dedupe key needs it:
+    /// `updated_at` is second-resolution, so a success → failure → success
+    /// bounce within one second would collapse the final success onto the
+    /// first and a parked train would never wake (Codex M5 round 17).
+    pub status_id: u64,
 }
 
 /// Action for pull request review events.
@@ -362,6 +451,18 @@ pub enum ReviewAction {
     Dismissed,
     /// Review was edited.
     Edited,
+}
+
+impl ReviewAction {
+    /// The action's GitHub wire string (pinned to the serde encoding by a
+    /// property test) — dedupe keys embed it.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReviewAction::Submitted => "submitted",
+            ReviewAction::Dismissed => "dismissed",
+            ReviewAction::Edited => "edited",
+        }
+    }
 }
 
 /// State of a pull request review.
@@ -403,6 +504,8 @@ pub struct PullRequestReviewEvent {
 
     /// The review body (may be empty).
     pub body: String,
+    /// The review's id (`review.id`), the dedupe identity for review events.
+    pub review_id: u64,
 }
 
 #[cfg(test)]
@@ -479,6 +582,10 @@ mod tests {
         ]
     }
 
+    fn arb_updated_at() -> impl Strategy<Value = DateTime<Utc>> {
+        (946684800i64..4102444800i64).prop_map(|secs| DateTime::from_timestamp(secs, 0).unwrap())
+    }
+
     fn arb_issue_comment_event() -> impl Strategy<Value = IssueCommentEvent> {
         (
             arb_repo_id(),
@@ -486,11 +593,21 @@ mod tests {
             proptest::option::of(1u64..10000u64),
             1u64..10000u64,
             "[a-zA-Z0-9 @#]{0,100}",
-            1u64..1000000u64,
+            (1u64..1000000u64, 1u64..1000000u64),
             "[a-z][a-z0-9]{0,15}",
+            arb_updated_at(),
         )
             .prop_map(
-                |(repo, action, pr_number, comment_id, body, author_id, author_login)| {
+                |(
+                    repo,
+                    action,
+                    pr_number,
+                    comment_id,
+                    body,
+                    (author_id, pr_author_id),
+                    author_login,
+                    updated_at,
+                )| {
                     IssueCommentEvent {
                         repo,
                         action,
@@ -498,7 +615,11 @@ mod tests {
                         comment_id: CommentId(comment_id),
                         body,
                         author_id,
+                        sender_id: author_id,
+                        sender_login: author_login.clone(),
                         author_login,
+                        pr_author_id,
+                        updated_at,
                     }
                 },
             )
@@ -523,7 +644,7 @@ mod tests {
             "[a-z][a-z0-9/-]{0,20}",
             "[a-z][a-z0-9/-]{0,20}",
             proptest::bool::ANY,
-            1u64..1000000u64,
+            (1u64..1000000u64, arb_updated_at()),
         )
             .prop_map(
                 |(
@@ -535,7 +656,7 @@ mod tests {
                     base_branch,
                     head_branch,
                     is_draft,
-                    author_id,
+                    (author_id, updated_at),
                 )| {
                     PullRequestEvent {
                         repo,
@@ -547,6 +668,8 @@ mod tests {
                         head_branch,
                         is_draft,
                         author_id,
+                        updated_at,
+                        base_change_from: None,
                     }
                 },
             )
@@ -575,14 +698,18 @@ mod tests {
             arb_sha(),
             proptest::option::of(arb_check_suite_conclusion()),
             proptest::collection::vec(1u64..10000u64, 0..3),
+            1u64..u64::MAX,
+            arb_updated_at(),
         )
             .prop_map(
-                |(repo, action, head_sha, conclusion, prs)| CheckSuiteEvent {
+                |(repo, action, head_sha, conclusion, prs, suite_id, updated_at)| CheckSuiteEvent {
                     repo,
                     action,
                     head_sha,
                     conclusion,
                     pull_requests: prs.into_iter().map(PrNumber).collect(),
+                    suite_id,
+                    updated_at,
                 },
             )
     }
@@ -595,15 +722,18 @@ mod tests {
             "[a-z][a-z0-9/]{0,30}",
             proptest::option::of("[a-zA-Z0-9 ]{0,50}"),
             proptest::option::of("https://[a-z.]+/[a-z0-9/]{0,20}"),
+            arb_updated_at(),
         )
             .prop_map(
-                |(repo, sha, state, context, description, target_url)| StatusEvent {
+                |(repo, sha, state, context, description, target_url, updated_at)| StatusEvent {
+                    status_id: 7,
                     repo,
                     sha,
                     state,
                     context,
                     description,
                     target_url,
+                    updated_at,
                 },
             )
     }
@@ -617,9 +747,10 @@ mod tests {
             1u64..1000000u64,
             "[a-z][a-z0-9]{0,15}",
             "[a-zA-Z0-9 ]{0,100}",
+            1u64..u64::MAX,
         )
             .prop_map(
-                |(repo, action, pr_number, state, reviewer_id, reviewer_login, body)| {
+                |(repo, action, pr_number, state, reviewer_id, reviewer_login, body, review_id)| {
                     PullRequestReviewEvent {
                         repo,
                         action,
@@ -628,6 +759,7 @@ mod tests {
                         reviewer_id,
                         reviewer_login,
                         body,
+                        review_id,
                     }
                 },
             )
@@ -654,6 +786,33 @@ mod tests {
             let json = serde_json::to_string(&event).unwrap();
             let parsed: GitHubEvent = serde_json::from_str(&json).unwrap();
             prop_assert_eq!(event, parsed);
+        }
+
+        /// `as_str` is pinned to the serde (GitHub wire) encoding: dedupe
+        /// keys embed it, so drift between the two would silently change
+        /// every key's identity.
+        #[test]
+        fn pr_action_as_str_matches_serde(action in arb_pr_action()) {
+            let json = serde_json::to_string(&action).unwrap();
+            prop_assert_eq!(json, format!("\"{}\"", action.as_str()));
+        }
+
+        #[test]
+        fn check_suite_action_as_str_matches_serde(action in arb_check_suite_action()) {
+            let json = serde_json::to_string(&action).unwrap();
+            prop_assert_eq!(json, format!("\"{}\"", action.as_str()));
+        }
+
+        #[test]
+        fn review_action_as_str_matches_serde(action in arb_review_action()) {
+            let json = serde_json::to_string(&action).unwrap();
+            prop_assert_eq!(json, format!("\"{}\"", action.as_str()));
+        }
+
+        #[test]
+        fn status_state_as_str_matches_serde(state in arb_status_state()) {
+            let json = serde_json::to_string(&state).unwrap();
+            prop_assert_eq!(json, format!("\"{}\"", state.as_str()));
         }
 
         /// IssueCommentEvent serialization roundtrip.

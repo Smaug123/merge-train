@@ -176,9 +176,16 @@ pub struct GitConfig {
 }
 
 impl GitConfig {
-    /// Returns the path to the repo directory (owner-repo/).
+    /// Returns the path to the repo directory (`<base>/<owner>/<repo>/`).
+    ///
+    /// Nested, not `owner-repo`: the flat form collapsed distinct
+    /// repositories onto one clone (`a-b/c` and `a/b-c` both gave `a-b-c`),
+    /// letting one repo's worker run git against another's origin (Codex M5
+    /// round 9, P1). Owner and repo are validated path components at intake
+    /// (no separators), so nesting cannot collide; the layout also matches
+    /// the state DB's `<state_dir>/<owner>/<repo>`.
     pub fn repo_dir(&self) -> PathBuf {
-        self.base_dir.join(format!("{}-{}", self.owner, self.repo))
+        self.base_dir.join(&self.owner).join(&self.repo)
     }
 
     /// Returns the path to the shared bare clone.
@@ -239,11 +246,16 @@ pub(crate) fn git_command(workdir: &Path) -> std::process::Command {
     // - HOME: ssh needs it for ~/.ssh/config, keys, and known_hosts. Git
     //   config injection via ~/.gitconfig is still blocked: GIT_CONFIG_GLOBAL
     //   and GIT_CONFIG_NOSYSTEM below are pinned regardless of HOME.
-    // - SSH_AUTH_SOCK: agent-based SSH auth for fetch/push/ls-remote.
+    // - SSH_AUTH_SOCK: agent-based SSH auth for fetch/push/ls-push/ls-remote.
+    // - GITHUB_TOKEN: the credential helper wired into clones
+    //   (`worker::executor::CREDENTIAL_HELPER`) reads it at fetch/push time;
+    //   scrubbing it would make every authenticated HTTPS operation run
+    //   with an empty password (Codex M5 round 5, P1). The value still never
+    //   reaches command lines or git config.
     // Deliberately NOT preserved: GIT_SSH/GIT_SSH_COMMAND (arbitrary command
     // execution; deployments needing a custom SSH wrapper must configure it
     // explicitly when such a knob exists) and credential-helper overrides.
-    for var in ["PATH", "HOME", "SSH_AUTH_SOCK"] {
+    for var in ["PATH", "HOME", "SSH_AUTH_SOCK", "GITHUB_TOKEN"] {
         if let Some(value) = std::env::var_os(var) {
             cmd.env(var, value);
         }
@@ -430,6 +442,53 @@ pub(crate) fn worktree_path_str(path: &Path) -> GitResult<&str> {
 mod tests {
     use super::*;
 
+    /// `{owner}-{repo}` collapsed distinct repositories onto one clone
+    /// (`a-b/c` and `a/b-c` both gave `a-b-c`), so the second repo's worker
+    /// would fetch and push against the first's origin (Codex M5 round 9,
+    /// P1). Nested directories cannot collide — path separators are
+    /// rejected in owner/repo at intake — and match the state DB's
+    /// `<state_dir>/<owner>/<repo>` layout.
+    #[test]
+    fn repo_dirs_never_collide_across_the_owner_repo_boundary() {
+        let config = |owner: &str, repo: &str| GitConfig {
+            base_dir: PathBuf::from("/repos"),
+            owner: owner.to_owned(),
+            repo: repo.to_owned(),
+            default_branch: "main".to_owned(),
+            worktree_max_age: std::time::Duration::from_secs(1),
+            commit_identity: CommitIdentity {
+                name: "n".to_owned(),
+                email: "e".to_owned(),
+                signing_key: None,
+            },
+        };
+        assert_ne!(config("a-b", "c").repo_dir(), config("a", "b-c").repo_dir());
+    }
+
+    /// The credential helper wired into clones (`worker::executor`) reads
+    /// `${GITHUB_TOKEN}` at fetch/push time, so `git_command`'s env
+    /// allowlist must pass it through to git subprocesses — without it,
+    /// every authenticated HTTPS operation runs with an empty password
+    /// despite startup having validated the token (Codex M5 round 5, P1).
+    #[test]
+    fn git_subprocesses_see_the_github_token() {
+        // Safety: Rust guards its own env access with a lock; nothing else
+        // in the test suite reads GITHUB_TOKEN.
+        unsafe { std::env::set_var("GITHUB_TOKEN", "helper-visible") };
+        let dir = tempfile::tempdir().unwrap();
+        run_git_stdout(dir.path(), &["init"]).unwrap();
+        let out = run_git_stdout(
+            dir.path(),
+            &[
+                "-c",
+                "alias.dump-token=!printenv GITHUB_TOKEN",
+                "dump-token",
+            ],
+        )
+        .unwrap();
+        assert_eq!(out, "helper-visible");
+    }
+
     #[test]
     fn parse_stack_dir_name_valid() {
         let path = PathBuf::from("/some/path/worktrees/stack-123");
@@ -480,19 +539,19 @@ mod tests {
 
         assert_eq!(
             config.repo_dir(),
-            PathBuf::from("/var/lib/merge-train/repos/owner-repo")
+            PathBuf::from("/var/lib/merge-train/repos/owner/repo")
         );
         assert_eq!(
             config.clone_dir(),
-            PathBuf::from("/var/lib/merge-train/repos/owner-repo/clone")
+            PathBuf::from("/var/lib/merge-train/repos/owner/repo/clone")
         );
         assert_eq!(
             config.worktrees_dir(),
-            PathBuf::from("/var/lib/merge-train/repos/owner-repo/worktrees")
+            PathBuf::from("/var/lib/merge-train/repos/owner/repo/worktrees")
         );
         assert_eq!(
             config.worktree_path(PrNumber(123)),
-            PathBuf::from("/var/lib/merge-train/repos/owner-repo/worktrees/stack-123")
+            PathBuf::from("/var/lib/merge-train/repos/owner/repo/worktrees/stack-123")
         );
     }
 

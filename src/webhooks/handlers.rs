@@ -187,9 +187,14 @@ fn handle_issue_comment(
         },
         // Created or edited: re-interpret the body, honoring a predecessor
         // declaration this very comment may already own (Codex review #55).
-        CommentAction::Created | CommentAction::Edited => {
-            handle_comment_command(pr, event.comment_id, &event.body, state, &ctx.bot_name)
-        }
+        action @ (CommentAction::Created | CommentAction::Edited) => handle_comment_command(
+            pr,
+            event.comment_id,
+            &event.body,
+            state,
+            &ctx.bot_name,
+            action,
+        ),
     }
 }
 
@@ -199,12 +204,18 @@ fn handle_issue_comment(
 /// that currently owns `pr`'s predecessor declaration is handled specially:
 /// editing the declaration away retracts it, and editing it to a different
 /// predecessor updates it (rather than rejecting as already-declared).
+///
+/// Start/stop commands fire only from *created* comments: a command is an
+/// utterance, not a state, so an edit neither runs one nor re-runs one
+/// (Codex M5 round 2 — accepting edits let comment editors impersonate the
+/// original author, and re-ran commands on every unrelated edit).
 fn handle_comment_command(
     pr: PrNumber,
     comment_id: CommentId,
     body: &str,
     state: &RepoState,
     bot_name: &str,
+    action: CommentAction,
 ) -> HandlerOutput {
     // Does this comment currently own pr's predecessor declaration?
     let declared = state
@@ -229,6 +240,8 @@ fn handle_comment_command(
         HandlerOutput::default()
     };
     match command {
+        Some(Command::Start | Command::Stop | Command::StopForce)
+            if action != CommentAction::Created => {}
         Some(Command::Start) => {
             out.effects.push(ack(comment_id));
             out.triggers.push(Trigger::StartTrain { pr });
@@ -267,6 +280,20 @@ fn handle_predecessor_command(
     // Idempotent re-statement of the same declaration.
     if declared_by_this_comment && cached.predecessor == Some(predecessor) {
         return HandlerOutput::default();
+    }
+
+    // Re-stating the current declaration from a *new* comment transfers
+    // ownership to it — the topology is unchanged, so nothing to validate.
+    // This is also the recovery path after a refused unauthorized
+    // retraction (Codex M5 round 3): if the owning comment was deleted on
+    // GitHub but the bot kept the declaration, the author re-states it in a
+    // live comment and can then edit or delete *that* one.
+    if !declared_by_this_comment && cached.predecessor == Some(predecessor) {
+        return HandlerOutput::event(StateEventPayload::PredecessorDeclared {
+            pr,
+            predecessor,
+            comment_id,
+        });
     }
 
     // Validate first. If this comment already owns the declaration, an edit
@@ -741,11 +768,19 @@ mod tests {
             body: body.to_owned(),
             author_id: author,
             author_login: "alice".to_owned(),
+            sender_id: author,
+            sender_login: "alice".to_owned(),
+            // Deliberately never equal to a commenter id used in these tests:
+            // the pure handlers assume authorization already happened (M5's
+            // job) and must not read this field.
+            pr_author_id: 999_999,
+            updated_at: ts(),
         })
     }
 
     fn pr_event(action: PrAction, number: u64, base: &str, merge: MergeStatus) -> GitHubEvent {
         GitHubEvent::PullRequest(PullRequestEvent {
+            base_change_from: None,
             repo: repo(),
             action,
             pr_number: PrNumber(number),
@@ -755,6 +790,7 @@ mod tests {
             head_branch: format!("feature-{number}"),
             is_draft: false,
             author_id: 1,
+            updated_at: ts(),
         })
     }
 
@@ -767,6 +803,7 @@ mod tests {
             reviewer_id: 1,
             reviewer_login: "bob".to_owned(),
             body: String::new(),
+            review_id: 11,
         })
     }
 
@@ -1109,12 +1146,14 @@ mod tests {
 
         let status = handle_event(
             &GitHubEvent::Status(crate::webhooks::events::StatusEvent {
+                status_id: 7,
                 repo: repo(),
                 sha: sha(),
                 state: crate::webhooks::events::StatusState::Success,
                 context: "ci/test".to_owned(),
                 description: None,
                 target_url: None,
+                updated_at: ts(),
             }),
             &state,
             &ctx(),
@@ -1205,6 +1244,8 @@ mod tests {
                 head_sha: sha(),
                 conclusion: Some(CheckSuiteConclusion::Success),
                 pull_requests: vec![],
+                suite_id: 5,
+                updated_at: ts(),
             })
         };
         assert!(
@@ -1295,12 +1336,14 @@ mod tests {
 
         let status = handle_event(
             &GitHubEvent::Status(StatusEvent {
+                status_id: 7,
                 repo: repo(),
                 sha: sha(),
                 state: StatusState::Success,
                 context: "ci".to_owned(),
                 description: None,
                 target_url: None,
+                updated_at: ts(),
             }),
             &state,
             &ctx(),
@@ -1319,6 +1362,8 @@ mod tests {
                 head_sha: sha(),
                 conclusion: Some(CheckSuiteConclusion::TimedOut),
                 pull_requests: vec![],
+                suite_id: 5,
+                updated_at: ts(),
             }),
             &state,
             &ctx(),
@@ -1432,6 +1477,8 @@ mod tests {
                 head_sha: sha(),
                 conclusion: Some(CheckSuiteConclusion::Success),
                 pull_requests: vec![],
+                suite_id: 5,
+                updated_at: ts(),
             }),
             &state,
             &ctx(),
@@ -1502,12 +1549,14 @@ mod tests {
         let state = RepoState::from_snapshot(snap);
         let mk = |st| {
             GitHubEvent::Status(StatusEvent {
+                status_id: 7,
                 repo: repo(),
                 sha: sha(),
                 state: st,
                 context: "ci".to_owned(),
                 description: None,
                 target_url: None,
+                updated_at: ts(),
             })
         };
 
@@ -1577,6 +1626,8 @@ mod tests {
                 head_sha: other_head,
                 conclusion: Some(CheckSuiteConclusion::Success),
                 pull_requests: vec![PrNumber(1)],
+                suite_id: 5,
+                updated_at: ts(),
             }),
             &state,
             &ctx(),
@@ -1652,6 +1703,7 @@ mod tests {
         let state = state_with(vec![open_pr(1, "main", None)]);
         let new_head = Sha::parse("c".repeat(40)).unwrap();
         let event = GitHubEvent::PullRequest(PullRequestEvent {
+            base_change_from: None,
             repo: repo(),
             action: PrAction::Reopened,
             pr_number: PrNumber(1),
@@ -1661,6 +1713,7 @@ mod tests {
             head_branch: "feature-1".to_owned(),
             is_draft: true,
             author_id: 1,
+            updated_at: ts(),
         });
         let out = handle_event(&event, &state, &ctx());
         assert!(

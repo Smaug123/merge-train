@@ -20,6 +20,7 @@ mod conformance_tests;
 #[cfg(test)]
 mod model_tests;
 
+pub(crate) use engine::handler_abort_cleanup;
 pub use engine::{MAX_TRAIN_SIZE, advance, recover_train, start_train, stop_train};
 pub use observe::{ObserveError, observe};
 pub use plan::{

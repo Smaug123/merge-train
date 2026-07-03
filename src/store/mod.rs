@@ -30,14 +30,15 @@ use thiserror::Error;
 
 use crate::persistence::event::{StateEvent, StateEventPayload};
 use crate::persistence::snapshot::{PersistedRepoSnapshot, SCHEMA_VERSION};
-use crate::spool::DedupeKey;
 use crate::state::RepoState;
+use crate::types::PrNumber;
+use crate::webhooks::dedupe::DedupeKey;
 
 /// Schema version for the SQLite store. Bump on a breaking schema change; a DB
 /// at a different version is rejected loudly rather than mis-read.
 ///
 /// v2 added the `deliveries` and `dedupe_keys` tables (the webhook queue).
-const STORE_SCHEMA_VERSION: i64 = 2;
+const STORE_SCHEMA_VERSION: i64 = 4;
 
 /// Errors from the store.
 #[derive(Debug, Error)]
@@ -99,6 +100,26 @@ pub struct Delivery {
     pub body: Vec<u8>,
     /// When the delivery was received.
     pub received_at: DateTime<Utc>,
+}
+
+/// A user command persisted in `pending_commands`: authorized at intake,
+/// awaiting the saga slot, durable until answered (Codex M5 rounds 2/19 —
+/// a command that lived only in RAM between its delivery's close and its
+/// application was lost by a crash, and redelivery is deduped).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableCommand {
+    /// `@bot start` on `pr`.
+    Start {
+        /// The PR the start was issued on.
+        pr: PrNumber,
+    },
+    /// `@bot stop[ --force]` on `pr`.
+    Stop {
+        /// The PR the stop was issued on.
+        pr: PrNumber,
+        /// Whether `--force` was given.
+        force: bool,
+    },
 }
 
 impl Store {
@@ -242,6 +263,72 @@ impl Store {
         Ok(event)
     }
 
+    /// Appends `payloads` in order as ONE transaction — the whole batch commits
+    /// or none of it does. This is the durability shape a cascade `StepPlan`
+    /// requires: the relative order of a plan's events (e.g. `PrSynchronized`
+    /// strictly before `ReconciliationRecorded`, a terminal event before
+    /// nothing else) must be atomic, never observable half-applied.
+    pub fn append_batch(
+        &mut self,
+        payloads: &[StateEventPayload],
+        ts: DateTime<Utc>,
+    ) -> Result<Vec<StateEvent>, StoreError> {
+        if payloads.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut next_state = self.state.clone();
+        let mut seq = self.next_seq;
+        let mut events = Vec::with_capacity(payloads.len());
+
+        let tx = self.conn.transaction()?;
+        for payload in payloads {
+            let event = StateEvent {
+                seq,
+                ts,
+                payload: payload.clone(),
+            };
+            insert_and_apply(&tx, &mut next_state, &event)?;
+            events.push(event);
+            seq += 1;
+        }
+        upsert_cache(&tx, &next_state, seq, ts)?;
+        tx.commit()?;
+
+        self.state = next_state;
+        self.next_seq = seq;
+        Ok(events)
+    }
+
+    /// Reads the full event log in append order.
+    ///
+    /// The worker derives [`crate::cascade::ReplayFacts`] from this on every
+    /// train evaluation. Reading the whole log is O(events-so-far); acceptable
+    /// until log pruning/compaction exists (deferred to bootstrap, M6), at
+    /// which point a bounded suffix read replaces it.
+    pub fn events(&self) -> Result<Vec<StateEvent>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT seq, ts, payload FROM events ORDER BY seq")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut events = Vec::new();
+        for row in rows {
+            let (seq, ts, payload) = row?;
+            events.push(StateEvent {
+                seq: seq as u64,
+                ts: parse_ts(&ts)?,
+                payload: serde_json::from_str(&payload)?,
+            });
+        }
+        Ok(events)
+    }
+
     /// Enqueues a pending webhook delivery. Returns `false` if a delivery with
     /// the same id is already present (idempotent intake — GitHub redelivers).
     pub fn enqueue(
@@ -308,17 +395,23 @@ impl Store {
         Ok(delivery)
     }
 
-    /// Closes a delivery: appends its final state events, records the dedupe key
-    /// (if any), and marks it `done` — all in one transaction, so the result and
-    /// the close commit together (no window where state advanced but the
+    /// Closes a delivery: appends its final state events, records the dedupe
+    /// key (if any), persists any authorized `commands` the delivery
+    /// carries, and marks it `done` — all in one transaction, so the result
+    /// and the close commit together (no window where state advanced but the
     /// delivery is still open). See `SQLITE_MIGRATION_PLAN.md`.
+    ///
+    /// Returns the `pending_commands` row ids for `commands`, in order — the
+    /// caller deletes each row (`delete_pending_command`) once the command
+    /// is answered.
     pub fn commit_delivery(
         &mut self,
         delivery_id: &str,
         events: &[StateEventPayload],
         dedupe: Option<&DedupeKey>,
+        commands: &[DurableCommand],
         ts: DateTime<Utc>,
-    ) -> Result<(), StoreError> {
+    ) -> Result<Vec<i64>, StoreError> {
         let mut next_state = self.state.clone();
         let mut seq = self.next_seq;
 
@@ -339,6 +432,18 @@ impl Store {
                 rusqlite::params![key.as_str(), ts.to_rfc3339()],
             )?;
         }
+        let mut command_ids = Vec::with_capacity(commands.len());
+        for command in commands {
+            let (kind, pr, force) = match command {
+                DurableCommand::Start { pr } => ("start", *pr, false),
+                DurableCommand::Stop { pr, force } => ("stop", *pr, *force),
+            };
+            tx.execute(
+                "INSERT INTO pending_commands (kind, pr, force_stop) VALUES (?1, ?2, ?3)",
+                rusqlite::params![kind, pr.0 as i64, force],
+            )?;
+            command_ids.push(tx.last_insert_rowid());
+        }
         tx.execute(
             "UPDATE deliveries SET status = 'done' WHERE delivery_id = ?1",
             rusqlite::params![delivery_id],
@@ -347,6 +452,91 @@ impl Store {
 
         self.state = next_state;
         self.next_seq = seq;
+        Ok(command_ids)
+    }
+
+    /// The persisted user commands not yet answered, in arrival (`id`) order
+    /// — the user's command order, which reload must preserve (a reloaded
+    /// `start → stop` must not become `stop → start`).
+    pub fn pending_commands(&self) -> Result<Vec<(i64, DurableCommand)>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, kind, pr, force_stop FROM pending_commands ORDER BY id")?;
+        let rows = stmt.query_map([], |r| {
+            let id: i64 = r.get(0)?;
+            let kind: String = r.get(1)?;
+            let pr = PrNumber(r.get::<_, i64>(2)? as u64);
+            let force: bool = r.get(3)?;
+            Ok((id, kind, pr, force))
+        })?;
+        let mut commands = Vec::new();
+        for row in rows {
+            let (id, kind, pr, force) = row?;
+            let command = match kind.as_str() {
+                "start" => DurableCommand::Start { pr },
+                "stop" => DurableCommand::Stop { pr, force },
+                other => {
+                    return Err(StoreError::Io(std::io::Error::other(format!(
+                        "unknown pending command kind {other:?} (row {id})"
+                    ))));
+                }
+            };
+            commands.push((id, command));
+        }
+        Ok(commands)
+    }
+
+    /// Atomically replaces a pending stop with stops for `prs` — the fan-out
+    /// expansion: a stop for a root whose train is about to fan out becomes
+    /// stops for every spawned root, and the replacement must be durable
+    /// BEFORE the fan-out integrates or a crash in between loses the
+    /// acknowledged stop (Codex M5 round 15: the old-root row resolves to no
+    /// train after the fan-out). Returns the new row ids, in `prs` order.
+    pub fn replace_pending_stop(
+        &mut self,
+        old_id: i64,
+        prs: &[(PrNumber, bool)],
+    ) -> Result<Vec<i64>, StoreError> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM pending_commands WHERE id = ?1",
+            rusqlite::params![old_id],
+        )?;
+        let mut ids = Vec::with_capacity(prs.len());
+        for (pr, force) in prs {
+            tx.execute(
+                "INSERT INTO pending_commands (kind, pr, force_stop) VALUES ('stop', ?1, ?2)",
+                rusqlite::params![pr.0 as i64, *force],
+            )?;
+            ids.push(tx.last_insert_rowid());
+        }
+        tx.commit()?;
+        Ok(ids)
+    }
+
+    /// Removes an answered command. Deleting after (not atomically with) the
+    /// command's durable answer means a crash in between replays it, which
+    /// is harmless: stopping a stopped train answers "no active train", and
+    /// starting an already-started one is rejected as already running.
+    pub fn delete_pending_command(&mut self, id: i64) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM pending_commands WHERE id = ?1",
+            rusqlite::params![id],
+        )?;
+        Ok(())
+    }
+
+    /// Releases a claimed delivery back to `pending` — used when processing
+    /// cannot proceed for an *external* reason (GitHub unreachable) and must
+    /// be retried later without losing the delivery or killing the worker.
+    /// Only a `processing` row is touched; releasing an unclaimed or closed
+    /// delivery is a no-op.
+    pub fn release_delivery(&mut self, delivery_id: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE deliveries SET status = 'pending'
+             WHERE delivery_id = ?1 AND status = 'processing'",
+            rusqlite::params![delivery_id],
+        )?;
         Ok(())
     }
 
@@ -385,25 +575,8 @@ impl Store {
         let mut state = RepoState::from_snapshot(PersistedRepoSnapshot::new(
             self.state.default_branch.clone(),
         ));
-        let mut stmt = self
-            .conn
-            .prepare("SELECT seq, ts, payload FROM events ORDER BY seq")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })?;
-        for row in rows {
-            let (seq, ts, payload) = row?;
-            let payload: StateEventPayload = serde_json::from_str(&payload)?;
-            let ts = parse_ts(&ts)?;
-            state.apply_event(&StateEvent {
-                seq: seq as u64,
-                ts,
-                payload,
-            });
+        for event in self.events()? {
+            state.apply_event(&event);
         }
         Ok(state)
     }
@@ -444,7 +617,7 @@ fn upsert_cache(
     next_seq: u64,
     ts: DateTime<Utc>,
 ) -> Result<(), StoreError> {
-    let cache_json = serde_json::to_string(&state.to_snapshot(0, 0, next_seq, ts))?;
+    let cache_json = serde_json::to_string(&state.to_snapshot(next_seq, ts))?;
     tx.execute(
         "INSERT INTO repo_state (id, snapshot) VALUES (0, ?1)
          ON CONFLICT(id) DO UPDATE SET snapshot = excluded.snapshot",
@@ -483,6 +656,17 @@ fn init_schema(conn: &Connection) -> Result<(), StoreError> {
         CREATE TABLE dedupe_keys (
             key     TEXT PRIMARY KEY,
             seen_at TEXT NOT NULL
+        );
+        -- Authorized user commands (start/stop) awaiting the saga slot.
+        -- Inserted in the same transaction as the delivery's close, so an
+        -- acknowledged command survives a crash while it waits out an
+        -- in-flight saga (Codex M5 rounds 2 and 19). `id` order is the
+        -- user's command order. Deleted when the command is answered.
+        CREATE TABLE pending_commands (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind       TEXT NOT NULL,
+            pr         INTEGER NOT NULL,
+            force_stop INTEGER NOT NULL
         );",
     )?;
     // `user_version` is a transactional header write, so the DDL above and this
@@ -578,6 +762,58 @@ mod tests {
             prop_assert_eq!(reopened.state(), &state_before);
             prop_assert_eq!(reopened.next_seq(), seq_before);
         }
+
+        /// One `append_batch` is observationally equal to appending the same
+        /// payloads one at a time: same state, same `next_seq`, same log.
+        #[test]
+        fn append_batch_equals_sequential_appends(
+            payloads in prop::collection::vec(arb_state_event_payload(), 0..20),
+        ) {
+            let dir_batch = tempdir().unwrap();
+            let dir_seq = tempdir().unwrap();
+            let mut batched = open_temp(&dir_batch);
+            let mut sequential = open_temp(&dir_seq);
+            let ts = test_timestamp();
+
+            let events = batched.append_batch(&payloads, ts).unwrap();
+            for payload in &payloads {
+                sequential.append(payload.clone(), ts).unwrap();
+            }
+
+            prop_assert_eq!(batched.state(), sequential.state());
+            prop_assert_eq!(batched.next_seq(), sequential.next_seq());
+            prop_assert_eq!(&events, &batched.events().unwrap());
+            prop_assert_eq!(&events, &sequential.events().unwrap());
+        }
+
+        /// `events` reads back exactly what was written, in append order,
+        /// across a mix of single appends, batches, and delivery commits.
+        #[test]
+        fn events_reads_back_the_log_in_order(
+            singles in prop::collection::vec(arb_state_event_payload(), 0..8),
+            batch in prop::collection::vec(arb_state_event_payload(), 0..8),
+            committed in prop::collection::vec(arb_state_event_payload(), 0..8),
+        ) {
+            let dir = tempdir().unwrap();
+            let mut store = open_temp(&dir);
+            let ts = test_timestamp();
+
+            let mut expected = Vec::new();
+            for payload in &singles {
+                expected.push(store.append(payload.clone(), ts).unwrap());
+            }
+            expected.extend(store.append_batch(&batch, ts).unwrap());
+            store.enqueue("d1", "pull_request", "{}", b"{}", ts).unwrap();
+            store.claim_next_delivery().unwrap().unwrap();
+            store.commit_delivery("d1", &committed, None, &[], ts).unwrap();
+            expected.extend(committed.iter().enumerate().map(|(i, p)| StateEvent {
+                seq: (singles.len() + batch.len() + i) as u64,
+                ts,
+                payload: p.clone(),
+            }));
+
+            prop_assert_eq!(store.events().unwrap(), expected);
+        }
     }
 
     #[test]
@@ -670,9 +906,31 @@ mod tests {
     }
 
     #[test]
+    fn released_delivery_is_reclaimable() {
+        let dir = tempdir().unwrap();
+        let mut store = open_temp(&dir);
+        let ts = test_timestamp();
+        store
+            .enqueue("d1", "pull_request", "{}", b"{}", ts)
+            .unwrap();
+
+        let claimed = store.claim_next_delivery().unwrap().unwrap();
+        assert!(store.claim_next_delivery().unwrap().is_none());
+
+        store.release_delivery(&claimed.delivery_id).unwrap();
+        let reclaimed = store.claim_next_delivery().unwrap().unwrap();
+        assert_eq!(reclaimed.delivery_id, "d1");
+
+        // Releasing a closed delivery is a no-op — it must not reopen.
+        store.commit_delivery("d1", &[], None, &[], ts).unwrap();
+        store.release_delivery("d1").unwrap();
+        assert!(store.claim_next_delivery().unwrap().is_none());
+    }
+
+    #[test]
     fn enqueue_claim_commit_flow() {
-        use crate::spool::DedupeKey;
         use crate::types::{CommentId, PrNumber};
+        use crate::webhooks::dedupe::DedupeKey;
 
         let dir = tempdir().unwrap();
         let mut store = Store::open(&dir.path().join("state.db")).unwrap();
@@ -705,6 +963,7 @@ mod tests {
                     current_pr: PrNumber(7),
                 }],
                 Some(&key),
+                &[],
                 ts,
             )
             .unwrap();
@@ -754,8 +1013,8 @@ mod tests {
 
     #[test]
     fn prune_drops_old_dedupe_and_done_deliveries() {
-        use crate::spool::DedupeKey;
         use crate::types::{CommentId, PrNumber};
+        use crate::webhooks::dedupe::DedupeKey;
 
         let dir = tempdir().unwrap();
         let mut store = Store::open(&dir.path().join("state.db")).unwrap();
@@ -765,7 +1024,9 @@ mod tests {
         store.enqueue("d1", "status", "{}", b"x", old).unwrap();
         store.claim_next_delivery().unwrap();
         let key = DedupeKey::issue_comment_created(PrNumber(1), CommentId(1));
-        store.commit_delivery("d1", &[], Some(&key), old).unwrap();
+        store
+            .commit_delivery("d1", &[], Some(&key), &[], old)
+            .unwrap();
 
         assert!(store.is_duplicate(&key).unwrap());
         assert_eq!(store.prune_dedupe(cutoff).unwrap(), 1);

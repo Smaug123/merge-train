@@ -113,29 +113,15 @@ pub struct InvalidDeliveryId {
     reason: &'static str,
 }
 
-/// Maximum length of a delivery ID in bytes.
+/// Maximum length of a delivery ID in bytes: 214.
 ///
-/// The delivery ID is the stem of every spool filename, and most filesystems
-/// cap a single filename component at 255 bytes. The longest derived name is
-/// the payload temp written during spooling (see [`crate::spool`]),
-/// `<id>.json.tmp.<pid>.<counter>`: a `.json.tmp.` infix, a `u32` PID (at
-/// most 10 digits), a dot, and a `u64` counter (at most 20 digits) — 41 bytes
-/// at worst. Reserving that headroom keeps every spool filename, temps
-/// included, within 255 bytes, so `parse` rejects an un-spoolable ID up front
-/// instead of letting it fail with an I/O error at spool time. GitHub
-/// delivery IDs are 36-character UUIDs, so this is still generous.
-///
-/// The coupling to the actual suffixes is machine-checked by
-/// `spool::delivery`'s `max_length_delivery_id_yields_spoolable_filenames`.
-pub(crate) const MAX_DELIVERY_ID_LEN: usize = {
-    const FS_NAME_LIMIT: usize = 255;
-    // Digits in the largest value each integer can print.
-    const PID_DIGITS: usize = u32::MAX.ilog10() as usize + 1; // 10
-    const COUNTER_DIGITS: usize = u64::MAX.ilog10() as usize + 1; // 20
-    // Longest derived spool name: "<id>.json.tmp.<pid>.<counter>".
-    const MAX_SUFFIX: usize = ".json.tmp.".len() + PID_DIGITS + ".".len() + COUNTER_DIGITS;
-    FS_NAME_LIMIT - MAX_SUFFIX
-};
+/// Delivery IDs are stored in SQLite now, so there is no hard structural
+/// limit; this is a sanity bound on attacker-controlled header input. The
+/// value is inherited from the deleted filesystem spool (255-byte filename
+/// component minus the longest derived temp-file suffix) and kept stable so
+/// every previously-accepted ID stays accepted. GitHub delivery IDs are
+/// 36-character UUIDs, so this is generous.
+pub(crate) const MAX_DELIVERY_ID_LEN: usize = 214;
 
 /// A GitHub webhook delivery ID (the `X-GitHub-Delivery` header value).
 ///
@@ -153,8 +139,7 @@ impl DeliveryId {
     ///
     /// Rejects:
     /// - Empty strings
-    /// - Strings too long to spool safely (see [`MAX_DELIVERY_ID_LEN`], which
-    ///   reserves room for the longest derived spool filename)
+    /// - Strings over [`MAX_DELIVERY_ID_LEN`] bytes
     /// - Strings containing `/`, `\`, or null bytes (path traversal)
     /// - Strings starting with `.` (hidden files; also covers `.` and `..`)
     pub fn parse(s: impl Into<String>) -> Result<Self, InvalidDeliveryId> {
@@ -166,7 +151,7 @@ impl DeliveryId {
         }
         if s.len() > MAX_DELIVERY_ID_LEN {
             return Err(InvalidDeliveryId {
-                reason: "too long to spool safely",
+                reason: "longer than MAX_DELIVERY_ID_LEN",
             });
         }
         if s.contains('/') || s.contains('\\') || s.contains('\0') {

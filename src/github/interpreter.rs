@@ -11,16 +11,18 @@
 use chrono::{Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::cascade::EffectError;
+use crate::effects::github::CollaboratorRole;
 use crate::effects::{
     BranchProtectionData, CommentData, GitHubEffect, GitHubResponse, PrData, Reaction,
     RepoSettingsData, RulesetData,
 };
-use crate::types::{CommentId, MergeStateStatus, PrNumber, PrState, Sha};
+use crate::types::{CommentId, MergeStateStatus, PrNumber, PrState, Sha, TrainErrorKind};
 
 use std::future::Future;
 
 use super::client::OctocrabClient;
-use super::error::{GitHubApiError, is_rate_limit_error, is_transient_message};
+use super::error::{GitHubApiError, GitHubErrorKind, is_rate_limit_error, is_transient_message};
 use super::retry::{RetryConfig, RetryPolicy, RetryResult, retry_with_backoff};
 
 // ─── GraphQL Types ────────────────────────────────────────────────────────────
@@ -162,6 +164,9 @@ async fn execute_effect(
             reaction,
         } => add_reaction(client, comment_id, reaction).await,
         GitHubEffect::ListComments { pr } => list_comments(client, pr).await,
+        GitHubEffect::GetCollaboratorPermission { username } => {
+            get_collaborator_permission(client, username).await
+        }
         GitHubEffect::GetBranchProtection { branch } => get_branch_protection(client, branch).await,
         GitHubEffect::GetRulesets => get_rulesets(client).await,
         GitHubEffect::GetRepoSettings => get_repo_settings(client).await,
@@ -780,6 +785,90 @@ async fn list_comments(
     Ok(GitHubResponse::Comments(all_comments))
 }
 
+// ─── Collaborators ────────────────────────────────────────────────────────────
+
+/// Response from the collaborator-permission endpoint. Only `role_name`
+/// matters: the legacy `permission` field collapses `maintain` into `write`.
+#[derive(Debug, Deserialize)]
+struct CollaboratorPermissionResponse {
+    role_name: String,
+}
+
+async fn get_collaborator_permission(
+    client: &OctocrabClient,
+    username: String,
+) -> Result<GitHubResponse, GitHubApiError> {
+    let encoded_username = urlencoding::encode(&username);
+    let url = format!(
+        "/repos/{}/{}/collaborators/{}/permission",
+        client.owner(),
+        client.repo_name(),
+        encoded_username
+    );
+
+    let result: Result<CollaboratorPermissionResponse, _> =
+        client.inner().get(&url, None::<&()>).await;
+
+    match result {
+        Ok(response) => Ok(GitHubResponse::CollaboratorPermission {
+            role: CollaboratorRole::from_role_name(&response.role_name),
+        }),
+        // 404 means the username does not resolve to a collaborator (e.g. a
+        // deleted account). For an authorization question the answer is "no
+        // role" — the caller denies — not an operational failure.
+        Err(e) if is_not_found(&e) => Ok(GitHubResponse::CollaboratorPermission {
+            role: CollaboratorRole::None,
+        }),
+        Err(e) => Err(GitHubApiError::from_octocrab(e)),
+    }
+}
+
+/// Whether an octocrab error is specifically HTTP 404.
+fn is_not_found(err: &octocrab::Error) -> bool {
+    match err {
+        octocrab::Error::GitHub { source, .. } => source.status_code.as_u16() == 404,
+        _ => false,
+    }
+}
+
+// ─── Error classification (M5) ────────────────────────────────────────────────
+
+/// The fixed [`GitHubApiError`] → [`EffectError`] table — the GitHub-side
+/// mirror of `git::interpreter::classify_git_error`. The engine branches only
+/// on the classification.
+///
+/// - `ShaMismatch` (squash 409: the head moved between the pin and the merge)
+///   is the force-push race the `expected_sha` guard exists to catch —
+///   permanent, aborts with `HeadShaChanged`.
+/// - HTTP 405 is the merge endpoint's *state* complaint ("Pull Request is not
+///   mergeable"): already merged externally, became a draft, lost mergeability.
+///   Retrying the same call cannot help, but neither is the *train* doomed —
+///   the park→re-evaluate path refetches the PR and decides from fresh facts
+///   (an externally-merged PR is adopted via `ValidateSquashCommit`; a dirty
+///   one aborts with the precise kind). So it classifies `Transient`, where
+///   "transient" means "re-derive from the ledger", exactly as for a network
+///   failure. Parking is bounded per event, so this cannot loop hot.
+/// - Everything else permanent is `ApiError`: auth failures, 422s, malformed
+///   responses. The engine aborts; a human reads the detail.
+pub fn classify_github_error(error: &GitHubApiError) -> EffectError {
+    match error.kind {
+        GitHubErrorKind::Transient => EffectError::Transient {
+            detail: error.to_string(),
+        },
+        GitHubErrorKind::ShaMismatch => EffectError::Permanent {
+            kind: TrainErrorKind::HeadShaChanged,
+            detail: error.to_string(),
+        },
+        GitHubErrorKind::Permanent if error.status_code == Some(405) => EffectError::Transient {
+            detail: error.to_string(),
+        },
+        GitHubErrorKind::Permanent => EffectError::Permanent {
+            kind: TrainErrorKind::ApiError,
+            detail: error.to_string(),
+        },
+    }
+}
+
 // ─── Repository Settings ──────────────────────────────────────────────────────
 
 /// Checks if an error indicates we should fall back to "unknown" status.
@@ -1048,6 +1137,59 @@ mod tests {
     use super::*;
     use crate::github::error::test_support::github_error;
     use proptest::prelude::*;
+
+    // ─── Error classification (the fixed table the engine branches on) ───────
+
+    #[test]
+    fn classify_transient_is_transient() {
+        let err = GitHubApiError::transient_without_source("connection reset");
+        assert!(matches!(
+            classify_github_error(&err),
+            EffectError::Transient { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn classify_sha_mismatch_is_permanent_head_changed() {
+        let err = GitHubApiError::sha_mismatch(
+            PrNumber(7),
+            &Sha::parse("a".repeat(40)).unwrap(),
+            github_error(409, "Head branch was modified").await,
+        );
+        assert!(matches!(
+            classify_github_error(&err),
+            EffectError::Permanent {
+                kind: TrainErrorKind::HeadShaChanged,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn classify_405_not_mergeable_is_transient() {
+        // The merge endpoint's state complaint — including "already merged"
+        // externally. Must NOT abort: parking re-derives from a fresh refetch,
+        // which adopts an external squash or aborts with the precise kind.
+        let err =
+            GitHubApiError::from_octocrab(github_error(405, "Pull Request is not mergeable").await);
+        assert_eq!(err.kind, GitHubErrorKind::Permanent, "precondition");
+        assert!(matches!(
+            classify_github_error(&err),
+            EffectError::Transient { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn classify_other_permanent_is_api_error() {
+        let err = GitHubApiError::from_octocrab(github_error(401, "Bad credentials").await);
+        assert!(matches!(
+            classify_github_error(&err),
+            EffectError::Permanent {
+                kind: TrainErrorKind::ApiError,
+                ..
+            }
+        ));
+    }
 
     // ─── Unit Tests ───────────────────────────────────────────────────────────
 
@@ -1528,6 +1670,86 @@ mod tests {
                 .await
                 .expect("403 must fall back to unknown");
             assert!(matches!(response, GitHubResponse::BranchProtectionUnknown));
+        }
+
+        #[tokio::test]
+        async fn collaborator_permission_uses_role_name_not_permission() {
+            // A maintainer: the legacy `permission` field collapses maintain
+            // into "write", so reading it would deny a maintainer's `stop`.
+            // The conflicting fields here pin that we read `role_name`.
+            let (base, _hits) = spawn_mock_server(vec![CannedResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: serde_json::json!({
+                    "permission": "write",
+                    "role_name": "maintain",
+                    "user": { "login": "m", "id": 1 },
+                })
+                .to_string(),
+            }])
+            .await;
+            let client = mock_client(&base);
+
+            let response = client
+                .interpret(GitHubEffect::GetCollaboratorPermission {
+                    username: "m".to_string(),
+                })
+                .await
+                .expect("permission lookup succeeds");
+            assert_eq!(
+                response,
+                GitHubResponse::CollaboratorPermission {
+                    role: CollaboratorRole::Maintain
+                }
+            );
+        }
+
+        #[tokio::test]
+        async fn collaborator_permission_404_is_no_role() {
+            let (base, _hits) = spawn_mock_server(vec![error_response(404, "Not Found")]).await;
+            let client = mock_client(&base);
+
+            let response = client
+                .interpret(GitHubEffect::GetCollaboratorPermission {
+                    username: "ghost".to_string(),
+                })
+                .await
+                .expect("404 is an answer (no role), not a failure");
+            assert_eq!(
+                response,
+                GitHubResponse::CollaboratorPermission {
+                    role: CollaboratorRole::None
+                }
+            );
+        }
+
+        #[tokio::test]
+        async fn collaborator_permission_custom_role_is_other() {
+            let (base, _hits) = spawn_mock_server(vec![CannedResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: serde_json::json!({
+                    "permission": "write",
+                    "role_name": "deployer",
+                    "user": { "login": "d", "id": 2 },
+                })
+                .to_string(),
+            }])
+            .await;
+            let client = mock_client(&base);
+
+            let response = client
+                .interpret(GitHubEffect::GetCollaboratorPermission {
+                    username: "d".to_string(),
+                })
+                .await
+                .expect("custom role parses");
+            assert_eq!(
+                response,
+                GitHubResponse::CollaboratorPermission {
+                    role: CollaboratorRole::Other("deployer".to_string())
+                }
+            );
         }
 
         #[tokio::test]

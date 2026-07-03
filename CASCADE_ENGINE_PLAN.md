@@ -508,6 +508,110 @@ leaves a dirty worktree, which `git::recovery::cleanup_worktree_on_restart`
 
 ## Stage M5 — Per-repo serial worker + server wiring
 
+> **Amendments (2026-07-02, applied during implementation).** The substrate
+> below (EventLog + filesystem spool + Dispatcher/queue) was superseded by
+> the SQLite migration before M5 started: the durable queue is the `Store`'s
+> `deliveries` table and the "worker" is S4's per-repo OS thread that owns
+> the `Store`. The actual files are `src/worker/mod.rs` (registry + thread
+> loop + executor dispatch), `src/worker/pipeline.rs` (`Processor`: the
+> per-delivery pipeline and the saga machine), `src/worker/executor.rs`
+> (`GitHubExec`, `execute_batch`, clone-on-first-use), and
+> `src/worker/authz.rs`. `dispatch.rs`/`queue.rs`/`worker.rs` were never
+> created. Decisions made during implementation:
+>
+> 1. **Off-thread sagas, one per repo.** The worker thread never blocks on
+>    effects: each `StepPlan`'s effects run on a spawned executor thread
+>    whose `EffectOutcome`s return through the worker's own mailbox
+>    (`WorkerMsg::SagaOutcomes`). Deliveries keep processing *mid-saga* —
+>    that is how stops and head-moved observations reach the engine — and
+>    the engine work they trigger queues (`PendingWork`, deduped) for the
+>    single saga slot. Queued **stops run at every observation boundary**,
+>    so a `stop` takes effect after at most one effect batch (DESIGN's
+>    bounded staleness) without any priority queue: `classify_priority`
+>    stays unwired and deliveries process strictly in arrival order.
+>    Ordering at the boundary (Codex M5 round 1, P1): the completed batch's
+>    outcomes integrate (`observe` → `advance` → append) *before* stops
+>    retire the train — those effects already ran, and a stopped train
+>    ignores observations, so stopping first silently discarded e.g. an
+>    executed squash and the store diverged from GitHub. The stop then
+>    suppresses only the planned *continuation* (not yet run; a suppressed
+>    intent is the crash-before-dispatch state the recovery contract
+>    already covers). Exception: the start-cancel window (stop naming the
+>    saga root before its train exists) still skips integration outright —
+>    preflight outcomes are pure reads.
+> 2. **Atomic close-first.** `Store::commit_delivery` (handler events +
+>    dedupe key + `done`, one transaction) runs *before* handler effects and
+>    engine work, keeping S2's exactly-once intake invariant; everything
+>    irreversible the engine does afterwards is guarded by its own
+>    intent/done ledger, not delivery accounting. Known window: a crash
+>    after the close but before the engine appends `TrainStarted` loses that
+>    start (the user re-issues it); it never double-runs anything.
+> 3. **Stop-during-preflight cancels the saga.** Found by the integration
+>    tests: a `stop` arriving while the start's preflight fetch was in
+>    flight saw no train yet (TrainStarted lands only after preflight),
+>    answered "no active train", and the train then started anyway. A
+>    queued stop whose PR matches the in-flight saga root with no train
+>    record now cancels the saga at the observation boundary.
+> 4. **Command authorization is a two-phase pure decision**
+>    (`worker::authz`): `authorize_by_author` (predecessor/start = PR author
+>    only; identity-only stops) then, only when needed, one
+>    `GetCollaboratorPermission` effect feeding `authorize_by_role` (stop =
+>    author or admin/maintain; `stop --force` = admin only, per DESIGN).
+> 5. **Dedupe collapsed into the Store.** `DedupeKey::for_event` (now
+>    `webhooks::dedupe`; the spool module is deleted) is checked against the
+>    `dedupe_keys` table inside the pipeline; the key commits atomically
+>    with the close. `done` deliveries and dedupe keys share a 7-day
+>    retention, pruned at worker startup and idle boundaries.
+> 6. **Default-branch discovery on first contact:** a fresh store has no
+>    default branch and M6 bootstrap doesn't exist, so the pipeline's first
+>    delivery for a repo emits `GetRepoSettings` and appends the new
+>    `DefaultBranchSet` state event.
+> 7. **Referenced-PR precache:** events referencing unknown PRs emit `GetPr`
+>    and append cache-fill observations (`PrOpened` + state + merge-state)
+>    before handling, so handlers never see an un-cached PR.
+> 8. **GitHub unavailability stalls intake** (correctness over
+>    availability): pre-close pipeline steps that need GitHub (discovery,
+>    authorization, precache) release the delivery back to `pending`
+>    (`Store::release_delivery`) and the worker stalls — but schedules its
+>    own retry (`WorkerMsg::RetryStalled` after `stall_retry_delay`, 30s),
+>    because the webhook was already acked and no external party will
+>    redeliver it (Codex M5 round 1). `classify_github_error` maps API
+>    errors to `EffectError` (405 not-mergeable → `Transient`, park →
+>    refetch-adopt).
+> 9. **Crash boundary (iv) as planned:** inherited non-Idle trains are
+>    refused loudly until M6 (`stop` still works); any train-lifecycle
+>    event for the root clears the refusal marker, so the documented
+>    stop-then-restart recovery works without a process restart (Codex M5
+>    round 1). The crash-point oracle
+>    became a sweep that drops and reopens the `Store` at every pipeline
+>    boundary and asserts the final state equals the no-crash run
+>    (`src/worker/tests.rs`); the end-to-end oracle drives a real stacked
+>    train — real git repo, real Store, fake GitHub — to completion and
+>    checks the squash content on `origin/main` and an empty unmatched
+>    intent ledger.
+> 10. **Git auth via credential helper, never the URL** (Codex M5 round 1,
+>    P1): clone URLs are credential-free; `ensure_clone` persists a
+>    credential helper (`clone --config`) that reads `GITHUB_TOKEN` from
+>    the process environment at each fetch/push, so the token never
+>    appears in git command lines, error output, or on-disk config.
+>    `GITHUB_TOKEN` must be a *user-scoped* token: startup identity is
+>    `GET /user` (resolved question 3), which App installation tokens
+>    cannot call; App-auth support is deferred.
+> 11. **Reloaded commands queue immediately at startup, in id order**
+>    (2026-07-03, self-review round 20). A `pending_commands` row's
+>    delivery closed before every backlog delivery arrived, so
+>    front-of-queue is the user's utterance order — among the reloaded
+>    commands *and* against any command the backlog still carries.
+>    Round 19's first shape deferred them behind the backlog drain
+>    (symmetry with the round-6 evaluate deferral), which inverted
+>    command order across a restart: a post-restart `stop` was answered
+>    "no active merge train" and the older reloaded start then started
+>    the train the user had just refused. The round-6 hazard does not
+>    apply to commands: a start's plan is read-only preflight whose
+>    `TrainStarted` lands only at the observation boundary (run against
+>    the drained backlog), and a stop appends terminal events valid at
+>    any staleness. Startup *evaluations* stay deferred.
+
 **Dependencies:** M2, M3, M4. **Implements:** DESIGN.md §Per-repo serial
 event processing worker loop, §Event processing flow, §Restart safety steps
 1–4.
@@ -574,6 +678,32 @@ stage shippable).
 ---
 
 ## Stage M6 — Bootstrap and recovery
+
+> **Design item queued from M5's review (2026-07-03, owner to rule on).**
+> **Unify engine-work durability.** M5 ended up with four durability
+> stories for queued engine work: user commands are durable rows
+> (`pending_commands`, written in the delivery's close transaction —
+> rounds 2/19 both hit the volatile-command class before this
+> generalized), deferred handler aborts are volatile-with-durable-causes,
+> evaluations are derived (re-queued for every active train at startup),
+> and fan-out stop expansion rewrites rows mid-flight (round 15). Nine of
+> the nineteen review rounds were ordering/durability bugs in exactly this
+> machinery — and round 20 (self-review, amendment 11) found a tenth: the
+> command-reload deferral inverted utterance order across a restart. The
+> interleaving harness could not see that class either; its invariants
+> check answers exist, not that answers respect utterance order — a
+> command-order invariant becomes natural once the queue is unified. The candidate simplification: ONE ordered, durable
+> engine-work queue (a `pending_work` table subsuming `pending_commands`)
+> that every queued item flows through, with "answered" as the single
+> deletion contract — collapsing the per-kind special cases and making the
+> worker loop's recovery story uniform. Costs: schema churn, a migration
+> of the boundary-stop machinery, and care not to persist re-derivable
+> work (evaluations are cheap to recompute and SHOULD stay derived — the
+> question is only whether aborts and expansions join commands in the
+> table). The interleaving model check (`worker::tests::interleaving`)
+> and the dedupe class oracle now pin the behavior either way; do this
+> refactor, if at all, before M6's recovery builds more on the current
+> shape.
 
 **Dependencies:** M5 (+ M2 `recover_train`). **Implements:** DESIGN.md
 §Bootstrap algorithm, §Handling cache misses, §Recovery precedence,

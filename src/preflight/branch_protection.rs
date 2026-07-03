@@ -184,6 +184,7 @@ fn response_variant_name(response: &GitHubResponse) -> &'static str {
         GitHubResponse::CommentUpdated => "CommentUpdated",
         GitHubResponse::ReactionAdded => "ReactionAdded",
         GitHubResponse::Comments(_) => "Comments",
+        GitHubResponse::CollaboratorPermission { .. } => "CollaboratorPermission",
         GitHubResponse::BranchProtection(_) => "BranchProtection",
         GitHubResponse::BranchProtectionUnknown => "BranchProtectionUnknown",
         GitHubResponse::Rulesets(_) => "Rulesets",

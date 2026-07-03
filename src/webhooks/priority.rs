@@ -63,6 +63,10 @@ pub enum EventPriority {
 ///     body: "@merge-train stop".to_string(),
 ///     author_id: 1,
 ///     author_login: "user".to_string(),
+///     sender_id: 1,
+///     sender_login: "user".to_string(),
+///     pr_author_id: 7,
+///     updated_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
 /// };
 ///
 /// assert_eq!(
@@ -138,11 +142,16 @@ mod tests {
             body: body.to_string(),
             author_id: 1,
             author_login: "user".to_string(),
+            sender_id: 1,
+            sender_login: "user".to_string(),
+            pr_author_id: 7,
+            updated_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
         })
     }
 
     fn make_pr_event() -> GitHubEvent {
         GitHubEvent::PullRequest(PullRequestEvent {
+            base_change_from: None,
             repo: RepoId::new("owner", "repo"),
             action: PrAction::Closed,
             pr_number: PrNumber(42),
@@ -154,6 +163,7 @@ mod tests {
             head_branch: "feature".to_string(),
             is_draft: false,
             author_id: 1,
+            updated_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
         })
     }
 
@@ -164,17 +174,21 @@ mod tests {
             head_sha: Sha::parse("c".repeat(40)).unwrap(),
             conclusion: Some(CheckSuiteConclusion::Success),
             pull_requests: vec![PrNumber(42)],
+            suite_id: 5,
+            updated_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
         })
     }
 
     fn make_status_event() -> GitHubEvent {
         GitHubEvent::Status(StatusEvent {
+            status_id: 7,
             repo: RepoId::new("owner", "repo"),
             sha: Sha::parse("d".repeat(40)).unwrap(),
             state: StatusState::Success,
             context: "ci/test".to_string(),
             description: None,
             target_url: None,
+            updated_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
         })
     }
 
@@ -187,6 +201,7 @@ mod tests {
             reviewer_id: 100,
             reviewer_login: "reviewer".to_string(),
             body: "LGTM".to_string(),
+            review_id: 11,
         })
     }
 
@@ -287,6 +302,10 @@ mod tests {
             body: "@merge-train stop".to_string(),
             author_id: 1,
             author_login: "user".to_string(),
+            sender_id: 1,
+            sender_login: "user".to_string(),
+            pr_author_id: 7,
+            updated_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
         });
         assert_eq!(classify_priority(&event), EventPriority::Normal);
     }
@@ -333,6 +352,10 @@ mod tests {
             body: "@my-custom-bot stop".to_string(),
             author_id: 1,
             author_login: "user".to_string(),
+            sender_id: 1,
+            sender_login: "user".to_string(),
+            pr_author_id: 7,
+            updated_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
         });
         assert_eq!(
             classify_priority_with_bot_name(&event, "my-custom-bot"),

@@ -62,9 +62,6 @@ pub struct RepoState {
     /// Reverse predecessor index (predecessor → descendants). Derived from
     /// `prs`; never mutated independently.
     pub descendants: HashMap<PrNumber, HashSet<PrNumber>>,
-
-    /// Seen dedupe keys with the timestamp they were first seen (TTL pruning).
-    pub seen_dedupe_keys: HashMap<String, DateTime<Utc>>,
 }
 
 impl RepoState {
@@ -77,31 +74,21 @@ impl RepoState {
             prs: snapshot.prs,
             active_trains: snapshot.active_trains,
             descendants,
-            seen_dedupe_keys: snapshot.seen_dedupe_keys,
         }
     }
 
     /// Captures the current state as a persisted snapshot. The persistence
-    /// metadata (`log_generation`/`log_position`/`next_seq`/`snapshot_at`) is
-    /// supplied by the caller — `RepoState` does not track it. The derived
-    /// `descendants` index is not stored (it is rebuilt by `from_snapshot`).
-    pub fn to_snapshot(
-        &self,
-        log_generation: u64,
-        log_position: u64,
-        next_seq: u64,
-        snapshot_at: DateTime<Utc>,
-    ) -> PersistedRepoSnapshot {
+    /// metadata (`next_seq`/`snapshot_at`) is supplied by the caller —
+    /// `RepoState` does not track it. The derived `descendants` index is not
+    /// stored (it is rebuilt by `from_snapshot`).
+    pub fn to_snapshot(&self, next_seq: u64, snapshot_at: DateTime<Utc>) -> PersistedRepoSnapshot {
         PersistedRepoSnapshot {
             schema_version: SCHEMA_VERSION,
             snapshot_at,
-            log_generation,
-            log_position,
             next_seq,
             default_branch: self.default_branch.clone(),
             prs: self.prs.clone(),
             active_trains: self.active_trains.clone(),
-            seen_dedupe_keys: self.seen_dedupe_keys.clone(),
         }
     }
 
@@ -443,6 +430,11 @@ impl RepoState {
             | StateEventPayload::DonePushCatchup { .. }
             | StateEventPayload::IntentRetarget { .. } => {}
 
+            // ─── Repo facts ───
+            StateEventPayload::DefaultBranchSet { branch } => {
+                self.default_branch = branch.clone();
+            }
+
             // ─── Engine observations: CI / review / descendant-skip events
             // drive the planner's decisions (M2+) and the train's progress
             // (carried wholesale on `PhaseTransition`), not the materialized PR
@@ -552,13 +544,10 @@ mod tests {
                     let snapshot = PersistedRepoSnapshot {
                         schema_version: SCHEMA_VERSION,
                         snapshot_at,
-                        log_generation: 0,
-                        log_position: 0,
                         next_seq: 0,
                         default_branch: "main".to_string(),
                         prs,
                         active_trains: HashMap::new(),
-                        seen_dedupe_keys: HashMap::new(),
                     };
                     RepoState::from_snapshot(snapshot)
                 })
@@ -777,7 +766,7 @@ mod tests {
             for event in &events[..k] {
                 cut_state.apply_event(event);
             }
-            let snapshot = cut_state.to_snapshot(7, 42, 99, crate::test_utils::test_timestamp());
+            let snapshot = cut_state.to_snapshot(99, crate::test_utils::test_timestamp());
             let mut resumed = RepoState::from_snapshot(snapshot);
             for event in &events[k..] {
                 resumed.apply_event(event);
@@ -797,8 +786,6 @@ mod tests {
         let snapshot = PersistedRepoSnapshot {
             schema_version: SCHEMA_VERSION,
             snapshot_at: crate::test_utils::test_timestamp(),
-            log_generation: 0,
-            log_position: 0,
             next_seq: 0,
             default_branch: "main".to_string(),
             prs: [PrNumber(1), PrNumber(2)]
@@ -820,7 +807,6 @@ mod tests {
                 })
                 .collect(),
             active_trains: HashMap::new(),
-            seen_dedupe_keys: HashMap::new(),
         };
         let mut state = RepoState::from_snapshot(snapshot);
         assert!(!state.descendants.contains_key(&PrNumber(1)));
@@ -865,13 +851,10 @@ mod tests {
         let snapshot = PersistedRepoSnapshot {
             schema_version: SCHEMA_VERSION,
             snapshot_at: crate::test_utils::test_timestamp(),
-            log_generation: 0,
-            log_position: 0,
             next_seq: 0,
             default_branch: "main".to_string(),
             prs: HashMap::from([(PrNumber(1), pr)]),
             active_trains: HashMap::new(),
-            seen_dedupe_keys: HashMap::new(),
         };
         let mut state = RepoState::from_snapshot(snapshot);
 
@@ -902,13 +885,10 @@ mod tests {
         RepoState::from_snapshot(PersistedRepoSnapshot {
             schema_version: SCHEMA_VERSION,
             snapshot_at: crate::test_utils::test_timestamp(),
-            log_generation: 0,
-            log_position: 0,
             next_seq: 0,
             default_branch: "main".to_string(),
             prs: HashMap::from([(pr.number, pr)]),
             active_trains: HashMap::new(),
-            seen_dedupe_keys: HashMap::new(),
         })
     }
 
@@ -1075,13 +1055,10 @@ mod tests {
         let snapshot = PersistedRepoSnapshot {
             schema_version: SCHEMA_VERSION,
             snapshot_at: crate::test_utils::test_timestamp(),
-            log_generation: 0,
-            log_position: 0,
             next_seq: 0,
             default_branch: default_branch.clone(),
             prs,
             active_trains: HashMap::new(),
-            seen_dedupe_keys: HashMap::new(),
         };
 
         let ts = crate::test_utils::test_timestamp();
@@ -1117,7 +1094,7 @@ mod tests {
         );
 
         // A marker against a *different* squash SHA must NOT make it a root.
-        let mut wrong = RepoState::from_snapshot(state.to_snapshot(0, 0, 0, ts));
+        let mut wrong = RepoState::from_snapshot(state.to_snapshot(0, ts));
         let other = Sha::parse("d".repeat(40)).unwrap();
         wrong.apply_event(&ev(StateEventPayload::ReconciliationRecorded {
             pr: desc,
@@ -1321,13 +1298,10 @@ mod tests {
         let snapshot = PersistedRepoSnapshot {
             schema_version: SCHEMA_VERSION,
             snapshot_at: crate::test_utils::test_timestamp(),
-            log_generation: 0,
-            log_position: 0,
             next_seq: 0,
             default_branch: "main".to_string(),
             prs,
             active_trains: HashMap::from([(PrNumber(1), train)]),
-            seen_dedupe_keys: HashMap::new(),
         };
         let state = RepoState::from_snapshot(snapshot);
 

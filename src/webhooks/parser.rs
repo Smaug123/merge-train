@@ -17,6 +17,7 @@
 //! - `X-GitHub-Delivery` - Unique delivery ID
 //! - `X-Hub-Signature-256` - HMAC-SHA256 signature (verified elsewhere)
 
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -63,16 +64,19 @@ pub enum ParseError {
 ///     "comment": {
 ///         "id": 123,
 ///         "body": "@merge-train start",
-///         "user": { "id": 456, "login": "octocat" }
+///         "user": { "id": 456, "login": "octocat" },
+///         "updated_at": "2024-01-15T10:00:00Z"
 ///     },
 ///     "issue": {
 ///         "number": 42,
-///         "pull_request": { "url": "..." }
+///         "pull_request": { "url": "..." },
+///         "user": { "id": 789, "login": "pr-author" }
 ///     },
 ///     "repository": {
 ///         "owner": { "login": "owner" },
 ///         "name": "repo"
-///     }
+///     },
+///     "sender": { "id": 456, "login": "octocat" }
 /// }"#;
 ///
 /// let result = parse_webhook("issue_comment", payload);
@@ -128,6 +132,7 @@ struct RawIssueCommentPayload {
     comment: RawComment,
     issue: RawIssue,
     repository: RawRepository,
+    sender: RawUser,
 }
 
 #[derive(Debug, Deserialize)]
@@ -135,6 +140,7 @@ struct RawComment {
     id: u64,
     body: Option<String>,
     user: RawUser,
+    updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -142,6 +148,7 @@ struct RawIssue {
     number: u64,
     // If this field is present, the issue is actually a PR
     pull_request: Option<serde_json::Value>,
+    user: RawUser,
 }
 
 fn parse_issue_comment(payload: &[u8]) -> Result<IssueCommentEvent, ParseError> {
@@ -179,6 +186,10 @@ fn parse_issue_comment(payload: &[u8]) -> Result<IssueCommentEvent, ParseError> 
         body,
         author_id: raw.comment.user.id,
         author_login: raw.comment.user.login,
+        sender_id: raw.sender.id,
+        sender_login: raw.sender.login,
+        pr_author_id: raw.issue.user.id,
+        updated_at: raw.comment.updated_at,
     })
 }
 
@@ -191,6 +202,23 @@ struct RawPullRequestPayload {
     action: String,
     pull_request: RawPullRequest,
     repository: RawRepository,
+    changes: Option<RawChanges>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawChanges {
+    base: Option<RawBaseChange>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawBaseChange {
+    #[serde(rename = "ref")]
+    ref_change: RawFrom,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawFrom {
+    from: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -202,6 +230,7 @@ struct RawPullRequest {
     base: RawRef,
     draft: Option<bool>,
     user: RawUser,
+    updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -263,6 +292,8 @@ fn parse_pull_request(payload: &[u8]) -> Result<Option<PullRequestEvent>, ParseE
         head_branch: raw.pull_request.head.ref_name,
         is_draft: raw.pull_request.draft.unwrap_or(false),
         author_id: raw.pull_request.user.id,
+        updated_at: raw.pull_request.updated_at,
+        base_change_from: raw.changes.and_then(|c| c.base).map(|b| b.ref_change.from),
     }))
 }
 
@@ -279,9 +310,11 @@ struct RawCheckSuitePayload {
 
 #[derive(Debug, Deserialize)]
 struct RawCheckSuite {
+    id: u64,
     head_sha: String,
     conclusion: Option<String>,
     pull_requests: Vec<RawCheckSuitePr>,
+    updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -325,6 +358,8 @@ fn parse_check_suite(payload: &[u8]) -> Result<CheckSuiteEvent, ParseError> {
             .into_iter()
             .map(|pr| PrNumber(pr.number))
             .collect(),
+        suite_id: raw.check_suite.id,
+        updated_at: raw.check_suite.updated_at,
     })
 }
 
@@ -334,12 +369,14 @@ fn parse_check_suite(payload: &[u8]) -> Result<CheckSuiteEvent, ParseError> {
 
 #[derive(Debug, Deserialize)]
 struct RawStatusPayload {
+    id: u64,
     sha: String,
     state: String,
     context: String,
     description: Option<String>,
     target_url: Option<String>,
     repository: RawRepository,
+    updated_at: DateTime<Utc>,
 }
 
 fn parse_status(payload: &[u8]) -> Result<StatusEvent, ParseError> {
@@ -364,12 +401,14 @@ fn parse_status(payload: &[u8]) -> Result<StatusEvent, ParseError> {
     })?;
 
     Ok(StatusEvent {
+        status_id: raw.id,
         repo: RepoId::new(raw.repository.owner.login, raw.repository.name),
         sha,
         state,
         context: raw.context,
         description: raw.description,
         target_url: raw.target_url,
+        updated_at: raw.updated_at,
     })
 }
 
@@ -387,6 +426,7 @@ struct RawPullRequestReviewPayload {
 
 #[derive(Debug, Deserialize)]
 struct RawReview {
+    id: u64,
     user: RawUser,
     state: String,
     body: Option<String>,
@@ -436,6 +476,7 @@ fn parse_pull_request_review(payload: &[u8]) -> Result<PullRequestReviewEvent, P
         reviewer_id: raw.review.user.id,
         reviewer_login: raw.review.user.login,
         body: raw.review.body.unwrap_or_default(),
+        review_id: raw.review.id,
     })
 }
 
@@ -454,16 +495,19 @@ mod tests {
             "comment": {
                 "id": 12345,
                 "body": "@merge-train start",
-                "user": { "id": 100, "login": "octocat" }
+                "user": { "id": 100, "login": "octocat" },
+                "updated_at": "2024-01-15T10:00:00Z"
             },
             "issue": {
                 "number": 42,
-                "pull_request": { "url": "https://api.github.com/repos/owner/repo/pulls/42" }
+                "pull_request": { "url": "https://api.github.com/repos/owner/repo/pulls/42" },
+                "user": { "id": 200, "login": "pr-author" }
             },
             "repository": {
                 "owner": { "login": "myorg" },
                 "name": "myrepo"
-            }
+            },
+            "sender": { "id": 100, "login": "octocat" }
         }"#;
 
         let result = parse_webhook("issue_comment", payload.as_bytes()).unwrap();
@@ -478,6 +522,9 @@ mod tests {
                 assert_eq!(e.body, "@merge-train start");
                 assert_eq!(e.author_id, 100);
                 assert_eq!(e.author_login, "octocat");
+                // The PR author comes from issue.user, NOT comment.user —
+                // authorization compares the two.
+                assert_eq!(e.pr_author_id, 200);
             }
             _ => panic!("expected IssueComment"),
         }
@@ -490,15 +537,18 @@ mod tests {
             "comment": {
                 "id": 999,
                 "body": "test comment",
-                "user": { "id": 1, "login": "user" }
+                "user": { "id": 1, "login": "user" },
+                "updated_at": "2024-01-15T10:00:00Z"
             },
             "issue": {
-                "number": 10
+                "number": 10,
+                "user": { "id": 2, "login": "issue-author" }
             },
             "repository": {
                 "owner": { "login": "org" },
                 "name": "repo"
-            }
+            },
+            "sender": { "id": 1, "login": "user" }
         }"#;
 
         let result = parse_webhook("issue_comment", payload.as_bytes()).unwrap();
@@ -519,16 +569,19 @@ mod tests {
             "action": "deleted",
             "comment": {
                 "id": 999,
-                "user": { "id": 1, "login": "user" }
+                "user": { "id": 1, "login": "user" },
+                "updated_at": "2024-01-15T10:00:00Z"
             },
             "issue": {
                 "number": 10,
-                "pull_request": {}
+                "pull_request": {},
+                "user": { "id": 2, "login": "pr-author" }
             },
             "repository": {
                 "owner": { "login": "org" },
                 "name": "repo"
-            }
+            },
+            "sender": { "id": 1, "login": "user" }
         }"#;
 
         let result = parse_webhook("issue_comment", payload.as_bytes()).unwrap();
@@ -554,16 +607,19 @@ mod tests {
             "comment": {
                 "id": 999,
                 "body": "This was the original comment text",
-                "user": { "id": 1, "login": "user" }
+                "user": { "id": 1, "login": "user" },
+                "updated_at": "2024-01-15T10:00:00Z"
             },
             "issue": {
                 "number": 10,
-                "pull_request": {}
+                "pull_request": {},
+                "user": { "id": 2, "login": "pr-author" }
             },
             "repository": {
                 "owner": { "login": "org" },
                 "name": "repo"
-            }
+            },
+            "sender": { "id": 1, "login": "user" }
         }"#;
 
         let result = parse_webhook("issue_comment", payload.as_bytes()).unwrap();
@@ -594,7 +650,8 @@ mod tests {
                     "ref": "main"
                 },
                 "draft": false,
-                "user": { "id": 42, "login": "dev" }
+                "user": { "id": 42, "login": "dev" },
+                "updated_at": "2024-01-15T10:00:00Z"
             },
             "repository": {
                 "owner": { "login": "org" },
@@ -638,7 +695,8 @@ mod tests {
                     "sha": "0000000000000000000000000000000000000000",
                     "ref": "main"
                 },
-                "user": { "id": 1, "login": "author" }
+                "user": { "id": 1, "login": "author" },
+                "updated_at": "2024-01-15T10:00:00Z"
             },
             "repository": {
                 "owner": { "login": "org" },
@@ -681,7 +739,8 @@ mod tests {
                     "sha": "0000000000000000000000000000000000000000",
                     "ref": "main"
                 },
-                "user": { "id": 1, "login": "author" }
+                "user": { "id": 1, "login": "author" },
+                "updated_at": "2024-01-15T10:00:00Z"
             },
             "repository": {
                 "owner": { "login": "org" },
@@ -709,7 +768,8 @@ mod tests {
                     "sha": "0000000000000000000000000000000000000000",
                     "ref": "main"
                 },
-                "user": { "id": 1, "login": "author" }
+                "user": { "id": 1, "login": "author" },
+                "updated_at": "2024-01-15T10:00:00Z"
             },
             "repository": {
                 "owner": { "login": "org" },
@@ -740,7 +800,8 @@ mod tests {
                     "sha": "0000000000000000000000000000000000000000",
                     "ref": "main"
                 },
-                "user": { "id": 1, "login": "author" }
+                "user": { "id": 1, "login": "author" },
+                "updated_at": "2024-01-15T10:00:00Z"
             },
             "repository": {
                 "owner": { "login": "org" },
@@ -772,7 +833,8 @@ mod tests {
                     "sha": "1234567890abcdef1234567890abcdef12345678",
                     "ref": "main"
                 },
-                "user": { "id": 1, "login": "user" }
+                "user": { "id": 1, "login": "user" },
+                "updated_at": "2024-01-15T10:00:00Z"
             },
             "repository": {
                 "owner": { "login": "org" },
@@ -801,7 +863,9 @@ mod tests {
                 "pull_requests": [
                     { "number": 10 },
                     { "number": 20 }
-                ]
+                ],
+                "id": 555,
+    "updated_at": "2024-01-15T10:00:00Z"
             },
             "repository": {
                 "owner": { "login": "org" },
@@ -832,7 +896,9 @@ mod tests {
             "action": "requested",
             "check_suite": {
                 "head_sha": "1111111111111111111111111111111111111111",
-                "pull_requests": []
+                "pull_requests": [],
+                "id": 555,
+    "updated_at": "2024-01-15T10:00:00Z"
             },
             "repository": {
                 "owner": { "login": "org" },
@@ -862,7 +928,9 @@ mod tests {
             "check_suite": {
                 "head_sha": "deadbeef1234567890abcdef1234567890abcdef",
                 "conclusion": "startup_failure",
-                "pull_requests": []
+                "pull_requests": [],
+                "id": 555,
+    "updated_at": "2024-01-15T10:00:00Z"
             },
             "repository": {
                 "owner": { "login": "org" },
@@ -887,11 +955,13 @@ mod tests {
     #[test]
     fn parse_status_success() {
         let payload = r#"{
+            "id": 1234,
             "sha": "abcdef1234567890abcdef1234567890abcdef12",
             "state": "success",
             "context": "ci/jenkins",
             "description": "Build passed",
             "target_url": "https://ci.example.com/build/123",
+            "updated_at": "2024-01-15T10:00:00Z",
             "repository": {
                 "owner": { "login": "org" },
                 "name": "repo"
@@ -922,9 +992,11 @@ mod tests {
     #[test]
     fn parse_status_pending_minimal() {
         let payload = r#"{
+            "id": 1234,
             "sha": "0000000000000000000000000000000000000000",
             "state": "pending",
             "context": "continuous-integration",
+            "updated_at": "2024-01-15T10:00:00Z",
             "repository": {
                 "owner": { "login": "org" },
                 "name": "repo"
@@ -949,6 +1021,7 @@ mod tests {
         let payload = r#"{
             "action": "submitted",
             "review": {
+                "id": 777,
                 "user": { "id": 555, "login": "reviewer" },
                 "state": "approved",
                 "body": "LGTM!"
@@ -983,6 +1056,7 @@ mod tests {
         let payload = r#"{
             "action": "dismissed",
             "review": {
+                "id": 777,
                 "user": { "id": 1, "login": "admin" },
                 "state": "dismissed"
             },
@@ -1013,6 +1087,7 @@ mod tests {
         let payload = r#"{
             "action": "submitted",
             "review": {
+                "id": 777,
                 "user": { "id": 1, "login": "reviewer" },
                 "state": "changes_requested",
                 "body": "Please fix the bug"
@@ -1069,8 +1144,11 @@ mod tests {
         // Missing repository
         let payload = r#"{
             "action": "created",
+            "comment": { "id": 1, "body": "test", "user": { "id": 1, "login": "u" },
+            "comment": { "id": 1, "body": "test", "user": { "id": 1, "login": "u" }     "updated_at": "2024-01-15T10:00:00Z"
             "comment": { "id": 1, "body": "test", "user": { "id": 1, "login": "u" } },
-            "issue": { "number": 1 }
+            "issue": { "number": 1, "user": { "id": 2, "login": "a" } },
+            "sender": { "id": 1, "login": "u" }
         }"#;
         let result = parse_webhook("issue_comment", payload.as_bytes());
         assert!(result.is_err());
@@ -1080,9 +1158,10 @@ mod tests {
     fn invalid_action_returns_error() {
         let payload = r#"{
             "action": "invalid_action",
-            "comment": { "id": 1, "body": "test", "user": { "id": 1, "login": "u" } },
-            "issue": { "number": 1 },
-            "repository": { "owner": { "login": "o" }, "name": "r" }
+            "comment": { "id": 1, "body": "test", "user": { "id": 1, "login": "u" }, "updated_at": "2024-01-15T10:00:00Z" },
+            "issue": { "number": 1, "user": { "id": 2, "login": "a" } },
+            "repository": { "owner": { "login": "o" }, "name": "r" },
+            "sender": { "id": 1, "login": "u" }
         }"#;
         let result = parse_webhook("issue_comment", payload.as_bytes());
         assert!(matches!(
@@ -1097,9 +1176,11 @@ mod tests {
     #[test]
     fn invalid_sha_returns_error() {
         let payload = r#"{
+            "id": 1234,
             "sha": "not-a-valid-sha",
             "state": "success",
             "context": "ci",
+            "updated_at": "2024-01-15T10:00:00Z",
             "repository": { "owner": { "login": "o" }, "name": "r" }
         }"#;
         let result = parse_webhook("status", payload.as_bytes());
@@ -1118,7 +1199,8 @@ mod tests {
                 "number": 1,
                 "head": { "sha": "1234567890abcdef1234567890abcdef12345678", "ref": "b" },
                 "base": { "sha": "abcdef1234567890abcdef1234567890abcdef12", "ref": "main" },
-                "user": { "id": 1, "login": "u" }
+                "user": { "id": 1, "login": "u" },
+                "updated_at": "2024-01-15T10:00:00Z"
             },
             "repository": { "owner": { "login": "o" }, "name": "r" }
         }"#;
@@ -1143,7 +1225,8 @@ mod tests {
                     "number": 1,
                     "head": {{ "sha": "1234567890abcdef1234567890abcdef12345678", "ref": "b" }},
                     "base": {{ "sha": "abcdef1234567890abcdef1234567890abcdef12", "ref": "main" }},
-                    "user": {{ "id": 1, "login": "u" }}
+                    "user": {{ "id": 1, "login": "u" }},
+                    "updated_at": "2024-01-15T10:00:00Z"
                 }},
                 "repository": {{ "owner": {{ "login": "o" }}, "name": "r" }}
             }}"#,
@@ -1170,6 +1253,7 @@ mod tests {
                 r#"{{
                 "action": "submitted",
                 "review": {{
+                    "id": 777,
                     "user": {{ "id": 1, "login": "u" }},
                     "state": "{}"
                 }},
