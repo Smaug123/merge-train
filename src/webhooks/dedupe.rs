@@ -11,7 +11,7 @@
 //! - `issue_comment.deleted`: `issue_comment:<pr>:<comment_id>:deleted`
 //! - `pull_request.<action>`: `pull_request:<pr>:<action>:<head_sha>:<merge>:<updated_at>`
 //! - `pull_request.edited`: `pull_request:<pr>:edited:<base-from>:<base>:<updated_at>`
-//! - `check_suite.<action>`: `check_suite:<suite_id>:<action>:<updated_at>`
+//! - `check_suite.<action>`: `check_suite:<suite_id>:<action>:<conclusion>:<updated_at>`
 //! - `status`: `status:<sha>:<context>:<state>:<status_id>:<updated_at>`
 //!
 //! Keys for events that can legitimately repeat (`status`, `pull_request`,
@@ -140,13 +140,23 @@ impl DedupeKey {
 
     /// Creates a dedupe key for a `check_suite` event.
     ///
-    /// Check suite reruns reuse the same suite ID, so `updated_at` distinguishes
-    /// subsequent completions.
-    pub fn check_suite(suite_id: u64, action: &str, updated_at: &DateTime<Utc>) -> Self {
+    /// Check suite reruns reuse the same suite ID, so `updated_at`
+    /// distinguishes subsequent completions — and because GitHub timestamps
+    /// are second-resolution, so does the conclusion: a same-second
+    /// failure → success re-run must not drop the success as a duplicate
+    /// (found by the `same_second_distinct_events_get_distinct_keys` sweep,
+    /// the class oracle for Codex M5 rounds 11–18).
+    pub fn check_suite(
+        suite_id: u64,
+        action: &str,
+        conclusion: &str,
+        updated_at: &DateTime<Utc>,
+    ) -> Self {
         DedupeKey(format!(
-            "check_suite:{}:{}:{}",
+            "check_suite:{}:{}:{}:{}",
             suite_id,
             action,
+            conclusion,
             updated_at.to_rfc3339()
         ))
     }
@@ -228,6 +238,7 @@ impl DedupeKey {
             GitHubEvent::CheckSuite(e) => Some(DedupeKey::check_suite(
                 e.suite_id,
                 e.action.as_str(),
+                e.conclusion.as_ref().map_or("none", |c| c.as_str()),
                 &e.updated_at,
             )),
             GitHubEvent::Status(e) => Some(DedupeKey::status(
@@ -263,8 +274,9 @@ mod tests {
     use crate::types::RepoId;
     use crate::webhooks::events::MergeStatus;
     use crate::webhooks::events::{
-        CheckSuiteAction, CheckSuiteEvent, IssueCommentEvent, PullRequestEvent,
-        PullRequestReviewEvent, ReviewAction, ReviewState, StatusEvent, StatusState,
+        CheckSuiteAction, CheckSuiteConclusion, CheckSuiteEvent, IssueCommentEvent,
+        PullRequestEvent, PullRequestReviewEvent, ReviewAction, ReviewState, StatusEvent,
+        StatusState,
     };
     use proptest::prelude::*;
 
@@ -539,6 +551,130 @@ mod tests {
             );
         }
 
+        /// THE CLASS-LEVEL SWEEP (Codex M5 rounds 11/12/13/16/17/18 were all
+        /// instances of one bug class): GitHub timestamps are second-
+        /// resolution, so *distinct* logical events can share `updated_at`.
+        /// For every event type, every field that (a) can differ across
+        /// distinct same-second events under GitHub's data model and (b) the
+        /// pipeline or handlers act on, MUST change the dedupe key.
+        ///
+        /// Fields exempt per type, with the GitHub invariant that justifies
+        /// each:
+        /// - `issue_comment.created`/`deleted`: everything but the id — a
+        ///   comment is created and deleted at most once, so two deliveries
+        ///   sharing (comment_id, action) ARE the same logical event.
+        /// - `pull_request.opened`: unique per PR number (a re-open is the
+        ///   `reopened` action).
+        /// - `check_suite`: `head_sha` — a suite is bound to one head;
+        ///   `pull_requests` — derived listing, and the handler also wakes
+        ///   via `prs_with_head`.
+        /// - `pull_request_review.submitted`/`dismissed`: at most once per
+        ///   `review_id`; `edited` reviews are handler no-ops.
+        /// - `status`: `description`/`target_url` — the handler ignores
+        ///   them; distinct same-second statuses differ in `status_id`.
+        #[test]
+        fn same_second_distinct_events_get_distinct_keys(
+            pr in arb_pr_number(),
+            comment_id in arb_comment_id(),
+            head in arb_sha(),
+            merge_sha in arb_sha(),
+            suite_id in 1u64..u64::MAX,
+            status_id in 1u64..u64::MAX,
+            updated_at in arb_datetime(),
+        ) {
+            let key = |e: GitHubEvent| DedupeKey::for_event(&e);
+
+            // issue_comment.edited: body and sender are behavior-relevant
+            // (commands / retraction authorization).
+            let base = comment_event(CommentAction::Edited, Some(pr), comment_id.0, updated_at);
+            let mut m = base.clone();
+            m.body = format!("{} (changed)", base.body);
+            prop_assert_ne!(
+                key(GitHubEvent::IssueComment(base.clone())),
+                key(GitHubEvent::IssueComment(m)),
+                "edited-comment body must be key-relevant"
+            );
+            let mut m = base.clone();
+            m.sender_id += 1;
+            prop_assert_ne!(
+                key(GitHubEvent::IssueComment(base.clone())),
+                key(GitHubEvent::IssueComment(m)),
+                "edited-comment sender must be key-relevant"
+            );
+
+            // pull_request (non-edited): head and merge status.
+            let base = pr_event(PrAction::Closed, pr, head.clone(), updated_at);
+            let mut m = base.clone();
+            m.merge_status = MergeStatus::Merged { merge_commit_sha: merge_sha };
+            prop_assert_ne!(
+                key(GitHubEvent::PullRequest(base.clone())),
+                key(GitHubEvent::PullRequest(m)),
+                "pull_request merge status must be key-relevant"
+            );
+
+            // pull_request.edited: the base transition.
+            let base = pr_event(PrAction::Edited, pr, head.clone(), updated_at);
+            let mut m = base.clone();
+            m.base_change_from = Some("elsewhere".to_owned());
+            prop_assert_ne!(
+                key(GitHubEvent::PullRequest(base.clone())),
+                key(GitHubEvent::PullRequest(m)),
+                "pull_request.edited base transition must be key-relevant"
+            );
+            let mut m = base.clone();
+            m.base_branch = format!("{}-2", base.base_branch);
+            prop_assert_ne!(
+                key(GitHubEvent::PullRequest(base.clone())),
+                key(GitHubEvent::PullRequest(m)),
+                "pull_request.edited base must be key-relevant"
+            );
+
+            // check_suite: the conclusion (re-runs reuse the suite id, and a
+            // same-second failure→success re-run must not dedupe away).
+            let base = CheckSuiteEvent {
+                repo: repo(),
+                action: CheckSuiteAction::Completed,
+                head_sha: head.clone(),
+                conclusion: Some(CheckSuiteConclusion::Failure),
+                pull_requests: vec![pr],
+                suite_id,
+                updated_at,
+            };
+            let mut m = base.clone();
+            m.conclusion = Some(CheckSuiteConclusion::Success);
+            prop_assert_ne!(
+                key(GitHubEvent::CheckSuite(base.clone())),
+                key(GitHubEvent::CheckSuite(m)),
+                "check_suite conclusion must be key-relevant"
+            );
+
+            // status: state and identity.
+            let base = StatusEvent {
+                status_id,
+                repo: repo(),
+                sha: head,
+                state: StatusState::Failure,
+                context: "ci".to_owned(),
+                description: None,
+                target_url: None,
+                updated_at,
+            };
+            let mut m = base.clone();
+            m.state = StatusState::Success;
+            prop_assert_ne!(
+                key(GitHubEvent::Status(base.clone())),
+                key(GitHubEvent::Status(m)),
+                "status state must be key-relevant"
+            );
+            let mut m = base.clone();
+            m.status_id += 1;
+            prop_assert_ne!(
+                key(GitHubEvent::Status(base.clone())),
+                key(GitHubEvent::Status(m)),
+                "status id must be key-relevant"
+            );
+        }
+
         /// A close → reopen → squash-merge of one head within one second:
         /// the merged close must not dedupe against the unmerged one, or
         /// the cache never records the merge (Codex M5 round 13).
@@ -632,7 +768,7 @@ mod tests {
             });
             prop_assert_eq!(
                 DedupeKey::for_event(&event),
-                Some(DedupeKey::check_suite(suite_id, "completed", &updated_at))
+                Some(DedupeKey::check_suite(suite_id, "completed", "none", &updated_at))
             );
         }
 

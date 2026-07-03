@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 47acdd7c8dd8ddb5f86d84108c6efeb45c78495c945ae7e77f56843de607c0a8 # shrinks to pr = PrNumber(1), comment_id = CommentId(1), head = Sha("a000000aa00aa0000a0a0a00a000aaa0aaa00a0a"), merge_sha = Sha("00aaa0aa000aaa0a00a0aaaaa0a000aaaaa0aa00"), suite_id = 1, status_id = 1, updated_at = 2000-01-01T00:00:00Z
