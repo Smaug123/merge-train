@@ -38,7 +38,7 @@ use crate::webhooks::dedupe::DedupeKey;
 /// at a different version is rejected loudly rather than mis-read.
 ///
 /// v2 added the `deliveries` and `dedupe_keys` tables (the webhook queue).
-const STORE_SCHEMA_VERSION: i64 = 3;
+const STORE_SCHEMA_VERSION: i64 = 4;
 
 /// Errors from the store.
 #[derive(Debug, Error)]
@@ -100,6 +100,26 @@ pub struct Delivery {
     pub body: Vec<u8>,
     /// When the delivery was received.
     pub received_at: DateTime<Utc>,
+}
+
+/// A user command persisted in `pending_commands`: authorized at intake,
+/// awaiting the saga slot, durable until answered (Codex M5 rounds 2/19 —
+/// a command that lived only in RAM between its delivery's close and its
+/// application was lost by a crash, and redelivery is deduped).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableCommand {
+    /// `@bot start` on `pr`.
+    Start {
+        /// The PR the start was issued on.
+        pr: PrNumber,
+    },
+    /// `@bot stop[ --force]` on `pr`.
+    Stop {
+        /// The PR the stop was issued on.
+        pr: PrNumber,
+        /// Whether `--force` was given.
+        force: bool,
+    },
 }
 
 impl Store {
@@ -376,19 +396,20 @@ impl Store {
     }
 
     /// Closes a delivery: appends its final state events, records the dedupe
-    /// key (if any), persists any authorized `stops` the delivery carries,
-    /// and marks it `done` — all in one transaction, so the result and the
-    /// close commit together (no window where state advanced but the delivery
-    /// is still open). See `SQLITE_MIGRATION_PLAN.md`.
+    /// key (if any), persists any authorized `commands` the delivery
+    /// carries, and marks it `done` — all in one transaction, so the result
+    /// and the close commit together (no window where state advanced but the
+    /// delivery is still open). See `SQLITE_MIGRATION_PLAN.md`.
     ///
-    /// Returns the `pending_stops` row ids for `stops`, in order — the caller
-    /// deletes each row (`delete_pending_stop`) once the stop is applied.
+    /// Returns the `pending_commands` row ids for `commands`, in order — the
+    /// caller deletes each row (`delete_pending_command`) once the command
+    /// is answered.
     pub fn commit_delivery(
         &mut self,
         delivery_id: &str,
         events: &[StateEventPayload],
         dedupe: Option<&DedupeKey>,
-        stops: &[(PrNumber, bool)],
+        commands: &[DurableCommand],
         ts: DateTime<Utc>,
     ) -> Result<Vec<i64>, StoreError> {
         let mut next_state = self.state.clone();
@@ -411,13 +432,17 @@ impl Store {
                 rusqlite::params![key.as_str(), ts.to_rfc3339()],
             )?;
         }
-        let mut stop_ids = Vec::with_capacity(stops.len());
-        for (pr, force) in stops {
+        let mut command_ids = Vec::with_capacity(commands.len());
+        for command in commands {
+            let (kind, pr, force) = match command {
+                DurableCommand::Start { pr } => ("start", *pr, false),
+                DurableCommand::Stop { pr, force } => ("stop", *pr, *force),
+            };
             tx.execute(
-                "INSERT INTO pending_stops (pr, force_stop) VALUES (?1, ?2)",
-                rusqlite::params![pr.0 as i64, *force],
+                "INSERT INTO pending_commands (kind, pr, force_stop) VALUES (?1, ?2, ?3)",
+                rusqlite::params![kind, pr.0 as i64, force],
             )?;
-            stop_ids.push(tx.last_insert_rowid());
+            command_ids.push(tx.last_insert_rowid());
         }
         tx.execute(
             "UPDATE deliveries SET status = 'done' WHERE delivery_id = ?1",
@@ -427,26 +452,38 @@ impl Store {
 
         self.state = next_state;
         self.next_seq = seq;
-        Ok(stop_ids)
+        Ok(command_ids)
     }
 
-    /// The persisted stop commands not yet applied, in arrival order.
-    pub fn pending_stops(&self) -> Result<Vec<(i64, PrNumber, bool)>, StoreError> {
+    /// The persisted user commands not yet answered, in arrival (`id`) order
+    /// — the user's command order, which reload must preserve (a reloaded
+    /// `start → stop` must not become `stop → start`).
+    pub fn pending_commands(&self) -> Result<Vec<(i64, DurableCommand)>, StoreError> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, pr, force_stop FROM pending_stops ORDER BY id")?;
+            .prepare("SELECT id, kind, pr, force_stop FROM pending_commands ORDER BY id")?;
         let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                PrNumber(r.get::<_, i64>(1)? as u64),
-                r.get::<_, bool>(2)?,
-            ))
+            let id: i64 = r.get(0)?;
+            let kind: String = r.get(1)?;
+            let pr = PrNumber(r.get::<_, i64>(2)? as u64);
+            let force: bool = r.get(3)?;
+            Ok((id, kind, pr, force))
         })?;
-        let mut stops = Vec::new();
+        let mut commands = Vec::new();
         for row in rows {
-            stops.push(row?);
+            let (id, kind, pr, force) = row?;
+            let command = match kind.as_str() {
+                "start" => DurableCommand::Start { pr },
+                "stop" => DurableCommand::Stop { pr, force },
+                other => {
+                    return Err(StoreError::Io(std::io::Error::other(format!(
+                        "unknown pending command kind {other:?} (row {id})"
+                    ))));
+                }
+            };
+            commands.push((id, command));
         }
-        Ok(stops)
+        Ok(commands)
     }
 
     /// Atomically replaces a pending stop with stops for `prs` — the fan-out
@@ -462,13 +499,13 @@ impl Store {
     ) -> Result<Vec<i64>, StoreError> {
         let tx = self.conn.transaction()?;
         tx.execute(
-            "DELETE FROM pending_stops WHERE id = ?1",
+            "DELETE FROM pending_commands WHERE id = ?1",
             rusqlite::params![old_id],
         )?;
         let mut ids = Vec::with_capacity(prs.len());
         for (pr, force) in prs {
             tx.execute(
-                "INSERT INTO pending_stops (pr, force_stop) VALUES (?1, ?2)",
+                "INSERT INTO pending_commands (kind, pr, force_stop) VALUES ('stop', ?1, ?2)",
                 rusqlite::params![pr.0 as i64, *force],
             )?;
             ids.push(tx.last_insert_rowid());
@@ -477,13 +514,13 @@ impl Store {
         Ok(ids)
     }
 
-    /// Removes an applied stop. Deleting after (not atomically with) the
-    /// stop's event append means a crash in between replays the stop, which
-    /// is harmless: stopping an already-stopped train answers "no active
-    /// train" as a best-effort comment.
-    pub fn delete_pending_stop(&mut self, id: i64) -> Result<(), StoreError> {
+    /// Removes an answered command. Deleting after (not atomically with) the
+    /// command's durable answer means a crash in between replays it, which
+    /// is harmless: stopping a stopped train answers "no active train", and
+    /// starting an already-started one is rejected as already running.
+    pub fn delete_pending_command(&mut self, id: i64) -> Result<(), StoreError> {
         self.conn.execute(
-            "DELETE FROM pending_stops WHERE id = ?1",
+            "DELETE FROM pending_commands WHERE id = ?1",
             rusqlite::params![id],
         )?;
         Ok(())
@@ -620,12 +657,14 @@ fn init_schema(conn: &Connection) -> Result<(), StoreError> {
             key     TEXT PRIMARY KEY,
             seen_at TEXT NOT NULL
         );
-        -- Authorized stop commands awaiting their observation boundary.
+        -- Authorized user commands (start/stop) awaiting the saga slot.
         -- Inserted in the same transaction as the delivery's close, so an
-        -- acknowledged stop survives a crash while it waits out an
-        -- in-flight saga (Codex M5 round 2). Deleted when applied.
-        CREATE TABLE pending_stops (
+        -- acknowledged command survives a crash while it waits out an
+        -- in-flight saga (Codex M5 rounds 2 and 19). `id` order is the
+        -- user's command order. Deleted when the command is answered.
+        CREATE TABLE pending_commands (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind       TEXT NOT NULL,
             pr         INTEGER NOT NULL,
             force_stop INTEGER NOT NULL
         );",

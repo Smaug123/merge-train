@@ -1219,6 +1219,73 @@ fn acknowledged_stop_survives_a_crash_before_its_boundary() {
     );
 }
 
+/// An acknowledged START must survive a crash, exactly like a stop (Codex
+/// M5 round 19, P1 — the mirror of round 2): the delivery closes (and
+/// dedupes) while the start waits in RAM for the saga slot, so a crash in
+/// that window lost the command and redelivery was skipped as a duplicate.
+/// The window is wide — a start queued behind another train's multi-minute
+/// saga sits in RAM the whole time.
+#[test]
+fn acknowledged_start_survives_a_crash_while_queued() {
+    let (mut world, heads) = World::linear_stack(2);
+    world
+        .github
+        .lock()
+        .unwrap()
+        .prs
+        .get_mut(&PrNumber(2))
+        .unwrap()
+        .base_ref = "main".to_owned();
+    let mut processor = world.processor();
+    // Two independent roots.
+    for i in 1..=2u64 {
+        let body = pr_opened_body(
+            &world.config,
+            i,
+            &heads[(i - 1) as usize],
+            &format!("pr-{i}"),
+            "main",
+        );
+        world.enqueue(&mut processor, "pull_request", body);
+    }
+    start_command(&mut world, &mut processor, 1);
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+
+    // Train 1's preflight occupies the saga slot; start 2 is acked and
+    // closed while it runs, waiting in the queue.
+    let batch = processor.pump().unwrap().expect("start 1 plans preflight");
+    let _outcomes = execute(&processor, &batch);
+    let body = comment_body(&world.config, 2, "@merge-train start", AUTHOR, "author", 3);
+    world.enqueue(&mut processor, "issue_comment", body);
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+
+    // Crash: in-flight outcomes and the RAM queue die.
+    drop(processor);
+
+    // On restart the acked start must still run, with no re-issued start.
+    // (Train 1 died mid-preflight; stop it so the completion driver is not
+    // held up by its inherited-refusal — that path is pinned elsewhere.)
+    let mut processor = world.processor();
+    let body = comment_body(&world.config, 1, "@merge-train stop", AUTHOR, "author", 4);
+    world.enqueue(&mut processor, "issue_comment", body);
+    drive_to_completion(&mut world, &mut processor);
+    let events = processor.store_mut().events().unwrap();
+    assert!(
+        events.iter().any(|e| matches!(
+            e.payload,
+            crate::persistence::event::StateEventPayload::TrainStarted {
+                root_pr: PrNumber(2),
+                ..
+            }
+        )),
+        "the acknowledged start was lost across the crash"
+    );
+}
+
 /// The evaluate half of trigger-work recovery: an active train whose pending
 /// evaluation died with the process (e.g. an acknowledged CI success whose
 /// trigger was queued but not yet run) must be re-evaluated at startup, not
@@ -1710,7 +1777,7 @@ fn expanded_fanout_stops_survive_a_crash() {
         processor.state().active_trains
     );
     assert!(
-        processor.store_mut().pending_stops().unwrap().is_empty(),
+        processor.store_mut().pending_commands().unwrap().is_empty(),
         "applied stops must consume their rows"
     );
 }

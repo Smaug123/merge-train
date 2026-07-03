@@ -111,13 +111,21 @@ pub enum PipelineOutcome {
 /// Engine work waiting for the (single) saga slot.
 #[derive(Debug, PartialEq, Eq)]
 enum PendingWork {
-    /// A handler-emitted trigger (`LateAddition` is answered inline and never
-    /// queued; `StopTrain` becomes the durable [`PendingWork::Stop`]).
+    /// A handler-emitted trigger (`LateAddition` is answered inline and
+    /// never queued; `StartTrain`/`StopTrain` become the durable
+    /// [`PendingWork::Start`]/[`PendingWork::Stop`]).
     Trigger(Trigger),
-    /// An authorized stop command, persisted in the `pending_stops` table by
-    /// the delivery's close (an acknowledged stop must survive a crash while
-    /// it waits out an in-flight saga — Codex M5 round 2, P1). `id` is the
-    /// durable row, deleted when the stop applies.
+    /// An authorized start command, persisted in the `pending_commands`
+    /// table by the delivery's close (an acknowledged start must survive a
+    /// crash while it waits out an in-flight saga — Codex M5 round 19, P1;
+    /// the mirror of round 2's stops). `id` is the durable row, deleted when
+    /// the start is answered: `TrainStarted` appended, rejected, cancelled
+    /// by a stop, or its preflight failed with a told-the-user comment.
+    Start { id: i64, pr: PrNumber },
+    /// An authorized stop command, persisted in the `pending_commands` table
+    /// by the delivery's close (an acknowledged stop must survive a crash
+    /// while it waits out an in-flight saga — Codex M5 round 2, P1). `id` is
+    /// the durable row, deleted when the stop applies.
     Stop { id: i64, pr: PrNumber, force: bool },
     /// Best-effort cleanup for a train the handlers aborted directly
     /// (worktree + final comment/status), run once the saga slot frees.
@@ -160,6 +168,14 @@ pub(crate) struct Processor {
     /// Active-train evaluations owed at startup, queued when the durable
     /// backlog first drains (`Some` until then; see [`Processor::claim`]).
     startup_evaluates: Option<Vec<PrNumber>>,
+    /// The durable row of the start whose preflight saga is in flight; the
+    /// row is deleted when the start is answered (see [`PendingWork::Start`]).
+    active_start: Option<(i64, PrNumber)>,
+    /// Reloaded not-yet-answered commands, queued (in command order, ahead
+    /// of the startup evaluations) when the backlog first drains — the same
+    /// deferral evaluates get, and for the same reason: they must act on
+    /// state that includes every already-acked delivery (Codex M5 round 6).
+    startup_commands: Option<Vec<PendingWork>>,
 }
 
 impl Processor {
@@ -190,10 +206,16 @@ impl Processor {
         // against state that predates already-acked deliveries (Codex M5
         // round 6, P1: e.g. a queued topology-change abort overtaken by a
         // squash).
-        let mut pending = VecDeque::new();
-        for (id, pr, force) in store.pending_stops()? {
-            pending.push_back(PendingWork::Stop { id, pr, force });
-        }
+        let startup_commands: Vec<PendingWork> = store
+            .pending_commands()?
+            .into_iter()
+            .map(|(id, command)| match command {
+                crate::store::DurableCommand::Start { pr } => PendingWork::Start { id, pr },
+                crate::store::DurableCommand::Stop { pr, force } => {
+                    PendingWork::Stop { id, pr, force }
+                }
+            })
+            .collect();
         let startup_evaluates = store
             .state()
             .active_trains
@@ -205,10 +227,12 @@ impl Processor {
         Ok(Processor {
             store,
             deps,
-            pending,
+            pending: VecDeque::new(),
             in_flight: None,
             inherited_mid_flight,
             startup_evaluates: Some(startup_evaluates),
+            active_start: None,
+            startup_commands: Some(startup_commands),
         })
     }
 
@@ -274,11 +298,18 @@ impl Processor {
     /// backlog (Codex M5 round 6, P1).
     pub fn claim(&mut self) -> Result<Option<Delivery>, StoreError> {
         let claimed = self.store.claim_next_delivery()?;
-        if claimed.is_none()
-            && let Some(roots) = self.startup_evaluates.take()
-        {
-            for root in roots {
-                self.queue(PendingWork::Trigger(Trigger::EvaluateTrain { root }));
+        if claimed.is_none() {
+            // Reloaded commands first (in the user's order — a reloaded
+            // `start → stop` must stay that way), then the evaluations.
+            if let Some(commands) = self.startup_commands.take() {
+                for work in commands {
+                    self.queue(work);
+                }
+            }
+            if let Some(roots) = self.startup_evaluates.take() {
+                for root in roots {
+                    self.queue(PendingWork::Trigger(Trigger::EvaluateTrain { root }));
+                }
             }
         }
         Ok(claimed)
@@ -447,25 +478,35 @@ impl Processor {
             }
         }
 
-        // Authorized stops persist in the close transaction: the stop may
-        // wait out a multi-minute saga before its observation boundary, and
-        // an acknowledged stop must survive a crash in that window (Codex M5
-        // round 2, P1).
-        let stops: Vec<(PrNumber, bool)> = output
+        // Authorized commands persist in the close transaction: a command
+        // may wait out a multi-minute saga before the slot frees, and an
+        // acknowledged command must survive a crash in that window — the
+        // delivery is `done` and deduped, so nothing external replays it
+        // (Codex M5 rounds 2 and 19, both P1).
+        let commands: Vec<crate::store::DurableCommand> = output
             .triggers
             .iter()
             .filter_map(|t| match t {
-                Trigger::StopTrain { pr, force } => Some((*pr, *force)),
+                Trigger::StartTrain { pr } => Some(crate::store::DurableCommand::Start { pr: *pr }),
+                Trigger::StopTrain { pr, force } => Some(crate::store::DurableCommand::Stop {
+                    pr: *pr,
+                    force: *force,
+                }),
                 _ => None,
             })
             .collect();
 
-        let stop_ids =
+        let command_ids =
             self.store
-                .commit_delivery(&id, &events, key.as_ref(), &stops, Utc::now())?;
+                .commit_delivery(&id, &events, key.as_ref(), &commands, Utc::now())?;
         self.clear_inherited_markers(&events);
-        for (&(pr, force), id) in stops.iter().zip(stop_ids) {
-            self.queue(PendingWork::Stop { id, pr, force });
+        for (&command, id) in commands.iter().zip(command_ids) {
+            self.queue(match command {
+                crate::store::DurableCommand::Start { pr } => PendingWork::Start { id, pr },
+                crate::store::DurableCommand::Stop { pr, force } => {
+                    PendingWork::Stop { id, pr, force }
+                }
+            });
         }
 
         // Handler-terminated trains need worker-side cleanup (the engine's
@@ -502,7 +543,7 @@ impl Processor {
                     });
                 }
                 // Persisted (and queued) above.
-                Trigger::StopTrain { .. } => {}
+                Trigger::StartTrain { .. } | Trigger::StopTrain { .. } => {}
                 other => self.queue(PendingWork::Trigger(other)),
             }
         }
@@ -757,8 +798,38 @@ impl Processor {
             let now = Utc::now();
             let state = self.store.state();
             let (root, plan) = match work {
-                PendingWork::Trigger(Trigger::StartTrain { pr }) => {
-                    (pr, cascade::start_train(state, pr, now))
+                PendingWork::Trigger(Trigger::StartTrain { .. }) => {
+                    unreachable!("starts are persisted and queued as PendingWork::Start")
+                }
+                // A start applying from the queue: its durable row lives
+                // until the start is *answered* (TrainStarted, a rejection,
+                // a preflight failure that told the user, or cancellation by
+                // a stop), so a crash anywhere in between reloads and
+                // re-plans it — start_train is a pure decision and preflight
+                // is read-only, so replay is safe.
+                PendingWork::Start { id, pr } => {
+                    match cascade::start_train(state, pr, now) {
+                        Ok(plan) => {
+                            let decided = !matches!(plan.control, Control::Continue);
+                            let batch = self.integrate_plan(pr, plan)?;
+                            if decided {
+                                // Rejected (or otherwise settled) with no
+                                // preflight in flight: answered.
+                                self.store.delete_pending_command(id)?;
+                            } else {
+                                self.active_start = Some((id, pr));
+                            }
+                            match batch {
+                                Some(batch) => return Ok(Some(batch)),
+                                None => continue,
+                            }
+                        }
+                        Err(e) => {
+                            error!(%pr, error = %e, "engine refused to plan the start");
+                            self.store.delete_pending_command(id)?;
+                            continue;
+                        }
+                    }
                 }
                 PendingWork::Trigger(Trigger::StopTrain { .. }) => {
                     unreachable!("stops are persisted and queued as PendingWork::Stop")
@@ -776,7 +847,7 @@ impl Processor {
                             None
                         }
                     };
-                    self.store.delete_pending_stop(id)?;
+                    self.store.delete_pending_command(id)?;
                     match integrated {
                         Some(batch) => return Ok(Some(batch)),
                         None => continue,
@@ -872,7 +943,7 @@ impl Processor {
         // Observation boundary: queued stops and deferred handler aborts act
         // here, so a human's stop (or a handler's abort) preempts whatever
         // this saga would do next.
-        let stops = self.take_queued_stops();
+        let stops = self.take_queued_stops()?;
         let aborts = self.take_deferred_aborts();
 
         // The start-cancel window: a stop naming this saga's root while no
@@ -889,9 +960,16 @@ impl Processor {
             let (mut cleanup, _) = self.apply_stops(others)?;
             let (mut abort_cleanup, _) = self.apply_deferred_aborts(aborts)?;
             cleanup.append(&mut abort_cleanup);
-            // Cancelling the start IS these stops' application.
+            // Cancelling the start IS these stops' application — and the
+            // start's own answer, so its row goes too.
             for stop in cancels {
-                self.store.delete_pending_stop(stop.id)?;
+                self.store.delete_pending_command(stop.id)?;
+            }
+            if let Some((id, pr)) = self.active_start
+                && pr == root
+            {
+                self.store.delete_pending_command(id)?;
+                self.active_start = None;
             }
             cleanup.push(Effect::GitHub(GitHubEffect::PostComment {
                 pr: root,
@@ -910,6 +988,13 @@ impl Processor {
             && let Some(failed) = outcomes.iter().find(|o| o.result.is_err())
         {
             warn!(%root, failure = ?failed.result, "start preflight failed; answering the user");
+            // The re-issue answer IS the start's resolution.
+            if let Some((id, pr)) = self.active_start
+                && pr == root
+            {
+                self.store.delete_pending_command(id)?;
+                self.active_start = None;
+            }
             let (mut cleanup, _) = self.apply_stops(stops)?;
             let (mut abort_cleanup, _) = self.apply_deferred_aborts(aborts)?;
             cleanup.append(&mut abort_cleanup);
@@ -1037,15 +1122,20 @@ impl Processor {
     /// suppress it, or the train starts anyway once the slot frees (Codex M5
     /// round 6). Starts queued *after* a stop are the user starting anew and
     /// survive (Codex M5 round 8).
-    fn take_queued_stops(&mut self) -> Vec<QueuedStop> {
+    fn take_queued_stops(&mut self) -> Result<Vec<QueuedStop>, StoreError> {
         let mut stops: Vec<QueuedStop> = Vec::new();
         let mut kept: VecDeque<PendingWork> = VecDeque::new();
+        let mut consumed_start_rows: Vec<i64> = Vec::new();
         for work in std::mem::take(&mut self.pending) {
             match work {
                 PendingWork::Stop { id, pr, force } => {
                     let before = kept.len();
-                    kept.retain(|w| {
-                        !matches!(w, PendingWork::Trigger(Trigger::StartTrain { pr: p }) if *p == pr)
+                    kept.retain(|w| match w {
+                        PendingWork::Start { id, pr: p } if *p == pr => {
+                            consumed_start_rows.push(*id);
+                            false
+                        }
+                        _ => true,
                     });
                     stops.push(QueuedStop {
                         id,
@@ -1058,7 +1148,11 @@ impl Processor {
             }
         }
         self.pending = kept;
-        stops
+        // A consumed start is answered (cancelled): its row goes with it.
+        for id in consumed_start_rows {
+            self.store.delete_pending_command(id)?;
+        }
+        Ok(stops)
     }
 
     /// Extracts every queued deferred handler abort.
@@ -1130,7 +1224,7 @@ impl Processor {
                     pr,
                     body: "\u{1f6d1} Merge train start cancelled.".to_owned(),
                 }));
-                self.store.delete_pending_stop(id)?;
+                self.store.delete_pending_command(id)?;
                 continue;
             }
             let now = Utc::now();
@@ -1153,7 +1247,7 @@ impl Processor {
                 }
                 Err(e) => error!(%pr, error = %e, "stop_train refused"),
             }
-            self.store.delete_pending_stop(id)?;
+            self.store.delete_pending_command(id)?;
         }
         Ok((cleanup, stopped_roots))
     }
@@ -1173,6 +1267,22 @@ impl Processor {
         } = plan;
         self.store.append_batch(&events, Utc::now())?;
         self.clear_inherited_markers(&events);
+
+        // TrainStarted answers the in-flight start: its durable row is
+        // consumed. (Delete-after-append: a crash in between reloads the
+        // start, which re-plans against the now-active train and is
+        // rejected as already running — harmless.)
+        if let Some((id, pr)) = self.active_start
+            && events.iter().any(|e| {
+                matches!(
+                    e,
+                    StateEventPayload::TrainStarted { root_pr, .. } if *root_pr == pr
+                )
+            })
+        {
+            self.store.delete_pending_command(id)?;
+            self.active_start = None;
+        }
 
         let feedback = matches!(control, Control::Continue);
         if let Control::FanOut { new_roots } = control {
