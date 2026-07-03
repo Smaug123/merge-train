@@ -180,6 +180,7 @@ mod tests {
 
     fn make_status_event() -> GitHubEvent {
         GitHubEvent::Status(StatusEvent {
+            status_id: 7,
             repo: RepoId::new("owner", "repo"),
             sha: Sha::parse("d".repeat(40)).unwrap(),
             state: StatusState::Success,

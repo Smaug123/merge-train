@@ -1349,6 +1349,33 @@ fn ensure_clone_uses_an_env_credential_helper_and_a_credential_free_origin() {
         !origin.contains('@'),
         "origin URL must carry no credentials, got: {origin}"
     );
+
+    // A PRE-EXISTING clone from before the auth change (credential-bearing
+    // origin, no helper) is normalized on the next ensure_clone — otherwise
+    // the auth change silently misses exactly the repos that predate it
+    // (Codex M5 round 17).
+    run_git_stdout(&clone_dir, &["config", "--unset", "credential.helper"]).unwrap();
+    run_git_stdout(
+        &clone_dir,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://x-access-token:ghp_old@github.com/o/r.git",
+        ],
+    )
+    .unwrap();
+    super::executor::ensure_clone(&config, Some(remote.to_str().unwrap())).unwrap();
+    let helper = run_git_stdout(&clone_dir, &["config", "credential.helper"]).unwrap();
+    assert!(
+        helper.contains("${GITHUB_TOKEN}"),
+        "an existing clone must get the helper installed, got: {helper}"
+    );
+    let origin = run_git_stdout(&clone_dir, &["remote", "get-url", "origin"]).unwrap();
+    assert!(
+        !origin.contains('@'),
+        "an existing clone's credentialed origin must be replaced, got: {origin}"
+    );
 }
 
 /// A stop for a train whose `start` is still *queued* (waiting for the saga

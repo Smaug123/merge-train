@@ -17,13 +17,26 @@ use crate::git::interpreter::{WorktreeGitInterpreter, classify_git_error};
 use crate::git::{GitConfig, GitError, run_git_sync};
 use crate::github::{OctocrabClient, classify_github_error};
 
-/// Ensures the repo's shared clone exists, cloning on first use (M5
-/// integration decision: repos are cloned lazily when the first git effect
-/// needs them, not at startup). Idempotent; races are impossible because only
-/// one saga executes per repo at a time.
+/// Ensures the repo's shared clone exists and is correctly configured,
+/// cloning on first use (M5 integration decision: repos are cloned lazily
+/// when the first git effect needs them, not at startup). Idempotent; races
+/// are impossible because only one saga executes per repo at a time.
+///
+/// A *pre-existing* clone (operator-created, or from an older build whose
+/// origin URL carried credentials) is normalized too: the credential helper
+/// is (re-)installed and, when a `clone_url` is configured, the origin URL
+/// is pinned to it — otherwise the auth change silently doesn't apply to
+/// exactly the repos that existed before it (Codex M5 round 17).
 pub fn ensure_clone(config: &GitConfig, clone_url: Option<&str>) -> Result<(), GitError> {
     let clone_dir = config.clone_dir();
     if clone_dir.exists() {
+        run_git_sync(
+            &clone_dir,
+            &["config", "credential.helper", CREDENTIAL_HELPER],
+        )?;
+        if let Some(url) = clone_url {
+            run_git_sync(&clone_dir, &["remote", "set-url", "origin", url])?;
+        }
         return Ok(());
     }
     let Some(url) = clone_url else {

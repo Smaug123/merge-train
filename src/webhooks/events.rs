@@ -425,6 +425,12 @@ pub struct StatusEvent {
     /// keys need it because the same (sha, context, state) triple can
     /// legitimately repeat (success → failure → success).
     pub updated_at: DateTime<Utc>,
+
+    /// The status's unique id (top-level `id`). The dedupe key needs it:
+    /// `updated_at` is second-resolution, so a success → failure → success
+    /// bounce within one second would collapse the final success onto the
+    /// first and a parked train would never wake (Codex M5 round 17).
+    pub status_id: u64,
 }
 
 /// Action for pull request review events.
@@ -711,6 +717,7 @@ mod tests {
         )
             .prop_map(
                 |(repo, sha, state, context, description, target_url, updated_at)| StatusEvent {
+                    status_id: 7,
                     repo,
                     sha,
                     state,

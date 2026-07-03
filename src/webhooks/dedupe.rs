@@ -12,7 +12,7 @@
 //! - `pull_request.<action>`: `pull_request:<pr>:<action>:<head_sha>:<merge>:<updated_at>`
 //! - `pull_request.edited`: `pull_request:<pr>:edited:<base>:<updated_at>`
 //! - `check_suite.<action>`: `check_suite:<suite_id>:<action>:<updated_at>`
-//! - `status`: `status:<sha>:<context>:<state>:<updated_at>`
+//! - `status`: `status:<sha>:<context>:<state>:<status_id>:<updated_at>`
 //!
 //! Keys for events that can legitimately repeat (`status`, `pull_request`,
 //! `check_suite`) include the event timestamp: without it, e.g. CI going
@@ -149,18 +149,29 @@ impl DedupeKey {
     /// Creates a dedupe key for a `status` event.
     ///
     /// `updated_at` distinguishes legitimate repeats of the same
-    /// (sha, context, state) triple, e.g. CI success → failure → success.
+    /// (sha, context, state) triple, e.g. CI success → failure → success —
+    /// and because GitHub timestamps are second-resolution, the status's
+    /// unique payload `id` is part of the key too: a same-second bounce
+    /// would otherwise drop the final success and leave a parked train
+    /// without its wakeup (Codex M5 round 17).
     ///
     /// The context is escaped to prevent collisions when it contains the
     /// separator character (`:`): backslashes first, then colons, so the key
     /// parses unambiguously.
-    pub fn status(sha: &Sha, context: &str, state: &str, updated_at: &DateTime<Utc>) -> Self {
+    pub fn status(
+        sha: &Sha,
+        context: &str,
+        state: &str,
+        status_id: u64,
+        updated_at: &DateTime<Utc>,
+    ) -> Self {
         let escaped_context = context.replace('\\', "\\\\").replace(':', "\\:");
         DedupeKey(format!(
-            "status:{}:{}:{}:{}",
+            "status:{}:{}:{}:{}:{}",
             sha.as_str(),
             escaped_context,
             state,
+            status_id,
             updated_at.to_rfc3339()
         ))
     }
@@ -215,6 +226,7 @@ impl DedupeKey {
                 &e.sha,
                 &e.context,
                 e.state.as_str(),
+                e.status_id,
                 &e.updated_at,
             )),
             GitHubEvent::PullRequestReview(e) => Some(DedupeKey::pull_request_review(
@@ -430,8 +442,8 @@ mod tests {
             updated_at2 in arb_datetime(),
         ) {
             prop_assume!(updated_at1 != updated_at2);
-            let key1 = DedupeKey::status(&sha, &context, &state, &updated_at1);
-            let key2 = DedupeKey::status(&sha, &context, &state, &updated_at2);
+            let key1 = DedupeKey::status(&sha, &context, &state, 7, &updated_at1);
+            let key2 = DedupeKey::status(&sha, &context, &state, 7, &updated_at2);
             prop_assert_ne!(key1, key2);
         }
 
@@ -606,6 +618,7 @@ mod tests {
             updated_at in arb_datetime(),
         ) {
             let event = GitHubEvent::Status(StatusEvent {
+                status_id: 7,
                 repo: repo(),
                 sha: sha.clone(),
                 state: StatusState::Success,
@@ -616,7 +629,7 @@ mod tests {
             });
             prop_assert_eq!(
                 DedupeKey::for_event(&event),
-                Some(DedupeKey::status(&sha, &context, "success", &updated_at))
+                Some(DedupeKey::status(&sha, &context, "success", 7, &updated_at))
             );
         }
 
@@ -662,6 +675,7 @@ mod tests {
                     updated_at,
                 }),
                 GitHubEvent::Status(StatusEvent {
+                    status_id: 7,
                     repo: repo(),
                     sha: sha.clone(),
                     state: StatusState::Failure,
@@ -702,8 +716,8 @@ mod tests {
         ) {
             prop_assume!(ctx1 != ctx2);
 
-            let key1 = DedupeKey::status(&sha, &ctx1, &state, &updated_at);
-            let key2 = DedupeKey::status(&sha, &ctx2, &state, &updated_at);
+            let key1 = DedupeKey::status(&sha, &ctx1, &state, 7, &updated_at);
+            let key2 = DedupeKey::status(&sha, &ctx2, &state, 7, &updated_at);
 
             prop_assert_ne!(key1, key2, "Different contexts must produce different keys");
         }
@@ -719,8 +733,8 @@ mod tests {
         ) {
             prop_assume!(state1 != state2);
 
-            let key1 = DedupeKey::status(&sha, &context, &state1, &updated_at);
-            let key2 = DedupeKey::status(&sha, &context, &state2, &updated_at);
+            let key1 = DedupeKey::status(&sha, &context, &state1, 7, &updated_at);
+            let key2 = DedupeKey::status(&sha, &context, &state2, 7, &updated_at);
 
             prop_assert_ne!(key1, key2, "Different states must produce different keys");
         }
@@ -744,8 +758,8 @@ mod tests {
             // These contexts are always different (ctx1 has colon, ctx2 doesn't)
             prop_assume!(ctx1 != ctx2);
 
-            let key1 = DedupeKey::status(&sha, &ctx1, &state, &updated_at);
-            let key2 = DedupeKey::status(&sha, &ctx2, &state, &updated_at);
+            let key1 = DedupeKey::status(&sha, &ctx1, &state, 7, &updated_at);
+            let key2 = DedupeKey::status(&sha, &ctx2, &state, 7, &updated_at);
 
             prop_assert_ne!(key1, key2);
         }
@@ -762,8 +776,8 @@ mod tests {
             let ctx_with_backslash = r"a\:b";
             let ctx_with_colon = "a:b";
 
-            let key1 = DedupeKey::status(&sha, ctx_with_backslash, &state, &updated_at);
-            let key2 = DedupeKey::status(&sha, ctx_with_colon, &state, &updated_at);
+            let key1 = DedupeKey::status(&sha, ctx_with_backslash, &state, 7, &updated_at);
+            let key2 = DedupeKey::status(&sha, ctx_with_colon, &state, 7, &updated_at);
 
             prop_assert_ne!(key1, key2, "Backslash-colon and plain colon must differ");
         }
@@ -813,12 +827,12 @@ mod tests {
         let updated_at = t0();
 
         // Context with colon should be escaped
-        let key = DedupeKey::status(&sha, "ci:build", "success", &updated_at);
+        let key = DedupeKey::status(&sha, "ci:build", "success", 7, &updated_at);
         assert!(key.as_str().contains("ci\\:build"));
         assert_eq!(
             key.as_str(),
             format!(
-                "status:{}:ci\\:build:success:{}",
+                "status:{}:ci\\:build:success:7:{}",
                 "a".repeat(40),
                 updated_at.to_rfc3339()
             )
@@ -830,7 +844,7 @@ mod tests {
         let sha = Sha::parse("a".repeat(40)).unwrap();
 
         // Context with backslash should be escaped
-        let key = DedupeKey::status(&sha, "ci\\test", "success", &t0());
+        let key = DedupeKey::status(&sha, "ci\\test", "success", 7, &t0());
         assert!(key.as_str().contains("ci\\\\test"));
     }
 
@@ -840,14 +854,14 @@ mod tests {
         let updated_at = t0();
 
         // Basic test: different contexts produce different keys
-        let key1 = DedupeKey::status(&sha, "ci:build", "success", &updated_at);
-        let key2 = DedupeKey::status(&sha, "ci", "success", &updated_at);
+        let key1 = DedupeKey::status(&sha, "ci:build", "success", 7, &updated_at);
+        let key2 = DedupeKey::status(&sha, "ci", "success", 7, &updated_at);
         assert_ne!(key1, key2);
 
         // Multiple levels of colons still produce distinct keys
-        let key3 = DedupeKey::status(&sha, "a:b:c", "pending", &updated_at);
-        let key4 = DedupeKey::status(&sha, "a:b", "pending", &updated_at);
-        let key5 = DedupeKey::status(&sha, "a", "pending", &updated_at);
+        let key3 = DedupeKey::status(&sha, "a:b:c", "pending", 7, &updated_at);
+        let key4 = DedupeKey::status(&sha, "a:b", "pending", 7, &updated_at);
+        let key5 = DedupeKey::status(&sha, "a", "pending", 7, &updated_at);
         assert_ne!(key3, key4);
         assert_ne!(key3, key5);
         assert_ne!(key4, key5);
@@ -863,8 +877,8 @@ mod tests {
         // the same key as "a:b" (just colon). With proper escaping:
         // - "a:b"  → "a\:b" in key (colon escaped)
         // - "a\:b" → "a\\\:b" in key (backslash escaped to \\, then colon escaped to \:)
-        let key_colon = DedupeKey::status(&sha, "a:b", "success", &updated_at);
-        let key_backslash_colon = DedupeKey::status(&sha, r"a\:b", "success", &updated_at);
+        let key_colon = DedupeKey::status(&sha, "a:b", "success", 7, &updated_at);
+        let key_backslash_colon = DedupeKey::status(&sha, r"a\:b", "success", 7, &updated_at);
 
         assert_ne!(
             key_colon, key_backslash_colon,
@@ -892,11 +906,11 @@ mod tests {
         let updated_at = t0();
 
         // Simple context without colons or backslashes
-        let key = DedupeKey::status(&sha, "continuous-integration", "success", &updated_at);
+        let key = DedupeKey::status(&sha, "continuous-integration", "success", 7, &updated_at);
         assert_eq!(
             key.as_str(),
             format!(
-                "status:{}:continuous-integration:success:{}",
+                "status:{}:continuous-integration:success:7:{}",
                 "a".repeat(40),
                 updated_at.to_rfc3339()
             )

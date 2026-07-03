@@ -351,6 +351,7 @@ fn parse_check_suite(payload: &[u8]) -> Result<CheckSuiteEvent, ParseError> {
 
 #[derive(Debug, Deserialize)]
 struct RawStatusPayload {
+    id: u64,
     sha: String,
     state: String,
     context: String,
@@ -382,6 +383,7 @@ fn parse_status(payload: &[u8]) -> Result<StatusEvent, ParseError> {
     })?;
 
     Ok(StatusEvent {
+        status_id: raw.id,
         repo: RepoId::new(raw.repository.owner.login, raw.repository.name),
         sha,
         state,
@@ -935,6 +937,7 @@ mod tests {
     #[test]
     fn parse_status_success() {
         let payload = r#"{
+            "id": 1234,
             "sha": "abcdef1234567890abcdef1234567890abcdef12",
             "state": "success",
             "context": "ci/jenkins",
@@ -971,6 +974,7 @@ mod tests {
     #[test]
     fn parse_status_pending_minimal() {
         let payload = r#"{
+            "id": 1234,
             "sha": "0000000000000000000000000000000000000000",
             "state": "pending",
             "context": "continuous-integration",
@@ -1154,6 +1158,7 @@ mod tests {
     #[test]
     fn invalid_sha_returns_error() {
         let payload = r#"{
+            "id": 1234,
             "sha": "not-a-valid-sha",
             "state": "success",
             "context": "ci",

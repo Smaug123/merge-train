@@ -1145,6 +1145,7 @@ mod tests {
 
         let status = handle_event(
             &GitHubEvent::Status(crate::webhooks::events::StatusEvent {
+                status_id: 7,
                 repo: repo(),
                 sha: sha(),
                 state: crate::webhooks::events::StatusState::Success,
@@ -1334,6 +1335,7 @@ mod tests {
 
         let status = handle_event(
             &GitHubEvent::Status(StatusEvent {
+                status_id: 7,
                 repo: repo(),
                 sha: sha(),
                 state: StatusState::Success,
@@ -1546,6 +1548,7 @@ mod tests {
         let state = RepoState::from_snapshot(snap);
         let mk = |st| {
             GitHubEvent::Status(StatusEvent {
+                status_id: 7,
                 repo: repo(),
                 sha: sha(),
                 state: st,
