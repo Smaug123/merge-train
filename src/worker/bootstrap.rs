@@ -221,10 +221,17 @@ pub(crate) fn crawl_events(
     // a status comment the crawl must see to adopt+abort its train (Codex
     // crawl review round 7). The declaration edge itself may still be
     // dropped once fetched (a closed predecessor fails validation) — the
-    // fetch is for train discovery, not the edge.
+    // fetch is for train discovery, not the edge. EDITED declarations count
+    // too: their EDGE stays untrusted (never recorded), but their target
+    // may be the closed root whose train must be discovered, so it is still
+    // reported for fetching (Codex crawl review — edited fixpoint discovery).
     let crawled_numbers: HashSet<PrNumber> = all_prs.iter().map(|p| p.number).collect();
     let mut referenced_uncrawled: Vec<PrNumber> = Vec::new();
-    for (_, _, target) in &candidates {
+    for target in candidates
+        .iter()
+        .map(|(_, _, target)| target)
+        .chain(edited_edges.iter().map(|(_, target)| target))
+    {
         if !crawled_numbers.contains(target) && !referenced_uncrawled.contains(target) {
             referenced_uncrawled.push(*target);
         }
@@ -710,6 +717,39 @@ mod tests {
         assert!(
             !declared(&outcome.events).contains(&(PrNumber(3), PrNumber(2))),
             "the edited declaration is not persisted"
+        );
+    }
+
+    /// An edited declaration's target is reported for fixpoint fetching
+    /// even though its edge is never recorded: the target may be a
+    /// closed-unmerged train root reachable only through the edited
+    /// declaration, and it must be fetched so its train is discovered and
+    /// adopted/aborted rather than orphaned (Codex crawl review round 16,
+    /// P2 — edited fixpoint discovery).
+    #[test]
+    fn an_edited_declaration_target_is_reported_for_fetching() {
+        let crawled = vec![child(2, AUTHOR, 77, PrState::Open)];
+        let mut edited = comment(1, AUTHOR, "@merge-train predecessor #77");
+        edited.edited = true;
+        let comments = vec![(PrNumber(2), vec![edited])];
+        let outcome = crawl_events(
+            "main",
+            &crawled,
+            &comments,
+            "merge-train",
+            BOT,
+            None,
+            &HashSet::new(),
+            test_now(),
+        );
+        assert!(
+            outcome.referenced_uncrawled.contains(&PrNumber(77)),
+            "the edited declaration's uncrawled target must be fetched, got {:?}",
+            outcome.referenced_uncrawled
+        );
+        assert!(
+            declared(&outcome.events).is_empty(),
+            "the edited edge itself is still not recorded"
         );
     }
 

@@ -916,7 +916,13 @@ stage shippable).
 >    by re-declaring, and reachable only with two same-predecessor
 >    declarations + a redelivery + DB loss. Not fixable in the crawl
 >    without changing live ownership semantics.
->    **Crawl review CONVERGED at 16 rounds** (round 16 clean) — lost-DB
+>    Round 16 also (P2): edited declarations enrich the stack-extension
+>    scratch (rounds 14–15) but were NOT reported for fixpoint discovery,
+>    so a closed-unmerged train root reachable ONLY through an edited
+>    descendant declaration was never fetched and its train orphaned;
+>    edited targets now join `referenced_uncrawled` (the EDGE stays
+>    untrusted/unrecorded — only the target is fetched, for train
+>    discovery, like round 7). **Crawl review CONVERGED at 17 rounds** — lost-DB
 >    reconstruction is the most adversarial recovery surface; every
 >    finding was a real divergence from live-operation guarantees, each
 >    pinned by a mutation-checked test. Round 6
