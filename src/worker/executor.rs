@@ -131,15 +131,44 @@ pub struct SagaBatch {
     pub best_effort: Vec<Effect>,
     /// Whether the outcomes must be fed back into the engine.
     pub feedback: bool,
+    /// This is the root's first batch since its train was recovered from a
+    /// dead process: run the one-time worktree restart cleanup first (a
+    /// mid-git-op crash leaves in-progress merges and dirt that no later
+    /// operation may see — DESIGN §Worktree cleanup on restart).
+    pub restart_cleanup: bool,
 }
 
-/// Executes one batch: observed effects in order (stop at first failure),
-/// then best-effort effects (failures logged). Returns the observed outcomes.
+/// Executes one batch: the one-time worktree restart cleanup if the batch
+/// asks for it, then observed effects in order (stop at first failure),
+/// then best-effort effects (failures logged). Returns the observed
+/// outcomes.
 pub fn execute_batch(
     git: &WorktreeGitInterpreter,
     github: &GitHubExec,
     batch: &SagaBatch,
 ) -> Vec<EffectOutcome> {
+    if batch.restart_cleanup
+        && let Err(e) = crate::git::recovery::cleanup_worktree_on_restart(git.config(), batch.root)
+    {
+        // Cleanup self-heals hard cases (delete-and-recreate), so an error
+        // here is exotic (filesystem trouble). The worktree cannot be
+        // trusted: fail the first observed effect as transient so the
+        // engine parks and recovery re-runs, rather than doing git work in
+        // a dirty tree.
+        warn!(root = %batch.root, error = %e, "worktree restart cleanup failed");
+        return batch
+            .effects
+            .first()
+            .map(|first| {
+                vec![EffectOutcome {
+                    effect: first.clone(),
+                    result: Err(EffectError::Transient {
+                        detail: format!("worktree restart cleanup failed: {e}"),
+                    }),
+                }]
+            })
+            .unwrap_or_default();
+    }
     let mut outcomes = Vec::with_capacity(batch.effects.len());
     for effect in &batch.effects {
         let result = execute_one(git, github, effect);

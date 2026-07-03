@@ -35,6 +35,7 @@
 pub mod authz;
 pub mod executor;
 mod pipeline;
+pub mod recovery;
 #[cfg(test)]
 mod tests;
 
@@ -520,6 +521,13 @@ fn run(
             }
         }
 
+        // (3b) Supplementary recovery found GitHub unavailable this turn:
+        // arm the stall-retry timer, whose message re-queues the parked
+        // recovery — nothing else wakes a traffic-less repo.
+        if processor.take_retry_request() {
+            schedule_stall_retry(processor.stall_retry_delay(), tx.clone());
+        }
+
         // (4) Nothing to do: prune expired intake bookkeeping, then block
         // until the next message (or shutdown). Never block while queued
         // engine work could pump into a free saga slot — an empty `claim`
@@ -654,9 +662,13 @@ fn handle_msg(
             *parked = Some((root, outcomes, feedback));
             Ok(None)
         }
-        // Receiving any message clears the stall in `run`; the timer message
-        // exists purely to guarantee one arrives.
-        WorkerMsg::RetryStalled => Ok(None),
+        // Receiving any message clears the stall in `run`. The timer also
+        // retries any recovery that parked on GitHub unavailability: the
+        // re-queued evaluations pump on the next turn.
+        WorkerMsg::RetryStalled => {
+            processor.requeue_marked_recoveries();
+            Ok(None)
+        }
     }
 }
 
@@ -786,7 +798,9 @@ pub(crate) mod test_support {
         prs: HashMap<PrNumber, FakePr>,
     ) -> (SharedDeps, Arc<Mutex<FakeGitHub>>) {
         let config = test_git_config(dir);
-        let fake = Arc::new(Mutex::new(FakeGitHub::new(config, prs)));
+        let mut fake = FakeGitHub::new(config, prs);
+        fake.comment_author = TEST_BOT_ID;
+        let fake = Arc::new(Mutex::new(fake));
         let deps = SharedDeps {
             github: GitHubBackend::Fake(fake.clone()),
             repos_dir: dir.join("repos"),

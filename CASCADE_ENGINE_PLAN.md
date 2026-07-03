@@ -679,6 +679,21 @@ stage shippable).
 
 ## Stage M6 — Bootstrap and recovery
 
+> **RULED (2026-07-03, M6 implementation): no `pending_work` table.**
+> After rounds 19+20, user commands are already ONE durable queue
+> (`pending_commands`) applied in utterance (id) order with a single
+> "answered" deletion contract. M6's recovery makes every other queued
+> kind properly *derived*: deferred handler aborts re-derive from their
+> durable cause events via the startup evaluation of active trains, and
+> a lost `AbortCleanup` is covered by worktree max-age GC plus restart
+> cleanup (stale status comments on trains whose abort cleanup died with
+> the process are tolerated — status comments are non-authoritative and
+> best-effort by design). Persisting re-derivable work is the failure
+> mode the item itself warned against; the schema churn buys nothing
+> once recovery lands. The command-order invariant the interleaving
+> harness lacks is noted below and remains desirable.
+>
+> *(Original item, for the record:)*
 > **Design item queued from M5's review (2026-07-03, owner to rule on).**
 > **Unify engine-work durability.** M5 ended up with four durability
 > stories for queued engine work: user commands are durable rows
@@ -705,8 +720,93 @@ stage shippable).
 > refactor, if at all, before M6's recovery builds more on the current
 > shape.
 
+> **Amendments (2026-07-03, applied during implementation).** The substrate
+> below predates the SQLite migration: there is no `EventLog`, snapshot
+> generation, or `persistence::recover()` — the disk fast path IS
+> `Store::open` (WAL + synchronous=FULL; the materialized cache and the
+> log commit together), so "snapshot missing/stale/corrupted" is not a
+> recoverable state distinct from DB loss. `src/bootstrap/` was never
+> created. What landed instead:
+>
+> 1. **Recovery is per-train, at its first evaluation** — not a worker
+>    lifecycle phase. `Processor::new` marks every inherited *active*
+>    train (Idle included: no git op was mid-flight, but the status
+>    comment may be ahead of a restored-from-backup store, or deleted);
+>    the `EvaluateTrain` pump arm runs `recover_inherited` before
+>    planning. The M5 refusal is gone. `cascade::recover_train` needed no
+>    changes — recovery IS resumption (M2 amendment 5), and the startup
+>    evaluations M5 already queued are the trigger.
+> 2. **Supplementary GitHub recovery** (`worker/recovery.rs`,
+>    `decide_comment_recovery` — pure, property-tested): `ListComments`
+>    on the root PR → bot-authored (DESIGN's forged-state defence),
+>    parseable, same-`original_root_pr` AND same-`started_at` candidates
+>    (the incarnation guard: a dead train's high `recovery_seq` comment
+>    must not hijack its restarted successor) → four verdicts: Adopt
+>    (strictly higher seq; the new `TrainRecordAdopted` event replaces
+>    the record wholesale — under SQLite the remote can be ahead ONLY
+>    when local durable state regressed, i.e. restore-from-backup, and
+>    adoption is what prevents re-running an already-landed squash;
+>    the event is an INTENT-LEDGER BOUNDARY in `ReplayFacts::for_train` —
+>    the restored log's stale unmatched intents were settled in a world
+>    that log never saw, and acting on them runs the wrong idempotency
+>    path against the adopted record [Codex M6 review, P2]),
+>    RepairCommentId (comment moved or posted-but-unrecorded — the id is
+>    recorded, then the body refreshed), RefreshComment (the live comment
+>    is behind the store — the COMMON crash shape, events commit before
+>    the best-effort update runs — or mangled; rewritten BEFORE the train
+>    resumes, or the backup cannot cover a DB loss in the resume window
+>    [Codex M6 round 3]), RepostBackup (comment gone: the worker re-posts
+>    the backup DURING recovery — the engine's self-heal runs only at
+>    idle evaluations, which a mid-phase resume may never pass — and
+>    records the fresh id via `StatusCommentPosted`, NOT via adoption:
+>    the local ledger is genuine there and must survive), KeepLocal
+>    (only when the live comment embeds the local record exactly).
+>    KeepLocal freshness requires ONE clock read per decision:
+>    `integrate_plan` takes the planner's `now`, so the comment's
+>    embedded `started_at` equals the event stamp by construction
+>    (Codex M6 round 2 — two reads made recovery reject the bot's own
+>    initial comment). Adopting a `Completed` record removes it from
+>    `active_trains`, mirroring the normal completion path (round 2).
+>    Codex round 4: converged, no actionable findings.
+> 3. **Worktree restart cleanup on the executor thread**: recovery flags
+>    the root; its next `SagaBatch` carries `restart_cleanup` and
+>    `execute_batch` runs `cleanup_worktree_on_restart` before any
+>    effect. Cleanup failure fails the first observed effect as
+>    transient (park) — the flag is consumed, but cleanup failing means
+>    even delete-and-recreate failed, i.e. the filesystem is broken and
+>    subsequent git ops fail loudly too.
+> 4. **GitHub-unavailable recovery parks at the stall cadence**: the
+>    evaluation is dropped (re-queuing would hot-spin the idle check),
+>    the root stays marked, and the stall-retry timer's message re-owes
+>    the evaluations — through the SAME backlog-drain gate as the
+>    startup evaluations, because the timer may have been armed for a
+>    *released delivery* and the loop pumps before it claims: queued
+>    directly, recovery would act (and push) ahead of an acked stop
+>    still sitting in the backlog (Codex M6 review, P1; the round-6
+>    rule again). Permanent `ListComments`/re-post failures park
+>    identically (proceeding unverified risks the exact double-squash
+>    the check prevents; `stop` works throughout).
+> 5. **Deliberately NOT here**: the full GitHub crawl fallback
+>    (ListOpenPrs/ListRecentlyMergedPrs/comment scan rebuilding a LOST
+>    db, DESIGN's inference-based recovery + `needs_manual_review`) — a
+>    fresh DB today re-learns topology from webhook traffic and refuses
+>    nothing irreversibly; the crawl is additive and rides with the
+>    polling/PeriodicSync stage. Events-table pruning/compaction — the
+>    log is still unbounded; its contract (preserve `replay()`'s
+>    from-empty oracle + active trains' intent history) is its own
+>    stage. `miss_count`/re-bootstrap stays deferred as planned.
+> 6. **Oracles**: the crash-at-every-saga-depth sweep (each depth leaves
+>    a different phase mid-flight with the final batch's effects
+>    executed-but-unobserved; restart must complete with ≤1 squash/PR,
+>    store == GitHub, matched ledgers); comment-ahead adoption,
+>    comment-deleted re-post, outage-parks-then-recovers tests; and the
+>    interleaving crash property now asserts FULL consistency (the
+>    pre-M6 "reality may be ahead" carve-out is deleted) with `finish()`
+>    playing reality's merged-close webhooks — how a train stopped after
+>    an unobserved squash reconciles — and no stop crutch.
+
 **Dependencies:** M5 (+ M2 `recover_train`). **Implements:** DESIGN.md
-§Bootstrap algorithm, §Handling cache misses, §Recovery precedence,
+§Bootstrap algorithm (SQLite fast path only), §Recovery precedence,
 §Supplementary GitHub recovery, §Restart safety / Worktree cleanup on restart.
 
 **Files:** create `src/bootstrap/mod.rs`, `src/bootstrap/disk.rs`,

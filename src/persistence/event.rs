@@ -106,6 +106,24 @@ pub enum StateEventPayload {
         root_pr: PrNumber,
     },
 
+    /// A train record adopted wholesale from a recovery source — the status
+    /// comment on the root PR (DESIGN §Recovery precedence). Appended ONLY
+    /// when the comment's `recovery_seq` is strictly ahead of the local
+    /// record, i.e. local durable state regressed relative to what the bot
+    /// already published (the state DB was restored from a backup);
+    /// replaying the adopted record instead of the stale local one is what
+    /// prevents re-running an already-landed squash. This event is an
+    /// intent-ledger boundary (`ReplayFacts::for_train`): intents logged
+    /// below it belong to the superseded record and were settled in a world
+    /// this log never saw.
+    #[serde(rename = "train_record_adopted")]
+    TrainRecordAdopted {
+        /// The original root PR of the train.
+        root_pr: PrNumber,
+        /// The record to adopt, verbatim.
+        record: crate::types::TrainRecord,
+    },
+
     /// The train's status comment was created on the root PR.
     ///
     /// Durable so replay restores `TrainRecord.status_comment_id` — without
@@ -515,7 +533,10 @@ impl StateEventPayload {
             | StateEventPayload::TrainCompleted { .. }
             | StateEventPayload::TrainAborted { .. }
             | StateEventPayload::TrainParked { .. }
-            | StateEventPayload::TrainResumed { .. } => true,
+            | StateEventPayload::TrainResumed { .. }
+            // Recovery adoption replaces the whole record; losing it would
+            // resurrect exactly the stale state it corrects.
+            | StateEventPayload::TrainRecordAdopted { .. } => true,
 
             // Phase transitions
             StateEventPayload::PhaseTransition { .. }

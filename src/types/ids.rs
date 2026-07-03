@@ -189,7 +189,7 @@ impl<'de> Deserialize<'de> for DeliveryId {
 }
 
 /// A GitHub comment ID.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct CommentId(pub u64);
 

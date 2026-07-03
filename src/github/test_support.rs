@@ -35,6 +35,16 @@ pub struct FakePr {
     pub state: FakePrState,
 }
 
+/// A comment as the fake GitHub stores it (the live, mutable copy that
+/// `UpdateComment` edits and `ListComments` returns — unlike
+/// `posted_comments`, which is an append-only log of `PostComment` calls).
+#[derive(Debug, Clone)]
+pub struct FakeComment {
+    pub pr: PrNumber,
+    pub author_id: u64,
+    pub body: String,
+}
+
 /// The GitHub half of a test world whose git half is real.
 pub struct FakeGitHub {
     pub config: GitConfig,
@@ -47,6 +57,15 @@ pub struct FakeGitHub {
     pub roles: HashMap<String, CollaboratorRole>,
     /// Every `PostComment` body, for asserting rejections/acks.
     pub posted_comments: Vec<(PrNumber, String)>,
+    /// Live comments by id (`BTreeMap` so `ListComments` is id-ordered).
+    /// `PostComment` inserts with `comment_author` as the author;
+    /// `UpdateComment` edits in place (404 if deleted); tests may insert
+    /// user-authored comments or delete the bot's to exercise recovery.
+    pub comments: std::collections::BTreeMap<CommentId, FakeComment>,
+    /// The author id stamped on bot-posted comments (the worker tests set
+    /// this to the bot's user id so status comments pass recovery's
+    /// author check).
+    pub comment_author: u64,
     /// Outage injection: while set, every effect fails `Transient`.
     pub unavailable: bool,
     /// While set, `GetCollaboratorPermission` fails `Permanent` (e.g. the
@@ -66,6 +85,8 @@ impl FakeGitHub {
             squash_count: HashMap::new(),
             roles: HashMap::new(),
             posted_comments: Vec::new(),
+            comments: std::collections::BTreeMap::new(),
+            comment_author: 0,
             unavailable: false,
             permission_lookup_broken: false,
             settings_fetches: 0,
@@ -235,9 +256,40 @@ impl FakeGitHub {
                 let id = CommentId(self.next_comment);
                 self.next_comment += 1;
                 self.posted_comments.push((*pr, body.clone()));
+                self.comments.insert(
+                    id,
+                    FakeComment {
+                        pr: *pr,
+                        author_id: self.comment_author,
+                        body: body.clone(),
+                    },
+                );
                 Ok(GitHubResponse::CommentPosted { id })
             }
-            GitHubEffect::UpdateComment { .. } => Ok(GitHubResponse::CommentUpdated),
+            GitHubEffect::UpdateComment { comment_id, body } => {
+                match self.comments.get_mut(comment_id) {
+                    Some(comment) => {
+                        comment.body = body.clone();
+                        Ok(GitHubResponse::CommentUpdated)
+                    }
+                    // A deleted comment 404s, exactly like GitHub.
+                    None => Err(EffectError::Permanent {
+                        kind: TrainErrorKind::ApiError,
+                        detail: format!("no such comment {comment_id} (fake 404)"),
+                    }),
+                }
+            }
+            GitHubEffect::ListComments { pr } => Ok(GitHubResponse::Comments(
+                self.comments
+                    .iter()
+                    .filter(|(_, c)| c.pr == *pr)
+                    .map(|(id, c)| crate::effects::github::CommentData {
+                        id: *id,
+                        author_id: c.author_id,
+                        body: c.body.clone(),
+                    })
+                    .collect(),
+            )),
             GitHubEffect::AddReaction { .. } => Ok(GitHubResponse::ReactionAdded),
 
             other => panic!("the engine does not emit {other:?}"),

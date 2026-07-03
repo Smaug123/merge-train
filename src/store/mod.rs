@@ -304,8 +304,10 @@ impl Store {
     ///
     /// The worker derives [`crate::cascade::ReplayFacts`] from this on every
     /// train evaluation. Reading the whole log is O(events-so-far); acceptable
-    /// until log pruning/compaction exists (deferred to bootstrap, M6), at
-    /// which point a bounded suffix read replaces it.
+    /// until log pruning/compaction exists (its own stage — the pruning
+    /// contract must preserve both `replay()`'s from-empty oracle and every
+    /// active train's intent/done history), at which point a bounded suffix
+    /// read replaces it.
     pub fn events(&self) -> Result<Vec<StateEvent>, StoreError> {
         let mut stmt = self
             .conn

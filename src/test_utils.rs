@@ -215,6 +215,10 @@ pub fn arb_state_event_payload() -> impl Strategy<Value = StateEventPayload> {
                 comment_id: cid,
             }
         }),
+        // Recovery adoption
+        (arb_pr_number(), arb_train_record()).prop_map(|(r, record)| {
+            StateEventPayload::TrainRecordAdopted { root_pr: r, record }
+        }),
         // Phase transitions
         (
             arb_pr_number(),

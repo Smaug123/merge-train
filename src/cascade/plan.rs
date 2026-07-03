@@ -376,8 +376,15 @@ impl ReplayFacts {
             match &event.payload {
                 // Phase/lifecycle boundaries reset the ledger: every intent
                 // belonging to earlier work was settled before the boundary
-                // was written.
+                // was written. Recovery adoption is a boundary too — it
+                // replaces the record wholesale because the LOCAL log
+                // regressed (restore-from-backup), so intents below it were
+                // settled in a world this log never saw (Codex M6 review).
                 StateEventPayload::PhaseTransition { train_root, .. }
+                | StateEventPayload::TrainRecordAdopted {
+                    root_pr: train_root,
+                    ..
+                }
                 | StateEventPayload::TrainStarted {
                     root_pr: train_root,
                     ..
@@ -531,5 +538,76 @@ fn mark_done(intents: &mut [IntentFact], pred: impl Fn(&IntentFact) -> bool) {
             | IntentFact::PushCatchup { done, .. }
             | IntentFact::Retarget { done, .. } => *done = true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{TimeZone, Utc};
+
+    use super::*;
+    use crate::persistence::event::{StateEvent, StateEventPayload};
+    use crate::types::{Sha, TrainRecord};
+
+    fn event(seq: u64, payload: StateEventPayload) -> StateEvent {
+        StateEvent {
+            seq,
+            ts: Utc.with_ymd_and_hms(2026, 7, 1, 0, 0, 0).unwrap(),
+            payload,
+        }
+    }
+
+    fn sha(c: char) -> Sha {
+        Sha::parse(c.to_string().repeat(40)).unwrap()
+    }
+
+    /// Remote adoption replaces the train's operational state wholesale
+    /// (DESIGN §Recovery precedence), so it is a ledger boundary: an intent
+    /// logged by the superseded (restored-from-backup) record must not
+    /// drive recovery planning for the adopted one — its `done` happened in
+    /// the world the backup never saw, and acting on the "unmatched" intent
+    /// runs the wrong idempotency path against the adopted record (Codex M6
+    /// review, P2).
+    #[test]
+    fn adoption_is_a_ledger_boundary() {
+        let root = PrNumber(1);
+        let ts = Utc.with_ymd_and_hms(2026, 7, 1, 0, 0, 0).unwrap();
+        let events = vec![
+            event(
+                0,
+                StateEventPayload::TrainStarted {
+                    root_pr: root,
+                    current_pr: root,
+                },
+            ),
+            event(
+                1,
+                StateEventPayload::IntentPushPrep {
+                    train_root: root,
+                    branch: "pr-2".to_owned(),
+                    pre_push_sha: sha('a'),
+                    expected_tree: sha('b'),
+                    predecessor_head: Some(sha('c')),
+                },
+            ),
+            event(
+                2,
+                StateEventPayload::TrainRecordAdopted {
+                    root_pr: root,
+                    record: TrainRecord::new(root, ts),
+                },
+            ),
+        ];
+
+        // Not vacuous: without the adoption the intent is unmatched.
+        let before = ReplayFacts::for_train(&events[..2], root);
+        assert_eq!(before.unmatched().count(), 1);
+
+        let after = ReplayFacts::for_train(&events, root);
+        assert_eq!(
+            after.unmatched().count(),
+            0,
+            "the superseded record's intent must not survive adoption"
+        );
     }
 }
