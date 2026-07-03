@@ -91,7 +91,12 @@ pub(crate) fn crawl_events(
     let authors: HashMap<PrNumber, u64> = all_prs.iter().map(|p| (p.number, p.author_id)).collect();
 
     // Predecessor declarations: author-only (the live pipeline's rule),
-    // last declaration on a PR wins, the bot never declares.
+    // last declaration on a PR wins, the bot never declares. EDITED
+    // comments are refused outright: the API reports only the original
+    // author, never the editor, so an edited body cannot be attributed —
+    // honoring it would reopen the edit-impersonation hole the live path
+    // closes by authorizing the SENDER (Codex crawl review round 2).
+    let mut declared_targets: Vec<PrNumber> = Vec::new();
     for (pr, pr_comments) in comments {
         let Some(&author) = authors.get(pr) else {
             continue;
@@ -101,11 +106,22 @@ pub(crate) fn crawl_events(
             if comment.author_id != author || comment.author_id == bot_user_id {
                 continue;
             }
-            if let Some(Command::Predecessor(target)) = parse_command(&comment.body, bot_name) {
-                last = Some((target, comment.id));
+            let Some(Command::Predecessor(target)) = parse_command(&comment.body, bot_name) else {
+                continue;
+            };
+            if comment.edited {
+                tracing::warn!(
+                    %pr, comment = %comment.id,
+                    "ignoring an EDITED predecessor declaration during the \
+                     crawl (the editor cannot be verified); the author can \
+                     re-declare in a fresh comment"
+                );
+                continue;
             }
+            last = Some((target, comment.id));
         }
         if let Some((predecessor, comment_id)) = last {
+            declared_targets.push(predecessor);
             events.push(StateEventPayload::PredecessorDeclared {
                 pr: *pr,
                 predecessor,
@@ -148,7 +164,16 @@ pub(crate) fn crawl_events(
         all_prs.iter().map(|p| p.number).collect();
 
     let mut recovered_roots = Vec::new();
-    let mut missing_members = Vec::new();
+    // Declaration targets outside the crawl are fetched individually,
+    // exactly like adopted-train members: `is_root` must see the target's
+    // real state (merged-beyond-the-window, closed) rather than wedge on
+    // an invisible PR; the declaration itself persists, matching the live
+    // path's record-then-validate-loudly order (Codex crawl review
+    // round 2).
+    let mut missing_members: Vec<PrNumber> = declared_targets
+        .into_iter()
+        .filter(|t| !crawled_numbers.contains(t))
+        .collect();
     let mut roots: Vec<PrNumber> = best.keys().copied().collect();
     roots.sort_unstable();
     for root in roots {
@@ -184,6 +209,7 @@ pub(crate) fn crawl_events(
         });
     }
     missing_members.sort_unstable();
+    missing_members.dedup();
 
     CrawlOutcome {
         events,
@@ -225,6 +251,7 @@ mod tests {
             id: CommentId(id),
             author_id,
             body: body.to_owned(),
+            edited: false,
         }
     }
 
@@ -368,6 +395,57 @@ mod tests {
             })
             .expect("adopted");
         assert_eq!(adopted.started_at, t1, "the newer incarnation wins");
+    }
+
+    /// An EDITED comment cannot be attributed to its author (GitHub reports
+    /// only the original author, not the editor), so the crawl must not
+    /// honor its declaration — the edit-impersonation hole the live path
+    /// closes by checking `sender_id` (Codex crawl review round 2, P2).
+    #[test]
+    fn edited_declaration_comments_are_not_trusted() {
+        let open = vec![pr(1, AUTHOR, PrState::Open), pr(2, AUTHOR, PrState::Open)];
+        let mut edited = comment(1, AUTHOR, "@merge-train predecessor #1");
+        edited.edited = true;
+        let comments = vec![(PrNumber(2), vec![edited])];
+        let outcome = crawl_events(
+            "main",
+            &open,
+            &[],
+            &comments,
+            "merge-train",
+            BOT,
+            test_now(),
+        );
+        assert!(
+            declared(&outcome.events).is_empty(),
+            "an edited body has an unknowable author; fail closed"
+        );
+    }
+
+    /// A declaration target outside the crawl (merged beyond the window,
+    /// closed, or a typo) is handed back for individual fetching — exactly
+    /// like an adopted train's members — so `is_root` sees the target's
+    /// real state instead of wedging on an invisible PR. The declaration
+    /// itself persists (the live path records first, validates loudly at
+    /// start).
+    #[test]
+    fn uncrawled_declaration_targets_are_fetched() {
+        let open = vec![pr(2, AUTHOR, PrState::Open)];
+        let comments = vec![(
+            PrNumber(2),
+            vec![comment(1, AUTHOR, "@merge-train predecessor #77")],
+        )];
+        let outcome = crawl_events(
+            "main",
+            &open,
+            &[],
+            &comments,
+            "merge-train",
+            BOT,
+            test_now(),
+        );
+        assert_eq!(declared(&outcome.events), vec![(PrNumber(2), PrNumber(77))]);
+        assert_eq!(outcome.missing_members, vec![PrNumber(77)]);
     }
 
     /// Staleness: an ACTIVE record whose current PR and every frozen
