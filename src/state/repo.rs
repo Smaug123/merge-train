@@ -193,7 +193,17 @@ impl RepoState {
 
             // ─── Recovery adoption (DESIGN §Recovery precedence) ───
             StateEventPayload::TrainRecordAdopted { root_pr, record } => {
-                self.active_trains.insert(*root_pr, record.clone());
+                // A completed record lands where the normal completion path
+                // does: out of the map. The `Completed` variant exists only
+                // for status comments (see `TrainState::Completed`) —
+                // inserting it would park a terminal record in
+                // `active_trains` forever, since nothing evaluates (and so
+                // nothing removes) an inactive train.
+                if matches!(record.state, TrainState::Completed { .. }) {
+                    self.active_trains.remove(root_pr);
+                } else {
+                    self.active_trains.insert(*root_pr, record.clone());
+                }
             }
 
             // A completed train is fully done — it leaves the active set.
@@ -1318,6 +1328,33 @@ mod tests {
             );
         }
         assert_eq!(state.train_involving(PrNumber(99)), None);
+    }
+
+    /// Adopting a COMPLETED record (the status comment of a train that
+    /// finished after the backup was taken) must land the store where the
+    /// normal completion path does: out of `active_trains`. The `Completed`
+    /// variant exists only for status comments and is documented never to
+    /// appear in the map (Codex M6 review round 2, P2).
+    #[test]
+    fn adopting_a_completed_record_removes_the_train() {
+        let ts = crate::test_utils::test_timestamp();
+        let mut state = RepoState::from_snapshot(PersistedRepoSnapshot::new("main".to_string()));
+        state.apply_event(&event(StateEventPayload::TrainStarted {
+            root_pr: PrNumber(1),
+            current_pr: PrNumber(1),
+        }));
+        assert!(state.active_trains.contains_key(&PrNumber(1)));
+
+        let mut completed = state.active_trains[&PrNumber(1)].clone();
+        completed.state = crate::types::TrainState::Completed { ended_at: ts };
+        state.apply_event(&event(StateEventPayload::TrainRecordAdopted {
+            root_pr: PrNumber(1),
+            record: completed,
+        }));
+        assert!(
+            !state.active_trains.contains_key(&PrNumber(1)),
+            "a completed record must never sit in active_trains"
+        );
     }
 
     /// Mergeability observations enter the cache through the log.

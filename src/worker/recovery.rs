@@ -92,6 +92,14 @@ pub fn decide_comment_recovery(
         }
         // Gone without replacement: the worker re-posts the backup.
         Some(_) => CommentRecovery::RepostBackup,
+        // No id recorded, but the bot's comment for this incarnation is
+        // live: the crash landed after the initial `PostComment` succeeded
+        // and before `StatusCommentPosted` was appended. Attach to it —
+        // posting again would leave a duplicate status comment (Codex M6
+        // review round 2, P3).
+        None if best.is_some() => {
+            CommentRecovery::RepairCommentId(best.expect("checked is_some").0)
+        }
         // Never posted (crash before the preflight's comment landed): the
         // engine's self-healing posts it; nothing to decide here.
         None => CommentRecovery::KeepLocal,
@@ -246,6 +254,18 @@ mod tests {
         assert_eq!(
             decide_comment_recovery(&local, &[], BOT),
             CommentRecovery::KeepLocal
+        );
+    }
+
+    /// The posted-but-unrecorded crash window: no id in the store, but the
+    /// bot's comment for this incarnation is live — attach, don't re-post.
+    #[test]
+    fn posted_but_unrecorded_comment_is_attached() {
+        let local = local_at(0, None);
+        let comments = vec![comment(4, BOT, &local)];
+        assert_eq!(
+            decide_comment_recovery(&local, &comments, BOT),
+            CommentRecovery::RepairCommentId(CommentId(4))
         );
     }
 }

@@ -1010,7 +1010,7 @@ impl Processor {
                     match cascade::start_train(state, pr, now) {
                         Ok(plan) => {
                             let decided = !matches!(plan.control, Control::Continue);
-                            let batch = self.integrate_plan(pr, plan)?;
+                            let batch = self.integrate_plan(pr, plan, now)?;
                             if decided {
                                 // Rejected (or otherwise settled) with no
                                 // preflight in flight: answered.
@@ -1040,7 +1040,7 @@ impl Processor {
                     let root = state.train_involving(pr).unwrap_or(pr);
                     let plan = cascade::stop_train(state, pr, force, now);
                     let integrated = match plan {
-                        Ok(plan) => self.integrate_plan(root, plan)?,
+                        Ok(plan) => self.integrate_plan(root, plan, now)?,
                         Err(e) => {
                             error!(%root, error = %e, "engine refused to plan");
                             None
@@ -1120,7 +1120,7 @@ impl Processor {
             };
             match plan {
                 Ok(plan) => {
-                    if let Some(batch) = self.integrate_plan(root, plan)? {
+                    if let Some(batch) = self.integrate_plan(root, plan, now)? {
                         return Ok(Some(batch));
                     }
                     // Plan finished without effects; keep pumping.
@@ -1225,8 +1225,12 @@ impl Processor {
         // review, P1). Stops then suppress the *continuation*, which has not
         // run yet and is therefore safe to drop.
         let mut stops = stops;
+        // One clock read for the plan AND its append: the engine bakes `now`
+        // into effect payloads that `apply_event` must reproduce from the
+        // event stamp (see `integrate_plan`).
+        let now = Utc::now();
         let planned = match observe(&outcomes) {
-            Ok(obs) => match cascade::advance(self.store.state(), root, obs, Utc::now()) {
+            Ok(obs) => match cascade::advance(self.store.state(), root, obs, now) {
                 Ok(plan) => {
                     // A fan-out retires `root` and spawns new roots; a stop
                     // for `root` queued during this batch must retire those
@@ -1270,7 +1274,7 @@ impl Processor {
                         }
                         stops = expanded;
                     }
-                    self.integrate_plan(root, plan)?
+                    self.integrate_plan(root, plan, now)?
                 }
                 Err(e) => {
                     error!(%root, error = %e, "engine rejected an observation; abandoning step");
@@ -1465,10 +1469,19 @@ impl Processor {
 
     /// Appends a plan's events and turns its effects into a batch. `None`
     /// means the plan completed immediately (no effects to run).
+    ///
+    /// `now` MUST be the timestamp the plan was computed with: the engine
+    /// bakes it into effect payloads (the preflight status comment embeds
+    /// `TrainRecord::started_at = now`) and `apply_event` derives the same
+    /// fields from the event's stamp — a second clock read here would make
+    /// the comment and the store disagree about the train's identity, and
+    /// recovery's incarnation match would reject the bot's own comment
+    /// (Codex M6 review round 2, P3).
     fn integrate_plan(
         &mut self,
         root: PrNumber,
         plan: StepPlan,
+        now: chrono::DateTime<Utc>,
     ) -> Result<Option<SagaBatch>, StoreError> {
         let StepPlan {
             events,
@@ -1476,7 +1489,7 @@ impl Processor {
             best_effort,
             control,
         } = plan;
-        self.store.append_batch(&events, Utc::now())?;
+        self.store.append_batch(&events, now)?;
         self.clear_inherited_markers(&events);
 
         // TrainStarted answers the in-flight start: its durable row is

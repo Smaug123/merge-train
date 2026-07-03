@@ -2428,6 +2428,38 @@ fn a_status_comment_ahead_of_the_store_is_adopted() {
     assert_recovered_exactly_once(&world, &mut processor, "comment-ahead");
 }
 
+/// A crash after the initial status comment posts but before
+/// `StatusCommentPosted` lands leaves a live comment the store has no id
+/// for. Recovery must ATTACH to it, not post a duplicate — which requires
+/// the comment's embedded `started_at` to equal the store record's (one
+/// clock read per decision, not one per plan-then-append), and the
+/// no-id-recorded case to consult the comment scan (Codex M6 review
+/// round 2, P3).
+#[test]
+fn recovery_attaches_to_a_posted_but_unrecorded_status_comment() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    start_command(&mut world, &mut processor, 1);
+    // Depth 2: batch 2 posts the status comment; the crash drops its
+    // outcomes, so `StatusCommentPosted` is never appended.
+    run_batches_then_crash(&mut world, processor, 2);
+
+    let mut processor = world.processor();
+    drive_to_completion(&mut world, &mut processor);
+    assert_recovered_exactly_once(&world, &mut processor, "posted-but-unrecorded");
+    let github = world.github.lock().unwrap();
+    let status_comments = github
+        .comments
+        .values()
+        .filter(|c| c.pr == PrNumber(1) && c.body.contains("merge-train-state"))
+        .count();
+    assert_eq!(
+        status_comments, 1,
+        "recovery must attach to the live status comment, not duplicate it"
+    );
+}
+
 /// A deleted status comment must not strand recovery: the dangling id is
 /// cleared and the engine re-posts its off-disk backup as it resumes.
 #[test]
