@@ -196,6 +196,13 @@ pub struct CommentData {
     pub author_id: u64,
     /// The comment body.
     pub body: String,
+    /// Whether the comment has been edited since creation
+    /// (`updated_at > created_at`). GitHub's REST API reports only the
+    /// ORIGINAL author, not the last editor, so an edited comment's body
+    /// cannot be attributed to `author_id` — author-gated decisions (the
+    /// bootstrap crawl's predecessor declarations) must fail closed on it.
+    #[serde(default)]
+    pub edited: bool,
 }
 
 /// Branch protection settings.
@@ -475,6 +482,7 @@ mod tests {
                 id,
                 author_id,
                 body,
+                edited: false,
             }
         })
     }

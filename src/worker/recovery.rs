@@ -151,6 +151,7 @@ mod tests {
             id: CommentId(id),
             author_id,
             body: format_status_comment(record, "status").unwrap(),
+            edited: false,
         }
     }
 
@@ -275,6 +276,7 @@ mod tests {
             id: CommentId(3),
             author_id: BOT,
             body: "someone edited this".to_owned(),
+            edited: false,
         }];
         assert_eq!(
             decide_comment_recovery(&local, &comments, BOT),

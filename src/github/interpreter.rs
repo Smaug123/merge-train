@@ -782,6 +782,9 @@ async fn list_comments(
             id: CommentId(comment.id.into_inner()),
             author_id: comment.user.id.into_inner(),
             body: comment.body.unwrap_or_default(),
+            edited: comment
+                .updated_at
+                .is_some_and(|updated| updated > comment.created_at),
         })
         .collect();
 

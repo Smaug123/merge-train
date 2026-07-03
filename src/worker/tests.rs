@@ -2664,6 +2664,7 @@ fn onboarding_crawl_learns_an_existing_stack() {
             pr: PrNumber(2),
             author_id: AUTHOR,
             body: "@merge-train predecessor #1".to_owned(),
+            edited: false,
         },
     );
     let mut processor = world.processor();
@@ -2693,6 +2694,7 @@ fn a_lost_state_db_is_rebuilt_by_the_crawl_and_the_train_resumes() {
             pr: PrNumber(2),
             author_id: AUTHOR,
             body: "@merge-train predecessor #1".to_owned(),
+            edited: false,
         },
     );
     let mut processor = world.processor();
@@ -2741,6 +2743,7 @@ fn a_member_closed_during_the_db_loss_gap_aborts_the_train_cleanly() {
             pr: PrNumber(2),
             author_id: AUTHOR,
             body: "@merge-train predecessor #1".to_owned(),
+            edited: false,
         },
     );
     let mut processor = world.processor();
