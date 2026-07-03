@@ -808,9 +808,20 @@ stage shippable).
 >    not silent. Crawl-review notes: edited comments are refused in the
 >    declaration scan (the API names only the original author, so an
 >    edited body is unattributable — the live path's sender check has no
->    crawl equivalent); declaration targets and adopted-train members
->    outside the crawl are fetched individually before the atomic append;
->    a finished train's stale ACTIVE comment adopts as completed (an
+>    crawl equivalent); declarations are REPLAYED in comment-id order and
+>    each is run through the live `validate_predecessor_declaration`
+>    (first-valid-wins, closed/missing/mismatched/cycle rejected, a
+>    merged predecessor is a late addition recording nothing) so the
+>    crawl persists exactly the edges the live handler would — an
+>    unvalidated edge would wedge `is_root` or fabricate a bogus stack
+>    extension, and the redelivered webhook treats the already-owned
+>    declaration as idempotent and never rejects it (round 5, P2). That
+>    validation SUBSUMES the earlier "fetch uncrawled declaration
+>    targets" answer: `ListOpenPrs` returns every open PR, so an
+>    unrecorded predecessor is necessarily closed/merged and never a
+>    valid edge; only adopted-train frozen members absent from the crawl
+>    are still fetched individually before the atomic append. A finished
+>    train's stale ACTIVE comment adopts as completed (an
 >    unfinished train necessarily has unmerged members); fan-out replay
 >    never clobbers a child record born during-or-after the parent train
 >    (protecting both progress and a user's stop), while prior-incarnation

@@ -41,6 +41,7 @@ use crate::persistence::event::{StateEvent, StateEventPayload};
 use crate::persistence::snapshot::PersistedRepoSnapshot;
 use crate::state::RepoState;
 use crate::state::descendants::collect_all_descendants;
+use crate::state::validation::validate_predecessor_declaration;
 use crate::status::parse::parse_status_comment;
 use crate::types::{MergeStateStatus, PrNumber, TrainError, TrainErrorKind, TrainRecord};
 
@@ -142,18 +143,24 @@ pub(crate) fn crawl_events(
     }
     let authors: HashMap<PrNumber, u64> = all_prs.iter().map(|p| (p.number, p.author_id)).collect();
 
-    // Predecessor declarations: author-only (the live pipeline's rule),
-    // last declaration on a PR wins, the bot never declares. EDITED
-    // comments are refused outright: the API reports only the original
-    // author, never the editor, so an edited body cannot be attributed —
-    // honoring it would reopen the edit-impersonation hole the live path
-    // closes by authorizing the SENDER (Codex crawl review round 2).
-    let mut declared_targets: Vec<PrNumber> = Vec::new();
+    // The topology scratch: built from the cache fills, then grown one
+    // validated declaration at a time so the crawl records EXACTLY the
+    // predecessor edges the live handler would have persisted.
+    let mut topology = replay_topology(default_branch, &events, now);
+
+    // Candidate declarations: author-only (the live pipeline's rule), the
+    // bot never declares. EDITED comments are refused outright — the API
+    // reports only the original author, never the editor, so an edited body
+    // cannot be attributed, and honoring it would reopen the
+    // edit-impersonation hole the live path closes by authorizing the
+    // SENDER (Codex crawl review round 2). Replayed in comment-id order so
+    // each is validated against the edges accepted before it — giving
+    // first-declaration-wins exactly as the live handler does over time.
+    let mut candidates: Vec<(crate::types::CommentId, PrNumber, PrNumber)> = Vec::new();
     for (pr, pr_comments) in comments {
         let Some(&author) = authors.get(pr) else {
             continue;
         };
-        let mut last: Option<(PrNumber, crate::types::CommentId)> = None;
         for comment in pr_comments {
             if comment.author_id != author || comment.author_id == bot_user_id {
                 continue;
@@ -170,16 +177,60 @@ pub(crate) fn crawl_events(
                 );
                 continue;
             }
-            last = Some((target, comment.id));
+            candidates.push((comment.id, *pr, target));
         }
-        if let Some((predecessor, comment_id)) = last {
-            declared_targets.push(predecessor);
-            events.push(StateEventPayload::PredecessorDeclared {
-                pr: *pr,
-                predecessor,
-                comment_id,
-            });
+    }
+    candidates.sort_by_key(|(id, _, _)| *id);
+
+    // Record only VALID, non-late-addition declarations (Codex crawl review
+    // round 5): the crawl bypasses the live command path, so an unvalidated
+    // edge — a closed/missing/mismatched predecessor, a cycle — would wedge
+    // `is_root` or fabricate a bogus stack extension, and the redelivered
+    // webhook would treat the already-owned declaration as idempotent and
+    // never reject it. A MERGED predecessor is a late addition the live
+    // handler records nothing for (it answers `LateAddition` instead), so
+    // it is skipped here too. This also subsumes round 2's uncrawled-target
+    // fetch: `ListOpenPrs` returns every open PR, so an unrecorded
+    // predecessor is necessarily closed or merged — either way not a valid
+    // edge — and never needs a follow-up fetch.
+    for (comment_id, pr, predecessor) in candidates {
+        let recordable = topology.prs.contains_key(&pr)
+            && !topology
+                .prs
+                .get(&predecessor)
+                .is_some_and(|p| p.state.is_merged())
+            && {
+                let cached = topology.prs.get(&pr).expect("checked contains_key");
+                match validate_predecessor_declaration(
+                    cached,
+                    predecessor,
+                    &topology.prs,
+                    default_branch,
+                ) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        tracing::warn!(
+                            %pr, %predecessor, error = %e,
+                            "dropping an invalid crawled predecessor declaration"
+                        );
+                        false
+                    }
+                }
+            };
+        if !recordable {
+            continue;
         }
+        let decl = StateEventPayload::PredecessorDeclared {
+            pr,
+            predecessor,
+            comment_id,
+        };
+        topology.apply_event(&StateEvent {
+            seq: events.len() as u64,
+            ts: now,
+            payload: decl.clone(),
+        });
+        events.push(decl);
     }
 
     // Train recovery from the bot's status comments. Trust gates: authored
@@ -216,20 +267,10 @@ pub(crate) fn crawl_events(
         all_prs.iter().map(|p| p.number).collect();
 
     let mut recovered_roots = Vec::new();
-    // Declaration targets outside the crawl are fetched individually,
-    // exactly like adopted-train members: `is_root` must see the target's
-    // real state (merged-beyond-the-window, closed) rather than wedge on
-    // an invisible PR; the declaration itself persists, matching the live
-    // path's record-then-validate-loudly order (Codex crawl review
-    // round 2).
-    let mut missing_members: Vec<PrNumber> = declared_targets
-        .into_iter()
-        .filter(|t| !crawled_numbers.contains(t))
-        .collect();
-    // The crawled topology (default branch + PR cache + declarations), for
-    // the stack-extension check: `events` holds exactly those so far, since
-    // no adoption has been pushed yet.
-    let topology = replay_topology(default_branch, &events, now);
+    // Adopted-train members absent from the crawl (a frozen descendant
+    // closed during the gap — neither open nor recently merged) are fetched
+    // individually so the resumed train's evaluation sees them (below).
+    let mut missing_members: Vec<PrNumber> = Vec::new();
 
     let mut roots: Vec<PrNumber> = best.keys().copied().collect();
     roots.sort_unstable();
@@ -307,6 +348,7 @@ mod tests {
         Utc.with_ymd_and_hms(2026, 7, 3, 0, 0, 0).unwrap()
     }
 
+    /// A root PR: targets `main`, branch `pr-<n>`.
     fn pr(number: u64, author_id: u64, state: PrState) -> PrData {
         PrData {
             number: PrNumber(number),
@@ -316,6 +358,15 @@ mod tests {
             state,
             is_draft: false,
             author_id,
+        }
+    }
+
+    /// A stacked PR whose base branch is its predecessor's head branch, so
+    /// `validate_predecessor_declaration`'s base-match check passes.
+    fn child(number: u64, author_id: u64, predecessor: u64, state: PrState) -> PrData {
+        PrData {
+            base_ref: format!("pr-{predecessor}"),
+            ..pr(number, author_id, state)
         }
     }
 
@@ -341,16 +392,21 @@ mod tests {
     }
 
     /// Declarations obey the live pipeline's authorization: only the PR
-    /// author's comments declare, and the last declaration wins.
+    /// author's comments declare, and the FIRST valid declaration wins
+    /// (a later distinct declaration rejects as already-declared, exactly
+    /// like the live handler).
     #[test]
-    fn declarations_are_author_only_and_last_wins() {
-        let open = vec![pr(1, AUTHOR, PrState::Open), pr(2, AUTHOR, PrState::Open)];
+    fn declarations_are_author_only_and_first_valid_wins() {
+        let open = vec![
+            pr(1, AUTHOR, PrState::Open),
+            child(2, AUTHOR, 1, PrState::Open),
+        ];
         let comments = vec![(
             PrNumber(2),
             vec![
-                comment(1, STRANGER, "@merge-train predecessor #9"),
-                comment(2, AUTHOR, "@merge-train predecessor #7"),
-                comment(3, AUTHOR, "@merge-train predecessor #1"),
+                comment(1, STRANGER, "@merge-train predecessor #1"),
+                comment(2, AUTHOR, "@merge-train predecessor #1"),
+                comment(3, AUTHOR, "@merge-train predecessor #9"),
             ],
         )];
         let outcome = crawl_events(
@@ -362,7 +418,71 @@ mod tests {
             BOT,
             test_now(),
         );
-        assert_eq!(declared(&outcome.events), vec![(PrNumber(2), PrNumber(1))]);
+        assert_eq!(
+            declared(&outcome.events),
+            vec![(PrNumber(2), PrNumber(1))],
+            "the stranger's comment is ignored; the author's first valid one wins"
+        );
+    }
+
+    /// The crawl runs the SAME validation the live command path does, and
+    /// records only edges the handler would have persisted: a closed
+    /// predecessor rejects, a merged one is a late addition (nothing
+    /// recorded), a base mismatch rejects. Recording any of these would
+    /// wedge `is_root` or fabricate a bogus stack extension (Codex crawl
+    /// review round 5).
+    #[test]
+    fn invalid_declarations_are_dropped() {
+        let open = vec![
+            pr(1, AUTHOR, PrState::Open),
+            child(2, AUTHOR, 1, PrState::Open), // #2 -> #1 (closed): rejected
+            child(3, AUTHOR, 4, PrState::Open), // #3 -> #4 (merged): late addition
+            pr(5, AUTHOR, PrState::Open),       // #6 -> #5 but base is main: mismatch
+            pr(6, AUTHOR, PrState::Open),
+        ];
+        // #1 closed, #4 merged.
+        let mut closed_one = pr(1, AUTHOR, PrState::Closed);
+        closed_one.head_ref = "pr-1".to_owned();
+        let open = {
+            let mut v = open;
+            v[0] = closed_one;
+            v
+        };
+        let merged = vec![pr(
+            4,
+            AUTHOR,
+            PrState::Merged {
+                merge_commit_sha: Sha::parse("b".repeat(40)).unwrap(),
+            },
+        )];
+        let comments = vec![
+            (
+                PrNumber(2),
+                vec![comment(1, AUTHOR, "@merge-train predecessor #1")],
+            ),
+            (
+                PrNumber(3),
+                vec![comment(2, AUTHOR, "@merge-train predecessor #4")],
+            ),
+            (
+                PrNumber(6),
+                vec![comment(3, AUTHOR, "@merge-train predecessor #5")],
+            ),
+        ];
+        let outcome = crawl_events(
+            "main",
+            &open,
+            &merged,
+            &comments,
+            "merge-train",
+            BOT,
+            test_now(),
+        );
+        assert!(
+            declared(&outcome.events).is_empty(),
+            "every invalid/late-addition declaration is dropped, got {:?}",
+            declared(&outcome.events)
+        );
     }
 
     /// A bot status comment on its own root is adopted (id repaired), and
@@ -476,7 +596,11 @@ mod tests {
     /// closes by checking `sender_id` (Codex crawl review round 2, P2).
     #[test]
     fn edited_declaration_comments_are_not_trusted() {
-        let open = vec![pr(1, AUTHOR, PrState::Open), pr(2, AUTHOR, PrState::Open)];
+        // #2 is a valid child of #1, so only the edit flag can drop it.
+        let open = vec![
+            pr(1, AUTHOR, PrState::Open),
+            child(2, AUTHOR, 1, PrState::Open),
+        ];
         let mut edited = comment(1, AUTHOR, "@merge-train predecessor #1");
         edited.edited = true;
         let comments = vec![(PrNumber(2), vec![edited])];
@@ -495,15 +619,14 @@ mod tests {
         );
     }
 
-    /// A declaration target outside the crawl (merged beyond the window,
-    /// closed, or a typo) is handed back for individual fetching — exactly
-    /// like an adopted train's members — so `is_root` sees the target's
-    /// real state instead of wedging on an invisible PR. The declaration
-    /// itself persists (the live path records first, validates loudly at
-    /// start).
+    /// A declaration naming a predecessor outside the crawl is dropped:
+    /// `ListOpenPrs` returns every open PR, so an unrecorded predecessor is
+    /// necessarily closed or merged (or a typo) — not a valid edge — and
+    /// validation rejects it, exactly as the live path would (Codex crawl
+    /// review round 5; supersedes the earlier "fetch the target" answer).
     #[test]
-    fn uncrawled_declaration_targets_are_fetched() {
-        let open = vec![pr(2, AUTHOR, PrState::Open)];
+    fn a_declaration_to_an_uncrawled_predecessor_is_dropped() {
+        let open = vec![child(2, AUTHOR, 77, PrState::Open)];
         let comments = vec![(
             PrNumber(2),
             vec![comment(1, AUTHOR, "@merge-train predecessor #77")],
@@ -517,8 +640,14 @@ mod tests {
             BOT,
             test_now(),
         );
-        assert_eq!(declared(&outcome.events), vec![(PrNumber(2), PrNumber(77))]);
-        assert_eq!(outcome.missing_members, vec![PrNumber(77)]);
+        assert!(
+            declared(&outcome.events).is_empty(),
+            "a declaration to an uncrawled (closed/merged) predecessor is dropped"
+        );
+        assert!(
+            outcome.missing_members.is_empty(),
+            "and needs no follow-up fetch"
+        );
     }
 
     /// Staleness: an ACTIVE record whose current PR and every frozen
@@ -610,8 +739,8 @@ mod tests {
         // declaring #2 — extending the active train's stack.
         let open = vec![
             pr(1, AUTHOR, PrState::Open),
-            pr(2, AUTHOR, PrState::Open),
-            pr(3, AUTHOR, PrState::Open),
+            child(2, AUTHOR, 1, PrState::Open),
+            child(3, AUTHOR, 2, PrState::Open),
         ];
         let comments = vec![
             (PrNumber(1), vec![comment(1, BOT, &body)]),
@@ -652,7 +781,10 @@ mod tests {
             progress: DescendantProgress::new(vec![PrNumber(2)]),
         };
         let body = format_status_comment(&record, "mid").unwrap();
-        let open = vec![pr(1, AUTHOR, PrState::Open), pr(2, AUTHOR, PrState::Open)];
+        let open = vec![
+            pr(1, AUTHOR, PrState::Open),
+            child(2, AUTHOR, 1, PrState::Open),
+        ];
         let comments = vec![
             (PrNumber(1), vec![comment(1, BOT, &body)]),
             (
@@ -661,6 +793,11 @@ mod tests {
             ),
         ];
         let outcome = crawl_events("main", &open, &[], &comments, "merge-train", BOT, ts);
+        assert_eq!(
+            declared(&outcome.events),
+            vec![(PrNumber(2), PrNumber(1))],
+            "the unchanged declared edge is recorded"
+        );
         assert_eq!(outcome.recovered_roots, vec![PrNumber(1)]);
         assert!(
             !outcome
@@ -677,7 +814,10 @@ mod tests {
         let ts = Utc.with_ymd_and_hms(2026, 7, 1, 0, 0, 0).unwrap();
         let record = TrainRecord::new(PrNumber(1), ts);
         let body = format_status_comment(&record, "s").unwrap();
-        let open = vec![pr(1, AUTHOR, PrState::Open), pr(2, AUTHOR, PrState::Open)];
+        let open = vec![
+            pr(1, AUTHOR, PrState::Open),
+            child(2, AUTHOR, 1, PrState::Open),
+        ];
         let comments = vec![
             (PrNumber(1), vec![comment(1, BOT, &body)]),
             (
