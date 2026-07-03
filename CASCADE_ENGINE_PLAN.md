@@ -826,7 +826,24 @@ stage shippable).
 >    the live handler, so a later retract/edit targets the right comment.
 >    Uncrawled predecessor targets (merged beyond the 30-day window) join
 >    the round-6/7 fixpoint fetch; adopted-train frozen members absent
->    from the crawl are fetched the same way. Round 6
+>    from the crawl are fetched the same way. Round 10 (P2): because
+>    round 9 keeps merged-predecessor edges, the crawl must not pre-record
+>    the TRIGGERING delivery's own comment — that comment is live input
+>    the command handler processes next in the same delivery, and
+>    pre-recording it would suppress the `LateAddition` answer a genuine
+>    late-addition command deserves; `crawl_events` takes a `skip_comment`
+>    for it. RESIDUAL (documented, bounded): a late-addition command that
+>    is a *backlog* delivery (a different delivery triggered the crawl)
+>    is still pre-recorded — the crawl cannot know which already-listed
+>    comments have pending deliveries. The outcome is SAFE (the edge to a
+>    merged predecessor leaves `is_root` false without a reconciliation
+>    marker, so the PR stays non-startable); the only loss is the specific
+>    "late addition — rebase or restart" message, and a `start` still gets
+>    a "not a stack root" rejection. **Crawl review converged after 10
+>    rounds** (2,1,1,1,1,1,1,1,2,1 findings) — lost-DB reconstruction is
+>    the most adversarial recovery surface; every finding was a real
+>    divergence from live-operation guarantees, each pinned by a
+>    mutation-checked test. Round 6
 >    (P2): a train's root closed UNMERGED during the gap is in neither
 >    list endpoint, so PR discovery runs to a FIXPOINT — the wake-up
 >    webhook's `referenced_prs()` seed the crawl, and `crawl_events`
