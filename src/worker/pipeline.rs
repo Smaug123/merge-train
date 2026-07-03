@@ -859,6 +859,16 @@ impl Processor {
             "bootstrapped the repo from a crawl"
         );
         self.store.append_batch(&outcome.events, Utc::now())?;
+        self.clear_inherited_markers(&outcome.events);
+        // A train the crawl aborted (its stack was extended during the gap)
+        // needs the same worker-side cleanup a handler abort gets — stale
+        // worktree removal + a final status comment (the engine's own
+        // aborts carry cleanup in their plans; this one has no plan).
+        for payload in &outcome.events {
+            if let StateEventPayload::TrainAborted { root_pr, .. } = payload {
+                self.queue(PendingWork::AbortCleanup { root: *root_pr });
+            }
+        }
         for root in outcome.recovered_roots {
             self.inherited_mid_flight.insert(root);
         }
