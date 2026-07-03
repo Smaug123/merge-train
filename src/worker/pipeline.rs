@@ -351,47 +351,19 @@ impl Processor {
             return self.close(&id, None, "duplicate content");
         }
 
-        // First-contact default-branch discovery: a fresh store has an empty
-        // default branch, and root detection / base validation read it.
-        if self.store.state().default_branch.is_empty() {
-            match self.deps.github.execute(GitHubEffect::GetRepoSettings) {
-                Ok(GitHubResponse::RepoSettings(settings)) => {
-                    info!(default_branch = %settings.default_branch, "discovered default branch");
-                    self.store.append_batch(
-                        &[StateEventPayload::DefaultBranchSet {
-                            branch: settings.default_branch,
-                        }],
-                        Utc::now(),
-                    )?;
-                }
-                Ok(other) => {
-                    error!(?other, "GetRepoSettings answered the wrong variant");
-                    return self.release(&id);
-                }
-                Err(e @ EffectError::Transient { .. }) => {
-                    warn!(error = ?e, "cannot discover default branch; releasing delivery");
-                    return self.release(&id);
-                }
-                // Permanent (token lacks access, repo deleted/renamed):
-                // release too — DELIBERATELY, unlike role lookups. There a
-                // denial is a safe answer; here there is none: without the
-                // default branch nothing can be processed, and closing the
-                // delivery would silently drop webhooks GitHub will never
-                // resend. The repo's queue pauses (retrying at the stall
-                // cadence, which also heals "permanent" auth errors the
-                // moment the operator fixes the token) and this error says
-                // so as loudly as we can.
-                Err(e) => {
-                    error!(
-                        error = ?e,
-                        "cannot discover the default branch and the failure is \
-                         permanent; the repo's queue is PAUSED until discovery \
-                         succeeds — operator action likely required (token \
-                         scopes? repo moved?)"
-                    );
-                    return self.release(&id);
-                }
-            }
+        // First contact — a fresh store (brand-new repo, or a LOST state
+        // db) has an empty default branch. Webhooks only describe the
+        // future, so bootstrap crawls the present: settings, open and
+        // recently merged PRs, their comments (predecessor topology,
+        // author-gated), and the bot's own status comments (train recovery
+        // — DESIGN §Bootstrap Phase 2). Any failure releases the delivery:
+        // there is no safe way to process anything without the bootstrap,
+        // and closing would silently drop webhooks GitHub will never
+        // resend — the repo's queue pauses at the stall cadence (which
+        // also heals "permanent" auth errors the moment the operator fixes
+        // the token).
+        if self.store.state().default_branch.is_empty() && !self.bootstrap_crawl()? {
+            return self.release(&id);
         }
 
         // Command authorization + referenced-PR precache (commands only).
@@ -776,6 +748,92 @@ impl Processor {
             return;
         }
         self.pending.push_back(work);
+    }
+
+    /// The first-contact crawl (DESIGN §Bootstrap algorithm, Phase 2):
+    /// fetches settings, open + recently merged PRs, and every crawled
+    /// PR's comments, then appends [`super::bootstrap::crawl_events`]'s
+    /// result as ONE atomic batch — a crash or a released retry re-crawls
+    /// from nothing (idempotent reads, no partial state). Adopted ACTIVE
+    /// trains are marked for M6 recovery, deferred behind the backlog
+    /// drain like every other recovery. Returns `false` when GitHub was
+    /// unavailable (any failure: transient, permanent, or a wrong
+    /// variant): the caller releases the delivery and the queue pauses at
+    /// the stall cadence — there is no safe degraded answer at bootstrap.
+    fn bootstrap_crawl(&mut self) -> Result<bool, StoreError> {
+        /// How many days of merged PRs the crawl considers: predecessor
+        /// targets and mid-cascade roots older than this are treated as
+        /// history (DESIGN bounds the resurrection window the same way).
+        const MERGED_SINCE_DAYS: u32 = 30;
+
+        macro_rules! fetch {
+            ($effect:expr, $expected:pat => $value:expr) => {
+                match self.deps.github.execute($effect) {
+                    Ok($expected) => $value,
+                    Ok(other) => {
+                        error!(?other, "bootstrap fetch answered the wrong variant");
+                        return Ok(false);
+                    }
+                    Err(e) => {
+                        warn!(error = ?e, "bootstrap crawl failed; the repo's queue \
+                               pauses until it succeeds");
+                        return Ok(false);
+                    }
+                }
+            };
+        }
+
+        let settings = fetch!(
+            GitHubEffect::GetRepoSettings,
+            GitHubResponse::RepoSettings(s) => s
+        );
+        if settings.default_branch.is_empty() {
+            error!("repository settings carry an empty default branch");
+            return Ok(false);
+        }
+        let open = fetch!(GitHubEffect::ListOpenPrs, GitHubResponse::PrList(prs) => prs);
+        let (merged, may_be_incomplete) = fetch!(
+            GitHubEffect::ListRecentlyMergedPrs { since_days: MERGED_SINCE_DAYS },
+            GitHubResponse::RecentlyMergedPrList { prs, may_be_incomplete } => (prs, may_be_incomplete)
+        );
+        if may_be_incomplete {
+            warn!(
+                "the recently-merged crawl hit its pagination limit; trains \
+                 rooted at older merged PRs will not be recovered"
+            );
+        }
+        let mut comments = Vec::with_capacity(open.len() + merged.len());
+        for pr in open.iter().chain(merged.iter()).map(|p| p.number) {
+            let pr_comments = fetch!(
+                GitHubEffect::ListComments { pr },
+                GitHubResponse::Comments(c) => c
+            );
+            comments.push((pr, pr_comments));
+        }
+
+        let outcome = super::bootstrap::crawl_events(
+            &settings.default_branch,
+            &open,
+            &merged,
+            &comments,
+            &self.deps.bot_name,
+            self.deps.bot_user_id,
+        );
+        info!(
+            default_branch = %settings.default_branch,
+            open = open.len(),
+            merged = merged.len(),
+            recovered_trains = outcome.recovered_roots.len(),
+            "bootstrapped the repo from a crawl"
+        );
+        self.store.append_batch(&outcome.events, Utc::now())?;
+        for root in outcome.recovered_roots {
+            self.inherited_mid_flight.insert(root);
+        }
+        // The recoveries defer behind the backlog drain, exactly like
+        // startup evaluations (the round-6/round-20 gating).
+        self.requeue_marked_recoveries();
+        Ok(true)
     }
 
     /// Supplementary GitHub recovery for a train inherited mid-cascade
