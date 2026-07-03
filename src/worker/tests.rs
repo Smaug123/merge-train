@@ -259,6 +259,7 @@ impl World {
             bot_user_id: TEST_BOT_ID,
             bot_name: "merge-train".to_owned(),
             stall_retry_delay: std::time::Duration::from_millis(25),
+            poll_interval: std::time::Duration::ZERO,
         }
     }
 
@@ -3086,6 +3087,150 @@ mod registry {
 ///
 /// Each case does real git work, so the case counts are deliberately small;
 /// raise them locally (`PROPTEST_CASES`) when touching worker ordering.
+// ─── Polling fallback: missed-webhook recovery ───
+
+/// The production idle wait runs on a plain OS thread and borrows the
+/// server's runtime for its timer. It must time out (the poll tick) and
+/// deliver a message that arrives first — and, above all, not panic for
+/// constructing the timer outside the runtime (Codex polling review round
+/// 3, P1: the fake-backed tests never take this path).
+#[test]
+fn timed_recv_times_out_and_delivers_from_a_plain_thread() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let handle = runtime.handle().clone();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<u32>(4);
+    let outcome = std::thread::spawn(move || {
+        let timed_out = super::timed_recv(&handle, &mut rx, std::time::Duration::from_millis(20));
+        tx.blocking_send(7).unwrap();
+        let delivered = super::timed_recv(&handle, &mut rx, std::time::Duration::from_secs(5));
+        (timed_out.is_err(), delivered)
+    })
+    .join()
+    .unwrap();
+    assert!(outcome.0, "an empty mailbox times out at the poll deadline");
+    assert!(
+        matches!(outcome.1, Ok(Some(7))),
+        "a message arriving first is delivered"
+    );
+}
+
+/// The headline: a train parked `WaitingCi` because its frontier PR is not
+/// mergeable will resume when readiness changes — even if the webhook that
+/// would have announced it (a `check_suite`/`status`) is never delivered.
+/// The poll re-evaluates, the engine re-fetches merge state, and progress
+/// is made. (Before polling, a missed webhook stranded the train forever.)
+#[test]
+fn poll_recovers_a_train_stranded_by_a_missed_ci_webhook() {
+    let (mut world, _heads) = World::linear_stack(1);
+    world.github.lock().unwrap().blocked.insert(PrNumber(1));
+    let mut processor = world.processor();
+    start_command(&mut world, &mut processor, 1);
+    drain(&mut processor);
+
+    // The frontier PR is blocked, so the train parked without merging.
+    assert!(
+        processor
+            .state()
+            .active_trains
+            .values()
+            .any(|t| t.state.is_active()),
+        "the train must be parked (active, WaitingCi), not gone"
+    );
+    assert!(
+        !processor.state().prs[&PrNumber(1)].state.is_merged(),
+        "a blocked frontier PR must not have merged"
+    );
+
+    // A poll while still blocked re-evaluates but makes no progress.
+    processor.poll_active_trains();
+    drain(&mut processor);
+    assert_eq!(
+        world
+            .github
+            .lock()
+            .unwrap()
+            .squash_count
+            .values()
+            .sum::<u32>(),
+        0,
+        "a poll while still blocked must not merge anything"
+    );
+    // And persists nothing: an unchanged observation is not an event.
+    // Compaction refuses active trains and every evaluation replays the
+    // train's log, so a parked train polled forever must not grow the log
+    // (Codex polling review, P2).
+    let events_after_first_poll = processor.store_mut().events().unwrap().len();
+    processor.poll_active_trains();
+    drain(&mut processor);
+    assert_eq!(
+        processor.store_mut().events().unwrap().len(),
+        events_after_first_poll,
+        "a poll that observes nothing new must append nothing"
+    );
+
+    // Readiness flips with NO webhook delivered; the next poll recovers it.
+    // `drain` (not `drive_to_completion`) makes NO CI nudge, so only the
+    // poll's re-evaluation can complete the train.
+    world.github.lock().unwrap().blocked.clear();
+    processor.poll_active_trains();
+    drain(&mut processor);
+    assert!(
+        processor.state().prs[&PrNumber(1)].state.is_merged(),
+        "the poll alone (no webhook) must recover the stranded train"
+    );
+}
+
+/// A poll must not evaluate ahead of the acked backlog: its evaluations
+/// route through the same backlog-drain gate as the startup ones, so a
+/// pending stop/topology delivery is applied first (the round-6 rule).
+#[test]
+fn poll_does_not_overtake_the_acked_backlog() {
+    let (mut world, heads) = World::linear_stack(1);
+    // Block #1 so the train stays parked (active) after start.
+    world.github.lock().unwrap().blocked.insert(PrNumber(1));
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 1, &heads);
+    start_command(&mut world, &mut processor, 1);
+    drain(&mut processor);
+    assert!(
+        processor
+            .state()
+            .active_trains
+            .values()
+            .any(|t| t.state.is_active())
+    );
+
+    // A delivery is waiting in the backlog; a poll now must not jump it.
+    let head = {
+        let github = world.github.lock().unwrap();
+        github.branch_head("pr-1")
+    };
+    let body = check_suite_green_body(&world.config, &head, &[1], 800);
+    world.enqueue(&mut processor, "check_suite", body);
+    processor.poll_active_trains();
+    assert!(
+        processor.pump().unwrap().is_none(),
+        "poll evaluations must wait behind the pending delivery"
+    );
+    assert!(
+        !processor.has_queued_work(),
+        "nothing is queued until the backlog drains"
+    );
+}
+
+/// A poll with no active trains queues nothing — pure overhead avoidance.
+#[test]
+fn poll_with_no_active_trains_is_a_noop() {
+    let (world, _heads) = World::linear_stack(1);
+    let mut processor = world.processor();
+    processor.poll_active_trains();
+    assert!(processor.claim().unwrap().is_none());
+    assert!(
+        !processor.has_queued_work(),
+        "a poll with no active trains queues no work"
+    );
+}
+
 mod interleaving {
     use proptest::prelude::*;
 
