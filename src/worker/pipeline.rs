@@ -853,6 +853,17 @@ impl Processor {
                     Utc::now(),
                 )?;
             }
+            CommentRecovery::RefreshComment(comment_id) => {
+                // The recorded comment is live but behind the store (the
+                // common crash shape: events commit before the best-effort
+                // update runs) or mangled. Rewrite it BEFORE resuming: the
+                // comment is the only recovery source if the DB is lost in
+                // the resume window (Codex M6 review round 3).
+                info!(%root, %comment_id, "status comment is behind the store; refreshing");
+                if !self.refresh_status_comment(root, &local, comment_id)? {
+                    return Ok(false);
+                }
+            }
             CommentRecovery::RepairCommentId(comment_id) => {
                 info!(%root, %comment_id, "status comment moved; repairing the id");
                 self.store.append_batch(
@@ -862,6 +873,13 @@ impl Processor {
                     }],
                     Utc::now(),
                 )?;
+                // The found comment's content is at best as old as the
+                // local record: bring the backup current before resuming
+                // (a crash between the append above and this refresh
+                // re-decides as RefreshComment — same repair, converges).
+                if !self.refresh_status_comment(root, &local, comment_id)? {
+                    return Ok(false);
+                }
             }
             CommentRecovery::RepostBackup => {
                 // Re-establish the off-disk backup NOW: the engine's own
@@ -933,6 +951,51 @@ impl Processor {
         self.needs_restart_cleanup.insert(root);
         info!(%root, "recovered an inherited mid-cascade train; resuming");
         Ok(true)
+    }
+
+    /// Rewrites the live status comment from `record` so the off-disk
+    /// backup is current before a recovered train resumes. Returns `false`
+    /// (with the retry timer requested) when GitHub was unavailable —
+    /// parking the whole recovery, exactly like the re-post path. A record
+    /// that cannot be formatted resumes without the refresh, loudly
+    /// (unreachable in practice: a record that formatted before fits now).
+    fn refresh_status_comment(
+        &mut self,
+        root: PrNumber,
+        record: &crate::types::TrainRecord,
+        comment_id: crate::types::CommentId,
+    ) -> Result<bool, StoreError> {
+        let mut record = record.clone();
+        record.status_comment_id = Some(comment_id);
+        match crate::status::format::format_status_comment(
+            &record,
+            "🚂 Merge train recovered after a restart.",
+        ) {
+            Ok(body) => match self
+                .deps
+                .github
+                .execute(GitHubEffect::UpdateComment { comment_id, body })
+            {
+                Ok(_) => Ok(true),
+                Err(e) => {
+                    // Transient and permanent park identically (see the
+                    // re-post path). A permanent 404 — deleted between the
+                    // list and this update — re-decides as RepostBackup on
+                    // the retry.
+                    warn!(%root, error = ?e, "cannot refresh the status comment; recovery parked");
+                    self.retry_requested = true;
+                    Ok(false)
+                }
+            },
+            Err(e) => {
+                error!(
+                    %root, error = %e,
+                    "recovered record cannot be formatted as a status \
+                     comment; resuming WITHOUT refreshing the backup"
+                );
+                Ok(true)
+            }
+        }
     }
 
     /// Whether the worker loop should arm the stall-retry timer (set when

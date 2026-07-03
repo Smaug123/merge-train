@@ -36,13 +36,23 @@ pub enum CommentRecovery {
     /// adopt it wholesale. `status_comment_id` is already repaired to the
     /// comment it was found in.
     Adopt(Box<TrainRecord>),
-    /// The local record is current (or ahead): keep it.
+    /// The local record is current and the live comment already embeds it
+    /// (same incarnation, same `recovery_seq`): keep both.
     KeepLocal,
+    /// The local record is current but the recorded comment's content is
+    /// behind it — the common crash shape: events commit before the
+    /// best-effort `UpdateComment` runs — or unparseable. The worker must
+    /// rewrite the comment body from the local record BEFORE the train
+    /// resumes: the comment is the only recovery source if the DB is lost
+    /// in the resume window, and a stale `recovery_seq` there cannot
+    /// prevent replaying work already performed (Codex M6 review round 3).
+    RefreshComment(CommentId),
     /// The local record is current but its `status_comment_id` points at a
     /// comment that no longer exists, while the bot's status comment for
-    /// this train lives at this id (e.g. the DB was restored from a backup
-    /// taken before a user deleted and the bot re-posted the comment):
-    /// repair the id so updates reach the live comment.
+    /// this train lives at this id (a crash between the initial post and
+    /// `StatusCommentPosted`, or a restore from a backup predating a
+    /// delete-and-repost): record the id, then refresh the body (the found
+    /// comment's content is at best as old as the local record).
     RepairCommentId(CommentId),
     /// The status comment is gone entirely: local state stands, but the
     /// worker must re-post the off-disk backup and record the fresh id
@@ -82,16 +92,33 @@ pub fn decide_comment_recovery(
     }
 
     match local.status_comment_id {
-        // The recorded comment still exists: nothing to repair. (Content
-        // may lag the local record; the next transition's update fixes it.)
-        Some(local_id) if comments.iter().any(|c| c.id == local_id) => CommentRecovery::KeepLocal,
-        // The recorded comment is gone, but the bot's status comment for
-        // this train lives elsewhere: point at it.
-        Some(_) if best.is_some() => {
-            CommentRecovery::RepairCommentId(best.expect("checked is_some").0)
+        Some(local_id) => {
+            if let Some(live) = comments.iter().find(|c| c.id == local_id) {
+                // Remote-ahead was handled above (Adopt), so the live
+                // content is at most as new as the local record. It is a
+                // sound backup only if it embeds exactly this record;
+                // anything else — behind after a crash-before-update,
+                // mangled by an edit — must be rewritten before the train
+                // resumes.
+                let fresh = parse_status_comment(&live.body).is_ok_and(|r| {
+                    r.original_root_pr == local.original_root_pr
+                        && r.started_at == local.started_at
+                        && r.recovery_seq == local.recovery_seq
+                });
+                if fresh {
+                    CommentRecovery::KeepLocal
+                } else {
+                    CommentRecovery::RefreshComment(local_id)
+                }
+            } else if let Some((id, _)) = best {
+                // The recorded comment is gone, but the bot's status
+                // comment for this train lives elsewhere: point at it.
+                CommentRecovery::RepairCommentId(id)
+            } else {
+                // Gone without replacement: the worker re-posts the backup.
+                CommentRecovery::RepostBackup
+            }
         }
-        // Gone without replacement: the worker re-posts the backup.
-        Some(_) => CommentRecovery::RepostBackup,
         // No id recorded, but the bot's comment for this incarnation is
         // live: the crash landed after the initial `PostComment` succeeded
         // and before `StatusCommentPosted` was appended. Attach to it —
@@ -216,13 +243,42 @@ mod tests {
     }
 
     #[test]
-    fn intact_comment_keeps_local() {
+    fn a_current_comment_keeps_local() {
+        let local = local_at(5, Some(3));
+        let embedded = local_at(5, None);
+        let comments = vec![comment(3, BOT, &embedded)];
+        assert_eq!(
+            decide_comment_recovery(&local, &comments, BOT),
+            CommentRecovery::KeepLocal
+        );
+    }
+
+    /// The common crash shape: events committed, the best-effort update
+    /// never ran, so the live comment is behind the store. It must be
+    /// rewritten before the train resumes.
+    #[test]
+    fn a_stale_comment_is_refreshed() {
         let local = local_at(5, Some(3));
         let behind = local_at(4, None);
         let comments = vec![comment(3, BOT, &behind)];
         assert_eq!(
             decide_comment_recovery(&local, &comments, BOT),
-            CommentRecovery::KeepLocal
+            CommentRecovery::RefreshComment(CommentId(3))
+        );
+    }
+
+    /// A mangled (unparseable) live comment is no backup at all: rewrite it.
+    #[test]
+    fn a_mangled_comment_is_refreshed() {
+        let local = local_at(5, Some(3));
+        let comments = vec![CommentData {
+            id: CommentId(3),
+            author_id: BOT,
+            body: "someone edited this".to_owned(),
+        }];
+        assert_eq!(
+            decide_comment_recovery(&local, &comments, BOT),
+            CommentRecovery::RefreshComment(CommentId(3))
         );
     }
 

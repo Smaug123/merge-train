@@ -2428,6 +2428,68 @@ fn a_status_comment_ahead_of_the_store_is_adopted() {
     assert_recovered_exactly_once(&world, &mut processor, "comment-ahead");
 }
 
+/// A crash between an append and its best-effort status update — the
+/// COMMON crash shape, since events commit before effects run — leaves the
+/// live comment behind the store. Recovery must refresh the backup BEFORE
+/// the train resumes: the comment is the only recovery source if the DB is
+/// lost in the resume window, and a stale `recovery_seq` there cannot
+/// prevent replaying work already performed (Codex M6 review round 3, P2).
+#[test]
+fn recovery_refreshes_a_stale_status_comment_before_resuming() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    start_command(&mut world, &mut processor, 1);
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+    // Execute through batch 3 (preflight → status post → refetch), then let
+    // boundary 3 plan the Preparing phase: its PhaseTransition (seq bump)
+    // is appended, but the batch — carrying the status update — never runs.
+    let b1 = processor.pump().unwrap().expect("preflight");
+    let o1 = execute(&processor, &b1);
+    let b2 = processor
+        .on_outcomes(b1.root, o1, b1.feedback)
+        .unwrap()
+        .expect("status post");
+    let o2 = execute(&processor, &b2);
+    let b3 = processor
+        .on_outcomes(b2.root, o2, b2.feedback)
+        .unwrap()
+        .expect("refetch");
+    let o3 = execute(&processor, &b3);
+    let _unexecuted = processor
+        .on_outcomes(b3.root, o3, b3.feedback)
+        .unwrap()
+        .expect("preparing batch");
+    drop(processor); // crash
+
+    let mut processor = world.processor();
+    let local = processor.state().active_trains[&PrNumber(1)].clone();
+    let comment_id = local.status_comment_id.expect("comment recorded");
+    let embedded = |world: &World| {
+        let github = world.github.lock().unwrap();
+        crate::status::parse::parse_status_comment(&github.comments[&comment_id].body)
+            .expect("status comment parses")
+            .recovery_seq
+    };
+    assert!(
+        embedded(&world) < local.recovery_seq,
+        "precondition: the crash left the backup behind the store"
+    );
+
+    // Loop-faithfully reach the recovery pump; the returned batch is NOT
+    // executed — the backup must already be current by then.
+    assert!(processor.pump().unwrap().is_none(), "evaluates deferred");
+    assert!(processor.claim().unwrap().is_none());
+    let _resumed = processor.pump().unwrap();
+    assert_eq!(
+        embedded(&world),
+        local.recovery_seq,
+        "the backup must be refreshed before any resumed effect runs"
+    );
+}
+
 /// A crash after the initial status comment posts but before
 /// `StatusCommentPosted` lands leaves a live comment the store has no id
 /// for. Recovery must ATTACH to it, not post a duplicate — which requires
