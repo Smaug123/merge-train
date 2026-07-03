@@ -2800,6 +2800,107 @@ fn a_member_closed_during_the_db_loss_gap_aborts_the_train_cleanly() {
     );
 }
 
+/// A stack EXTENDED during a DB-loss gap must abort on recovery, matching
+/// the live topology-change abort: a new PR declaring a stack member as its
+/// predecessor appears during the outage, the crawl records it as baseline,
+/// and the adopted train aborts instead of silently resuming over changed
+/// topology (Codex crawl review round 4, P1).
+#[test]
+fn a_stack_extended_during_a_db_loss_gap_aborts_on_recovery() {
+    let (mut world, heads) = World::linear_stack(2);
+    world.github.lock().unwrap().comments.insert(
+        CommentId(1000),
+        FakeComment {
+            pr: PrNumber(2),
+            author_id: AUTHOR,
+            body: "@merge-train predecessor #1".to_owned(),
+            edited: false,
+        },
+    );
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    start_command(&mut world, &mut processor, 1);
+    run_batches_then_crash(&mut world, processor, 4);
+
+    // The DB dies.
+    let db = world.db_path();
+    for path in [
+        db.clone(),
+        db.with_extension("db-wal"),
+        db.with_extension("db-shm"),
+        db.with_extension("lock"),
+    ] {
+        let _ = std::fs::remove_file(path);
+    }
+    // During the gap a NEW PR #3 is opened declaring #2 — the stack grew
+    // under the interrupted train.
+    let head3 = create_branch_with_file(&world.config, "pr-3", "pr-3.txt", "content 3", "pr-2");
+    create_pr_ref(&world.config, 3, &head3);
+    {
+        let mut github = world.github.lock().unwrap();
+        github.prs.insert(
+            PrNumber(3),
+            FakePr {
+                author_id: AUTHOR,
+                branch: "pr-3".to_owned(),
+                base_ref: "pr-2".to_owned(),
+                state: FakePrState::Open,
+            },
+        );
+        github.comments.insert(
+            CommentId(1001),
+            FakeComment {
+                pr: PrNumber(3),
+                author_id: AUTHOR,
+                body: "@merge-train predecessor #2".to_owned(),
+                edited: false,
+            },
+        );
+    }
+
+    // The wake-up webhook triggers the crawl, which must abort the train.
+    let mut processor = world.processor();
+    let head = {
+        let github = world.github.lock().unwrap();
+        github.branch_head("pr-1")
+    };
+    let body = check_suite_green_body(&world.config, &head, &[1], world.next_delivery + 900);
+    world.enqueue(&mut processor, "check_suite", body);
+    drain(&mut processor);
+
+    assert!(
+        processor
+            .state()
+            .active_trains
+            .values()
+            .all(|t| !t.state.is_active()),
+        "the extended-stack train must not resume active: {:?}",
+        processor.state().active_trains
+    );
+    assert!(
+        matches!(
+            processor
+                .state()
+                .active_trains
+                .get(&PrNumber(1))
+                .map(|t| &t.state),
+            Some(crate::types::TrainState::Aborted { .. })
+        ),
+        "train #1 must be aborted (topology changed under it)"
+    );
+    assert_eq!(
+        world
+            .github
+            .lock()
+            .unwrap()
+            .squash_count
+            .values()
+            .sum::<u32>(),
+        0,
+        "an aborted train must not squash anything"
+    );
+}
+
 /// GitHub down at first contact: the delivery releases (nothing can be
 /// processed without the bootstrap) and succeeds when retried.
 #[test]

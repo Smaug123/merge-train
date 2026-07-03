@@ -814,7 +814,17 @@ stage shippable).
 >    unfinished train necessarily has unmerged members); fan-out replay
 >    never clobbers a child record born during-or-after the parent train
 >    (protecting both progress and a user's stop), while prior-incarnation
->    records are replaced. REBUTTED (round 3, P1): a handler-emitted
+>    records are replaced. Round 4 (P1): a stack EXTENDED during the gap
+>    (a new PR declaring a stack member — the live path fires
+>    `topology_change_abort`) is detected against the crawled descendant
+>    closure and the adopted train is aborted with `PredecessorChanged`
+>    (+ `AbortCleanup` queued for its stale worktree), never silently
+>    resumed. Only extensions are detected: the cascade prepares each
+>    frozen descendant against `current_pr` (the frozen frontier), not
+>    its live-declared predecessor, so intra-set reorders/removals leave
+>    the recovered git operations self-consistent, and detecting them
+>    would false-positive on the legitimate merged-member-blocks-traversal
+>    mid-cascade state. REBUTTED (round 3, P1): a handler-emitted
 >    EvaluateTrain for a crawl-adopted train legitimately bypasses the
 >    startup deferral — it has an in-order cause (the wake-up delivery
 >    itself), so a stop queued behind it applies at the next observation

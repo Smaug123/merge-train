@@ -32,14 +32,17 @@
 //! the cache, so a fresh `start` gets the engine's loud validations (and
 //! the late-addition answer) rather than silence.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::commands::{Command, parse_command};
 use crate::effects::PrData;
 use crate::effects::github::CommentData;
-use crate::persistence::event::StateEventPayload;
+use crate::persistence::event::{StateEvent, StateEventPayload};
+use crate::persistence::snapshot::PersistedRepoSnapshot;
+use crate::state::RepoState;
+use crate::state::descendants::collect_all_descendants;
 use crate::status::parse::parse_status_comment;
-use crate::types::{MergeStateStatus, PrNumber, TrainRecord};
+use crate::types::{MergeStateStatus, PrNumber, TrainError, TrainErrorKind, TrainRecord};
 
 use super::pipeline::cache_fill_events;
 
@@ -62,6 +65,55 @@ fn members(record: &TrainRecord) -> Vec<PrNumber> {
         members.extend_from_slice(progress.frozen_descendants());
     }
     members
+}
+
+/// Builds a scratch [`RepoState`] from the topology events (default branch,
+/// PR cache fills, predecessor declarations) so the stack-extension check
+/// can walk the descendants index `apply_event` maintains.
+fn replay_topology(
+    default_branch: &str,
+    events: &[StateEventPayload],
+    now: chrono::DateTime<chrono::Utc>,
+) -> RepoState {
+    let mut state = RepoState::from_snapshot(PersistedRepoSnapshot::new(default_branch.to_owned()));
+    for (seq, payload) in events.iter().enumerate() {
+        state.apply_event(&StateEvent {
+            seq: seq as u64,
+            ts: now,
+            payload: payload.clone(),
+        });
+    }
+    state
+}
+
+/// Whether the crawled topology extends `record`'s stack beyond what it
+/// froze — a new PR declaring a stack member as its predecessor, appearing
+/// in the train's descendant closure but absent from its frozen set. In
+/// live operation such a declaration fires `topology_change_abort`; the
+/// crawl records it as baseline, so the extension has to be detected here.
+///
+/// Only *extensions* are detected, not pure reorders or removals within the
+/// frozen set: the cascade prepares each frozen descendant against
+/// `current_pr` (the frozen frontier), not against its live-declared
+/// predecessor, so a recovered train's git operations stay self-consistent
+/// regardless of intra-set churn — and detecting removal/reorder cannot be
+/// done without false-positives on the legitimate mid-cascade state where a
+/// merged member blocks traversal to its still-pending children. An
+/// extension, by contrast, is unambiguous and matches the reviewer's
+/// scenario exactly. An `Idle`-phase train has no frozen set yet (it will
+/// freeze against the current topology at its next `Preparing`), so it is
+/// never flagged.
+fn stack_extended(topology: &RepoState, record: &TrainRecord) -> bool {
+    let Some(progress) = record.cascade_phase.progress() else {
+        return false;
+    };
+    let mut frozen: HashSet<PrNumber> = progress.frozen_descendants().iter().copied().collect();
+    frozen.insert(record.original_root_pr);
+    frozen.insert(record.current_pr);
+    [record.original_root_pr, record.current_pr]
+        .into_iter()
+        .flat_map(|anchor| collect_all_descendants(anchor, &topology.descendants, &topology.prs))
+        .any(|d| !frozen.contains(&d))
 }
 
 /// Turns crawled facts into state events. Pure: fetching is the caller's;
@@ -174,6 +226,11 @@ pub(crate) fn crawl_events(
         .into_iter()
         .filter(|t| !crawled_numbers.contains(t))
         .collect();
+    // The crawled topology (default branch + PR cache + declarations), for
+    // the stack-extension check: `events` holds exactly those so far, since
+    // no adoption has been pushed yet.
+    let topology = replay_topology(default_branch, &events, now);
+
     let mut roots: Vec<PrNumber> = best.keys().copied().collect();
     roots.sort_unstable();
     for root in roots {
@@ -195,7 +252,10 @@ pub(crate) fn crawl_events(
         if record.state.is_active() && all_members_merged {
             record.state = crate::types::TrainState::Completed { ended_at: now };
         }
-        if record.state.is_active() {
+        // A stack extended during the gap aborts, matching the live
+        // topology-change abort (Codex crawl review round 4).
+        let extended = record.state.is_active() && stack_extended(&topology, &record);
+        if record.state.is_active() && !extended {
             recovered_roots.push(root);
             for member in members(&record) {
                 if !crawled_numbers.contains(&member) && !missing_members.contains(&member) {
@@ -207,6 +267,19 @@ pub(crate) fn crawl_events(
             root_pr: root,
             record,
         });
+        if extended {
+            events.push(StateEventPayload::TrainAborted {
+                root_pr: root,
+                error: TrainError::new(
+                    TrainErrorKind::PredecessorChanged,
+                    format!(
+                        "PR #{root}'s stack was extended while its train was interrupted \
+                         (a new predecessor declaration appeared); a merge train cannot \
+                         safely resume over changed topology — re-issue `@merge-train start`."
+                    ),
+                ),
+            });
+        }
     }
     missing_members.sort_unstable();
     missing_members.dedup();
@@ -516,6 +589,85 @@ mod tests {
         let outcome = crawl_events("main", &open, &[], &comments, "merge-train", BOT, ts);
         assert_eq!(outcome.recovered_roots, vec![PrNumber(1)]);
         assert_eq!(outcome.missing_members, vec![PrNumber(3)]);
+    }
+
+    /// A stack EXTENDED during the DB-loss gap — a new PR declaring a stack
+    /// member as its predecessor — must abort the adopted active train, not
+    /// silently resume over changed topology. In live operation that
+    /// declaration fires `topology_change_abort`; the crawl records it as
+    /// baseline, so bootstrap must synthesize the same abort (Codex crawl
+    /// review round 4, P1).
+    #[test]
+    fn a_stack_extended_during_the_gap_aborts_the_adopted_train() {
+        use crate::types::{CascadePhase, DescendantProgress, PrState};
+        let ts = test_now();
+        let mut record = TrainRecord::new(PrNumber(1), ts);
+        record.cascade_phase = CascadePhase::Preparing {
+            progress: DescendantProgress::new(vec![PrNumber(2)]),
+        };
+        let body = format_status_comment(&record, "mid").unwrap();
+        // #2 is the original stack member; #3 was ADDED during the gap,
+        // declaring #2 — extending the active train's stack.
+        let open = vec![
+            pr(1, AUTHOR, PrState::Open),
+            pr(2, AUTHOR, PrState::Open),
+            pr(3, AUTHOR, PrState::Open),
+        ];
+        let comments = vec![
+            (PrNumber(1), vec![comment(1, BOT, &body)]),
+            (
+                PrNumber(2),
+                vec![comment(2, AUTHOR, "@merge-train predecessor #1")],
+            ),
+            (
+                PrNumber(3),
+                vec![comment(3, AUTHOR, "@merge-train predecessor #2")],
+            ),
+        ];
+        let outcome = crawl_events("main", &open, &[], &comments, "merge-train", BOT, ts);
+        assert!(
+            outcome.recovered_roots.is_empty(),
+            "an extended stack must not silently resume"
+        );
+        assert!(
+            outcome.events.iter().any(|e| matches!(
+                e,
+                StateEventPayload::TrainAborted {
+                    root_pr: PrNumber(1),
+                    ..
+                }
+            )),
+            "the extended-stack train must abort"
+        );
+    }
+
+    /// A NORMAL mid-cascade active train (its declared stack unchanged since
+    /// freeze) recovers — the extension check must not false-abort it.
+    #[test]
+    fn an_unchanged_stack_still_recovers() {
+        use crate::types::{CascadePhase, DescendantProgress, PrState};
+        let ts = test_now();
+        let mut record = TrainRecord::new(PrNumber(1), ts);
+        record.cascade_phase = CascadePhase::Preparing {
+            progress: DescendantProgress::new(vec![PrNumber(2)]),
+        };
+        let body = format_status_comment(&record, "mid").unwrap();
+        let open = vec![pr(1, AUTHOR, PrState::Open), pr(2, AUTHOR, PrState::Open)];
+        let comments = vec![
+            (PrNumber(1), vec![comment(1, BOT, &body)]),
+            (
+                PrNumber(2),
+                vec![comment(2, AUTHOR, "@merge-train predecessor #1")],
+            ),
+        ];
+        let outcome = crawl_events("main", &open, &[], &comments, "merge-train", BOT, ts);
+        assert_eq!(outcome.recovered_roots, vec![PrNumber(1)]);
+        assert!(
+            !outcome
+                .events
+                .iter()
+                .any(|e| matches!(e, StateEventPayload::TrainAborted { .. }))
+        );
     }
 
     /// Cache fills precede declarations and adoptions, so `apply_event`
