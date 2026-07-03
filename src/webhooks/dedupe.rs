@@ -7,7 +7,7 @@
 //! # Key Formats by Event Type
 //!
 //! - `issue_comment.created`: `issue_comment:<pr>:<comment_id>:created`
-//! - `issue_comment.edited`: `issue_comment:<pr>:<comment_id>:edited:<updated_at>:<body-digest>`
+//! - `issue_comment.edited`: `issue_comment:<pr>:<comment_id>:edited:<updated_at>:<body-digest>:<sender>`
 //! - `issue_comment.deleted`: `issue_comment:<pr>:<comment_id>:deleted`
 //! - `pull_request.<action>`: `pull_request:<pr>:<action>:<head_sha>:<merge>:<updated_at>`
 //! - `pull_request.edited`: `pull_request:<pr>:edited:<base>:<updated_at>`
@@ -51,22 +51,26 @@ impl DedupeKey {
     /// are second-resolution, and edited bodies drive predecessor
     /// declarations and retractions, so a rapid correction within one second
     /// must not be dropped as a duplicate: a digest of the body is part of
-    /// the key (Codex M5 round 12). Pure redeliveries share the body and
-    /// still dedupe.
+    /// the key (Codex M5 round 12), and so is the editor — authorization is
+    /// sender-based, so a denied non-author edit must not swallow the
+    /// author's identical same-second edit (Codex M5 round 16). Pure
+    /// redeliveries share body and sender and still dedupe.
     pub fn issue_comment_edited(
         pr: PrNumber,
         comment_id: CommentId,
+        sender_id: u64,
         body: &str,
         updated_at: &DateTime<Utc>,
     ) -> Self {
         use sha2::{Digest, Sha256};
         let digest = Sha256::digest(body.as_bytes());
         DedupeKey(format!(
-            "issue_comment:{}:{}:edited:{}:{}",
+            "issue_comment:{}:{}:edited:{}:{}:{}",
             pr.0,
             comment_id.0,
             updated_at.to_rfc3339(),
             hex::encode(&digest[..8]),
+            sender_id,
         ))
     }
 
@@ -178,9 +182,13 @@ impl DedupeKey {
                 let pr = e.pr_number?;
                 Some(match e.action {
                     CommentAction::Created => DedupeKey::issue_comment_created(pr, e.comment_id),
-                    CommentAction::Edited => {
-                        DedupeKey::issue_comment_edited(pr, e.comment_id, &e.body, &e.updated_at)
-                    }
+                    CommentAction::Edited => DedupeKey::issue_comment_edited(
+                        pr,
+                        e.comment_id,
+                        e.sender_id,
+                        &e.body,
+                        &e.updated_at,
+                    ),
                     CommentAction::Deleted => DedupeKey::issue_comment_deleted(pr, e.comment_id),
                 })
             }
@@ -360,12 +368,26 @@ mod tests {
             updated_at in arb_datetime(),
         ) {
             let key1 = DedupeKey::issue_comment_created(pr, comment_id);
-            let key2 = DedupeKey::issue_comment_edited(pr, comment_id, "b", &updated_at);
+            let key2 = DedupeKey::issue_comment_edited(pr, comment_id, 1, "b", &updated_at);
             let key3 = DedupeKey::issue_comment_deleted(pr, comment_id);
             // Compare using as_str() to avoid move issues
             prop_assert_ne!(key1.as_str(), key2.as_str());
             prop_assert_ne!(key2.as_str(), key3.as_str());
             prop_assert_ne!(key1.as_str(), key3.as_str());
+        }
+
+        /// Authorization is sender-based: a denied non-author edit must not
+        /// swallow the author's identical same-second edit (Codex M5
+        /// round 16).
+        #[test]
+        fn same_second_identical_edits_by_different_senders_differ(
+            pr in arb_pr_number(),
+            comment_id in arb_comment_id(),
+            updated_at in arb_datetime(),
+        ) {
+            let a = DedupeKey::issue_comment_edited(pr, comment_id, 1, "same", &updated_at);
+            let b = DedupeKey::issue_comment_edited(pr, comment_id, 2, "same", &updated_at);
+            prop_assert_ne!(a, b);
         }
 
         /// Second-resolution timestamps mean two edits of one comment can
@@ -377,8 +399,8 @@ mod tests {
             comment_id in arb_comment_id(),
             updated_at in arb_datetime(),
         ) {
-            let a = DedupeKey::issue_comment_edited(pr, comment_id, "@bot predecessor #1", &updated_at);
-            let b = DedupeKey::issue_comment_edited(pr, comment_id, "@bot predecessor #2", &updated_at);
+            let a = DedupeKey::issue_comment_edited(pr, comment_id, 1, "@bot predecessor #1", &updated_at);
+            let b = DedupeKey::issue_comment_edited(pr, comment_id, 1, "@bot predecessor #2", &updated_at);
             prop_assert_ne!(a, b);
         }
 
@@ -390,8 +412,8 @@ mod tests {
             updated_at2 in arb_datetime(),
         ) {
             prop_assume!(updated_at1 != updated_at2);
-            let key1 = DedupeKey::issue_comment_edited(pr, comment_id, "b", &updated_at1);
-            let key2 = DedupeKey::issue_comment_edited(pr, comment_id, "b", &updated_at2);
+            let key1 = DedupeKey::issue_comment_edited(pr, comment_id, 1, "b", &updated_at1);
+            let key2 = DedupeKey::issue_comment_edited(pr, comment_id, 1, "b", &updated_at2);
             prop_assert_ne!(key1, key2);
         }
 
@@ -456,7 +478,7 @@ mod tests {
         ) {
             for (action, expected) in [
                 (CommentAction::Created, DedupeKey::issue_comment_created(pr, CommentId(comment_id.0))),
-                (CommentAction::Edited, DedupeKey::issue_comment_edited(pr, CommentId(comment_id.0), "", &updated_at)),
+                (CommentAction::Edited, DedupeKey::issue_comment_edited(pr, CommentId(comment_id.0), 1, "", &updated_at)),
                 (CommentAction::Deleted, DedupeKey::issue_comment_deleted(pr, CommentId(comment_id.0))),
             ] {
                 let event = GitHubEvent::IssueComment(comment_event(action, Some(pr), comment_id.0, updated_at));
