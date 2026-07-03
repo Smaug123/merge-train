@@ -967,10 +967,21 @@ but `SquashCommitted` lost — is closed here by supplementary GitHub recovery
 
 ## Explicitly deferred (with ordering rationale)
 
-- **Polling fallback (`PollActiveTrains`) and `PeriodicSync` timers +
-  jitter**: pure liveness insurance for missed webhooks; correctness is
-  carried by webhooks + restart recovery. `QueuedEventPayload` reserves the
-  variants so this is additive after M6.
+- ~~**Polling fallback (`PollActiveTrains`)**~~ — **LANDED 2026-07-03**
+  (post-M6, branch `polling-fallback`). A recurring per-worker timer
+  (`WorkerMsg::PollTimer`, `MERGE_TRAIN_POLL_INTERVAL_MINS` default 10, `0`
+  disables) calls `Processor::poll_active_trains`, which OWES an
+  `EvaluateTrain` for every active train through the SAME
+  `startup_evaluates` backlog-drain gate as startup/recovery evaluations
+  (the round-6 rule — a poll never acts ahead of a pending stop). No new
+  engine path: the engine's `evaluate` re-fetches the frontier PR's merge
+  state as it resumes, so a train stranded by a lost
+  `check_suite`/`status`/`review` webhook makes progress on the next poll.
+  A deterministic per-repo `poll_stagger` (hash of `owner/repo`, no RNG)
+  spreads load. `FakeGitHub.blocked` lets tests park a train on a
+  `Blocked` frontier and prove poll-only recovery. `PeriodicSync`
+  (periodic full re-bootstrap) is still deferred — restart recovery + the
+  crawl cover the correctness need; a periodic re-sync is pure insurance.
 - **Late-addition reconciliation flow** (`handle_late_addition`): a distinct
   git flow with its own squash-vs-rebase validation. M3 *detects*
   (`Trigger::LateAddition`) and M5 responds with an explicit "not yet

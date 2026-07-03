@@ -126,6 +126,10 @@ pub enum WorkerMsg {
     /// was unavailable) is due for another attempt. Carries nothing — waking
     /// the loop clears the stall, and the next turn re-claims.
     RetryStalled,
+    /// Self-message from the recurring poll timer: re-evaluate active trains
+    /// as a fallback for missed `check_suite`/`status`/`review` webhooks
+    /// (DESIGN §Polling fallback).
+    PollTimer,
 }
 
 /// Why routing a delivery to a worker failed (distinct from a successful
@@ -184,6 +188,9 @@ pub struct SharedDeps {
     /// was unavailable for a pipeline step). Bounds the recovery latency
     /// when no other webhook traffic arrives to wake the worker.
     pub stall_retry_delay: std::time::Duration,
+    /// How often each worker re-evaluates its active trains as a fallback
+    /// for missed webhooks (DESIGN §Polling fallback). Zero disables it.
+    pub poll_interval: std::time::Duration,
 }
 
 impl SharedDeps {
@@ -212,6 +219,7 @@ impl SharedDeps {
             bot_user_id: self.bot_user_id,
             bot_name: self.bot_name.clone(),
             stall_retry_delay: self.stall_retry_delay,
+            poll_interval: self.poll_interval,
         }
     }
 }
@@ -445,6 +453,17 @@ fn run(
     if let Err(e) = prune_expired_intake(&mut processor) {
         return fatal(e);
     }
+
+    // Arm the recurring poll timer (the missed-webhook fallback). It fires
+    // for the worker's lifetime; each `PollTimer` owes a re-evaluation of
+    // active trains. A per-repo stagger spreads the load so many repos
+    // restarting together do not poll in lockstep (DESIGN §Distributed
+    // polling).
+    spawn_poll_timer(
+        processor.poll_interval(),
+        processor.poll_stagger(),
+        tx.clone(),
+    );
 
     loop {
         // (1) Service waiting messages, capped at one mailbox's worth so
@@ -681,6 +700,42 @@ fn handle_msg(
             processor.requeue_marked_recoveries();
             Ok(None)
         }
+        // The recurring poll timer: owe a re-evaluation of every active
+        // train (gated behind the backlog drain), the fallback for missed
+        // webhooks.
+        WorkerMsg::PollTimer => {
+            processor.poll_active_trains();
+            Ok(None)
+        }
+    }
+}
+
+/// Spawns the recurring poll timer: after an initial `stagger` (spreading
+/// repos out), it sends [`WorkerMsg::PollTimer`] every `interval` for the
+/// worker's lifetime. Exits when the worker's mailbox closes (the send
+/// fails). A zero `interval` disables polling (tests that drive polls
+/// directly).
+fn spawn_poll_timer(
+    interval: std::time::Duration,
+    stagger: std::time::Duration,
+    tx: mpsc::Sender<WorkerMsg>,
+) {
+    if interval.is_zero() {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("poll-timer".to_owned())
+        .spawn(move || {
+            std::thread::sleep(stagger);
+            loop {
+                if tx.blocking_send(WorkerMsg::PollTimer).is_err() {
+                    return; // worker gone
+                }
+                std::thread::sleep(interval);
+            }
+        });
+    if spawned.is_err() {
+        error!("failed to spawn the poll timer thread; the missed-webhook fallback is off");
     }
 }
 
@@ -822,6 +877,9 @@ pub(crate) mod test_support {
             bot_user_id: TEST_BOT_ID,
             bot_name: "merge-train".to_owned(),
             stall_retry_delay: std::time::Duration::from_millis(25),
+            // Tests drive polls directly (`Processor::poll_active_trains`);
+            // the background timer stays off for determinism.
+            poll_interval: std::time::Duration::ZERO,
         };
         (deps, fake)
     }

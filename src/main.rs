@@ -33,6 +33,10 @@ struct Config {
     /// deploys this as a GitHub App.
     github_token: String,
 
+    /// How often each worker re-evaluates its active trains as a fallback
+    /// for missed webhooks. Zero disables polling.
+    poll_interval: std::time::Duration,
+
     /// Overrides for the git commit identity (defaults derive from the bot's
     /// GitHub identity at startup).
     git_user_name: Option<String>,
@@ -109,12 +113,22 @@ impl Config {
         let webhook_secret = webhook_secret_from(std::env::var("WEBHOOK_SECRET").ok())?;
         let github_token = github_token_from(std::env::var("GITHUB_TOKEN").ok())?;
 
+        // Missed-webhook polling cadence (DESIGN §Polling fallback). Default
+        // 10 minutes; `0` disables polling (webhooks + restart recovery
+        // remain). A malformed value falls back to the default rather than
+        // refusing to start.
+        let poll_interval_mins = std::env::var("MERGE_TRAIN_POLL_INTERVAL_MINS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(10);
+
         Ok(Config {
             listen_addr,
             state_dir,
             repos_dir,
             webhook_secret,
             github_token,
+            poll_interval: std::time::Duration::from_secs(poll_interval_mins * 60),
             git_user_name: std::env::var("GIT_USER_NAME").ok(),
             git_user_email: std::env::var("GIT_USER_EMAIL").ok(),
             git_signing_key: std::env::var("GIT_SIGNING_KEY").ok(),
@@ -217,6 +231,7 @@ async fn main() {
         bot_user_id: identity.user_id,
         bot_name: identity.login,
         stall_retry_delay: std::time::Duration::from_secs(30),
+        poll_interval: config.poll_interval,
     };
 
     // Create application state
