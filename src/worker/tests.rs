@@ -2456,3 +2456,371 @@ mod registry {
         );
     }
 }
+
+// ─── The interleaving model check ───
+
+/// Codex review rounds 1, 2, 6, 7, 8, 10, 13, 15, and 19 were all ordering
+/// bugs in the worker's command/saga/backlog machinery — each round a human
+/// reviewer exploring one more schedule by hand. This harness mechanizes
+/// that: proptest generates schedules interleaving delivery processing,
+/// observation boundaries, command injection, and (in the second property)
+/// crashes, then asserts the invariants every schedule must preserve:
+///
+/// - **≤ 1 squash per PR** — the cascade's core idempotency guarantee;
+/// - **the store is never ahead of reality** — a PR the store calls merged
+///   is merged on (fake) GitHub;
+/// - **every acknowledged command is answered** — `pending_commands` is
+///   empty at quiescence and no train is left active;
+/// - *(no-crash schedules only)* store and GitHub agree exactly, and every
+///   completed train's intent ledger is fully matched. (Under a crash,
+///   reality can be ahead of the store until M6's recovery lands — the
+///   inherited-mid-flight refusal — so equality is deliberately not
+///   asserted there.)
+///
+/// Each case does real git work, so the case counts are deliberately small;
+/// raise them locally (`PROPTEST_CASES`) when touching worker ordering.
+mod interleaving {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    /// One scheduler decision.
+    #[derive(Debug, Clone, Copy)]
+    enum Step {
+        /// Claim and process one delivery, if any.
+        ProcessOne,
+        /// Feed held saga outcomes back (an observation boundary).
+        Boundary,
+        /// Start the next queued saga if the slot is free.
+        Pump,
+        /// A user posts `@merge-train stop` on PR 1.
+        InjectStop,
+        /// CI goes green for every active train's current head.
+        InjectCiGreen,
+        /// The process dies and restarts.
+        Crash,
+    }
+
+    /// Weighted: processing and boundaries dominate real schedules, and a
+    /// uniform decoder rarely reached deep states (the mutation check on the
+    /// reload path caught the harness being too shallow).
+    fn decode(code: u8, allow_crash: bool) -> Step {
+        match code % if allow_crash { 10 } else { 9 } {
+            0..=3 => Step::ProcessOne,
+            4..=5 => Step::Boundary,
+            6..=7 => Step::Pump,
+            8 if code & 1 == 0 => Step::InjectStop,
+            8 => Step::InjectCiGreen,
+            _ => Step::Crash,
+        }
+    }
+
+    struct Run {
+        world: World,
+        /// `None` only transiently during a crash (the old processor must
+        /// drop — releasing the Store lock — before the successor opens).
+        processor: Option<Processor>,
+        /// A dispatched batch whose effects have run (reality has mutated)
+        /// but whose outcomes are not yet observed — the real race window.
+        held: Option<(SagaBatch, Vec<EffectOutcome>)>,
+        /// Comment ids fold mod 10 (see `comment_body`) and 0/1 are used by
+        /// setup, so injected stops draw from 2..=9 and then stop.
+        next_stop_comment: u64,
+        next_suite: u64,
+    }
+
+    impl Run {
+        fn new() -> Run {
+            let (mut world, heads) = World::linear_stack(2);
+            let mut processor = world.processor();
+            world.enqueue_stack_setup(&mut processor, 2, &heads);
+            start_command(&mut world, &mut processor, 1);
+            Run {
+                world,
+                processor: Some(processor),
+                held: None,
+                next_stop_comment: 2,
+                next_suite: 900,
+            }
+        }
+
+        fn processor(&mut self) -> &mut Processor {
+            self.processor.as_mut().expect("processor present")
+        }
+
+        /// Executes `batch` against reality now; holds the outcomes.
+        fn dispatch(&mut self, batch: SagaBatch) {
+            let outcomes = execute(self.processor.as_ref().unwrap(), &batch);
+            self.held = Some((batch, outcomes));
+        }
+
+        fn apply(&mut self, step: Step) {
+            match step {
+                Step::ProcessOne => {
+                    if let Some(delivery) = self.processor().claim().unwrap() {
+                        assert_eq!(
+                            self.processor().process_claimed(delivery).unwrap(),
+                            PipelineOutcome::Processed,
+                            "the fake is up; nothing may release"
+                        );
+                    }
+                }
+                Step::Boundary => {
+                    if let Some((batch, outcomes)) = self.held.take()
+                        && let Some(next) = self
+                            .processor()
+                            .on_outcomes(batch.root, outcomes, batch.feedback)
+                            .unwrap()
+                    {
+                        self.dispatch(next);
+                    }
+                }
+                Step::Pump => {
+                    if self.held.is_none()
+                        && let Some(batch) = self.processor().pump().unwrap()
+                    {
+                        self.dispatch(batch);
+                    }
+                }
+                Step::InjectStop => {
+                    if self.next_stop_comment <= 9 {
+                        let id = self.next_stop_comment;
+                        self.next_stop_comment += 1;
+                        let body = comment_body(
+                            &self.world.config,
+                            1,
+                            "@merge-train stop",
+                            AUTHOR,
+                            "author",
+                            id,
+                        );
+                        let processor = self.processor.as_mut().unwrap();
+                        self.world.enqueue(processor, "issue_comment", body);
+                    }
+                }
+                Step::InjectCiGreen => self.nudge_ci(),
+                Step::Crash => {
+                    self.held = None;
+                    self.processor = None; // drop first: releases the lock
+                    self.processor = Some(self.world.processor());
+                }
+            }
+        }
+
+        fn nudge_ci(&mut self) {
+            let targets: Vec<(Sha, u64)> = {
+                let github = self.world.github.lock().unwrap();
+                self.processor
+                    .as_ref()
+                    .unwrap()
+                    .state()
+                    .active_trains
+                    .values()
+                    .filter(|t| t.state.is_active())
+                    .filter_map(|t| {
+                        github
+                            .prs
+                            .get(&t.current_pr)
+                            .map(|fake| (github.branch_head(&fake.branch), t.current_pr.0))
+                    })
+                    .collect()
+            };
+            for (head, pr) in targets {
+                self.next_suite += 1;
+                let body =
+                    check_suite_green_body(&self.world.config, &head, &[pr], self.next_suite);
+                let processor = self.processor.as_mut().unwrap();
+                self.world.enqueue(processor, "check_suite", body);
+            }
+        }
+
+        /// Runs the deterministic tail to quiescence: settle everything,
+        /// nudge CI while trains progress, stop whatever refuses to finish
+        /// (pre-M6, a crash mid-cascade leaves a train only a stop can
+        /// retire). Panics if the system will not go quiet.
+        fn finish(&mut self) {
+            for round in 0..40 {
+                // Settle: boundaries, deliveries, pumps, until a fixpoint.
+                loop {
+                    let mut progressed = false;
+                    if self.held.is_some() {
+                        self.apply(Step::Boundary);
+                        progressed = true;
+                    }
+                    while let Some(delivery) = self.processor().claim().unwrap() {
+                        self.processor().process_claimed(delivery).unwrap();
+                        progressed = true;
+                    }
+                    if self.held.is_none()
+                        && let Some(batch) = self.processor().pump().unwrap()
+                    {
+                        self.dispatch(batch);
+                        progressed = true;
+                    }
+                    if !progressed {
+                        break;
+                    }
+                }
+                let any_active = self
+                    .processor()
+                    .state()
+                    .active_trains
+                    .values()
+                    .any(|t| t.state.is_active());
+                if !any_active {
+                    return;
+                }
+                if round < 20 {
+                    self.nudge_ci();
+                }
+                if round >= 10 && self.next_stop_comment <= 9 {
+                    // Stop every active train's root (inherited-refused
+                    // trains never finish on CI alone before M6).
+                    let roots: Vec<u64> = self
+                        .processor()
+                        .state()
+                        .active_trains
+                        .values()
+                        .filter(|t| t.state.is_active())
+                        .map(|t| t.original_root_pr.0)
+                        .collect();
+                    for root in roots {
+                        if self.next_stop_comment > 9 {
+                            break;
+                        }
+                        let id = self.next_stop_comment;
+                        self.next_stop_comment += 1;
+                        let body = comment_body(
+                            &self.world.config,
+                            root,
+                            "@merge-train stop",
+                            AUTHOR,
+                            "author",
+                            id,
+                        );
+                        let processor = self.processor.as_mut().unwrap();
+                        self.world.enqueue(processor, "issue_comment", body);
+                    }
+                }
+            }
+            panic!(
+                "did not quiesce: {:?}",
+                self.processor().state().active_trains
+            );
+        }
+
+        /// The invariants every schedule must preserve.
+        fn assert_safety(&mut self) {
+            let github = self.world.github.clone();
+            let github = github.lock().unwrap();
+            for (pr, count) in &github.squash_count {
+                assert!(*count <= 1, "PR #{pr} squashed {count} times");
+            }
+            for (pr, cached) in &self.processor.as_ref().unwrap().state().prs {
+                if cached.state.is_merged() {
+                    assert!(
+                        matches!(
+                            github.prs.get(pr).map(|f| &f.state),
+                            Some(FakePrState::Merged { .. })
+                        ),
+                        "store claims PR #{pr} merged but reality disagrees"
+                    );
+                }
+            }
+            drop(github);
+            assert!(
+                self.processor()
+                    .store_mut()
+                    .pending_commands()
+                    .unwrap()
+                    .is_empty(),
+                "acknowledged commands left unanswered at quiescence"
+            );
+            assert!(
+                self.processor()
+                    .state()
+                    .active_trains
+                    .values()
+                    .all(|t| !t.state.is_active()),
+                "active trains left at quiescence"
+            );
+        }
+
+        /// The additional invariants no-crash schedules must preserve.
+        fn assert_full_consistency(&mut self) {
+            let github = self.world.github.clone();
+            let github = github.lock().unwrap();
+            for (pr, fake) in &github.prs {
+                let store_merged = self
+                    .processor
+                    .as_ref()
+                    .unwrap()
+                    .state()
+                    .prs
+                    .get(pr)
+                    .is_some_and(|c| c.state.is_merged());
+                let real_merged = matches!(fake.state, FakePrState::Merged { .. });
+                assert_eq!(
+                    store_merged, real_merged,
+                    "store and reality disagree about PR #{pr}"
+                );
+            }
+            drop(github);
+            let events = self.processor().store_mut().events().unwrap();
+            let completed: Vec<PrNumber> = events
+                .iter()
+                .filter_map(|e| match e.payload {
+                    crate::persistence::event::StateEventPayload::TrainCompleted { root_pr } => {
+                        Some(root_pr)
+                    }
+                    _ => None,
+                })
+                .collect();
+            for root in completed {
+                let facts = ReplayFacts::for_train(&events, root);
+                assert_eq!(
+                    facts.unmatched().count(),
+                    0,
+                    "completed train #{root} has unmatched intents"
+                );
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 8,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn schedules_without_crashes_preserve_all_invariants(
+            codes in proptest::collection::vec(any::<u8>(), 6..24),
+        ) {
+            let mut run = Run::new();
+            for code in codes {
+                run.apply(decode(code, false));
+            }
+            run.finish();
+            run.assert_safety();
+            run.assert_full_consistency();
+        }
+
+        #[test]
+        fn schedules_with_crashes_preserve_safety(
+            codes in proptest::collection::vec(any::<u8>(), 6..24),
+        ) {
+            let mut run = Run::new();
+            for code in codes {
+                run.apply(decode(code, true));
+            }
+            // Every case also crashes at wherever the schedule left the
+            // system — a crash-at-random-point sweep — so recovery is
+            // exercised from arbitrary depths, not only when the random
+            // codes happen to include a crash.
+            run.apply(Step::Crash);
+            run.finish();
+            run.assert_safety();
+        }
+    }
+}
