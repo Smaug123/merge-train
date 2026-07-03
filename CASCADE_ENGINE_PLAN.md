@@ -665,6 +665,28 @@ stage shippable).
 
 ## Stage M6 — Bootstrap and recovery
 
+> **Design item queued from M5's review (2026-07-03, owner to rule on).**
+> **Unify engine-work durability.** M5 ended up with four durability
+> stories for queued engine work: user commands are durable rows
+> (`pending_commands`, written in the delivery's close transaction —
+> rounds 2/19 both hit the volatile-command class before this
+> generalized), deferred handler aborts are volatile-with-durable-causes,
+> evaluations are derived (re-queued for every active train at startup),
+> and fan-out stop expansion rewrites rows mid-flight (round 15). Nine of
+> the nineteen review rounds were ordering/durability bugs in exactly this
+> machinery. The candidate simplification: ONE ordered, durable
+> engine-work queue (a `pending_work` table subsuming `pending_commands`)
+> that every queued item flows through, with "answered" as the single
+> deletion contract — collapsing the per-kind special cases and making the
+> worker loop's recovery story uniform. Costs: schema churn, a migration
+> of the boundary-stop machinery, and care not to persist re-derivable
+> work (evaluations are cheap to recompute and SHOULD stay derived — the
+> question is only whether aborts and expansions join commands in the
+> table). The interleaving model check (`worker::tests::interleaving`)
+> and the dedupe class oracle now pin the behavior either way; do this
+> refactor, if at all, before M6's recovery builds more on the current
+> shape.
+
 **Dependencies:** M5 (+ M2 `recover_train`). **Implements:** DESIGN.md
 §Bootstrap algorithm, §Handling cache misses, §Recovery precedence,
 §Supplementary GitHub recovery, §Restart safety / Worktree cleanup on restart.
