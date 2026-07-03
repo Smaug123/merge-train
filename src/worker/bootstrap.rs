@@ -291,6 +291,12 @@ pub(crate) fn crawl_events(
         .collect();
 
     let mut recovered_roots = Vec::new();
+    // Each adopted root's start time, for the fan-out-parent check below.
+    let root_started: HashMap<PrNumber, chrono::DateTime<chrono::Utc>> = best
+        .iter()
+        .map(|(root, (record, _))| (*root, record.started_at))
+        .collect();
+
     // Adopted-train members absent from the crawl (a frozen descendant, or
     // a closed root, that neither list endpoint returned) join the
     // referenced-uncrawled set so the caller fetches them and re-crawls.
@@ -312,7 +318,21 @@ pub(crate) fn crawl_events(
                 .iter()
                 .skip(1) // the root legitimately merges early in the cascade
                 .all(|m| merged_numbers.contains(m));
-        if record.state.is_active() && all_members_merged {
+        // A stale FAN-OUT parent (Codex crawl review round 8): fan-out's
+        // best-effort completion update to the old root's comment can fail,
+        // leaving it ACTIVE — with still-open children, so the
+        // all-members-merged check above does not fire. But each fan-out
+        // child is a fresh root born at fan-out time, so a frozen
+        // descendant that now carries its own adopted root record started
+        // AFTER this one means this train already fanned out. Complete it,
+        // or it resurrects in parallel with its children (double squash).
+        let fanned_out = record.cascade_phase.progress().is_some()
+            && members(&record).iter().skip(1).any(|m| {
+                root_started
+                    .get(m)
+                    .is_some_and(|started| *started > record.started_at)
+            });
+        if record.state.is_active() && (all_members_merged || fanned_out) {
             record.state = crate::types::TrainState::Completed { ended_at: now };
         }
         // A stack extended during the gap aborts, matching the live
@@ -665,6 +685,82 @@ mod tests {
         assert!(
             matches!(adopted.state, crate::types::TrainState::Completed { .. }),
             "adopted as completed, so application removes it"
+        );
+    }
+
+    /// A fan-out parent whose best-effort completion update failed leaves a
+    /// stale ACTIVE comment. If the crawl adopted it as active it would
+    /// resurrect the old train in parallel with the child roots it fanned
+    /// into — two trains over the same PRs, risking a double squash. The
+    /// parent is completed instead, detected by a child root's own record
+    /// being born after it (Codex crawl review round 8, P2).
+    #[test]
+    fn a_stale_fan_out_parent_is_not_resurrected_alongside_its_children() {
+        use crate::types::{CascadePhase, DescendantProgress, PrState};
+        let t0 = Utc.with_ymd_and_hms(2026, 7, 1, 0, 0, 0).unwrap();
+        let t1 = Utc.with_ymd_and_hms(2026, 7, 2, 0, 0, 0).unwrap();
+
+        // The parent #1, still ACTIVE in its stale comment, frozen [#2, #3].
+        let mut parent = TrainRecord::new(PrNumber(1), t0);
+        parent.cascade_phase = CascadePhase::Reconciling {
+            progress: DescendantProgress::new(vec![PrNumber(2), PrNumber(3)]),
+            squash_sha: Sha::parse("a".repeat(40)).unwrap(),
+        };
+        // The children, each a fresh root born at fan-out time (t1 > t0).
+        let child2 = TrainRecord::new(PrNumber(2), t1);
+        let child3 = TrainRecord::new(PrNumber(3), t1);
+
+        let open = vec![
+            pr(1, AUTHOR, PrState::Open),
+            pr(2, AUTHOR, PrState::Open),
+            pr(3, AUTHOR, PrState::Open),
+        ];
+        let comments = vec![
+            (
+                PrNumber(1),
+                vec![comment(
+                    1,
+                    BOT,
+                    &format_status_comment(&parent, "stale").unwrap(),
+                )],
+            ),
+            (
+                PrNumber(2),
+                vec![comment(
+                    2,
+                    BOT,
+                    &format_status_comment(&child2, "c2").unwrap(),
+                )],
+            ),
+            (
+                PrNumber(3),
+                vec![comment(
+                    3,
+                    BOT,
+                    &format_status_comment(&child3, "c3").unwrap(),
+                )],
+            ),
+        ];
+        let outcome = crawl_events("main", &open, &comments, "merge-train", BOT, t1);
+        assert_eq!(
+            outcome.recovered_roots,
+            vec![PrNumber(2), PrNumber(3)],
+            "only the child roots recover; the fanned-out parent does not"
+        );
+        let parent_state = outcome.events.iter().find_map(|e| match e {
+            StateEventPayload::TrainRecordAdopted { root_pr, record }
+                if *root_pr == PrNumber(1) =>
+            {
+                Some(&record.state)
+            }
+            _ => None,
+        });
+        assert!(
+            matches!(
+                parent_state,
+                Some(crate::types::TrainState::Completed { .. })
+            ),
+            "the parent is adopted as completed (application removes it)"
         );
     }
 
