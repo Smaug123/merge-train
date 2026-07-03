@@ -2141,10 +2141,20 @@ fn refresh_events(
         }
     }
 
-    events.push(StateEventPayload::PrMergeStateChanged {
-        pr,
-        status: merge_state,
-    });
+    // The fetched mergeability is an event only when it says something the
+    // cache does not: either it differs, or an event above reset the
+    // cached value (a head or base change clears mergeability, and the
+    // fetched value postdates it). An unchanged observation persists
+    // nothing — a parked train is re-fetched on every poll, compaction
+    // refuses active trains, and every evaluation replays the train's log,
+    // so idle polls must not grow it (Codex polling review, P2).
+    let cached_status = cached.map(|c| c.merge_state_status);
+    if !events.is_empty() || cached_status != Some(merge_state) {
+        events.push(StateEventPayload::PrMergeStateChanged {
+            pr,
+            status: merge_state,
+        });
+    }
     events
 }
 

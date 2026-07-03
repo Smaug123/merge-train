@@ -187,6 +187,9 @@ pub struct SharedDeps {
     /// was unavailable for a pipeline step). Bounds the recovery latency
     /// when no other webhook traffic arrives to wake the worker.
     pub stall_retry_delay: std::time::Duration,
+    /// How often each worker re-evaluates its active trains as a fallback
+    /// for missed webhooks (DESIGN §Polling fallback). Zero disables it.
+    pub poll_interval: std::time::Duration,
 }
 
 impl SharedDeps {
@@ -215,6 +218,7 @@ impl SharedDeps {
             bot_user_id: self.bot_user_id,
             bot_name: self.bot_name.clone(),
             stall_retry_delay: self.stall_retry_delay,
+            poll_interval: self.poll_interval,
         }
     }
 }
@@ -449,6 +453,16 @@ fn run(
         return fatal(e);
     }
 
+    // The recurring poll (the missed-webhook fallback) is a DEADLINE on the
+    // idle wait below, not a timer thread: a sleeping thread per repo —
+    // including every historical repo `recover_existing` wakes — would
+    // double the process's thread count for nothing (Codex polling review,
+    // P2). A per-repo stagger spreads the load so many repos restarting
+    // together do not poll in lockstep (DESIGN §Distributed polling).
+    let poll_interval = processor.poll_interval();
+    let mut next_poll: Option<std::time::Instant> =
+        (!poll_interval.is_zero()).then(|| std::time::Instant::now() + processor.poll_stagger());
+
     loop {
         // (1) Service waiting messages, capped at one mailbox's worth so
         // sustained intake cannot starve backlog processing (Codex review #53).
@@ -525,6 +539,23 @@ fn run(
             }
         }
 
+        // (3a) A poll that has come DUE takes its place in the stream here,
+        // whatever else the turn did: nested under the idle branch below it
+        // would never run on a repo with sustained traffic, and the missed
+        // webhook it exists to cover would strand a parked train forever
+        // (Codex polling review round 5, P2).
+        if let Some(deadline) = next_poll
+            && std::time::Instant::now() >= deadline
+        {
+            processor.poll_active_trains();
+            next_poll = Some(std::time::Instant::now() + poll_interval);
+            // Round again rather than falling into the idle wait: the owed
+            // evaluations sit behind the backlog-drain gate, which only a
+            // fresh `claim` opens, and blocking now would hold them for
+            // another full interval (Codex polling review round 6, P2).
+            continue;
+        }
+
         // (3b) Supplementary recovery found GitHub unavailable this turn:
         // arm the stall-retry timer, whose message re-queues the parked
         // recovery — nothing else wakes a traffic-less repo.
@@ -544,7 +575,26 @@ fn run(
             if let Err(e) = prune_expired_intake(&mut processor) {
                 return fatal(e);
             }
-            match rx.blocking_recv() {
+            // Wait for the next message, or until the poll deadline. The
+            // timed wait needs the server's runtime; without one (tests,
+            // which drive polls directly) the wait is untimed.
+            let received = match (next_poll, processor.github().runtime()) {
+                (Some(deadline), Some(handle)) => {
+                    let wait = deadline.saturating_duration_since(std::time::Instant::now());
+                    match timed_recv(handle, &mut rx, wait) {
+                        Ok(received) => received,
+                        Err(_elapsed) => {
+                            // Owe a re-evaluation of every active train
+                            // (gated behind the backlog drain).
+                            processor.poll_active_trains();
+                            next_poll = Some(std::time::Instant::now() + poll_interval);
+                            continue;
+                        }
+                    }
+                }
+                _ => rx.blocking_recv(),
+            };
+            match received {
                 Some(msg) => {
                     stalled = false;
                     match handle_msg(&mut processor, msg, &mut parked) {
@@ -688,6 +738,20 @@ fn handle_msg(
             Ok(None)
         }
     }
+}
+
+/// Waits for the next mailbox message for at most `wait`, from a plain OS
+/// thread, via the runtime that owns the timer. The timeout future must be
+/// CONSTRUCTED inside the runtime — `tokio::time::timeout` registers its
+/// timer with the current runtime at construction, and built outside
+/// `block_on` it panics with "there is no reactor running" on the worker's
+/// first idle wait (Codex polling review round 3, P1).
+pub(crate) fn timed_recv<T>(
+    handle: &tokio::runtime::Handle,
+    rx: &mut mpsc::Receiver<T>,
+    wait: std::time::Duration,
+) -> Result<Option<T>, tokio::time::error::Elapsed> {
+    handle.block_on(async { tokio::time::timeout(wait, rx.recv()).await })
 }
 
 /// Arms a one-shot timer that wakes the worker to retry a released delivery.
@@ -842,6 +906,9 @@ pub(crate) mod test_support {
             bot_user_id: TEST_BOT_ID,
             bot_name: "merge-train".to_owned(),
             stall_retry_delay: std::time::Duration::from_millis(25),
+            // Tests drive polls directly (`Processor::poll_active_trains`);
+            // the background timer stays off for determinism.
+            poll_interval: std::time::Duration::ZERO,
         };
         (deps, fake)
     }

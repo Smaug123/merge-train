@@ -80,6 +80,9 @@ pub struct WorkerDeps {
     pub bot_name: String,
     /// How long the worker waits before retrying a released delivery.
     pub stall_retry_delay: std::time::Duration,
+    /// How often the poll timer re-evaluates active trains (the
+    /// missed-webhook fallback). Zero disables polling.
+    pub poll_interval: std::time::Duration,
 }
 
 /// The git-side settings a [`GitConfig`] is derived from per saga (the
@@ -315,6 +318,28 @@ impl Processor {
 
     pub fn stall_retry_delay(&self) -> std::time::Duration {
         self.deps.stall_retry_delay
+    }
+
+    /// How often the poll timer fires (zero disables it).
+    pub fn poll_interval(&self) -> std::time::Duration {
+        self.deps.poll_interval
+    }
+
+    /// A deterministic per-repo initial poll delay in `[0, poll_interval)`,
+    /// derived from the repo identity, so many repos restarting together do
+    /// not poll in lockstep (DESIGN §Distributed polling). No RNG — the
+    /// stagger is a pure function of `owner/repo`, stable across restarts.
+    pub fn poll_stagger(&self) -> std::time::Duration {
+        let interval = self.deps.poll_interval;
+        if interval.is_zero() {
+            return std::time::Duration::ZERO;
+        }
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.deps.git.owner.hash(&mut hasher);
+        self.deps.git.repo.hash(&mut hasher);
+        let frac = hasher.finish() % interval.as_millis().max(1) as u64;
+        std::time::Duration::from_millis(frac)
     }
 
     pub fn git_settings(&self) -> &GitSettings {
@@ -1617,6 +1642,36 @@ impl Processor {
             }
         }
         Ok(())
+    }
+
+    /// The polling fallback (DESIGN §Polling fallback): owes a re-evaluation
+    /// of every active train, gated behind the backlog drain exactly like
+    /// the startup evaluations. Webhooks are the primary trigger, but a lost
+    /// `check_suite`/`status`/`review` delivery would strand a parked train
+    /// forever; the worker's poll timer calls this periodically. The engine's
+    /// `evaluate` re-fetches the frontier PR's merge state as it resumes, so
+    /// a train whose readiness changed while its webhook went missing makes
+    /// progress on the next poll. Evaluations coalesce in the queue
+    /// ([`Processor::queue`]), so a poll overlapping owed work adds nothing,
+    /// and a poll with no active trains is a no-op.
+    pub fn poll_active_trains(&mut self) {
+        let active: Vec<PrNumber> = self
+            .store
+            .state()
+            .active_trains
+            .values()
+            .filter(|t| t.state.is_active())
+            .map(|t| t.original_root_pr)
+            .collect();
+        if active.is_empty() {
+            return;
+        }
+        let owed = self.startup_evaluates.get_or_insert_with(Vec::new);
+        for root in active {
+            if !owed.contains(&root) {
+                owed.push(root);
+            }
+        }
     }
 
     /// Inherited-marker upkeep: a root stays marked for recovery only while

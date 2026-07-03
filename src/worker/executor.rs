@@ -92,6 +92,18 @@ pub enum GitHubExec {
 }
 
 impl GitHubExec {
+    /// The server's async runtime, when there is one: the worker loop
+    /// uses it for a TIMED mailbox wait (the poll cadence) instead of a
+    /// dedicated timer thread per repo. The fake has none, and tests drive
+    /// polls directly.
+    pub fn runtime(&self) -> Option<&tokio::runtime::Handle> {
+        match self {
+            GitHubExec::Real { handle, .. } => Some(handle),
+            #[cfg(test)]
+            GitHubExec::Fake(_) => None,
+        }
+    }
+
     /// Executes one GitHub effect, classifying failures into the engine's
     /// [`EffectError`] vocabulary.
     pub fn execute(&self, effect: GitHubEffect) -> Result<GitHubResponse, EffectError> {
