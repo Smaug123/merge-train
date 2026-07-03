@@ -132,6 +132,10 @@ fn stack_extended(topology: &RepoState, record: &TrainRecord) -> bool {
 ///
 /// `comments` pairs each crawled PR with its comments (id-ordered); PRs
 /// missing from it simply contribute no declarations or records.
+// Every argument is a distinct, load-bearing input to this pure transform
+// (repo facts, fetched data, and the caller's two exclusion sets); bundling
+// them would obscure rather than clarify.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn crawl_events(
     default_branch: &str,
     crawled_prs: &[PrData],
@@ -139,6 +143,7 @@ pub(crate) fn crawl_events(
     bot_name: &str,
     bot_user_id: u64,
     skip_comment: Option<crate::types::CommentId>,
+    unfetchable: &HashSet<PrNumber>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> CrawlOutcome {
     let mut events = vec![StateEventPayload::DefaultBranchSet {
@@ -254,26 +259,45 @@ pub(crate) fn crawl_events(
         if !recordable {
             continue;
         }
+        let is_trigger = skip_comment == Some(comment_id);
+        // The TRIGGERING delivery's own comment is live input the handler
+        // processes next, treated as a FRESH declaration — so a MERGED
+        // predecessor is a late addition the handler records nothing for
+        // (LateAddition). It must not create a scratch edge either: a
+        // phantom late-addition edge would shadow a genuinely-later valid
+        // declaration on the same PR as `AlreadyHasPredecessor` and drop
+        // it, and after a DB loss no webhook replays to recover it (Codex
+        // crawl review round 12). An OPEN-predecessor triggering edge IS
+        // applied to the scratch — the handler will record it, and
+        // `stack_extended` needs it to catch an extension (round 11).
+        if is_trigger
+            && topology
+                .prs
+                .get(&predecessor)
+                .is_some_and(|p| p.state.is_merged())
+        {
+            continue;
+        }
         let decl = StateEventPayload::PredecessorDeclared {
             pr,
             predecessor,
             comment_id,
         };
-        // Always apply to the topology scratch — the stack-extension check
-        // and validation of later candidates must see this edge.
+        // Apply to the topology scratch — the stack-extension check and
+        // validation of later candidates must see this edge.
         topology.apply_event(&StateEvent {
             seq: events.len() as u64,
             ts: now,
             payload: decl.clone(),
         });
-        // But do NOT persist the TRIGGERING delivery's own comment: it is
-        // live input the command handler processes next in the same
-        // delivery, and pre-recording it would suppress the handler's
-        // late-addition answer (Codex crawl review round 10). It still
-        // shaped the topology above, so a triggering comment that extends
-        // an active train is caught by `stack_extended` and aborted (round
-        // 11) — the abort, not the edge, is what recovery owes.
-        if skip_comment != Some(comment_id) {
+        // But do NOT persist the triggering comment: it is live input the
+        // command handler processes next in the same delivery, and
+        // pre-recording it would suppress the handler's late-addition
+        // answer (round 10). It still shaped the topology above, so a
+        // triggering comment that extends an active train is caught by
+        // `stack_extended` and aborted (round 11) — the abort, not the
+        // edge, is what recovery owes.
+        if !is_trigger {
             events.push(decl);
         }
     }
@@ -357,7 +381,21 @@ pub(crate) fn crawl_events(
         // A stack extended during the gap aborts, matching the live
         // topology-change abort (Codex crawl review round 4).
         let extended = record.state.is_active() && stack_extended(&topology, &record);
-        if record.state.is_active() && !extended {
+        // A member the caller could not fetch (a permanent `GetPr` 404 —
+        // deleted, or the token lost access) means the train references a
+        // PR the crawl cannot see. Recovering it would let its first
+        // evaluation hit `UnknownPr` and stick; abort cleanly instead
+        // (Codex crawl review round 12).
+        let unreachable: Option<PrNumber> = record
+            .state
+            .is_active()
+            .then(|| {
+                members(&record)
+                    .into_iter()
+                    .find(|m| unfetchable.contains(m))
+            })
+            .flatten();
+        if record.state.is_active() && !extended && unreachable.is_none() {
             recovered_roots.push(root);
             for member in members(&record) {
                 if !crawled_numbers.contains(&member) && !referenced_uncrawled.contains(&member) {
@@ -378,6 +416,18 @@ pub(crate) fn crawl_events(
                         "PR #{root}'s stack was extended while its train was interrupted \
                          (a new predecessor declaration appeared); a merge train cannot \
                          safely resume over changed topology — re-issue `@merge-train start`."
+                    ),
+                ),
+            });
+        } else if let Some(member) = unreachable {
+            events.push(StateEventPayload::TrainAborted {
+                root_pr: root,
+                error: TrainError::new(
+                    TrainErrorKind::ApiError,
+                    format!(
+                        "PR #{root}'s train references PR #{member}, which the bot cannot \
+                         fetch (deleted, or the token lost access); the train cannot resume \
+                         — re-issue `@merge-train start` once the PR is reachable."
                     ),
                 ),
             });
@@ -477,6 +527,7 @@ mod tests {
             "merge-train",
             BOT,
             None,
+            &HashSet::new(),
             test_now(),
         );
         assert_eq!(
@@ -519,6 +570,7 @@ mod tests {
             "merge-train",
             BOT,
             None,
+            &HashSet::new(),
             test_now(),
         );
         assert!(
@@ -549,6 +601,7 @@ mod tests {
             "merge-train",
             BOT,
             Some(CommentId(7)),
+            &HashSet::new(),
             test_now(),
         );
         assert!(
@@ -596,6 +649,7 @@ mod tests {
             "merge-train",
             BOT,
             Some(CommentId(7)),
+            &HashSet::new(),
             ts,
         );
         assert!(
@@ -616,6 +670,91 @@ mod tests {
         assert!(
             !declared(&outcome.events).contains(&(PrNumber(3), PrNumber(2))),
             "the triggering edge is left for the handler to record"
+        );
+    }
+
+    /// A skipped (triggering) merged-predecessor comment must not leave a
+    /// phantom scratch edge that shadows a genuinely-later valid
+    /// declaration on the same PR (Codex crawl review round 12). #2's old
+    /// triggering comment declares merged #1 (a late addition the handler
+    /// records nothing for); a later comment declares open #3. The later,
+    /// real edge must survive.
+    #[test]
+    fn a_skipped_late_addition_does_not_shadow_a_later_declaration() {
+        let crawled = vec![
+            pr(
+                1,
+                AUTHOR,
+                PrState::Merged {
+                    merge_commit_sha: Sha::parse("b".repeat(40)).unwrap(),
+                },
+            ),
+            pr(3, AUTHOR, PrState::Open),
+            child(2, AUTHOR, 3, PrState::Open),
+        ];
+        let comments = vec![(
+            PrNumber(2),
+            vec![
+                comment(5, AUTHOR, "@merge-train predecessor #1"), // triggering, merged
+                comment(9, AUTHOR, "@merge-train predecessor #3"), // later, real
+            ],
+        )];
+        let outcome = crawl_events(
+            "main",
+            &crawled,
+            &comments,
+            "merge-train",
+            BOT,
+            Some(CommentId(5)),
+            &HashSet::new(),
+            test_now(),
+        );
+        assert_eq!(
+            declared(&outcome.events),
+            vec![(PrNumber(2), PrNumber(3))],
+            "the later real declaration must not be shadowed by the skipped phantom"
+        );
+    }
+
+    /// A train member the caller could not fetch (permanent 404) aborts the
+    /// train instead of recovering it into an `UnknownPr` stall (Codex crawl
+    /// review round 12).
+    #[test]
+    fn a_train_with_an_unfetchable_member_aborts() {
+        use crate::types::{CascadePhase, DescendantProgress};
+        let ts = test_now();
+        let mut record = TrainRecord::new(PrNumber(1), ts);
+        record.cascade_phase = CascadePhase::Preparing {
+            progress: DescendantProgress::new(vec![PrNumber(2)]),
+        };
+        let body = format_status_comment(&record, "mid").unwrap();
+        // Only #1 is crawled; #2 (a frozen member) is unfetchable.
+        let crawled = vec![pr(1, AUTHOR, PrState::Open)];
+        let comments = vec![(PrNumber(1), vec![comment(1, BOT, &body)])];
+        let unfetchable = HashSet::from([PrNumber(2)]);
+        let outcome = crawl_events(
+            "main",
+            &crawled,
+            &comments,
+            "merge-train",
+            BOT,
+            None,
+            &unfetchable,
+            ts,
+        );
+        assert!(
+            outcome.recovered_roots.is_empty(),
+            "a train with an unreachable member must not be recovered"
+        );
+        assert!(
+            outcome.events.iter().any(|e| matches!(
+                e,
+                StateEventPayload::TrainAborted {
+                    root_pr: PrNumber(1),
+                    ..
+                }
+            )),
+            "it aborts cleanly instead"
         );
     }
 
@@ -648,6 +787,7 @@ mod tests {
             "merge-train",
             BOT,
             None,
+            &HashSet::new(),
             test_now(),
         );
         assert_eq!(
@@ -681,6 +821,7 @@ mod tests {
             "merge-train",
             BOT,
             None,
+            &HashSet::new(),
             test_now(),
         );
         let owning = outcome.events.iter().rev().find_map(|e| match e {
@@ -716,6 +857,7 @@ mod tests {
             "merge-train",
             BOT,
             None,
+            &HashSet::new(),
             test_now(),
         );
         assert_eq!(outcome.recovered_roots, vec![PrNumber(1)]);
@@ -750,6 +892,7 @@ mod tests {
             "merge-train",
             BOT,
             None,
+            &HashSet::new(),
             test_now(),
         );
         assert!(outcome.recovered_roots.is_empty());
@@ -789,6 +932,7 @@ mod tests {
             "merge-train",
             BOT,
             None,
+            &HashSet::new(),
             test_now(),
         );
         assert!(outcome.recovered_roots.is_empty(), "completed: no recovery");
@@ -824,6 +968,7 @@ mod tests {
             "merge-train",
             BOT,
             None,
+            &HashSet::new(),
             test_now(),
         );
         assert!(
@@ -851,6 +996,7 @@ mod tests {
             "merge-train",
             BOT,
             None,
+            &HashSet::new(),
             test_now(),
         );
         assert!(
@@ -897,7 +1043,16 @@ mod tests {
             ),
         ];
         let comments = vec![(PrNumber(1), vec![comment(1, BOT, &body)])];
-        let outcome = crawl_events("main", &merged, &comments, "merge-train", BOT, None, ts);
+        let outcome = crawl_events(
+            "main",
+            &merged,
+            &comments,
+            "merge-train",
+            BOT,
+            None,
+            &HashSet::new(),
+            ts,
+        );
         assert!(outcome.recovered_roots.is_empty(), "no zombie");
         let adopted = outcome
             .events
@@ -966,7 +1121,16 @@ mod tests {
                 )],
             ),
         ];
-        let outcome = crawl_events("main", &open, &comments, "merge-train", BOT, None, t1);
+        let outcome = crawl_events(
+            "main",
+            &open,
+            &comments,
+            "merge-train",
+            BOT,
+            None,
+            &HashSet::new(),
+            t1,
+        );
         assert_eq!(
             outcome.recovered_roots,
             vec![PrNumber(2), PrNumber(3)],
@@ -1005,7 +1169,16 @@ mod tests {
         // crawl's lists never see it.
         let open = vec![pr(1, AUTHOR, PrState::Open), pr(2, AUTHOR, PrState::Open)];
         let comments = vec![(PrNumber(1), vec![comment(1, BOT, &body)])];
-        let outcome = crawl_events("main", &open, &comments, "merge-train", BOT, None, ts);
+        let outcome = crawl_events(
+            "main",
+            &open,
+            &comments,
+            "merge-train",
+            BOT,
+            None,
+            &HashSet::new(),
+            ts,
+        );
         assert_eq!(outcome.recovered_roots, vec![PrNumber(1)]);
         assert_eq!(outcome.referenced_uncrawled, vec![PrNumber(3)]);
     }
@@ -1043,7 +1216,16 @@ mod tests {
                 vec![comment(3, AUTHOR, "@merge-train predecessor #2")],
             ),
         ];
-        let outcome = crawl_events("main", &open, &comments, "merge-train", BOT, None, ts);
+        let outcome = crawl_events(
+            "main",
+            &open,
+            &comments,
+            "merge-train",
+            BOT,
+            None,
+            &HashSet::new(),
+            ts,
+        );
         assert!(
             outcome.recovered_roots.is_empty(),
             "an extended stack must not silently resume"
@@ -1082,7 +1264,16 @@ mod tests {
                 vec![comment(2, AUTHOR, "@merge-train predecessor #1")],
             ),
         ];
-        let outcome = crawl_events("main", &open, &comments, "merge-train", BOT, None, ts);
+        let outcome = crawl_events(
+            "main",
+            &open,
+            &comments,
+            "merge-train",
+            BOT,
+            None,
+            &HashSet::new(),
+            ts,
+        );
         assert_eq!(
             declared(&outcome.events),
             vec![(PrNumber(2), PrNumber(1))],
@@ -1122,6 +1313,7 @@ mod tests {
             "merge-train",
             BOT,
             None,
+            &HashSet::new(),
             test_now(),
         );
         let first_fill = outcome

@@ -831,6 +831,11 @@ impl Processor {
         let mut crawled: Vec<PrData> = open;
         crawled.extend(merged);
         let mut attempted: HashSet<PrNumber> = crawled.iter().map(|p| p.number).collect();
+        // Referenced PRs that a permanent `GetPr` failure could not fetch
+        // (deleted, or the token lost access). `crawl_events` aborts a train
+        // that references one rather than recover it into an `UnknownPr`
+        // stall (Codex crawl review round 12).
+        let mut unfetchable: HashSet<PrNumber> = HashSet::new();
         let mut comments: Vec<(PrNumber, Vec<CommentData>)> = Vec::new();
         let mut listed: HashSet<PrNumber> = HashSet::new();
         let mut pending: Vec<PrNumber> = seed_prs
@@ -852,6 +857,7 @@ impl Processor {
                     }
                     other => {
                         warn!(%pr, ?other, "referenced PR unfetchable; skipping it in the crawl");
+                        unfetchable.insert(pr);
                     }
                 }
             }
@@ -875,6 +881,7 @@ impl Processor {
                 &self.deps.bot_name,
                 self.deps.bot_user_id,
                 skip_comment,
+                &unfetchable,
                 Utc::now(),
             );
             let fresh: Vec<PrNumber> = outcome

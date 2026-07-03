@@ -855,8 +855,21 @@ stage shippable).
 >    (the edge to a merged predecessor leaves `is_root` false without a
 >    reconciliation marker, so the PR stays non-startable); the only loss
 >    is the specific "late addition — rebase or restart" message, and a
->    `start` still gets a "not a stack root" rejection. **Crawl review
->    ran 11 rounds** (2,1,1,1,1,1,1,1,2,1,1 findings) — lost-DB
+>    `start` still gets a "not a stack root" rejection. Round 12: two
+>    more P2s from the round-11 change. (a) A permanent `GetPr` 404 on an
+>    adopted-train MEMBER (deleted PR, or the token lost access) left the
+>    train recovered-but-broken — its first evaluation hits `UnknownPr`
+>    and sticks; the pipeline now tracks `unfetchable` PRs and
+>    `crawl_events` ABORTS a train referencing one instead of recovering
+>    it. (b) The round-11 "apply the triggering comment to the scratch"
+>    created a phantom edge when the triggering comment is a stale
+>    merged-predecessor (late-addition) redelivery: it shadowed a
+>    genuinely-later valid declaration as `AlreadyHasPredecessor`. So the
+>    triggering comment is now treated as a FRESH declaration for scratch
+>    purposes — a MERGED predecessor (LateAddition, handler records
+>    nothing) creates no scratch edge; only an OPEN-predecessor triggering
+>    edge shapes the scratch (for `stack_extended`). **Crawl review ran
+>    12 rounds** (2,1,1,1,1,1,1,1,2,1,1,2 findings) — lost-DB
 >    reconstruction is the most adversarial recovery surface; every
 >    finding was a real divergence from live-operation guarantees, each
 >    pinned by a mutation-checked test. Round 6
