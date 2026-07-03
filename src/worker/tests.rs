@@ -2562,6 +2562,62 @@ fn a_deleted_status_comment_is_reposted_during_recovery() {
     );
 }
 
+/// Life continues over a compacted log: after a completed train's history
+/// is summarized into a checkpoint, a NEW train — including one whose PR
+/// arrived after the checkpoint — plans, runs, and completes exactly as it
+/// would over the full log, and the replay oracle still holds.
+#[test]
+fn a_second_train_runs_over_a_compacted_log() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    start_command(&mut world, &mut processor, 1);
+    drive_to_completion(&mut world, &mut processor);
+
+    let compacted = processor
+        .store_mut()
+        .compact(0, chrono::Utc::now())
+        .unwrap();
+    assert!(
+        compacted.is_some(),
+        "an idle log past the threshold compacts"
+    );
+    assert_eq!(processor.store_mut().events().unwrap().len(), 1);
+    let replayed = processor.store_mut().replay().unwrap();
+    assert_eq!(
+        processor.state(),
+        &replayed,
+        "the replay oracle survives compaction"
+    );
+
+    // A brand-new PR arrives after the checkpoint; its train must run to
+    // completion over checkpoint-plus-suffix history.
+    let head = create_branch_with_file(&world.config, "pr-3", "pr-3.txt", "content 3", "main");
+    create_pr_ref(&world.config, 3, &head);
+    world.github.lock().unwrap().prs.insert(
+        PrNumber(3),
+        FakePr {
+            branch: "pr-3".to_owned(),
+            base_ref: "main".to_owned(),
+            state: FakePrState::Open,
+        },
+    );
+    let body = pr_opened_body(&world.config, 3, &head, "pr-3", "main");
+    world.enqueue(&mut processor, "pull_request", body);
+    start_command(&mut world, &mut processor, 3);
+    drive_to_completion(&mut world, &mut processor);
+
+    assert!(
+        processor.state().prs[&PrNumber(3)].state.is_merged(),
+        "the post-compaction train must complete"
+    );
+    let events = processor.store_mut().events().unwrap();
+    let facts = ReplayFacts::for_train(&events, PrNumber(3));
+    assert_eq!(facts.unmatched().count(), 0, "matched intent ledger");
+    let replayed = processor.store_mut().replay().unwrap();
+    assert_eq!(processor.state(), &replayed);
+}
+
 // ─── cache_fill_events: the unknown-PR upsert oracle ───
 
 mod cache_fill {

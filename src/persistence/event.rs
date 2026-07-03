@@ -106,6 +106,19 @@ pub enum StateEventPayload {
         root_pr: PrNumber,
     },
 
+    /// A compaction checkpoint: the full repo state as of this event's
+    /// `seq`, summarizing every event the compaction deleted. Written by
+    /// `Store::compact` ONLY when no train is active, so no intent-ledger
+    /// history is ever summarized away (`ReplayFacts::for_train` reads
+    /// only active trains). Keeps the log's core contract intact:
+    /// replaying the events table from empty still reproduces the cache —
+    /// a checkpoint replays by replacing the state wholesale.
+    #[serde(rename = "checkpoint")]
+    Checkpoint {
+        /// The state as of this point in the log.
+        snapshot: crate::persistence::snapshot::PersistedRepoSnapshot,
+    },
+
     /// A train record adopted wholesale from a recovery source — the status
     /// comment on the root PR (DESIGN §Recovery precedence). Appended ONLY
     /// when the comment's `recovery_seq` is strictly ahead of the local
@@ -536,7 +549,9 @@ impl StateEventPayload {
             | StateEventPayload::TrainResumed { .. }
             // Recovery adoption replaces the whole record; losing it would
             // resurrect exactly the stale state it corrects.
-            | StateEventPayload::TrainRecordAdopted { .. } => true,
+            | StateEventPayload::TrainRecordAdopted { .. }
+            // A checkpoint IS the durable summary of everything before it.
+            | StateEventPayload::Checkpoint { .. } => true,
 
             // Phase transitions
             StateEventPayload::PhaseTransition { .. }

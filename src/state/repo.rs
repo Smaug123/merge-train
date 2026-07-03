@@ -140,6 +140,11 @@ impl RepoState {
         let mut prs_mutated = false;
 
         match &event.payload {
+            // ─── Compaction checkpoint: the state as of this point ───
+            StateEventPayload::Checkpoint { snapshot } => {
+                *self = RepoState::from_snapshot(snapshot.clone());
+            }
+
             // ─── Train lifecycle ───
             StateEventPayload::TrainStarted {
                 root_pr,

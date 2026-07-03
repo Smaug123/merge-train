@@ -567,10 +567,18 @@ fn run(
 /// treated as a fresh event.
 const INTAKE_RETENTION_DAYS: i64 = 7;
 
-/// Prunes `done` deliveries and dedupe keys older than
-/// [`INTAKE_RETENTION_DAYS`]. Called at startup and at every idle boundary;
-/// both deletes are over tables bounded by the retention window, so this is
-/// cheap enough to run often.
+/// The event-log length above which idle maintenance compacts the log into
+/// a checkpoint. Well above any single train's event count (a train writes
+/// a few dozen), so compaction typically summarizes many completed trains
+/// at once; well below where reading the whole log per evaluation hurts.
+const EVENTS_COMPACTION_THRESHOLD: u64 = 1024;
+
+/// Idle-boundary maintenance: prunes `done` deliveries and dedupe keys
+/// older than [`INTAKE_RETENTION_DAYS`], and compacts the event log into a
+/// checkpoint once it exceeds [`EVENTS_COMPACTION_THRESHOLD`] (a no-op
+/// while any train is active — `Store::compact` refuses, preserving the
+/// intent-ledger history recovery reads). Called at startup and at every
+/// idle boundary; everything here is bounded, so it is cheap to run often.
 fn prune_expired_intake(processor: &mut Processor) -> Result<(), StoreError> {
     let cutoff = Utc::now() - chrono::Duration::days(INTAKE_RETENTION_DAYS);
     let store = processor.store_mut();
@@ -578,6 +586,9 @@ fn prune_expired_intake(processor: &mut Processor) -> Result<(), StoreError> {
     let deliveries = store.prune_deliveries(cutoff)?;
     if keys > 0 || deliveries > 0 {
         info!(keys, deliveries, "pruned expired intake bookkeeping");
+    }
+    if let Some(events) = store.compact(EVENTS_COMPACTION_THRESHOLD, Utc::now())? {
+        info!(events, "compacted the event log into a checkpoint");
     }
     Ok(())
 }

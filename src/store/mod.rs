@@ -303,11 +303,10 @@ impl Store {
     /// Reads the full event log in append order.
     ///
     /// The worker derives [`crate::cascade::ReplayFacts`] from this on every
-    /// train evaluation. Reading the whole log is O(events-so-far); acceptable
-    /// until log pruning/compaction exists (its own stage — the pruning
-    /// contract must preserve both `replay()`'s from-empty oracle and every
-    /// active train's intent/done history), at which point a bounded suffix
-    /// read replaces it.
+    /// train evaluation. Reading the whole log is O(events-since-the-last-
+    /// checkpoint): [`Store::compact`] (run by the worker's idle
+    /// maintenance) keeps the log bounded to roughly the events written
+    /// since the last train-free idle moment.
     pub fn events(&self) -> Result<Vec<StateEvent>, StoreError> {
         let mut stmt = self
             .conn
@@ -569,6 +568,74 @@ impl Store {
         )?)
     }
 
+    /// Compacts the event log: replaces every event with one `Checkpoint`
+    /// event (at `next_seq - 1`) carrying the current state, when it is
+    /// safe and worthwhile:
+    ///
+    /// - **safe** — no train is ACTIVE (enforced here, not by the caller:
+    ///   `ReplayFacts::for_train` reads active trains' intent history from
+    ///   the log, and summarizing it away would break recovery); retained
+    ///   stopped/aborted records need no history.
+    /// - **worthwhile** — the log holds more than `threshold` events
+    ///   (compacting a fresh checkpoint would just churn the WAL).
+    ///
+    /// The delete and the checkpoint insert commit in one transaction, and
+    /// `next_seq` is unchanged, so a crash leaves either the old log or
+    /// the compacted one. The from-empty replay oracle survives verbatim:
+    /// a checkpoint replays by replacing the state wholesale.
+    ///
+    /// Returns the number of events the checkpoint replaced, or `None` if
+    /// compaction was refused or not worthwhile.
+    pub fn compact(
+        &mut self,
+        threshold: u64,
+        now: DateTime<Utc>,
+    ) -> Result<Option<u64>, StoreError> {
+        if self
+            .state
+            .active_trains
+            .values()
+            .any(|t| t.state.is_active())
+        {
+            return Ok(None);
+        }
+        let count: u64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))?;
+        // Below the threshold the churn isn't worth a snapshot-sized WAL
+        // write; and a log that is already exactly one checkpoint gains
+        // nothing from another pass, whatever the threshold.
+        if count == 0 || count <= threshold {
+            return Ok(None);
+        }
+        if count == 1
+            && let Some(only) = self.events()?.first()
+            && matches!(only.payload, StateEventPayload::Checkpoint { .. })
+        {
+            return Ok(None);
+        }
+
+        let checkpoint = StateEvent {
+            seq: self.next_seq - 1,
+            ts: now,
+            payload: StateEventPayload::Checkpoint {
+                snapshot: self.state.to_snapshot(self.next_seq, now),
+            },
+        };
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM events", [])?;
+        tx.execute(
+            "INSERT INTO events (seq, ts, payload) VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                checkpoint.seq as i64,
+                checkpoint.ts.to_rfc3339(),
+                serde_json::to_string(&checkpoint.payload)?
+            ],
+        )?;
+        tx.commit()?;
+        Ok(Some(count))
+    }
+
     /// Replays the entire `events` log from an empty state — the equivalence
     /// oracle for the cache. While all state is event-derived (i.e. before a
     /// later stage's bootstrap introduces non-event state), `replay() ==
@@ -816,6 +883,134 @@ mod tests {
 
             prop_assert_eq!(store.events().unwrap(), expected);
         }
+
+        /// Compaction preserves every observable: the cache, the from-empty
+        /// replay oracle, `next_seq`, and the state a reopen recovers — and
+        /// the log afterwards is exactly one checkpoint plus whatever was
+        /// appended after it.
+        #[test]
+        fn compaction_preserves_state_and_replay(
+            before in prop::collection::vec(arb_state_event_payload(), 1..20),
+            after in prop::collection::vec(arb_state_event_payload(), 0..8),
+        ) {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("state.db");
+            let mut store = Store::open(&path).unwrap();
+            let ts = test_timestamp();
+            for payload in &before {
+                store.append(payload.clone(), ts).unwrap();
+            }
+            let state_before = store.state().clone();
+            let seq_before = store.next_seq();
+            let active = state_before.active_trains.values().any(|t| t.state.is_active());
+
+            let compacted = store.compact(0, ts).unwrap();
+            if active {
+                // Safety: an active train's history is never summarized.
+                prop_assert_eq!(compacted, None);
+                prop_assert_eq!(store.events().unwrap().len(), before.len());
+                return Ok(());
+            }
+            if before.len() == 1
+                && matches!(before[0], StateEventPayload::Checkpoint { .. })
+            {
+                // A log that is already exactly one checkpoint stays put.
+                prop_assert_eq!(compacted, None);
+                return Ok(());
+            }
+            prop_assert_eq!(compacted, Some(before.len() as u64));
+            prop_assert_eq!(store.state(), &state_before);
+            prop_assert_eq!(store.next_seq(), seq_before);
+            prop_assert_eq!(&store.replay().unwrap(), &state_before);
+            let log = store.events().unwrap();
+            prop_assert_eq!(log.len(), 1);
+            let is_checkpoint = matches!(log[0].payload, StateEventPayload::Checkpoint { .. });
+            prop_assert!(is_checkpoint);
+            prop_assert_eq!(log[0].seq, seq_before - 1);
+
+            // Appends continue seamlessly, and every oracle still holds.
+            for payload in &after {
+                store.append(payload.clone(), ts).unwrap();
+            }
+            prop_assert_eq!(store.state(), &store.replay().unwrap());
+            prop_assert_eq!(store.events().unwrap().len(), 1 + after.len());
+
+            // A reopen sees the compacted log's state.
+            let final_state = store.state().clone();
+            let final_seq = store.next_seq();
+            drop(store);
+            let reopened = Store::open(&path).unwrap();
+            prop_assert_eq!(reopened.state(), &final_state);
+            prop_assert_eq!(reopened.next_seq(), final_seq);
+            prop_assert_eq!(&reopened.replay().unwrap(), reopened.state());
+        }
+    }
+
+    /// The threshold gate: a log at or below it is left alone (compacting
+    /// a fresh checkpoint would churn forever at every idle boundary).
+    #[test]
+    fn compaction_respects_the_threshold() {
+        let dir = tempdir().unwrap();
+        let mut store = open_temp(&dir);
+        let ts = test_timestamp();
+        for i in 0..5u64 {
+            store
+                .append(
+                    StateEventPayload::DefaultBranchSet {
+                        branch: format!("b{i}"),
+                    },
+                    ts,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            store.compact(5, ts).unwrap(),
+            None,
+            "5 events ≤ threshold 5"
+        );
+        assert_eq!(
+            store.compact(4, ts).unwrap(),
+            Some(5),
+            "5 events > threshold 4"
+        );
+        // Already just a checkpoint: never worthwhile again.
+        assert_eq!(
+            store.compact(0, ts).unwrap(),
+            None,
+            "a lone checkpoint stays"
+        );
+    }
+
+    /// An ACTIVE train's history is never compacted away — the refusal is
+    /// the store's own invariant, not caller discipline.
+    #[test]
+    fn compaction_refuses_while_a_train_is_active() {
+        let dir = tempdir().unwrap();
+        let mut store = open_temp(&dir);
+        let ts = test_timestamp();
+        store
+            .append(
+                StateEventPayload::TrainStarted {
+                    root_pr: crate::types::PrNumber(1),
+                    current_pr: crate::types::PrNumber(1),
+                },
+                ts,
+            )
+            .unwrap();
+        assert_eq!(store.compact(0, ts).unwrap(), None);
+        assert_eq!(store.events().unwrap().len(), 1, "log untouched");
+
+        // Retired (stopped) trains need no history: compaction proceeds.
+        store
+            .append(
+                StateEventPayload::TrainStopped {
+                    root_pr: crate::types::PrNumber(1),
+                },
+                ts,
+            )
+            .unwrap();
+        assert_eq!(store.compact(0, ts).unwrap(), Some(2));
+        assert_eq!(store.state(), &store.replay().unwrap());
     }
 
     #[test]
