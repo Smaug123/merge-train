@@ -822,10 +822,17 @@ stage shippable).
 >    valid edge; only adopted-train frozen members absent from the crawl
 >    are still fetched individually before the atomic append. Round 6
 >    (P2): a train's root closed UNMERGED during the gap is in neither
->    list endpoint, so the wake-up webhook's `referenced_prs()` SEED the
->    crawl — the caller fetches any named PR the lists miss, its status
->    comment is found, and the train is adopted then aborted by the close
->    rather than orphaned with no cleanup or final status. A finished
+>    list endpoint, so PR discovery runs to a FIXPOINT — the wake-up
+>    webhook's `referenced_prs()` seed the crawl, and `crawl_events`
+>    reports every PR it referenced but did not fetch (declaration
+>    targets AND adopted-train members); the caller fetches those, lists
+>    their comments, and re-crawls until nothing new is referenced
+>    (`attempted` bounds it — each PR is fetched once, 404 included).
+>    Round 6 covered the wake-up naming the closed root directly; round 7
+>    covers it named only by an open descendant's declaration — the
+>    fixpoint follows that edge to the closed root, finds its status
+>    comment, and adopts+aborts the train rather than orphaning it. A
+>    finished
 >    train's stale ACTIVE comment adopts as completed (an
 >    unfinished train necessarily has unmerged members); fan-out replay
 >    never clobbers a child record born during-or-after the parent train
