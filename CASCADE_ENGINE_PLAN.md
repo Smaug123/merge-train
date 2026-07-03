@@ -868,8 +868,25 @@ stage shippable).
 >    triggering comment is now treated as a FRESH declaration for scratch
 >    purposes — a MERGED predecessor (LateAddition, handler records
 >    nothing) creates no scratch edge; only an OPEN-predecessor triggering
->    edge shapes the scratch (for `stack_extended`). **Crawl review ran
->    12 rounds** (2,1,1,1,1,1,1,1,2,1,1,2 findings) — lost-DB
+>    edge shapes the scratch (for `stack_extended`). Round 13 (2×P2,
+>    RULED as bounded residuals, no code change): both are inherent
+>    limits of the fan-out BIRTH-TIME discriminator (rounds 3, 8) — the
+>    `started_at` comparison cannot tell "this cascade's fan-out child"
+>    from "an unrelated stopped/aborted train record on a PR that later
+>    joined the stack." (a) The round-8 stale-parent check can read such
+>    an unrelated record as fan-out proof and complete an interrupted
+>    parent; (b) the round-3 fan-out-replay guard can preserve an
+>    unrelated terminal record and skip creating a real fan-out child.
+>    Both require a PR to have had its OWN train and then become a
+>    descendant of another active train — which itself brushes the
+>    normal-operation invariant "members cannot have trains" — and both
+>    outcomes are SAFE and RECOVERABLE (the affected train is dropped or
+>    not-continued, never wrong-merged; a fresh `@merge-train start`
+>    fixes it). A complete fix needs parent-lineage on `TrainRecord`,
+>    and (b) is directly wedged against round-3's "don't undo a user's
+>    stop"; not worth destabilizing the converged heuristics for these
+>    corners (owner tolerates conservative, recoverable recovery).
+>    **Crawl review ran 13 rounds** — lost-DB
 >    reconstruction is the most adversarial recovery surface; every
 >    finding was a real divergence from live-operation guarantees, each
 >    pinned by a mutation-checked test. Round 6
