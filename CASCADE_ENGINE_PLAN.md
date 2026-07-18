@@ -981,15 +981,23 @@ stage shippable).
 >    commenting to restart — are acceptable. That covers (a)'s residue
 >    (a future `start` refuses until the junk comment is deleted) and
 >    (c) (the descendant rejects `start` until re-declared; recovered
->    trains drive their frozen work identically either way). (b)
->    remains OPEN: it is NOT stop-shaped — a recovered train
->    re-freezing a later level against the crawled topology can MERGE
->    the resurrected descendant (the differential seed demonstrated
->    it) — equivalently, recovery honors GitHub's surviving visible
->    declarations exactly as onboarding or a fresh `start` would.
->    Candidate resolutions: accept that doctrine and document "delete
->    or edit EVERY declaring comment to retract durably", or bot-posted
->    retraction receipts the crawl reads.** An envelope property then
+>    trains drive their frozen work identically either way). (b) was
+>    NOT stop-shaped — a recovered train re-freezing a later level can
+>    MERGE the resurrected descendant — and the owner chose RETRACTION
+>    RECEIPTS: when an authorized retraction is applied
+>    (`PredecessorRemoved`), the worker posts a bot receipt on the PR
+>    (`status/retraction.rs`, a `merge-train-retraction` block) naming
+>    the RETRACTED comment's id; the crawl, trusting it only on the PR
+>    it names, tombstones every declaration at or below that ANCHOR.
+>    Anchoring to the retracted id (not the receipt's own) matters: the
+>    differential property killed the receipt-id design within one run
+>    — the receipt posts when the bot PROCESSES the deletion, so a
+>    re-declaration made during backlog lag legitimately PRECEDES the
+>    receipt and must survive. Receipts are best-effort like status
+>    updates (a lost receipt re-opens that one retraction's window —
+>    documented residual). The harness's Retract move is back to
+>    PARTIAL retraction and the differential holds with NO (b)
+>    allowance.** An envelope property then
 >    mutates GitHub during the gap (closes, manual merges, extensions,
 >    comment edits/deletes, deleted status comments) and asserts the
 >    documented guarantees: surviving comment ⟹ adopted; deleted ⟹ not
