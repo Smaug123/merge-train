@@ -325,7 +325,36 @@ pub(crate) fn crawl_events(
                     &topology.prs,
                     default_branch,
                 ) {
-                    Ok(()) => true,
+                    // Validation must skip the base-match check for a
+                    // MERGED predecessor (a legitimate mid-cascade
+                    // descendant was retargeted to the default branch) —
+                    // but live only ever HOLDS a merged-predecessor edge
+                    // that was recorded while the predecessor was OPEN,
+                    // when the declarer's base matched its branch, and the
+                    // cascade's own retarget afterwards produces only the
+                    // default branch. Any other base is an edge live never
+                    // held: a declaration live REJECTED as mismatched
+                    // whose target has since merged. Recording it would
+                    // fabricate topology and SHADOW the PR's real later
+                    // declaration as already-declared, stranding the stack
+                    // tail (lost_db differential finding).
+                    Ok(()) => {
+                        let implausible_merged_base =
+                            topology.prs.get(&predecessor).is_some_and(|p| {
+                                p.state.is_merged()
+                                    && cached.base_ref != p.head_ref
+                                    && cached.base_ref != default_branch
+                            });
+                        if implausible_merged_base {
+                            tracing::warn!(
+                                %pr, %predecessor,
+                                "dropping a crawled declaration onto a merged \
+                                 predecessor whose branch never matched the \
+                                 declarer's base (live rejected it)"
+                            );
+                        }
+                        !implausible_merged_base
+                    }
                     Err(e) => {
                         tracing::warn!(
                             %pr, %predecessor, error = %e,
@@ -616,6 +645,70 @@ mod tests {
             declared(&outcome.events),
             vec![(PrNumber(2), PrNumber(1))],
             "the stranger's comment is ignored; the author's first valid one wins"
+        );
+    }
+
+    /// A declaration REJECTED live (base mismatch against an OPEN
+    /// predecessor) must stay rejected after that predecessor MERGES. Live
+    /// only ever holds a merged-predecessor edge recorded while the
+    /// predecessor was open — when the declarer's base matched its branch —
+    /// and the cascade's own retarget afterwards moves the base to the
+    /// default branch; any other base is an edge live never held.
+    /// Fabricating it would also SHADOW the PR's real declaration as
+    /// already-declared and misroute the stack (found by the lost_db
+    /// differential property: junk 3→#1 fabricated after #1 merged,
+    /// shadowing the honest 3→#2 and stranding #3 unmerged).
+    #[test]
+    fn a_rejected_declaration_is_not_fabricated_once_its_target_merges() {
+        let merged_one = PrData {
+            state: PrState::Merged {
+                merge_commit_sha: Sha::parse("b".repeat(40)).unwrap(),
+            },
+            ..pr(1, AUTHOR, PrState::Open)
+        };
+        let crawled = vec![
+            merged_one,
+            child(2, AUTHOR, 1, PrState::Open),
+            child(3, AUTHOR, 2, PrState::Open),
+        ];
+        let comments = vec![
+            (
+                PrNumber(3),
+                vec![
+                    // Lowest id, so it replays FIRST: 3 → #1, whose base
+                    // "pr-2" matched neither "pr-1" nor "main" — live
+                    // rejected it while #1 was open.
+                    comment(1, AUTHOR, "@merge-train predecessor #1"),
+                    comment(3, AUTHOR, "@merge-train predecessor #2"),
+                ],
+            ),
+            (
+                PrNumber(2),
+                vec![comment(2, AUTHOR, "@merge-train predecessor #1")],
+            ),
+        ];
+        let outcome = crawl_events(
+            "main",
+            &crawled,
+            &comments,
+            "merge-train",
+            BOT,
+            None,
+            &HashSet::new(),
+            test_now(),
+        );
+        let edges = declared(&outcome.events);
+        assert!(
+            !edges.contains(&(PrNumber(3), PrNumber(1))),
+            "the live-rejected declaration must not be fabricated: {edges:?}"
+        );
+        assert!(
+            edges.contains(&(PrNumber(3), PrNumber(2))),
+            "the honest declaration must not be shadowed: {edges:?}"
+        );
+        assert!(
+            edges.contains(&(PrNumber(2), PrNumber(1))),
+            "the legitimate merged-predecessor edge is kept (round 9): {edges:?}"
         );
     }
 

@@ -962,7 +962,16 @@ stage shippable).
 >    history: (a) a base-mismatch declaration live REJECTED is accepted
 >    once its target MERGED (the merged-predecessor path must skip the
 >    base-match check — round 9's retarget blindness), fabricating an
->    edge that gates `is_root`'s reconciliation proof; (b) retracting a
+>    edge that gates `is_root`'s reconciliation proof — MOSTLY FIXED:
+>    the soak then showed the fabricated edge SHADOWING the PR's real
+>    later declaration (AlreadyHasPredecessor) and stranding the stack
+>    tail, so the crawl now requires a merged-predecessor declarer's
+>    base ∈ {predecessor's branch, default} (live records such an edge
+>    only while the predecessor is OPEN with matching base; its own
+>    retarget produces only the default branch afterwards); the
+>    residual fabrication is confined to default-based declarers, where
+>    "retargeted mid-cascade descendant" and "never-stacked rejected
+>    declaration" are genuinely indistinguishable; (b) retracting a
 >    restated declaration by deleting the OWNING comment leaves the
 >    older declaration standing, and the crawl resurrects the retracted
 >    edge (no tombstone exists in GitHub's present); (c) a mid-stack
