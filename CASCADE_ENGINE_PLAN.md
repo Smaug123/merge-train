@@ -933,7 +933,35 @@ stage shippable).
 >    ruling regardless of how many edits a PR carries. **Crawl review CONVERGED at 18 rounds** — lost-DB
 >    reconstruction is the most adversarial recovery surface; every
 >    finding was a real divergence from live-operation guarantees, each
->    pinned by a mutation-checked test. Round 6
+>    pinned by a mutation-checked test. **Post-convergence, the reviewer
+>    is MECHANIZED** (`worker/tests.rs::lost_db`, mirroring how the
+>    `interleaving` harness ended the M5/M6 saga-ordering rounds): a
+>    differential property runs one generated history (shapes incl.
+>    fan-out; valid/junk/stranger/restated/retracted declarations;
+>    starts/stops) in a never-crashed world and a lose-the-DB-at-any-
+>    saga-depth world and demands shape equivalence — with ONE exemption
+>    the harness itself surfaced: a command ACKED but unanswered when
+>    the DB dies is lost with it (GitHub never redelivers an acked
+>    webhook); bounded, visible, re-issuable. The harness's first runs
+>    also surfaced a REAL divergence, provisionally allowed in the
+>    oracle PENDING A RULING: a base-mismatch declaration live REJECTED
+>    gets re-validated by the crawl after its target MERGED — the
+>    merged-predecessor path must skip the base-match check (round 9's
+>    retarget blindness) — so the crawl records an edge live refused,
+>    and that edge gates `is_root`'s reconciliation proof; recoverable
+>    (delete the declaring comment), reachable only via invalid
+>    declaration + later merge + DB loss. An envelope property then
+>    mutates GitHub during the gap (closes, manual merges, extensions,
+>    comment edits/deletes, deleted status comments) and asserts the
+>    documented guarantees: surviving comment ⟹ adopted; deleted ⟹ not
+>    resurrected, no squashes; extension ⟹ aborted, never driven; every
+>    recovered edge backed by a surviving unedited author declaration;
+>    store never ahead of reality; ≤1 squash; quiescence. The oracle is
+>    itself mutation-checked: disabling the round-4 `stack_extended`,
+>    round-14/18 `edited_extends`, round-2 edited-skip, round-5
+>    validation, or round-6/7 fixpoint fixes each makes a property fail.
+>    Exit criterion henceforth: the properties (raise `PROPTEST_CASES`
+>    when touching the crawl), not reviewer exhaustion. Round 6
 >    (P2): a train's root closed UNMERGED during the gap is in neither
 >    list endpoint, so PR discovery runs to a FIXPOINT — the wake-up
 >    webhook's `referenced_prs()` seed the crawl, and `crawl_events`
