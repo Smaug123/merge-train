@@ -956,29 +956,40 @@ stage shippable).
 >    edge) the abort stands, and edited declarations stay outside the
 >    watermark entirely (their id reflects creation, not the edit).
 >    `FakeGitHub::PostComment` now allocates above every existing id to
->    model that monotonicity. Soaking also surfaced one residual CLASS,
->    provisionally allowed in the oracle PENDING A RULING — crawl
->    re-validation against the PRESENT is not live validation against
->    history: (a) a base-mismatch declaration live REJECTED is accepted
->    once its target MERGED (the merged-predecessor path must skip the
->    base-match check — round 9's retarget blindness), fabricating an
->    edge that gates `is_root`'s reconciliation proof — MOSTLY FIXED:
->    the soak then showed the fabricated edge SHADOWING the PR's real
->    later declaration (AlreadyHasPredecessor) and stranding the stack
->    tail, so the crawl now requires a merged-predecessor declarer's
->    base ∈ {predecessor's branch, default} (live records such an edge
->    only while the predecessor is OPEN with matching base; its own
->    retarget produces only the default branch afterwards); the
->    residual fabrication is confined to default-based declarers, where
->    "retargeted mid-cascade descendant" and "never-stacked rejected
->    declaration" are genuinely indistinguishable; (b) retracting a
->    restated declaration by deleting the OWNING comment leaves the
->    older declaration standing, and the crawl resurrects the retracted
->    edge (no tombstone exists in GitHub's present); (c) a mid-stack
->    retraction leaves descendants' surviving declarations
->    not-in-stack, so the crawl DROPS edges live retains. All three are
->    bounded and comment-recoverable; candidate real fix is bot-posted
->    tombstones/receipts the crawl could read. An envelope property then
+>    model that monotonicity. Soaking also surfaced one residual CLASS
+>    — crawl re-validation against the PRESENT is not live validation
+>    against history: (a) a base-mismatch declaration live REJECTED is
+>    accepted once its target MERGED (the merged-predecessor path must
+>    skip the base-match check — round 9's retarget blindness),
+>    fabricating an edge that gates `is_root`'s reconciliation proof —
+>    MOSTLY FIXED: the soak then showed the fabricated edge SHADOWING
+>    the PR's real later declaration (AlreadyHasPredecessor) and
+>    stranding the stack tail, so the crawl now requires a
+>    merged-predecessor declarer's base ∈ {predecessor's branch,
+>    default} (live records such an edge only while the predecessor is
+>    OPEN with matching base; its own retarget produces only the
+>    default branch afterwards); the residual fabrication is confined
+>    to default-based declarers, where "retargeted mid-cascade
+>    descendant" and "never-stacked rejected declaration" are genuinely
+>    indistinguishable; (b) retracting a restated declaration by
+>    deleting only the OWNING comment leaves the older declaration
+>    standing, and the crawl resurrects the retracted edge (no
+>    tombstone exists in GitHub's present); (c) a mid-stack retraction
+>    leaves descendants' surviving declarations not-in-stack, so the
+>    crawl DROPS edges live retains. **RULED (owner, 2026-07-18):
+>    stop-shaped residuals — the stack stops and requires manual
+>    commenting to restart — are acceptable. That covers (a)'s residue
+>    (a future `start` refuses until the junk comment is deleted) and
+>    (c) (the descendant rejects `start` until re-declared; recovered
+>    trains drive their frozen work identically either way). (b)
+>    remains OPEN: it is NOT stop-shaped — a recovered train
+>    re-freezing a later level against the crawled topology can MERGE
+>    the resurrected descendant (the differential seed demonstrated
+>    it) — equivalently, recovery honors GitHub's surviving visible
+>    declarations exactly as onboarding or a fresh `start` would.
+>    Candidate resolutions: accept that doctrine and document "delete
+>    or edit EVERY declaring comment to retract durably", or bot-posted
+>    retraction receipts the crawl reads.** An envelope property then
 >    mutates GitHub during the gap (closes, manual merges, extensions,
 >    comment edits/deletes, deleted status comments) and asserts the
 >    documented guarantees: surviving comment ⟹ adopted; deleted ⟹ not

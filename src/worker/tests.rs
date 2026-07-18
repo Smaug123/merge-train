@@ -4262,11 +4262,15 @@ mod lost_db {
                 // latest (the edge's owner) retracts live but leaves the
                 // older declaration standing on GitHub, and a lost-DB
                 // crawl — which cannot see deletions — resurrects the
-                // edge from it and will happily drive the re-attached
-                // descendant. That partial-retraction divergence is a
-                // REPORTED FINDING awaiting an owner ruling (inherent:
-                // GitHub's present carries no tombstone), so the
-                // generator models the durable form here.
+                // edge from it; a recovered train re-freezing a later
+                // level can then DRIVE the re-attached descendant. STILL
+                // OPEN: the owner ruled stop-shaped residuals fine
+                // (2026-07-18), and this one can merge, so it remains
+                // outside that ruling (inherent: GitHub's present carries
+                // no tombstone; candidate fixes are bot-posted retraction
+                // receipts, or documenting "delete every declaring
+                // comment to retract durably" — which is what the
+                // generator models here).
                 5 => {
                     let mut prs: Vec<u64> = h
                         .decl_ids
@@ -4688,27 +4692,35 @@ mod lost_db {
                     "PR #{pr}: cached state diverged"
                 );
             }
-            // KNOWN DIVERGENCE, PROVISIONAL ALLOWANCE (pending an owner
-            // ruling — found by this harness): live REJECTS a declaration
-            // whose base does not match its open predecessor's branch, but
-            // once that predecessor MERGES, `validate_predecessor_declaration`
-            // must skip the base-match check (a legitimate mid-cascade
-            // descendant is retargeted to the default branch), so a lost-DB
-            // crawl re-validating the same comment ACCEPTS the edge live
-            // refused — and that edge gates `is_root`'s reconciliation
-            // proof. Recoverable (the author deletes the declaring comment)
-            // but a real live-vs-crawl divergence. Only the exact shape
+            // KNOWN DIVERGENCE — RULED acceptable (owner, 2026-07-18:
+            // failure modes confined to "the stack stops and requires
+            // manual commenting to restart" are fine). Live REJECTS a
+            // declaration whose base does not match its open predecessor's
+            // branch, but once that predecessor MERGES,
+            // `validate_predecessor_declaration` must skip the base-match
+            // check (a legitimate mid-cascade descendant is retargeted to
+            // the default branch), so a lost-DB crawl re-validating the
+            // same comment ACCEPTS an edge live refused. After the
+            // shadowing fix this survives only for default-based declarers
+            // (genuinely indistinguishable from a retargeted descendant),
+            // where the edge can at worst gate `is_root` and make a future
+            // `start` refuse until the junk comment is deleted — the ruled
+            // stop, never a wrong drive. Only the exact shape
             // live=None/crawl=Some(merged target) is tolerated here.
             let fabricated_from_merged_target = l.predecessor.is_none()
                 && c.predecessor
                     .is_some_and(|t| lost.prs.get(&t).is_some_and(|p| p.state.is_merged()));
-            // Same class, opposite direction (also PENDING THE RULING):
-            // live KEEPS a descendant's edge when a mid-stack PR's own
-            // declaration is retracted (retraction does not cascade), but
-            // the crawl re-validates the descendant's comment against the
-            // PRESENT, finds the target unstacked (non-default base, no
-            // predecessor), and DROPS the edge as not-in-stack. Only that
-            // exact mechanism is tolerated.
+            // Same class, opposite direction — RULED acceptable (owner,
+            // 2026-07-18, same condition): live KEEPS a descendant's edge
+            // when a mid-stack PR's own declaration is retracted
+            // (retraction does not cascade), but the crawl re-validates the
+            // descendant's comment against the PRESENT, finds the target
+            // unstacked (non-default base, no predecessor), and DROPS the
+            // edge as not-in-stack. The dropped edge only makes a future
+            // `start` on the descendant reject loudly until it is
+            // re-declared (recovered trains drive their frozen work
+            // identically either way) — the ruled stop. Only that exact
+            // mechanism is tolerated.
             let dropped_by_unstacked_target = c.predecessor.is_none()
                 && l.predecessor.is_some_and(|t| {
                     lost.prs.get(&t).is_some_and(|p| {
