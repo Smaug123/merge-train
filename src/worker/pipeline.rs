@@ -49,7 +49,7 @@ use tracing::{error, info, warn};
 
 use crate::cascade::{self, Control, EffectError, Observation, ReplayFacts, StepPlan, observe};
 use crate::commands::{Command, parse_command};
-use crate::effects::github::GitHubEffect;
+use crate::effects::github::{CommentData, GitHubEffect};
 use crate::effects::{Effect, GitHubResponse, PrData};
 use crate::git::{CommitIdentity, GitConfig};
 use crate::persistence::event::StateEventPayload;
@@ -351,47 +351,32 @@ impl Processor {
             return self.close(&id, None, "duplicate content");
         }
 
-        // First-contact default-branch discovery: a fresh store has an empty
-        // default branch, and root detection / base validation read it.
-        if self.store.state().default_branch.is_empty() {
-            match self.deps.github.execute(GitHubEffect::GetRepoSettings) {
-                Ok(GitHubResponse::RepoSettings(settings)) => {
-                    info!(default_branch = %settings.default_branch, "discovered default branch");
-                    self.store.append_batch(
-                        &[StateEventPayload::DefaultBranchSet {
-                            branch: settings.default_branch,
-                        }],
-                        Utc::now(),
-                    )?;
-                }
-                Ok(other) => {
-                    error!(?other, "GetRepoSettings answered the wrong variant");
-                    return self.release(&id);
-                }
-                Err(e @ EffectError::Transient { .. }) => {
-                    warn!(error = ?e, "cannot discover default branch; releasing delivery");
-                    return self.release(&id);
-                }
-                // Permanent (token lacks access, repo deleted/renamed):
-                // release too — DELIBERATELY, unlike role lookups. There a
-                // denial is a safe answer; here there is none: without the
-                // default branch nothing can be processed, and closing the
-                // delivery would silently drop webhooks GitHub will never
-                // resend. The repo's queue pauses (retrying at the stall
-                // cadence, which also heals "permanent" auth errors the
-                // moment the operator fixes the token) and this error says
-                // so as loudly as we can.
-                Err(e) => {
-                    error!(
-                        error = ?e,
-                        "cannot discover the default branch and the failure is \
-                         permanent; the repo's queue is PAUSED until discovery \
-                         succeeds — operator action likely required (token \
-                         scopes? repo moved?)"
-                    );
-                    return self.release(&id);
-                }
-            }
+        // First contact — a fresh store (brand-new repo, or a LOST state
+        // db) has an empty default branch. Webhooks only describe the
+        // future, so bootstrap crawls the present: settings, open and
+        // recently merged PRs, their comments (predecessor topology,
+        // author-gated), and the bot's own status comments (train recovery
+        // — DESIGN §Bootstrap Phase 2). Any failure releases the delivery:
+        // there is no safe way to process anything without the bootstrap,
+        // and closing would silently drop webhooks GitHub will never
+        // resend — the repo's queue pauses at the stall cadence (which
+        // also heals "permanent" auth errors the moment the operator fixes
+        // the token).
+        //
+        // The crawl must NOT consume THIS delivery's own comment as a
+        // historical declaration: it is live input the command handler
+        // below is about to process, and pre-recording it (round 9 keeps
+        // merged-predecessor edges) would let the handler see it as
+        // already-owned and skip the `LateAddition` answer a genuine
+        // late-addition command deserves (Codex crawl review round 10).
+        let own_comment = match &event {
+            GitHubEvent::IssueComment(c) => Some(c.comment_id),
+            _ => None,
+        };
+        if self.store.state().default_branch.is_empty()
+            && !self.bootstrap_crawl(&event.referenced_prs(), own_comment)?
+        {
+            return self.release(&id);
         }
 
         // Command authorization + referenced-PR precache (commands only).
@@ -508,6 +493,33 @@ impl Processor {
             })
             .collect();
 
+        // A retraction's durable tombstone, captured against the PRE-commit
+        // state (the commit clears the edge). `PredecessorRemoved` is
+        // emitted only when an AUTHORIZED retraction is applied, and the
+        // deletion behind it leaves no trace in GitHub's present — an older
+        // declaration comment on the PR would resurrect the edge in a
+        // lost-DB crawl, whose recovered train could then DRIVE the
+        // descendant the user unstacked (owner ruling 2026-07-18). The
+        // receipt comment outlives the DB; the crawl reads it as a
+        // tombstone for every declaration on the PR up to the RETRACTED
+        // comment's id (its anchor — the receipt's own id would race a
+        // re-declaration posted while this delivery sat in the backlog).
+        // Posted best-effort after the close, like every status update — a
+        // receipt lost to an outage re-opens the window for that one
+        // retraction (documented residual).
+        let retraction_receipts: Vec<(PrNumber, crate::types::CommentId, Option<PrNumber>)> =
+            events
+                .iter()
+                .filter_map(|e| match e {
+                    StateEventPayload::PredecessorRemoved { pr, comment_id } => Some((
+                        *pr,
+                        *comment_id,
+                        self.store.state().prs.get(pr).and_then(|c| c.predecessor),
+                    )),
+                    _ => None,
+                })
+                .collect();
+
         let command_ids =
             self.store
                 .commit_delivery(&id, &events, key.as_ref(), &commands, Utc::now())?;
@@ -528,6 +540,13 @@ impl Processor {
             if let StateEventPayload::TrainAborted { root_pr, .. } = payload {
                 self.queue(PendingWork::AbortCleanup { root: *root_pr });
             }
+        }
+
+        for (pr, retracted, predecessor) in retraction_receipts {
+            self.best_effort_github(GitHubEffect::PostComment {
+                pr,
+                body: crate::status::format_retraction_receipt(pr, retracted, predecessor),
+            });
         }
 
         // Handler effects are cosmetic-or-cache: ack reactions, rejection
@@ -776,6 +795,164 @@ impl Processor {
             return;
         }
         self.pending.push_back(work);
+    }
+
+    /// The first-contact crawl (DESIGN §Bootstrap algorithm, Phase 2):
+    /// fetches settings, open + recently merged PRs, and every crawled
+    /// PR's comments, then appends [`super::bootstrap::crawl_events`]'s
+    /// result as ONE atomic batch — a crash or a released retry re-crawls
+    /// from nothing (idempotent reads, no partial state). Adopted ACTIVE
+    /// trains are marked for M6 recovery, deferred behind the backlog
+    /// drain like every other recovery. Returns `false` when GitHub was
+    /// unavailable (any failure: transient, permanent, or a wrong
+    /// variant): the caller releases the delivery and the queue pauses at
+    /// the stall cadence — there is no safe degraded answer at bootstrap.
+    fn bootstrap_crawl(
+        &mut self,
+        seed_prs: &[PrNumber],
+        skip_comment: Option<crate::types::CommentId>,
+    ) -> Result<bool, StoreError> {
+        /// How many days of merged PRs the crawl considers: predecessor
+        /// targets and mid-cascade roots older than this are treated as
+        /// history (DESIGN bounds the resurrection window the same way).
+        const MERGED_SINCE_DAYS: u32 = 30;
+
+        macro_rules! fetch {
+            ($effect:expr, $expected:pat => $value:expr) => {
+                match self.deps.github.execute($effect) {
+                    Ok($expected) => $value,
+                    Ok(other) => {
+                        error!(?other, "bootstrap fetch answered the wrong variant");
+                        return Ok(false);
+                    }
+                    Err(e) => {
+                        warn!(error = ?e, "bootstrap crawl failed; the repo's queue \
+                               pauses until it succeeds");
+                        return Ok(false);
+                    }
+                }
+            };
+        }
+
+        let settings = fetch!(
+            GitHubEffect::GetRepoSettings,
+            GitHubResponse::RepoSettings(s) => s
+        );
+        if settings.default_branch.is_empty() {
+            error!("repository settings carry an empty default branch");
+            return Ok(false);
+        }
+        let open = fetch!(GitHubEffect::ListOpenPrs, GitHubResponse::PrList(prs) => prs);
+        let (merged, may_be_incomplete) = fetch!(
+            GitHubEffect::ListRecentlyMergedPrs { since_days: MERGED_SINCE_DAYS },
+            GitHubResponse::RecentlyMergedPrList { prs, may_be_incomplete } => (prs, may_be_incomplete)
+        );
+        if may_be_incomplete {
+            warn!(
+                "the recently-merged crawl hit its pagination limit; trains \
+                 rooted at older merged PRs will not be recovered"
+            );
+        }
+        // Discover PRs to a fixpoint. The list endpoints miss a PR closed
+        // *unmerged* during the gap, but the wake-up webhook names some PRs
+        // (`seed_prs`) and the crawl surfaces more — declaration targets and
+        // adopted-train members it referenced but did not fetch. A closed
+        // root reachable only through its descendants' declarations is found
+        // this way: fetch the referenced PRs, list their comments, re-crawl,
+        // repeat until nothing new is referenced (Codex crawl review rounds
+        // 6–7). `attempted` bounds it — every PR is fetched at most once
+        // (a 404 counts), and the PR universe is finite — so it terminates.
+        let mut crawled: Vec<PrData> = open;
+        crawled.extend(merged);
+        let mut attempted: HashSet<PrNumber> = crawled.iter().map(|p| p.number).collect();
+        // Referenced PRs that a permanent `GetPr` failure could not fetch
+        // (deleted, or the token lost access). `crawl_events` aborts a train
+        // that references one rather than recover it into an `UnknownPr`
+        // stall (Codex crawl review round 12).
+        let mut unfetchable: HashSet<PrNumber> = HashSet::new();
+        let mut comments: Vec<(PrNumber, Vec<CommentData>)> = Vec::new();
+        let mut listed: HashSet<PrNumber> = HashSet::new();
+        let mut pending: Vec<PrNumber> = seed_prs
+            .iter()
+            .copied()
+            .filter(|pr| !attempted.contains(pr))
+            .collect();
+
+        let outcome = loop {
+            for pr in std::mem::take(&mut pending) {
+                if !attempted.insert(pr) {
+                    continue;
+                }
+                match self.deps.github.execute(GitHubEffect::GetPr { pr }) {
+                    Ok(GitHubResponse::Pr(data)) => crawled.push(data),
+                    Err(e @ EffectError::Transient { .. }) => {
+                        warn!(%pr, error = ?e, "cannot fetch a referenced PR; bootstrap paused");
+                        return Ok(false);
+                    }
+                    other => {
+                        warn!(%pr, ?other, "referenced PR unfetchable; skipping it in the crawl");
+                        unfetchable.insert(pr);
+                    }
+                }
+            }
+            let unlisted: Vec<PrNumber> = crawled
+                .iter()
+                .map(|p| p.number)
+                .filter(|pr| !listed.contains(pr))
+                .collect();
+            for pr in unlisted {
+                listed.insert(pr);
+                let pr_comments = fetch!(
+                    GitHubEffect::ListComments { pr },
+                    GitHubResponse::Comments(c) => c
+                );
+                comments.push((pr, pr_comments));
+            }
+            let outcome = super::bootstrap::crawl_events(
+                &settings.default_branch,
+                &crawled,
+                &comments,
+                &self.deps.bot_name,
+                self.deps.bot_user_id,
+                skip_comment,
+                &unfetchable,
+                Utc::now(),
+            );
+            let fresh: Vec<PrNumber> = outcome
+                .referenced_uncrawled
+                .iter()
+                .copied()
+                .filter(|pr| !attempted.contains(pr))
+                .collect();
+            if fresh.is_empty() {
+                break outcome;
+            }
+            pending = fresh;
+        };
+        info!(
+            default_branch = %settings.default_branch,
+            crawled_prs = crawled.len(),
+            recovered_trains = outcome.recovered_roots.len(),
+            "bootstrapped the repo from a crawl"
+        );
+        self.store.append_batch(&outcome.events, Utc::now())?;
+        self.clear_inherited_markers(&outcome.events);
+        // A train the crawl aborted (its stack was extended during the gap)
+        // needs the same worker-side cleanup a handler abort gets — stale
+        // worktree removal + a final status comment (the engine's own
+        // aborts carry cleanup in their plans; this one has no plan).
+        for payload in &outcome.events {
+            if let StateEventPayload::TrainAborted { root_pr, .. } = payload {
+                self.queue(PendingWork::AbortCleanup { root: *root_pr });
+            }
+        }
+        for root in outcome.recovered_roots {
+            self.inherited_mid_flight.insert(root);
+        }
+        // The recoveries defer behind the backlog drain, exactly like
+        // startup evaluations (the round-6/round-20 gating).
+        self.requeue_marked_recoveries();
+        Ok(true)
     }
 
     /// Supplementary GitHub recovery for a train inherited mid-cascade

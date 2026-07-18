@@ -786,12 +786,283 @@ stage shippable).
 >    rule again). Permanent `ListComments`/re-post failures park
 >    identically (proceeding unverified risks the exact double-squash
 >    the check prevents; `stop` works throughout).
-> 5. **Deliberately NOT here**: the full GitHub crawl fallback
->    (ListOpenPrs/ListRecentlyMergedPrs/comment scan rebuilding a LOST
->    db, DESIGN's inference-based recovery + `needs_manual_review`) — a
->    fresh DB today re-learns topology from webhook traffic and refuses
->    nothing irreversibly; the crawl is additive and rides with the
->    polling/PeriodicSync stage. Events-table compaction — **landed
+> 5. **Deliberately NOT in M6, landed separately (2026-07-03)**: the
+>    first-contact crawl (`worker/bootstrap.rs`, pure `crawl_events` +
+>    pipeline glue). A fresh store — new repo OR lost DB — crawls
+>    settings, open + recently-merged (30d) PRs, and their comments at
+>    the first delivery: PR cache fills, author-gated predecessor
+>    declarations (last wins), and train adoption from bot status
+>    comments (bot-authored, parseable, posted on their own root; per
+>    root the latest `started_at` at the highest `recovery_seq` wins) via
+>    `TrainRecordAdopted`; adopted ACTIVE trains take the normal M6
+>    recovery path, deferred behind the backlog drain. One atomic append;
+>    any fetch failure releases the delivery (queue pauses at the stall
+>    cadence — no safe degraded answer at bootstrap). `PrData` gained
+>    `author_id` (0 when GitHub omits the user — deny-safe). ENVELOPE:
+>    a train whose comment was deleted AND whose DB was lost is not
+>    resurrected (nothing sound to resurrect from); the cache still
+>    carries the merged PRs, so a fresh `start` gets the loud
+>    validations. DESIGN's `needs_manual_review` inference recovery is
+>    NOT implemented: with a lost DB it cannot be soundly distinguished
+>    from a user-merged stack, and the failure mode without it is loud,
+>    not silent. Crawl-review notes: edited comments are refused in the
+>    declaration scan (the API names only the original author, so an
+>    edited body is unattributable — the live path's sender check has no
+>    crawl equivalent); declarations are REPLAYED in comment-id order and
+>    each is run through the live `validate_predecessor_declaration`
+>    (first-valid-wins, closed/missing/mismatched/cycle rejected, a
+>    merged predecessor is a late addition recording nothing) so the
+>    crawl persists exactly the edges the live handler would — an
+>    unvalidated edge would wedge `is_root` or fabricate a bogus stack
+>    extension, and the redelivered webhook treats the already-owned
+>    declaration as idempotent and never rejects it (round 5, P2). That
+>    validation reconstructs the edges the live STATE holds. Round 9
+>    (P1): a MERGED-predecessor edge is KEPT, not dropped as a late
+>    addition — it was recorded while the predecessor was open and still
+>    gates `is_root`'s reconciliation proof; dropping it let a
+>    mid-cascade descendant merge as a plain root, bypassing that proof.
+>    Round 9 (P2): a new comment restating a PR's CURRENT predecessor
+>    transfers ownership (records with the later comment id), matching
+>    the live handler, so a later retract/edit targets the right comment.
+>    Uncrawled predecessor targets (merged beyond the 30-day window) join
+>    the round-6/7 fixpoint fetch; adopted-train frozen members absent
+>    from the crawl are fetched the same way. Round 10 (P2): because
+>    round 9 keeps merged-predecessor edges, the crawl must not pre-record
+>    the TRIGGERING delivery's own comment — that comment is live input
+>    the command handler processes next in the same delivery, and
+>    pre-recording it would suppress the `LateAddition` answer a genuine
+>    late-addition command deserves; `crawl_events` takes a `skip_comment`
+>    for it. Round 11 (P1): the round-10 skip must exclude the triggering
+>    comment ONLY from being *persisted*, not from the topology scratch —
+>    a triggering comment that EXTENDS an active recovered train (new PR
+>    #3 declares frozen #2) must still be seen by `stack_extended` so the
+>    train aborts (round 4). So the triggering comment is now applied to
+>    the topology scratch and collected into `referenced_uncrawled` like
+>    any other, and only its `PredecessorDeclared` event is withheld
+>    (the handler records it, and by then the train — if extended — is
+>    already aborted). **RULED (owner, 2026-07-03):** the crawl's
+>    stack-extension abort is deliberately STRICTER than the live
+>    handler. Live `topology_change_abort` (handlers.rs:348) reads state
+>    before applying the new declaration, so a brand-new PR extending an
+>    active train does NOT abort in live operation — only changing or
+>    removing an EXISTING member does. After a DB loss the frozen set
+>    cannot be fully trusted, so a RECOVERED train aborts on ANY
+>    extension and requires a fresh `@merge-train start` (human
+>    intervention). This divergence is intended. RESIDUAL (documented, bounded): a late-addition
+>    command that is a *backlog* delivery (a different delivery triggered
+>    the crawl) is still pre-recorded — the crawl cannot know which
+>    already-listed comments have pending deliveries. The outcome is SAFE
+>    (the edge to a merged predecessor leaves `is_root` false without a
+>    reconciliation marker, so the PR stays non-startable); the only loss
+>    is the specific "late addition — rebase or restart" message, and a
+>    `start` still gets a "not a stack root" rejection. Round 12: two
+>    more P2s from the round-11 change. (a) A permanent `GetPr` 404 on an
+>    adopted-train MEMBER (deleted PR, or the token lost access) left the
+>    train recovered-but-broken — its first evaluation hits `UnknownPr`
+>    and sticks; the pipeline now tracks `unfetchable` PRs and
+>    `crawl_events` ABORTS a train referencing one instead of recovering
+>    it. (b) The round-11 "apply the triggering comment to the scratch"
+>    created a phantom edge when the triggering comment is a stale
+>    merged-predecessor (late-addition) redelivery: it shadowed a
+>    genuinely-later valid declaration as `AlreadyHasPredecessor`. So the
+>    triggering comment is now treated as a FRESH declaration for scratch
+>    purposes — a MERGED predecessor (LateAddition, handler records
+>    nothing) creates no scratch edge; only an OPEN-predecessor triggering
+>    edge shapes the scratch (for `stack_extended`). Round 13 (2×P2,
+>    RULED as bounded residuals, no code change): both are inherent
+>    limits of the fan-out BIRTH-TIME discriminator (rounds 3, 8) — the
+>    `started_at` comparison cannot tell "this cascade's fan-out child"
+>    from "an unrelated stopped/aborted train record on a PR that later
+>    joined the stack." (a) The round-8 stale-parent check can read such
+>    an unrelated record as fan-out proof and complete an interrupted
+>    parent; (b) the round-3 fan-out-replay guard can preserve an
+>    unrelated terminal record and skip creating a real fan-out child.
+>    Both require a PR to have had its OWN train and then become a
+>    descendant of another active train — which itself brushes the
+>    normal-operation invariant "members cannot have trains" — and both
+>    outcomes are SAFE and RECOVERABLE (the affected train is dropped or
+>    not-continued, never wrong-merged; a fresh `@merge-train start`
+>    fixes it). A complete fix needs parent-lineage on `TrainRecord`,
+>    and (b) is directly wedged against round-3's "don't undo a user's
+>    stop"; not worth destabilizing the converged heuristics for these
+>    corners (owner tolerates conservative, recoverable recovery).
+>    Round 14 (P1): the round-2 edited-comment skip kept an EDITED
+>    predecessor declaration out of the stack-extension scratch entirely,
+>    so an edited comment adding a descendant to a recovered train was
+>    caught by neither the crawl (edited skipped) nor the later live
+>    `topology_change_abort` (reads pre-declaration state) — the train
+>    resumed over an extended stack, against the round-11 abort-on-any-
+>    extension ruling. Fix: edited declarations are STILL not recorded
+>    (their editor is unattributable — round 2), but they now enrich the
+>    stack-extension scratch as POSSIBLE extensions (applied after the
+>    recording loop, only where the PR has no recorded edge — no shadow,
+>    no overwrite), so `stack_extended` aborts on an edited extension too.
+>    Round 15 (P2, fixed): the edited-extension collection was gated on
+>    the PR AUTHOR, but an edited body is authorized live by the EDITOR
+>    (`sender_id`, which the crawl lacks), so an author editing someone
+>    else's comment was missed — the edited-extension check now ignores
+>    the original author (recording still requires the PR author).
+>    Round 15 (P2, RULED bounded residual, no fix): a lost-DB first
+>    contact triggered by an OLD redelivery of `predecessor #1`, with a
+>    LATER comment restating `#1`, lets the crawl persist the later
+>    comment as owner, then the handler's same-predecessor ownership
+>    transfer moves ownership back to the older trigger comment — so a
+>    later edit/delete of the true-latest declaration no longer retracts
+>    it. This is the LIVE handler's unconditional
+>    ownership-transfer-to-any-restatement (not crawl-specific — a
+>    redelivered old comment moves ownership in live operation too),
+>    surfaced by the crawl; the consequence is `predecessor_comment_id`
+>    mis-attribution (retraction targets the wrong comment), recoverable
+>    by re-declaring, and reachable only with two same-predecessor
+>    declarations + a redelivery + DB loss. Not fixable in the crawl
+>    without changing live ownership semantics.
+>    Round 16 also (P2): edited declarations enrich the stack-extension
+>    scratch (rounds 14–15) but were NOT reported for fixpoint discovery,
+>    so a closed-unmerged train root reachable ONLY through an edited
+>    descendant declaration was never fetched and its train orphaned;
+>    edited targets now join `referenced_uncrawled` (the EDGE stays
+>    untrusted/unrecorded — only the target is fetched, for train
+>    discovery, like round 7). Round 18 (P2): rounds 14–15 folded edited
+>    edges into the `RepoState` scratch to feed `stack_extended`, but a
+>    single-value predecessor holds only ONE edge per PR, so a second
+>    edited comment on the same PR declaring a frozen member was silently
+>    dropped and its extension missed. The fold is gone; a dedicated
+>    `edited_extends` now tests EVERY edited edge directly against the
+>    train's known stack (frozen ∪ primaries ∪ recorded closure) — an edge
+>    into the stack from outside it aborts, matching the round-4 extension
+>    ruling regardless of how many edits a PR carries. **Crawl review CONVERGED at 18 rounds** — lost-DB
+>    reconstruction is the most adversarial recovery surface; every
+>    finding was a real divergence from live-operation guarantees, each
+>    pinned by a mutation-checked test. **Post-convergence, the reviewer
+>    is MECHANIZED** (`worker/tests.rs::lost_db`, mirroring how the
+>    `interleaving` harness ended the M5/M6 saga-ordering rounds): a
+>    differential property runs one generated history (shapes incl.
+>    fan-out; valid/junk/stranger/restated/retracted declarations;
+>    starts/stops) in a never-crashed world and a lose-the-DB-at-any-
+>    saga-depth world and demands shape equivalence — with ONE exemption
+>    the harness itself surfaced: a command ACKED but unanswered when
+>    the DB dies is lost with it (GitHub never redelivers an acked
+>    webhook); bounded, visible, re-issuable. Soaking surfaced one BUG,
+>    FIXED: the frozen set carries only the current phase's DIRECT
+>    descendants, so on a ≥3-deep chain a legitimately pre-declared
+>    grandchild sat "in the closure, outside the frozen set" and
+>    `stack_extended` FALSELY ABORTED the recovered train on a QUIET
+>    gap (every crawl example test used depth-2 stacks; fan-out
+>    children are all direct — 18 rounds never built depth 3). Fix:
+>    the train's own status-comment id is a WATERMARK — GitHub comment
+>    ids are globally monotonic, so a non-edited declaration owned by a
+>    LOWER id provably predates the train (baseline, never extension);
+>    above it (mid-train, gap, or a gap restatement re-owning an old
+>    edge) the abort stands, and edited declarations stay outside the
+>    watermark entirely (their id reflects creation, not the edit).
+>    `FakeGitHub::PostComment` now allocates above every existing id to
+>    model that monotonicity. Soaking also surfaced one residual CLASS
+>    — crawl re-validation against the PRESENT is not live validation
+>    against history: (a) a base-mismatch declaration live REJECTED is
+>    accepted once its target MERGED (the merged-predecessor path must
+>    skip the base-match check — round 9's retarget blindness),
+>    fabricating an edge that gates `is_root`'s reconciliation proof —
+>    MOSTLY FIXED: the soak then showed the fabricated edge SHADOWING
+>    the PR's real later declaration (AlreadyHasPredecessor) and
+>    stranding the stack tail, so the crawl now requires a
+>    merged-predecessor declarer's base ∈ {predecessor's branch,
+>    default} (live records such an edge only while the predecessor is
+>    OPEN with matching base; its own retarget produces only the
+>    default branch afterwards); the residual fabrication is confined
+>    to default-based declarers, where "retargeted mid-cascade
+>    descendant" and "never-stacked rejected declaration" are genuinely
+>    indistinguishable; (b) retracting a restated declaration by
+>    deleting only the OWNING comment leaves the older declaration
+>    standing, and the crawl resurrects the retracted edge (no
+>    tombstone exists in GitHub's present); (c) a mid-stack retraction
+>    leaves descendants' surviving declarations not-in-stack, so the
+>    crawl DROPS edges live retains. **RULED (owner, 2026-07-18):
+>    stop-shaped residuals — the stack stops and requires manual
+>    commenting to restart — are acceptable. That covers (a)'s residue
+>    (a future `start` refuses until the junk comment is deleted) and
+>    (c) (the descendant rejects `start` until re-declared; recovered
+>    trains drive their frozen work identically either way). (b) was
+>    NOT stop-shaped — a recovered train re-freezing a later level can
+>    MERGE the resurrected descendant — and the owner chose RETRACTION
+>    RECEIPTS: when an authorized retraction is applied
+>    (`PredecessorRemoved`), the worker posts a bot receipt on the PR
+>    (`status/retraction.rs`, a `merge-train-retraction` block) naming
+>    the RETRACTED comment's id; the crawl, trusting it only on the PR
+>    it names, tombstones every declaration at or below that ANCHOR.
+>    Anchoring to the retracted id (not the receipt's own) matters: the
+>    differential property killed the receipt-id design within one run
+>    — the receipt posts when the bot PROCESSES the deletion, so a
+>    re-declaration made during backlog lag legitimately PRECEDES the
+>    receipt and must survive. Receipts are best-effort like status
+>    updates (a lost receipt re-opens that one retraction's window —
+>    documented residual). The harness's Retract move is back to
+>    PARTIAL retraction and the differential holds with NO (b)
+>    allowance. One further soak residual, within the same ruling: a
+>    train root closed UNMERGED during the gap that NOTHING still
+>    references (wake-up elsewhere, no surviving declaration on an open
+>    PR naming it) is unreachable by the fixpoint — rounds 6/7 cover
+>    the referenced cases — so its train is never adopted: sub-stop
+>    (the human closed the root; nothing runs or merges; residue is a
+>    stale status comment on a closed PR and a worktree that ages out).
+>    A `ListRecentlyClosedPrs` crawl endpoint would close it completely
+>    if ever wanted.** An envelope property then
+>    mutates GitHub during the gap (closes, manual merges, extensions,
+>    comment edits/deletes, deleted status comments) and asserts the
+>    documented guarantees: surviving comment ⟹ adopted; deleted ⟹ not
+>    resurrected, no squashes; extension ⟹ aborted, never driven; every
+>    recovered edge backed by a surviving unedited author declaration;
+>    store never ahead of reality; ≤1 squash; quiescence. The oracle is
+>    itself mutation-checked: disabling the round-4 `stack_extended`,
+>    round-14/18 `edited_extends`, round-2 edited-skip, round-5
+>    validation, or round-6/7 fixpoint fixes each makes a property fail.
+>    Exit criterion henceforth: the properties (raise `PROPTEST_CASES`
+>    when touching the crawl), not reviewer exhaustion. Round 6
+>    (P2): a train's root closed UNMERGED during the gap is in neither
+>    list endpoint, so PR discovery runs to a FIXPOINT — the wake-up
+>    webhook's `referenced_prs()` seed the crawl, and `crawl_events`
+>    reports every PR it referenced but did not fetch (declaration
+>    targets AND adopted-train members); the caller fetches those, lists
+>    their comments, and re-crawls until nothing new is referenced
+>    (`attempted` bounds it — each PR is fetched once, 404 included).
+>    Round 6 covered the wake-up naming the closed root directly; round 7
+>    covers it named only by an open descendant's declaration — the
+>    fixpoint follows that edge to the closed root, finds its status
+>    comment, and adopts+aborts the train rather than orphaning it. A
+>    finished
+>    train's stale ACTIVE comment adopts as completed (an
+>    unfinished train necessarily has unmerged members). Round 8 (P2): a
+>    stale FAN-OUT parent — fan-out's best-effort completion update to
+>    the old root's comment failed, leaving it ACTIVE with still-open
+>    children so the all-members-merged check misses it — is completed
+>    too, detected by a frozen descendant carrying its own adopted ROOT
+>    record born after the parent (each fan-out child is a fresh root at
+>    fan-out time); otherwise the parent resurrects in parallel with its
+>    children over the same PRs, risking a double squash. RESIDUAL
+>    (documented, bounded): detection needs the stale parent comment to
+>    carry a frozen set (`progress().is_some()`), which the fan-out phase
+>    always has; the narrow case where the last *successful* update
+>    predated the fan-out phase and was `Idle` is not detected — a stop
+>    (`@merge-train stop`) still retires such a parent. Fan-out replay
+>    never clobbers a child record born during-or-after the parent train
+>    (protecting both progress and a user's stop), while prior-incarnation
+>    records are replaced. Round 4 (P1): a stack EXTENDED during the gap
+>    (a new PR declaring a stack member — the live path fires
+>    `topology_change_abort`) is detected against the crawled descendant
+>    closure and the adopted train is aborted with `PredecessorChanged`
+>    (+ `AbortCleanup` queued for its stale worktree), never silently
+>    resumed. Only extensions are detected: the cascade prepares each
+>    frozen descendant against `current_pr` (the frozen frontier), not
+>    its live-declared predecessor, so intra-set reorders/removals leave
+>    the recovered git operations self-consistent, and detecting them
+>    would false-positive on the legitimate merged-member-blocks-traversal
+>    mid-cascade state. REBUTTED (round 3, P1): a handler-emitted
+>    EvaluateTrain for a crawl-adopted train legitimately bypasses the
+>    startup deferral — it has an in-order cause (the wake-up delivery
+>    itself), so a stop queued behind it applies at the next observation
+>    boundary: the same one-batch bounded staleness live operation has
+>    always had, and the same shape M6's converged review accepted for
+>    CI-triggered first evaluations of marked roots. The deferral gate
+>    exists for evaluates with NO delivery cause (startup, timers). Events-table compaction — **landed
 >    2026-07-03** (post-M6 stage): `Store::compact` replaces the log
 >    with one `Checkpoint { snapshot }` EVENT, so the from-empty
 >    `replay()` oracle survives verbatim (a checkpoint replays by
