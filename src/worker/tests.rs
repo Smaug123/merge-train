@@ -4630,7 +4630,20 @@ mod lost_db {
             let fabricated_from_merged_target = l.predecessor.is_none()
                 && c.predecessor
                     .is_some_and(|t| lost.prs.get(&t).is_some_and(|p| p.state.is_merged()));
-            if fabricated_from_merged_target {
+            // Same class, opposite direction (also PENDING THE RULING):
+            // live KEEPS a descendant's edge when a mid-stack PR's own
+            // declaration is retracted (retraction does not cascade), but
+            // the crawl re-validates the descendant's comment against the
+            // PRESENT, finds the target unstacked (non-default base, no
+            // predecessor), and DROPS the edge as not-in-stack. Only that
+            // exact mechanism is tolerated.
+            let dropped_by_unstacked_target = c.predecessor.is_none()
+                && l.predecessor.is_some_and(|t| {
+                    lost.prs.get(&t).is_some_and(|p| {
+                        p.predecessor.is_none() && p.base_ref != lost.default_branch
+                    })
+                });
+            if fabricated_from_merged_target || dropped_by_unstacked_target {
                 continue;
             }
             assert_eq!(
@@ -5177,15 +5190,17 @@ mod lost_db {
             if let Some(adopted_record) = mid_phase_adoption {
                 let stack = train_stack(at_loss, adopted_record);
                 let adopted_members = train_members(adopted_record);
-                // An extension counts only if its TARGET was still open
-                // when recovery began: a declaration onto a member that
+                // An extension counts only if BOTH ends were still open
+                // when recovery began. A declaration onto a member that
                 // had since merged (or closed) is what live treats as a
                 // late addition — it never joins the train, live never
                 // aborts for it, and the crawl's closure walk deliberately
-                // stops at merged members (round 13). The remaining train
-                // work is untouched by such an edge, so driving it is
-                // live-equivalent, not a ruling violation. (Judged from
-                // the pre-wake-up snapshot: a wrongly-resumed train could
+                // stops at merged members (round 13). A SOURCE closed (or
+                // merged) during the gap annulled the extension before
+                // recovery saw it — the stack is not growing under the
+                // train, and live (which records the edge without
+                // aborting) would drive on identically. (Judged from the
+                // pre-wake-up snapshot: a wrongly-resumed train could
                 // itself merge the target and mask the violation.)
                 let extended =
                     gap.extensions
@@ -5195,6 +5210,7 @@ mod lost_db {
                             stack.contains(&PrNumber(*target))
                                 && !stack.contains(&PrNumber(*source))
                                 && open_at_recovery.contains(target)
+                                && open_at_recovery.contains(source)
                         });
                 if extended {
                     assert_eq!(
