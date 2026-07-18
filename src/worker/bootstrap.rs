@@ -103,6 +103,20 @@ fn replay_topology(
 /// live operation such a declaration fires `topology_change_abort`; the
 /// crawl records it as baseline, so the extension has to be detected here.
 ///
+/// The frozen set carries only the CURRENT phase's direct descendants, so
+/// on a ≥3-deep chain a legitimately pre-declared grandchild is also "in
+/// the closure but outside the frozen set" — from the record alone it is
+/// indistinguishable from a gap extension (the lost_db differential
+/// property found exactly this false abort on a quiet gap). The train's
+/// own status comment disambiguates: GitHub comment ids are globally
+/// monotonic, so a non-edited declaration whose owning comment id is BELOW
+/// the status comment's id provably predates the train — baseline, never
+/// an extension. Above the watermark (a mid-train or during-gap
+/// declaration, or a gap RESTATEMENT re-owning an old edge under a fresh
+/// comment) the abort stands, conservatively. Edited declarations never
+/// enter this check — their id reflects creation, not the edit — see
+/// [`edited_extends`].
+///
 /// Only *extensions* are detected, not pure reorders or removals within the
 /// frozen set: the cascade prepares each frozen descendant against
 /// `current_pr` (the frozen frontier), not against its live-declared
@@ -121,10 +135,22 @@ fn stack_extended(topology: &RepoState, record: &TrainRecord) -> bool {
     let mut frozen: HashSet<PrNumber> = progress.frozen_descendants().iter().copied().collect();
     frozen.insert(record.original_root_pr);
     frozen.insert(record.current_pr);
+    let watermark = record.status_comment_id;
     [record.original_root_pr, record.current_pr]
         .into_iter()
         .flat_map(|anchor| collect_all_descendants(anchor, &topology.descendants, &topology.prs))
-        .any(|d| !frozen.contains(&d))
+        .any(|d| {
+            !frozen.contains(&d)
+                && topology.prs.get(&d).is_none_or(|p| {
+                    match (p.predecessor_comment_id, watermark) {
+                        // Declared before the train's own status comment
+                        // existed: visible at (or before) the freeze.
+                        (Some(declared), Some(mark)) => declared > mark,
+                        // Unattributable — stay conservative.
+                        _ => true,
+                    }
+                })
+        })
 }
 
 /// Whether any EDITED declaration extends `record`'s stack: a non-member PR

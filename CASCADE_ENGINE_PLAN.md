@@ -942,15 +942,34 @@ stage shippable).
 >    saga-depth world and demands shape equivalence — with ONE exemption
 >    the harness itself surfaced: a command ACKED but unanswered when
 >    the DB dies is lost with it (GitHub never redelivers an acked
->    webhook); bounded, visible, re-issuable. The harness's first runs
->    also surfaced a REAL divergence, provisionally allowed in the
->    oracle PENDING A RULING: a base-mismatch declaration live REJECTED
->    gets re-validated by the crawl after its target MERGED — the
->    merged-predecessor path must skip the base-match check (round 9's
->    retarget blindness) — so the crawl records an edge live refused,
->    and that edge gates `is_root`'s reconciliation proof; recoverable
->    (delete the declaring comment), reachable only via invalid
->    declaration + later merge + DB loss. An envelope property then
+>    webhook); bounded, visible, re-issuable. Soaking surfaced one BUG,
+>    FIXED: the frozen set carries only the current phase's DIRECT
+>    descendants, so on a ≥3-deep chain a legitimately pre-declared
+>    grandchild sat "in the closure, outside the frozen set" and
+>    `stack_extended` FALSELY ABORTED the recovered train on a QUIET
+>    gap (every crawl example test used depth-2 stacks; fan-out
+>    children are all direct — 18 rounds never built depth 3). Fix:
+>    the train's own status-comment id is a WATERMARK — GitHub comment
+>    ids are globally monotonic, so a non-edited declaration owned by a
+>    LOWER id provably predates the train (baseline, never extension);
+>    above it (mid-train, gap, or a gap restatement re-owning an old
+>    edge) the abort stands, and edited declarations stay outside the
+>    watermark entirely (their id reflects creation, not the edit).
+>    `FakeGitHub::PostComment` now allocates above every existing id to
+>    model that monotonicity. Soaking also surfaced one residual CLASS,
+>    provisionally allowed in the oracle PENDING A RULING — crawl
+>    re-validation against the PRESENT is not live validation against
+>    history: (a) a base-mismatch declaration live REJECTED is accepted
+>    once its target MERGED (the merged-predecessor path must skip the
+>    base-match check — round 9's retarget blindness), fabricating an
+>    edge that gates `is_root`'s reconciliation proof; (b) retracting a
+>    restated declaration by deleting the OWNING comment leaves the
+>    older declaration standing, and the crawl resurrects the retracted
+>    edge (no tombstone exists in GitHub's present); (c) a mid-stack
+>    retraction leaves descendants' surviving declarations
+>    not-in-stack, so the crawl DROPS edges live retains. All three are
+>    bounded and comment-recoverable; candidate real fix is bot-posted
+>    tombstones/receipts the crawl could read. An envelope property then
 >    mutates GitHub during the gap (closes, manual merges, extensions,
 >    comment edits/deletes, deleted status comments) and asserts the
 >    documented guarantees: surviving comment ⟹ adopted; deleted ⟹ not

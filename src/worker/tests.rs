@@ -2730,6 +2730,75 @@ fn a_lost_state_db_is_rebuilt_by_the_crawl_and_the_train_resumes() {
     assert_recovered_exactly_once(&world, &mut processor, "lost-db");
 }
 
+/// A THREE-deep chain interrupted mid-cascade must also resume after a
+/// quiet DB loss (found by the lost_db differential property). The cascade
+/// freezes only the CURRENT phase's direct descendants, so a mid-
+/// `Preparing` status comment for 1←2←3 carries `frozen: [2]` — and the
+/// crawl's extension check, walking the full descendant closure, saw the
+/// legitimately-pre-declared #3 outside the frozen set and falsely aborted
+/// the train as "extended", in a gap where NOTHING happened. The record
+/// alone cannot distinguish that shape from a genuine gap extension; the
+/// train's own status-comment id can: GitHub comment ids are globally
+/// monotonic, so a non-edited declaration with a LOWER id than the status
+/// comment provably predates the train and is baseline, never extension.
+#[test]
+fn a_three_deep_stack_resumes_after_a_quiet_db_loss() {
+    let (mut world, heads) = World::linear_stack(3);
+    {
+        let mut github = world.github.lock().unwrap();
+        for (pr, target, id) in [(2u64, 1u64, 1000u64), (3, 2, 1001)] {
+            github.comments.insert(
+                CommentId(id),
+                FakeComment {
+                    pr: PrNumber(pr),
+                    author_id: AUTHOR,
+                    body: format!("@merge-train predecessor #{target}"),
+                    edited: false,
+                },
+            );
+        }
+    }
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 3, &heads);
+    start_command(&mut world, &mut processor, 1);
+    // Mid-`Preparing`: the status comment freezes only the direct child.
+    run_batches_then_crash(&mut world, processor, 5);
+
+    let db = world.db_path();
+    for path in [
+        db.clone(),
+        db.with_extension("db-wal"),
+        db.with_extension("db-shm"),
+        db.with_extension("lock"),
+    ] {
+        let _ = std::fs::remove_file(path);
+    }
+
+    let mut processor = world.processor();
+    let head = {
+        let github = world.github.lock().unwrap();
+        github.branch_head("pr-1")
+    };
+    let body = check_suite_green_body(&world.config, &head, &[1], world.next_delivery + 900);
+    world.enqueue(&mut processor, "check_suite", body);
+    drive_to_completion(&mut world, &mut processor);
+
+    let github = world.github.lock().unwrap();
+    for i in 1..=3u64 {
+        assert!(
+            matches!(
+                github.prs.get(&PrNumber(i)).map(|f| &f.state),
+                Some(FakePrState::Merged { .. })
+            ),
+            "PR #{i} must merge after quiet-gap recovery (falsely-aborted \
+             trains leave the tail open)"
+        );
+    }
+    for (pr, count) in &github.squash_count {
+        assert!(*count <= 1, "PR #{pr} squashed {count} times");
+    }
+}
+
 /// A frozen descendant CLOSED (unmerged) during the DB-loss gap is neither
 /// open nor recently merged — the crawl fetches it individually so the
 /// resumed train sees the topology and aborts CLEANLY instead of erroring
@@ -2847,8 +2916,11 @@ fn a_stack_extended_during_a_db_loss_gap_aborts_on_recovery() {
                 state: FakePrState::Open,
             },
         );
+        // Far above every earlier id: the gap comment postdates the bot's
+        // status comment (ids are globally monotonic on GitHub), which is
+        // exactly what marks it a possible extension rather than baseline.
         github.comments.insert(
-            CommentId(1001),
+            CommentId(5001),
             FakeComment {
                 pr: PrNumber(3),
                 author_id: AUTHOR,

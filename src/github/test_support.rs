@@ -268,8 +268,13 @@ impl FakeGitHub {
             }
 
             GitHubEffect::PostComment { pr, body } => {
-                let id = CommentId(self.next_comment);
-                self.next_comment += 1;
+                // GitHub comment ids are globally monotonic — a new comment
+                // always outranks every existing one, including comments
+                // tests seeded directly into `comments`. Recovery's
+                // extension watermark relies on this ordering.
+                let floor = self.comments.keys().next_back().map_or(0, |max| max.0 + 1);
+                let id = CommentId(self.next_comment.max(floor));
+                self.next_comment = id.0 + 1;
                 self.posted_comments.push((*pr, body.clone()));
                 self.comments.insert(
                     id,
