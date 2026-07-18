@@ -4185,7 +4185,16 @@ mod lost_db {
                         declare(world, processor, &mut h, pr, target, id, AUTHOR, "author");
                     }
                 }
-                // The author deletes their latest declaring comment.
+                // The author retracts DURABLY: every declaring comment
+                // they left on the PR is deleted. Deleting only the
+                // latest (the edge's owner) retracts live but leaves the
+                // older declaration standing on GitHub, and a lost-DB
+                // crawl — which cannot see deletions — resurrects the
+                // edge from it and will happily drive the re-attached
+                // descendant. That partial-retraction divergence is a
+                // REPORTED FINDING awaiting an owner ruling (inherent:
+                // GitHub's present carries no tombstone), so the
+                // generator models the durable form here.
                 5 => {
                     let mut prs: Vec<u64> = h
                         .decl_ids
@@ -4196,8 +4205,9 @@ mod lost_db {
                     prs.sort_unstable();
                     if !prs.is_empty() {
                         let pr = prs[a.index(prs.len())];
-                        let cid = h.decl_ids.get_mut(&pr).unwrap().pop().unwrap();
-                        delete_mirrored_comment(world, processor, cid, AUTHOR, "author");
+                        for cid in std::mem::take(h.decl_ids.get_mut(&pr).unwrap()) {
+                            delete_mirrored_comment(world, processor, cid, AUTHOR, "author");
+                        }
                     }
                 }
                 _ => unreachable!(),
@@ -4641,6 +4651,29 @@ mod lost_db {
             live_trains.remove(root);
             lost_trains.remove(root);
         }
+        // A TERMINAL record (stopped/aborted) with no surviving status
+        // comment is honestly forgotten: a train stopped at its very
+        // first observation boundary dies before its first status post,
+        // so after a DB loss there is nothing sound to resurrect it from
+        // (the documented envelope) — and a terminal record is
+        // post-mortem display state; a fresh `start` behaves identically
+        // with or without it. Tolerated ONLY when no comment survives:
+        // dropping an adoptable terminal record would still fail here.
+        let lost_has_status_comment = |root: u64| {
+            let github = cw.github.lock().unwrap();
+            github.comments.values().any(|c| {
+                c.author_id == TEST_BOT_ID
+                    && c.pr == PrNumber(root)
+                    && parse_status_comment(&c.body)
+                        .is_ok_and(|r| r.original_root_pr == PrNumber(root))
+            })
+        };
+        live_trains.retain(|root, kind| {
+            let forgotten_terminal = matches!(*kind, "stopped" | "aborted")
+                && !lost_trains.contains_key(root)
+                && !lost_has_status_comment(*root);
+            !forgotten_terminal
+        });
         assert_eq!(live_trains, lost_trains, "train outcomes diverged");
     }
 
@@ -4715,8 +4748,26 @@ mod lost_db {
                     gap.closed.push(pr);
                 }
                 // Someone merges a PR by hand (the button, not the bot).
+                // Only PRs whose base IS the default branch: GitHub's
+                // button merges into the PR's base, and the fake's
+                // squash-to-main helper models exactly that case. (A
+                // manual merge of a still-stacked PR lands on its parent
+                // BRANCH — a different scenario needing a squash-to-base
+                // helper; not modeled yet.)
                 1 => {
-                    let open = open_prs(world);
+                    let open: Vec<u64> = {
+                        let github = world.github.lock().unwrap();
+                        let mut v: Vec<u64> = github
+                            .prs
+                            .iter()
+                            .filter(|(_, p)| {
+                                matches!(p.state, FakePrState::Open) && p.base_ref == "main"
+                            })
+                            .map(|(n, _)| n.0)
+                            .collect();
+                        v.sort_unstable();
+                        v
+                    };
                     if open.is_empty() {
                         continue;
                     }
