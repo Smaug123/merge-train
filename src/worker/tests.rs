@@ -5025,14 +5025,15 @@ mod lost_db {
 
     /// The generated wake-up webhook: whatever reality happens to send
     /// first after the outage. Falls back to a check-suite on PR 1 when the
-    /// chosen kind has no subject.
+    /// chosen kind has no subject. Returns the PR numbers the delivery
+    /// references — the crawl's seeds, which the orphan oracle needs.
     fn enqueue_wakeup(
         world: &mut World,
         processor: &mut Processor,
         wake: &(u8, Index),
         history: &History,
         gap: &Gap,
-    ) {
+    ) -> Vec<u64> {
         let (kind, pick) = wake;
         match kind % 4 {
             // The close webhook for a gap-closed PR.
@@ -5049,6 +5050,7 @@ mod lost_db {
                 };
                 let body = pr_closed_body(&world.config, pr, &head, &branch, &base);
                 world.enqueue(processor, "pull_request", body);
+                vec![pr]
             }
             // GitHub redelivers an old declaration comment — the round
             // 10/11 trigger. (Commands are excluded: re-running an old
@@ -5094,6 +5096,7 @@ mod lost_db {
                     "created",
                 );
                 world.enqueue(processor, "issue_comment", body);
+                vec![pr]
             }
             // The opened webhook for a gap-born extension PR.
             3 if !gap.extensions.is_empty() => {
@@ -5109,16 +5112,18 @@ mod lost_db {
                 };
                 let body = pr_opened_body(&world.config, pr, &head, &branch, &base);
                 world.enqueue(processor, "pull_request", body);
+                vec![pr]
             }
             _ => fallback_wakeup(world, processor),
         }
     }
 
-    fn fallback_wakeup(world: &mut World, processor: &mut Processor) {
+    fn fallback_wakeup(world: &mut World, processor: &mut Processor) -> Vec<u64> {
         let head = world.github.lock().unwrap().branch_head("pr-1");
         let suite = world.next_delivery + 900;
         let body = check_suite_green_body(&world.config, &head, &[1], suite);
         world.enqueue(processor, "check_suite", body);
+        vec![1]
     }
 
     // ── The envelope oracle ──
@@ -5166,6 +5171,8 @@ mod lost_db {
         gap: &Gap,
         squash_before: &HashMap<PrNumber, u32>,
         open_at_recovery: &HashSet<u64>,
+        closed_unmerged_at_recovery: &HashSet<u64>,
+        wake_referenced: &[u64],
     ) {
         // The absolutes: never ahead of reality, never a double squash.
         {
@@ -5230,11 +5237,48 @@ mod lost_db {
             let comment_survives = status_roots_at_loss.contains(&root.0)
                 && !gap.deleted_status_roots.contains(&root.0);
 
-            if comment_survives {
+            // A root closed UNMERGED during the gap is in neither crawl
+            // list endpoint; its status comment is reachable only if
+            // something still points at the PR — the wake-up naming it
+            // (round 6) or a surviving declaration on an OPEN PR (round
+            // 7; open PRs are always listed). With NO surviving
+            // reference, the crawl cannot adopt what it cannot see: a
+            // sub-stop residual (the root was closed by a human, nothing
+            // runs, nothing merges; the residue is a stale status comment
+            // on a closed PR) within the 2026-07-18 ruling. A
+            // `ListRecentlyClosedPrs` crawl endpoint would close it
+            // completely if ever wanted.
+            let reachable = !closed_unmerged_at_recovery.contains(&root.0) || {
+                wake_referenced.contains(&root.0) || {
+                    let github = world.github.lock().unwrap();
+                    github.comments.values().any(|c| {
+                        open_at_recovery.contains(&c.pr.0)
+                            && !c.edited
+                            && github
+                                .prs
+                                .get(&c.pr)
+                                .is_some_and(|p| p.author_id == c.author_id)
+                            && matches!(
+                                parse_command(&c.body, "merge-train"),
+                                Some(Command::Predecessor(t)) if t == *root
+                            )
+                    })
+                }
+            };
+            if comment_survives && reachable {
                 assert!(
                     adopted.contains(&root.0),
-                    "train #{root} had a surviving status comment but was never \
-                     adopted — orphaned by the crawl"
+                    "train #{root} had a surviving, reachable status comment but \
+                     was never adopted — orphaned by the crawl"
+                );
+            } else if comment_survives {
+                // Unreachable: adoption is impossible, but nothing of the
+                // train may move either.
+                assert_eq!(
+                    squash_delta(&members),
+                    0,
+                    "train #{root} is unreachable by the crawl yet its members \
+                     were squashed after recovery"
                 );
             } else {
                 // No sound record to resurrect from: the stack must behave
@@ -5514,7 +5558,7 @@ mod lost_db {
                     .collect()
             };
             let gap = apply_gap(&mut world, &gap_specs, &history, &at_loss);
-            let (squash_before, open_at_recovery) = {
+            let (squash_before, open_at_recovery, closed_unmerged_at_recovery) = {
                 let github = world.github.lock().unwrap();
                 let open: HashSet<u64> = github
                     .prs
@@ -5522,11 +5566,18 @@ mod lost_db {
                     .filter(|(_, p)| matches!(p.state, FakePrState::Open))
                     .map(|(n, _)| n.0)
                     .collect();
-                (github.squash_count.clone(), open)
+                let closed: HashSet<u64> = github
+                    .prs
+                    .iter()
+                    .filter(|(_, p)| matches!(p.state, FakePrState::Closed))
+                    .map(|(n, _)| n.0)
+                    .collect();
+                (github.squash_count.clone(), open, closed)
             };
 
             let mut processor = world.processor();
-            enqueue_wakeup(&mut world, &mut processor, &wake, &history, &gap);
+            let wake_referenced =
+                enqueue_wakeup(&mut world, &mut processor, &wake, &history, &gap);
             settle(&mut world, &mut processor);
             assert_envelope(
                 &world,
@@ -5536,6 +5587,8 @@ mod lost_db {
                 &gap,
                 &squash_before,
                 &open_at_recovery,
+                &closed_unmerged_at_recovery,
+                &wake_referenced,
             );
         }
     }

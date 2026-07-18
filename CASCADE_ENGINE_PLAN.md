@@ -997,7 +997,15 @@ stage shippable).
 >    updates (a lost receipt re-opens that one retraction's window —
 >    documented residual). The harness's Retract move is back to
 >    PARTIAL retraction and the differential holds with NO (b)
->    allowance.** An envelope property then
+>    allowance. One further soak residual, within the same ruling: a
+>    train root closed UNMERGED during the gap that NOTHING still
+>    references (wake-up elsewhere, no surviving declaration on an open
+>    PR naming it) is unreachable by the fixpoint — rounds 6/7 cover
+>    the referenced cases — so its train is never adopted: sub-stop
+>    (the human closed the root; nothing runs or merges; residue is a
+>    stale status comment on a closed PR and a worktree that ages out).
+>    A `ListRecentlyClosedPrs` crawl endpoint would close it completely
+>    if ever wanted.** An envelope property then
 >    mutates GitHub during the gap (closes, manual merges, extensions,
 >    comment edits/deletes, deleted status comments) and asserts the
 >    documented guarantees: surviving comment ⟹ adopted; deleted ⟹ not
