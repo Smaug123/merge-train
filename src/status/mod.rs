@@ -19,6 +19,8 @@
 
 pub mod format;
 pub mod parse;
+pub mod retraction;
 
 pub use format::{GITHUB_COMMENT_SIZE_LIMIT, format_status_comment, truncate_for_size_limit};
 pub use parse::{ParseError, parse_status_comment};
+pub use retraction::{format_retraction_receipt, parse_retraction_receipt};

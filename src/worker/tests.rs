@@ -4257,20 +4257,14 @@ mod lost_db {
                         declare(world, processor, &mut h, pr, target, id, AUTHOR, "author");
                     }
                 }
-                // The author retracts DURABLY: every declaring comment
-                // they left on the PR is deleted. Deleting only the
-                // latest (the edge's owner) retracts live but leaves the
-                // older declaration standing on GitHub, and a lost-DB
-                // crawl — which cannot see deletions — resurrects the
-                // edge from it; a recovered train re-freezing a later
-                // level can then DRIVE the re-attached descendant. STILL
-                // OPEN: the owner ruled stop-shaped residuals fine
-                // (2026-07-18), and this one can merge, so it remains
-                // outside that ruling (inherent: GitHub's present carries
-                // no tombstone; candidate fixes are bot-posted retraction
-                // receipts, or documenting "delete every declaring
-                // comment to retract durably" — which is what the
-                // generator models here).
+                // The author retracts PARTIALLY: only their latest
+                // declaring comment is deleted, leaving any older
+                // declarations standing on GitHub. Live retracts the edge
+                // and posts a retraction RECEIPT (owner ruling
+                // 2026-07-18); the crawl reads the receipt as a tombstone
+                // for the older comments, so recovery must NOT resurrect
+                // the edge — the differential property holds this with no
+                // allowance, which is the receipt feature's oracle.
                 5 => {
                     let mut prs: Vec<u64> = h
                         .decl_ids
@@ -4281,9 +4275,8 @@ mod lost_db {
                     prs.sort_unstable();
                     if !prs.is_empty() {
                         let pr = prs[a.index(prs.len())];
-                        for cid in std::mem::take(h.decl_ids.get_mut(&pr).unwrap()) {
-                            delete_mirrored_comment(world, processor, cid, AUTHOR, "author");
-                        }
+                        let cid = h.decl_ids.get_mut(&pr).unwrap().pop().unwrap();
+                        delete_mirrored_comment(world, processor, cid, AUTHOR, "author");
                     }
                 }
                 _ => unreachable!(),
@@ -5350,6 +5343,89 @@ mod lost_db {
         assert!(
             processor.store_mut().pending_commands().unwrap().is_empty(),
             "acknowledged commands left unanswered at quiescence"
+        );
+    }
+
+    // ── The retraction-receipt tombstone, end to end ──
+
+    /// The face-(b) scenario, deterministic (owner ruling 2026-07-18):
+    /// declare, restate (ownership moves to the newer comment), author
+    /// deletes the restatement — a live retraction. The ORIGINAL
+    /// declaration comment still stands on GitHub, so without a tombstone
+    /// a lost-DB crawl resurrects the edge and the recovered train MERGES
+    /// the descendant the user unstacked. The worker's retraction RECEIPT
+    /// (bot-posted, machine-parseable) outlives the DB and kills every
+    /// earlier declaration on the PR during the crawl's replay.
+    #[test]
+    fn a_partial_retraction_survives_a_db_loss() {
+        let (mut world, heads) = build_world(&[0, 1]);
+        let mut processor = world.processor();
+        for (number, base_name) in [(1u64, "main"), (2, "pr-1")] {
+            let body = pr_opened_body(
+                &world.config,
+                number,
+                &heads[number as usize - 1],
+                &format!("pr-{number}"),
+                base_name,
+            );
+            world.enqueue(&mut processor, "pull_request", body);
+        }
+        post_mirrored_comment(
+            &mut world,
+            &mut processor,
+            2,
+            1000,
+            "@merge-train predecessor #1",
+            AUTHOR,
+            "author",
+        );
+        post_mirrored_comment(
+            &mut world,
+            &mut processor,
+            2,
+            1001,
+            "@merge-train predecessor #1",
+            AUTHOR,
+            "author",
+        );
+        delete_mirrored_comment(&mut world, &mut processor, 1001, AUTHOR, "author");
+        post_mirrored_comment(
+            &mut world,
+            &mut processor,
+            1,
+            2000,
+            "@merge-train start",
+            AUTHOR,
+            "author",
+        );
+        run_batches_then_snapshot(&mut world, processor, 6);
+        crash_db(&world);
+
+        let mut processor = world.processor();
+        fallback_wakeup(&mut world, &mut processor);
+        settle(&mut world, &mut processor);
+
+        {
+            let github = world.github.lock().unwrap();
+            assert!(
+                matches!(
+                    github.prs.get(&PrNumber(1)).map(|f| &f.state),
+                    Some(FakePrState::Merged { .. })
+                ),
+                "the train on #1 must still complete"
+            );
+            assert!(
+                matches!(
+                    github.prs.get(&PrNumber(2)).map(|f| &f.state),
+                    Some(FakePrState::Open)
+                ),
+                "the retracted descendant #2 must NOT be driven after recovery"
+            );
+        }
+        assert_eq!(
+            processor.state().prs[&PrNumber(2)].predecessor,
+            None,
+            "the surviving older declaration must not resurrect the retracted edge"
         );
     }
 

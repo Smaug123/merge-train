@@ -242,10 +242,29 @@ pub(crate) fn crawl_events(
     // extension (owner ruling, round 11). So they are kept here only to
     // enrich the stack-extension scratch below, never to persist an edge.
     let mut edited_edges: Vec<(PrNumber, PrNumber)> = Vec::new();
+    // Retraction receipts — the bot's durable tombstones. A live
+    // retraction deletes (or edits away) the declaring comment, which
+    // leaves NO trace in GitHub's present; an older declaration comment
+    // on the same PR would resurrect the retracted edge here, and a
+    // recovered train re-freezing a later level would DRIVE it (owner
+    // ruling 2026-07-18: not acceptable). The worker posts a receipt when
+    // it applies a retraction, naming the RETRACTED comment's id; ids are
+    // globally monotonic, so declarations at or below that anchor are the
+    // retracted one and everything it had superseded, while a
+    // re-declaration posted later — possibly BEFORE the lagging receipt
+    // itself — stands. Trusted only on the PR the receipt names (the
+    // status-comment misplacement gate).
+    let mut receipts: HashMap<PrNumber, Vec<crate::types::CommentId>> = HashMap::new();
     for (pr, pr_comments) in comments {
         for comment in pr_comments {
-            // The bot never declares.
+            // The bot never declares — but its receipts tombstone.
             if comment.author_id == bot_user_id {
+                if let Some((named, retracted)) =
+                    crate::status::parse_retraction_receipt(&comment.body)
+                    && named == *pr
+                {
+                    receipts.entry(*pr).or_default().push(retracted);
+                }
                 continue;
             }
             let Some(Command::Predecessor(target)) = parse_command(&comment.body, bot_name) else {
@@ -313,6 +332,16 @@ pub(crate) fn crawl_events(
     //   — dropping it would let a mid-cascade descendant merge as a plain
     //   root, bypassing that proof (round 9, P1).
     for (comment_id, pr, predecessor) in candidates {
+        // A receipt anchored at or above this declaration tombstones it:
+        // the live path retracted the anchor's declaration, and everything
+        // the anchor had superseded died with it. (A declaration with a
+        // HIGHER id than every anchor is a re-declaration and stands.)
+        if receipts
+            .get(&pr)
+            .is_some_and(|anchors| anchors.iter().any(|anchor| *anchor >= comment_id))
+        {
+            continue;
+        }
         let recordable = match topology.prs.get(&pr) {
             None => false,
             // Same predecessor already declared: a new comment restating it
@@ -645,6 +674,92 @@ mod tests {
             declared(&outcome.events),
             vec![(PrNumber(2), PrNumber(1))],
             "the stranger's comment is ignored; the author's first valid one wins"
+        );
+    }
+
+    /// A retraction RECEIPT (the bot's tombstone, posted when a live
+    /// retraction is applied) kills every declaration on that PR whose id
+    /// is at or below its ANCHOR — the retracted comment's id — replaying
+    /// the live declare/retract history in utterance order. A
+    /// re-declaration above the anchor stands even when the lagging
+    /// receipt's own id is higher (the backlog race), and a receipt
+    /// sitting on a DIFFERENT PR than it names is forged/misplaced and
+    /// ignored (the status-comment trust gate).
+    #[test]
+    fn a_retraction_receipt_tombstones_earlier_declarations() {
+        let crawled = vec![
+            pr(1, AUTHOR, PrState::Open),
+            child(2, AUTHOR, 1, PrState::Open),
+        ];
+        let bot_receipt = |id: u64, named: u64, anchor: u64| CommentData {
+            id: CommentId(id),
+            author_id: BOT,
+            body: crate::status::format_retraction_receipt(
+                PrNumber(named),
+                CommentId(anchor),
+                Some(PrNumber(1)),
+            ),
+            edited: false,
+        };
+        let run = |comments: Vec<(PrNumber, Vec<CommentData>)>| {
+            declared(
+                &crawl_events(
+                    "main",
+                    &crawled,
+                    &comments,
+                    "merge-train",
+                    BOT,
+                    None,
+                    &HashSet::new(),
+                    test_now(),
+                )
+                .events,
+            )
+        };
+
+        // Declaration then receipt: the edge is retracted, not resurrected.
+        let edges = run(vec![(
+            PrNumber(2),
+            vec![
+                comment(10, AUTHOR, "@merge-train predecessor #1"),
+                bot_receipt(11, 2, 10),
+            ],
+        )]);
+        assert_eq!(
+            edges,
+            vec![],
+            "a receipt tombstones the anchored declaration"
+        );
+
+        // A re-declaration ABOVE the anchor stands — even though the
+        // lagging receipt's own comment id is the highest of all (the
+        // user re-declared while the deletion sat in the backlog).
+        let edges = run(vec![(
+            PrNumber(2),
+            vec![
+                comment(10, AUTHOR, "@merge-train predecessor #1"),
+                comment(12, AUTHOR, "@merge-train predecessor #1"),
+                bot_receipt(13, 2, 10),
+            ],
+        )]);
+        assert_eq!(
+            edges,
+            vec![(PrNumber(2), PrNumber(1))],
+            "a re-declaration above the anchor survives a lagging receipt"
+        );
+
+        // A receipt on the WRONG PR is ignored.
+        let edges = run(vec![
+            (
+                PrNumber(2),
+                vec![comment(10, AUTHOR, "@merge-train predecessor #1")],
+            ),
+            (PrNumber(1), vec![bot_receipt(11, 2, 10)]),
+        ]);
+        assert_eq!(
+            edges,
+            vec![(PrNumber(2), PrNumber(1))],
+            "a misplaced receipt must not tombstone"
         );
     }
 

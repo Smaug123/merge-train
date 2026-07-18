@@ -493,6 +493,33 @@ impl Processor {
             })
             .collect();
 
+        // A retraction's durable tombstone, captured against the PRE-commit
+        // state (the commit clears the edge). `PredecessorRemoved` is
+        // emitted only when an AUTHORIZED retraction is applied, and the
+        // deletion behind it leaves no trace in GitHub's present — an older
+        // declaration comment on the PR would resurrect the edge in a
+        // lost-DB crawl, whose recovered train could then DRIVE the
+        // descendant the user unstacked (owner ruling 2026-07-18). The
+        // receipt comment outlives the DB; the crawl reads it as a
+        // tombstone for every declaration on the PR up to the RETRACTED
+        // comment's id (its anchor — the receipt's own id would race a
+        // re-declaration posted while this delivery sat in the backlog).
+        // Posted best-effort after the close, like every status update — a
+        // receipt lost to an outage re-opens the window for that one
+        // retraction (documented residual).
+        let retraction_receipts: Vec<(PrNumber, crate::types::CommentId, Option<PrNumber>)> =
+            events
+                .iter()
+                .filter_map(|e| match e {
+                    StateEventPayload::PredecessorRemoved { pr, comment_id } => Some((
+                        *pr,
+                        *comment_id,
+                        self.store.state().prs.get(pr).and_then(|c| c.predecessor),
+                    )),
+                    _ => None,
+                })
+                .collect();
+
         let command_ids =
             self.store
                 .commit_delivery(&id, &events, key.as_ref(), &commands, Utc::now())?;
@@ -513,6 +540,13 @@ impl Processor {
             if let StateEventPayload::TrainAborted { root_pr, .. } = payload {
                 self.queue(PendingWork::AbortCleanup { root: *root_pr });
             }
+        }
+
+        for (pr, retracted, predecessor) in retraction_receipts {
+            self.best_effort_github(GitHubEffect::PostComment {
+                pr,
+                body: crate::status::format_retraction_receipt(pr, retracted, predecessor),
+            });
         }
 
         // Handler effects are cosmetic-or-cache: ack reactions, rejection
