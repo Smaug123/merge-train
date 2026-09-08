@@ -180,6 +180,11 @@ pub struct PrData {
     pub state: PrState,
     /// Whether the PR is a draft.
     pub is_draft: bool,
+    /// The PR author's GitHub user id. `0` when GitHub omitted the user
+    /// (deleted account): it matches no real commenter, so author-gated
+    /// decisions (crawl-time predecessor declarations) fail closed.
+    #[serde(default)]
+    pub author_id: u64,
 }
 
 /// Comment data returned from the GitHub API.
@@ -191,6 +196,16 @@ pub struct CommentData {
     pub author_id: u64,
     /// The comment body.
     pub body: String,
+    /// Whether the comment has been edited since creation, per GitHub's
+    /// edit history (GraphQL `lastEditedAt`). Deliberately NOT derived from
+    /// `updated_at > created_at`: those are second-resolution timestamps,
+    /// so an edit within the creation second would pass as unedited.
+    /// GitHub reports only the ORIGINAL author, not the last editor, so an
+    /// edited comment's body cannot be attributed to `author_id` —
+    /// author-gated decisions (the bootstrap crawl's predecessor
+    /// declarations) must fail closed on it.
+    #[serde(default)]
+    pub edited: bool,
 }
 
 /// Branch protection settings.
@@ -459,6 +474,7 @@ mod tests {
                     base_ref,
                     state,
                     is_draft,
+                    author_id: 7,
                 },
             )
     }
@@ -469,6 +485,7 @@ mod tests {
                 id,
                 author_id,
                 body,
+                edited: false,
             }
         })
     }

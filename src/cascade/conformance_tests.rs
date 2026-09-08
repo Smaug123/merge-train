@@ -81,6 +81,7 @@ fn seed(shape: &StackShape) -> (tempfile::TempDir, GitConfig, FakeGitHub, RepoSt
                 branch: branch_name(i),
                 base_ref: base_branch.clone(),
                 state: FakePrState::Open,
+                author_id: 7,
             },
         );
         cached.insert(

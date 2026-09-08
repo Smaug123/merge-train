@@ -73,6 +73,142 @@ struct MergeStatePr {
     is_draft: bool,
 }
 
+/// Issue comments on a PR, with GitHub's own edit history. REST exposes
+/// only `created_at`/`updated_at` at second resolution, so an edit within
+/// the creation second is invisible there; `lastEditedAt` is set by every
+/// edit (Codex plumbing review, P1). The comment id is `fullDatabaseId`, a
+/// string-encoded BigInt: `databaseId` is a 32-bit Int, and comment ids
+/// passed 2^31 long ago (Codex plumbing review round 2, P1). `author` is
+/// an `Actor`, whose numeric id lives on the concrete types.
+const COMMENTS_QUERY: &str = r#"
+query($owner: String!, $repo: String!, $number: Int!, $after: String) {
+    repository(owner: $owner, name: $repo) {
+        pullRequest(number: $number) {
+            comments(first: 100, after: $after) {
+                pageInfo { hasNextPage endCursor }
+                nodes {
+                    fullDatabaseId
+                    author {
+                        ... on User { databaseId }
+                        ... on Bot { databaseId }
+                        ... on Organization { databaseId }
+                        ... on Mannequin { databaseId }
+                    }
+                    body
+                    lastEditedAt
+                }
+            }
+        }
+    }
+}
+"#;
+
+#[derive(Debug, Deserialize)]
+struct CommentsQueryResponse {
+    data: Option<CommentsData>,
+    errors: Option<Vec<GraphQLError>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommentsData {
+    repository: Option<CommentsRepository>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommentsRepository {
+    pull_request: Option<CommentsPr>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommentsPr {
+    comments: CommentsConnection,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommentsConnection {
+    page_info: PageInfo,
+    nodes: Vec<CommentNode>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PageInfo {
+    has_next_page: bool,
+    end_cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommentNode {
+    /// GitHub's `BigInt` scalar: a decimal string.
+    full_database_id: Option<String>,
+    author: Option<ActorId>,
+    #[serde(default)]
+    body: String,
+    last_edited_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ActorId {
+    database_id: Option<u64>,
+}
+
+/// Joins a GraphQL response's error messages, for log lines and error text.
+fn graphql_error_hint(errors: Option<&Vec<GraphQLError>>) -> Option<String> {
+    errors.filter(|e| !e.is_empty()).map(|errors| {
+        let msgs: Vec<_> = errors.iter().map(|e| e.message.as_str()).collect();
+        msgs.join("; ")
+    })
+}
+
+/// Whether a GraphQL response's errors say the failure is transient.
+/// GitHub marks rate limiting with `"type": "RATE_LIMITED"` (the message is
+/// not guaranteed to mention rate limits).
+fn graphql_errors_are_transient(errors: Option<&Vec<GraphQLError>>) -> bool {
+    let rate_limited = errors.is_some_and(|errors| {
+        errors
+            .iter()
+            .any(|e| e.r#type.as_deref() == Some("RATE_LIMITED"))
+    });
+    let error_msg = graphql_error_hint(errors).unwrap_or_default();
+    rate_limited || is_rate_limit_error(&error_msg) || is_transient_message(&error_msg)
+}
+
+/// Classifies a GraphQL response that carried no data at all: transient
+/// when the errors say so, permanent otherwise.
+fn graphql_no_data_error(errors: Option<&Vec<GraphQLError>>, context: &str) -> GitHubApiError {
+    let error_msg = graphql_error_hint(errors).unwrap_or_else(|| "no data returned".to_string());
+    let full_msg = format!("GraphQL error {context}: {error_msg}");
+    if graphql_errors_are_transient(errors) {
+        GitHubApiError::transient_without_source(full_msg)
+    } else {
+        GitHubApiError::permanent_without_source(full_msg)
+    }
+}
+
+/// Classifies a response whose `data` is present but whose nested object
+/// (`repository` or `pullRequest`) is null. GitHub nulls a field it could
+/// not resolve AND attaches the reason as an error — a field-level rate
+/// limit looks exactly like a missing PR at the data level, so the errors
+/// decide: transient when they say so, otherwise the PR is not found
+/// (Codex plumbing review round 2, P2).
+fn graphql_missing_object_error(
+    errors: Option<&Vec<GraphQLError>>,
+    context: &str,
+) -> GitHubApiError {
+    let suffix = graphql_error_hint(errors)
+        .map(|e| format!(" (GraphQL errors: {e})"))
+        .unwrap_or_default();
+    if graphql_errors_are_transient(errors) {
+        GitHubApiError::transient_without_source(format!("{context} unavailable{suffix}"))
+    } else {
+        GitHubApiError::permanent_without_source(format!("{context} not found{suffix}"))
+    }
+}
+
 // ─── Interpreter Implementation ───────────────────────────────────────────────
 
 impl OctocrabClient {
@@ -255,6 +391,7 @@ async fn get_pr(client: &OctocrabClient, pr: PrNumber) -> Result<GitHubResponse,
                 base_ref: pull.base.ref_field,
                 state,
                 is_draft: pull.draft.unwrap_or(false),
+                author_id: pull.user.as_ref().map(|u| u.id.0).unwrap_or(0),
             }))
         }
         Err(e) => Err(GitHubApiError::from_octocrab(e)),
@@ -292,6 +429,7 @@ async fn list_open_prs(client: &OctocrabClient) -> Result<GitHubResponse, GitHub
             base_ref: pull.base.ref_field,
             state: PrState::Open,
             is_draft: pull.draft.unwrap_or(false),
+            author_id: pull.user.as_ref().map(|u| u.id.0).unwrap_or(0),
         });
     }
 
@@ -380,6 +518,7 @@ async fn list_recently_merged_prs(
                 base_ref: pull.base.ref_field,
                 state: PrState::Merged { merge_commit_sha },
                 is_draft: pull.draft.unwrap_or(false),
+                author_id: pull.user.as_ref().map(|u| u.id.0).unwrap_or(0),
             });
         }
 
@@ -434,16 +573,7 @@ async fn get_merge_state(
 
     match result {
         Ok(response) => {
-            // Format GraphQL errors for use in error messages
-            let error_hint = response
-                .errors
-                .as_ref()
-                .filter(|e| !e.is_empty())
-                .map(|errors| {
-                    let msgs: Vec<_> = errors.iter().map(|e| e.message.as_str()).collect();
-                    msgs.join("; ")
-                });
-
+            let error_hint = graphql_error_hint(response.errors.as_ref());
             if let Some(ref errors_str) = error_hint {
                 tracing::warn!(
                     pr = %pr,
@@ -452,44 +582,20 @@ async fn get_merge_state(
                 );
             }
 
-            // If we have no data at all, report the GraphQL errors
             if response.data.is_none() {
-                // GitHub marks GraphQL rate limiting with `"type": "RATE_LIMITED"`;
-                // the accompanying message is not guaranteed to mention rate limits.
-                let rate_limited = response.errors.as_ref().is_some_and(|errors| {
-                    errors
-                        .iter()
-                        .any(|e| e.r#type.as_deref() == Some("RATE_LIMITED"))
-                });
-
-                let error_msg = error_hint.unwrap_or_else(|| "no data returned".to_string());
-                let full_msg = format!(
-                    "GraphQL error querying PR {} merge state: {}",
-                    pr, error_msg
-                );
-
-                if rate_limited
-                    || is_rate_limit_error(&error_msg)
-                    || is_transient_message(&error_msg)
-                {
-                    return Err(GitHubApiError::transient_without_source(full_msg));
-                }
-
-                return Err(GitHubApiError::permanent_without_source(full_msg));
+                return Err(graphql_no_data_error(
+                    response.errors.as_ref(),
+                    &format!("querying PR {pr} merge state"),
+                ));
             }
 
+            let errors = response.errors;
             let pr_data = response
                 .data
                 .and_then(|d| d.repository)
                 .and_then(|r| r.pull_request)
                 .ok_or_else(|| {
-                    let suffix = error_hint
-                        .map(|e| format!(" (GraphQL errors: {})", e))
-                        .unwrap_or_default();
-                    GitHubApiError::permanent_without_source(format!(
-                        "PR {} not found{}",
-                        pr, suffix
-                    ))
+                    graphql_missing_object_error(errors.as_ref(), &format!("PR {pr}"))
                 })?;
 
             let status = resolve_merge_state(&pr_data.merge_state_status, pr_data.is_draft);
@@ -761,26 +867,86 @@ async fn list_comments(
     client: &OctocrabClient,
     pr: PrNumber,
 ) -> Result<GitHubResponse, GitHubApiError> {
-    let comments = collect_all_pages(|page_number| async move {
-        client
-            .inner()
-            .issues(client.owner(), client.repo_name())
-            .list_comments(pr.0)
-            .per_page(100)
-            .page(page_number)
-            .send()
-            .await
-    })
-    .await?;
+    #[derive(Serialize)]
+    struct Variables<'a> {
+        owner: &'a str,
+        repo: &'a str,
+        number: i64,
+        after: Option<String>,
+    }
 
-    let all_comments = comments
-        .into_iter()
-        .map(|comment| CommentData {
-            id: CommentId(comment.id.into_inner()),
-            author_id: comment.user.id.into_inner(),
-            body: comment.body.unwrap_or_default(),
-        })
-        .collect();
+    let mut all_comments = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let variables = Variables {
+            owner: client.owner(),
+            repo: client.repo_name(),
+            number: pr.0 as i64,
+            after: after.clone(),
+        };
+        let response: CommentsQueryResponse = client
+            .inner()
+            .graphql(&serde_json::json!({
+                "query": COMMENTS_QUERY,
+                "variables": variables,
+            }))
+            .await
+            .map_err(GitHubApiError::from_octocrab)?;
+
+        // A response carrying ANY error is not a listing: GitHub nulls the
+        // fields it could not resolve and attaches the reason as an error,
+        // so `data` alongside `errors` is a PARTIAL listing — a failed
+        // `endCursor` would end pagination early, a failed `lastEditedAt`
+        // would pass an edited comment as unedited — and recovery decides
+        // on every comment. Fail it, transient or permanent as the errors
+        // say (Codex plumbing review round 3, P1).
+        if response.errors.as_ref().is_some_and(|e| !e.is_empty()) || response.data.is_none() {
+            return Err(graphql_no_data_error(
+                response.errors.as_ref(),
+                &format!("listing PR {pr} comments"),
+            ));
+        }
+        let errors = response.errors;
+        let connection = response
+            .data
+            .and_then(|d| d.repository)
+            .and_then(|r| r.pull_request)
+            .map(|p| p.comments)
+            .ok_or_else(|| graphql_missing_object_error(errors.as_ref(), &format!("PR {pr}")))?;
+
+        for node in connection.nodes {
+            // Every issue comment has a database id; a response without one
+            // (or one that is not a decimal integer) is malformed, and
+            // silently dropping the comment could hide a predecessor
+            // declaration — refuse the whole listing.
+            let id = node
+                .full_database_id
+                .as_deref()
+                .and_then(|s| s.parse::<u64>().ok())
+                .ok_or_else(|| {
+                    GitHubApiError::permanent_without_source(format!(
+                        "PR {pr} comments listing returned a comment without a usable id: {:?}",
+                        node.full_database_id
+                    ))
+                })?;
+            all_comments.push(CommentData {
+                id: CommentId(id),
+                // A deleted account has no author: id 0 matches no real
+                // commenter, so author-gated decisions fail closed.
+                author_id: node.author.and_then(|a| a.database_id).unwrap_or(0),
+                body: node.body,
+                edited: node.last_edited_at.is_some(),
+            });
+        }
+
+        match (
+            connection.page_info.has_next_page,
+            connection.page_info.end_cursor,
+        ) {
+            (true, Some(cursor)) => after = Some(cursor),
+            _ => break,
+        }
+    }
 
     Ok(GitHubResponse::Comments(all_comments))
 }
@@ -1867,6 +2033,215 @@ mod tests {
             };
             assert_eq!(prs.len(), 100);
             assert_eq!(hits.load(Ordering::SeqCst), 1);
+        }
+
+        fn comments_page(
+            nodes: Vec<serde_json::Value>,
+            next_cursor: Option<&str>,
+        ) -> CannedResponse {
+            CannedResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: serde_json::json!({
+                    "data": { "repository": { "pullRequest": { "comments": {
+                        "pageInfo": {
+                            "hasNextPage": next_cursor.is_some(),
+                            "endCursor": next_cursor,
+                        },
+                        "nodes": nodes,
+                    }}}}
+                })
+                .to_string(),
+            }
+        }
+
+        fn comment_node(
+            id: u64,
+            author: Option<u64>,
+            last_edited_at: Option<&str>,
+        ) -> serde_json::Value {
+            serde_json::json!({
+                "fullDatabaseId": id.to_string(),
+                "author": author.map(|a| serde_json::json!({ "databaseId": a })),
+                "body": format!("comment {id}"),
+                "lastEditedAt": last_edited_at,
+            })
+        }
+
+        /// `edited` is GitHub's own edit history (`lastEditedAt`), never a
+        /// comparison of second-resolution timestamps: an edit made within
+        /// the creation second must still count, or an editor with comment
+        /// rights could have their body attributed to the original author
+        /// (Codex plumbing review, P1). A deleted author is id 0, matching
+        /// no real commenter.
+        #[tokio::test]
+        async fn list_comments_reports_edits_from_edit_history() {
+            let (base, hits) = spawn_mock_server(vec![comments_page(
+                vec![
+                    comment_node(10, Some(7), None),
+                    comment_node(11, Some(7), Some("2026-07-01T12:00:00Z")),
+                    comment_node(12, None, None),
+                ],
+                None,
+            )])
+            .await;
+            let client = mock_client(&base);
+
+            let response = list_comments(&client, PrNumber(5))
+                .await
+                .expect("must succeed");
+            let GitHubResponse::Comments(comments) = response else {
+                panic!("expected Comments");
+            };
+            assert_eq!(
+                comments,
+                vec![
+                    CommentData {
+                        id: CommentId(10),
+                        author_id: 7,
+                        body: "comment 10".to_owned(),
+                        edited: false,
+                    },
+                    CommentData {
+                        id: CommentId(11),
+                        author_id: 7,
+                        body: "comment 11".to_owned(),
+                        edited: true,
+                    },
+                    CommentData {
+                        id: CommentId(12),
+                        author_id: 0,
+                        body: "comment 12".to_owned(),
+                        edited: false,
+                    },
+                ]
+            );
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+        }
+
+        /// Pages are followed by cursor until `hasNextPage` is false, and
+        /// the comments come back in one id-ordered list.
+        #[tokio::test]
+        async fn list_comments_follows_cursors() {
+            let (base, hits) = spawn_mock_server(vec![
+                comments_page(
+                    vec![
+                        comment_node(1, Some(7), None),
+                        comment_node(2, Some(7), None),
+                    ],
+                    Some("cursor-1"),
+                ),
+                comments_page(vec![comment_node(3, Some(7), None)], None),
+            ])
+            .await;
+            let client = mock_client(&base);
+
+            let response = list_comments(&client, PrNumber(5))
+                .await
+                .expect("must succeed");
+            let GitHubResponse::Comments(comments) = response else {
+                panic!("expected Comments");
+            };
+            let ids: Vec<u64> = comments.iter().map(|c| c.id.0).collect();
+            assert_eq!(ids, vec![1, 2, 3]);
+            assert_eq!(hits.load(Ordering::SeqCst), 2);
+        }
+
+        /// Comment ids passed 2^31 long ago: they arrive as `fullDatabaseId`,
+        /// a string-encoded BigInt, and must round-trip as u64.
+        #[tokio::test]
+        async fn list_comments_handles_ids_beyond_32_bits() {
+            let big = 3_000_000_000u64;
+            let (base, _hits) = spawn_mock_server(vec![comments_page(
+                vec![comment_node(big, Some(7), None)],
+                None,
+            )])
+            .await;
+            let client = mock_client(&base);
+            let response = list_comments(&client, PrNumber(5))
+                .await
+                .expect("must succeed");
+            let GitHubResponse::Comments(comments) = response else {
+                panic!("expected Comments");
+            };
+            assert_eq!(comments[0].id, CommentId(big));
+        }
+
+        /// A response carrying `data` AND `errors` is a PARTIAL listing
+        /// (a nulled `endCursor` or `lastEditedAt` with the reason attached),
+        /// never a success: it fails, transient or permanent as the errors
+        /// say.
+        #[tokio::test]
+        async fn list_comments_partial_response_is_an_error() {
+            for (error_type, expected) in [
+                (Some("RATE_LIMITED"), GitHubErrorKind::Transient),
+                (None, GitHubErrorKind::Permanent),
+            ] {
+                let mut error = serde_json::json!({ "message": "field failed" });
+                if let Some(t) = error_type {
+                    error["type"] = serde_json::json!(t);
+                }
+                let (base, _hits) = spawn_mock_server(vec![CannedResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: serde_json::json!({
+                        "data": { "repository": { "pullRequest": { "comments": {
+                            "pageInfo": { "hasNextPage": true, "endCursor": null },
+                            "nodes": [comment_node(1, Some(7), None)],
+                        }}}},
+                        "errors": [error],
+                    })
+                    .to_string(),
+                }])
+                .await;
+                let client = mock_client(&base);
+                let err = list_comments(&client, PrNumber(5))
+                    .await
+                    .expect_err("a partial listing must fail");
+                assert_eq!(err.kind, expected, "error type {error_type:?}");
+            }
+        }
+
+        /// A nested null under a RATE_LIMITED error is a field-level rate
+        /// limit, not a missing PR: transient, so the retry policy applies.
+        #[tokio::test]
+        async fn list_comments_nested_rate_limit_is_transient() {
+            let (base, _hits) = spawn_mock_server(vec![CannedResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: serde_json::json!({
+                    "data": { "repository": null },
+                    "errors": [{ "message": "throttled", "type": "RATE_LIMITED" }],
+                })
+                .to_string(),
+            }])
+            .await;
+            let client = mock_client(&base);
+            let err = list_comments(&client, PrNumber(5))
+                .await
+                .expect_err("rate-limited listing must fail");
+            assert_eq!(err.kind, GitHubErrorKind::Transient);
+        }
+
+        /// A missing PR is a permanent failure, like the REST 404 it replaces.
+        #[tokio::test]
+        async fn list_comments_on_a_missing_pr_is_permanent() {
+            let (base, _hits) = spawn_mock_server(vec![CannedResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: serde_json::json!({
+                    "data": { "repository": { "pullRequest": null } },
+                    "errors": [{ "message": "Could not resolve to a PullRequest with the number of 5." }],
+                })
+                .to_string(),
+            }])
+            .await;
+            let client = mock_client(&base);
+
+            let err = list_comments(&client, PrNumber(5))
+                .await
+                .expect_err("a missing PR must fail");
+            assert_eq!(err.kind, GitHubErrorKind::Permanent);
         }
 
         #[tokio::test]

@@ -24,7 +24,11 @@ use crate::types::{CommentId, MergeStateStatus, PrNumber, PrState, Sha, TrainErr
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FakePrState {
     Open,
-    Merged { squash_sha: Sha },
+    /// Closed without merging.
+    Closed,
+    Merged {
+        squash_sha: Sha,
+    },
 }
 
 /// A PR as the fake GitHub tracks it.
@@ -33,6 +37,8 @@ pub struct FakePr {
     pub branch: String,
     pub base_ref: String,
     pub state: FakePrState,
+    /// The PR author's user id (author-gated decisions read it).
+    pub author_id: u64,
 }
 
 /// A comment as the fake GitHub stores it (the live, mutable copy that
@@ -43,6 +49,9 @@ pub struct FakeComment {
     pub pr: PrNumber,
     pub author_id: u64,
     pub body: String,
+    /// Set by `UpdateComment` (and seedable): mirrors GitHub's
+    /// `updated_at > created_at`.
+    pub edited: bool,
 }
 
 /// The GitHub half of a test world whose git half is real.
@@ -124,6 +133,11 @@ impl FakeGitHub {
                 self.branch_head(&fake.branch),
                 MergeStateStatus::Clean,
             ),
+            FakePrState::Closed => (
+                PrState::Closed,
+                self.branch_head(&fake.branch),
+                MergeStateStatus::Unknown,
+            ),
             FakePrState::Merged { squash_sha } => {
                 // The frozen PR ref names the squashed head.
                 let head = run_git_stdout(
@@ -148,6 +162,7 @@ impl FakeGitHub {
                 base_ref: fake.base_ref.clone(),
                 state,
                 is_draft: false,
+                author_id: fake.author_id,
             },
             merge_state,
         )
@@ -253,8 +268,13 @@ impl FakeGitHub {
             }
 
             GitHubEffect::PostComment { pr, body } => {
-                let id = CommentId(self.next_comment);
-                self.next_comment += 1;
+                // GitHub comment ids are globally monotonic — a new comment
+                // always outranks every existing one, including comments
+                // tests seeded directly into `comments`. Recovery's
+                // extension watermark relies on this ordering.
+                let floor = self.comments.keys().next_back().map_or(0, |max| max.0 + 1);
+                let id = CommentId(self.next_comment.max(floor));
+                self.next_comment = id.0 + 1;
                 self.posted_comments.push((*pr, body.clone()));
                 self.comments.insert(
                     id,
@@ -262,6 +282,7 @@ impl FakeGitHub {
                         pr: *pr,
                         author_id: self.comment_author,
                         body: body.clone(),
+                        edited: false,
                     },
                 );
                 Ok(GitHubResponse::CommentPosted { id })
@@ -270,6 +291,7 @@ impl FakeGitHub {
                 match self.comments.get_mut(comment_id) {
                     Some(comment) => {
                         comment.body = body.clone();
+                        comment.edited = true;
                         Ok(GitHubResponse::CommentUpdated)
                     }
                     // A deleted comment 404s, exactly like GitHub.
@@ -279,6 +301,31 @@ impl FakeGitHub {
                     }),
                 }
             }
+            GitHubEffect::ListOpenPrs => {
+                let mut numbers: Vec<PrNumber> = self
+                    .prs
+                    .iter()
+                    .filter(|(_, p)| matches!(p.state, FakePrState::Open))
+                    .map(|(n, _)| *n)
+                    .collect();
+                numbers.sort_unstable();
+                Ok(GitHubResponse::PrList(
+                    numbers.into_iter().map(|n| self.pr_data(n).0).collect(),
+                ))
+            }
+            GitHubEffect::ListRecentlyMergedPrs { .. } => {
+                let mut numbers: Vec<PrNumber> = self
+                    .prs
+                    .iter()
+                    .filter(|(_, p)| matches!(p.state, FakePrState::Merged { .. }))
+                    .map(|(n, _)| *n)
+                    .collect();
+                numbers.sort_unstable();
+                Ok(GitHubResponse::RecentlyMergedPrList {
+                    prs: numbers.into_iter().map(|n| self.pr_data(n).0).collect(),
+                    may_be_incomplete: false,
+                })
+            }
             GitHubEffect::ListComments { pr } => Ok(GitHubResponse::Comments(
                 self.comments
                     .iter()
@@ -287,6 +334,7 @@ impl FakeGitHub {
                         id: *id,
                         author_id: c.author_id,
                         body: c.body.clone(),
+                        edited: c.edited,
                     })
                     .collect(),
             )),
