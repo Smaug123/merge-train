@@ -256,6 +256,9 @@ mod tests {
                         predecessor_head_sha: None,
                         last_squash_parent_sha: None,
                         started_at,
+                        parent: None,
+                        default_branch: "main".to_owned(),
+                        watermark: None,
                         status_comment_id: None,
                     }
                 },

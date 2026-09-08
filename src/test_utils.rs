@@ -3,7 +3,7 @@
 use crate::persistence::event::{StateEvent, StateEventPayload};
 use crate::types::{
     CascadePhase, CommentId, DescendantProgress, MergeStateStatus, PrNumber, Sha, TrainError,
-    TrainErrorKind, TrainRecord, TrainState,
+    TrainErrorKind, TrainLineage, TrainRecord, TrainState,
 };
 use chrono::{DateTime, Utc};
 use proptest::prelude::*;
@@ -91,6 +91,11 @@ pub fn arb_train_record() -> impl Strategy<Value = TrainRecord> {
         any::<u64>(),
         arb_datetime(),
         prop::option::of(any::<u64>().prop_map(CommentId)),
+        (
+            prop::option::of((arb_pr_number(), arb_datetime())),
+            "[a-z]{0,8}",
+            prop::option::of(any::<u64>().prop_map(CommentId)),
+        ),
     )
         .prop_map(
             |(
@@ -104,6 +109,7 @@ pub fn arb_train_record() -> impl Strategy<Value = TrainRecord> {
                 recovery_seq,
                 started_at,
                 status_comment_id,
+                (parent, default_branch, watermark),
             )| {
                 TrainRecord {
                     version: 1,
@@ -116,6 +122,9 @@ pub fn arb_train_record() -> impl Strategy<Value = TrainRecord> {
                     predecessor_head_sha,
                     last_squash_parent_sha,
                     started_at,
+                    parent: parent.map(|(root, started_at)| TrainLineage { root, started_at }),
+                    default_branch,
+                    watermark,
                     status_comment_id,
                 }
             },

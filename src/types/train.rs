@@ -547,6 +547,17 @@ impl TrainError {
 /// IMPORTANT: `original_root_pr` is stable throughout the train's lifetime
 /// (the PR that received `@merge-train start`). `current_pr` advances as
 /// each PR in the stack is processed.
+/// The identity of the train a fan-out child was spawned from: the parent's
+/// root and `started_at` — the same incarnation key M6 recovery matches
+/// status comments on. Compared by EQUALITY only. Wall-clock timestamps may
+/// step backwards, so "born after the parent" is not a sound test of
+/// kinship (Codex fan-out review, P2); "names this parent" is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrainLineage {
+    pub root: PrNumber,
+    pub started_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrainRecord {
     /// Schema version for forward compatibility.
@@ -589,6 +600,29 @@ pub struct TrainRecord {
     /// ISO 8601 timestamp when started.
     pub started_at: DateTime<Utc>,
 
+    /// The fan-out that spawned this train, if any. A replayed fan-out
+    /// preserves a record already sitting on a new root only when that
+    /// record's lineage names the replaying parent — compared by equality,
+    /// never by clock order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<TrainLineage>,
+
+    /// The repository default branch the train was created against. Its
+    /// cascade steps name that branch (retargets, catch-up merges), so a
+    /// recovery from a status comment must refuse a train whose default
+    /// branch has since changed. Empty in records written before the field
+    /// existed: unknown.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub default_branch: String,
+
+    /// The id of the FIRST status comment posted for this train — an
+    /// immutable watermark. GitHub comment ids are globally monotonic, so a
+    /// declaration owned by a lower id provably predates the train. Unlike
+    /// `status_comment_id`, it never moves when the comment is reposted
+    /// under a new id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watermark: Option<CommentId>,
+
     /// The ID of the status comment on the original root PR.
     /// Used to update the comment as the train progresses.
     ///
@@ -617,6 +651,9 @@ impl TrainRecord {
             predecessor_head_sha: None,
             last_squash_parent_sha: None,
             started_at,
+            parent: None,
+            default_branch: String::new(),
+            watermark: None,
             status_comment_id: None,
         }
     }
