@@ -50,7 +50,7 @@ use tracing::{error, info, warn};
 
 use crate::cascade::{self, Control, EffectError, Observation, ReplayFacts, StepPlan, observe};
 use crate::commands::{Command, parse_command};
-use crate::effects::github::GitHubEffect;
+use crate::effects::github::{CommentData, GitHubEffect};
 use crate::effects::{Effect, GitHubResponse, PrData};
 use crate::git::{CommitIdentity, GitConfig};
 use crate::persistence::event::StateEventPayload;
@@ -64,6 +64,7 @@ use crate::webhooks::{GitHubEvent, parse_webhook};
 use super::authz::{
     AuthorDecision, RoleDecision, authorize_by_author, authorize_by_role, authorize_retraction,
 };
+use super::bootstrap::{CrawlInput, CrawlOutcome};
 use super::executor::{GitHubExec, SagaBatch};
 use super::recovery::{CommentRecovery, decide_comment_recovery};
 
@@ -221,6 +222,11 @@ pub(crate) struct Processor {
     /// one is out, further retry requests coalesce into it instead of
     /// arming more (see [`Self::take_retry_request`]).
     retry_timer_outstanding: bool,
+    /// Deliveries released once because their triggering comment was not in
+    /// the crawl's listing (GitHub is not read-after-write consistent). A
+    /// second absence is believed. In-memory: a restart re-crawls anyway,
+    /// by which point the listing has long caught up.
+    absent_triggers: HashSet<String>,
     /// The incarnation whose obligation the in-flight batch is PROBING
     /// (`ListComments` on the root), keyed by that root: the probe's
     /// outcome decides between the rewrite and clearing the obligation.
@@ -407,6 +413,7 @@ impl Processor {
             needs_restart_cleanup: HashSet::new(),
             retry_requested: false,
             retry_timer_outstanding: false,
+            absent_triggers: HashSet::new(),
             sync_probes: HashMap::new(),
             deferred_for_sync: HashSet::new(),
             ledger_probes: HashMap::new(),
@@ -519,6 +526,22 @@ impl Processor {
     pub fn process_claimed(&mut self, delivery: Delivery) -> Result<PipelineOutcome, StoreError> {
         let id = delivery.delivery_id.clone();
 
+        // A crawl already landed for this delivery in an earlier process.
+        // That crawl checked whether the delivery was still current by
+        // reading GitHub; the check did not survive, the store is now
+        // bootstrapped so it will not run again, and the comment may have
+        // been edited or deleted while we were down — an edited-away
+        // `start` has no retraction path at all. Close it unhandled; the
+        // user re-issues (Codex crawl review round 14, P1).
+        if delivery.crawled {
+            warn!(
+                delivery_id = %id,
+                "a crawl landed for this delivery before the process died; its \
+                 freshness check did not survive, so it is not acted on"
+            );
+            return self.close(&id, None, "crawled but never closed");
+        }
+
         let event = match parse_webhook(&delivery.event_type, &delivery.body) {
             Ok(Some(event)) => event,
             Ok(None) => return self.close(&id, None, "ignored event type"),
@@ -537,45 +560,65 @@ impl Processor {
             return self.close(&id, None, "duplicate content");
         }
 
-        // First-contact default-branch discovery: a fresh store has an empty
-        // default branch, and root detection / base validation read it.
+        // First contact — a fresh store (brand-new repo, or a LOST state
+        // db) has an empty default branch. Webhooks only describe the
+        // future, so bootstrap crawls the present: settings, open and
+        // recently merged PRs, their comments (predecessor topology,
+        // author-gated), and the bot's own status comments (train recovery
+        // — DESIGN §Bootstrap Phase 2). Any failure releases the delivery:
+        // there is no safe way to process anything without the bootstrap,
+        // and closing would silently drop webhooks GitHub will never
+        // resend — the repo's queue pauses at the stall cadence (which
+        // also heals "permanent" auth errors the moment the operator fixes
+        // the token).
+        //
+        // The crawl must NOT consume THIS delivery's own comment as a
+        // historical declaration: it is live input the command handler
+        // The crawl reads the bot's own records — status comments and
+        // stack ledgers — so the triggering comment shapes nothing in it:
+        // a fresh declaration has no ledger yet, and the handler below
+        // processes it against the crawled present as it would any other.
+        // What the crawl still decides about the trigger is whether the
+        // DELIVERY is current: a `created`/`edited` trigger whose comment
+        // is no longer in the PR's listing — or a `created` one whose
+        // comment has since been edited — is a stale redelivery, and
+        // handling it would record a body the comment no longer has.
         if self.store.state().default_branch.is_empty() {
-            match self.deps.github.execute(GitHubEffect::GetRepoSettings) {
-                Ok(GitHubResponse::RepoSettings(settings)) => {
-                    info!(default_branch = %settings.default_branch, "discovered default branch");
-                    self.store.append_batch(
-                        &[StateEventPayload::DefaultBranchSet {
-                            branch: settings.default_branch,
-                        }],
-                        Utc::now(),
-                    )?;
-                }
-                Ok(other) => {
-                    error!(?other, "GetRepoSettings answered the wrong variant");
+            let freshness = TriggerFreshness::of(&event);
+            let retried = self.absent_triggers.contains(&id);
+            match self.bootstrap_crawl(&event.referenced_prs(), freshness, retried)? {
+                Bootstrap::Unavailable => return self.release(&id),
+                Bootstrap::TriggerAbsent => {
+                    self.absent_triggers.insert(id.clone());
                     return self.release(&id);
                 }
-                Err(e @ EffectError::Transient { .. }) => {
-                    warn!(error = ?e, "cannot discover default branch; releasing delivery");
-                    return self.release(&id);
-                }
-                // Permanent (token lacks access, repo deleted/renamed):
-                // release too — DELIBERATELY, unlike role lookups. There a
-                // denial is a safe answer; here there is none: without the
-                // default branch nothing can be processed, and closing the
-                // delivery would silently drop webhooks GitHub will never
-                // resend. The repo's queue pauses (retrying at the stall
-                // cadence, which also heals "permanent" auth errors the
-                // moment the operator fixes the token) and this error says
-                // so as loudly as we can.
-                Err(e) => {
-                    error!(
-                        error = ?e,
-                        "cannot discover the default branch and the failure is \
-                         permanent; the repo's queue is PAUSED until discovery \
-                         succeeds — operator action likely required (token \
-                         scopes? repo moved?)"
-                    );
-                    return self.release(&id);
+                Bootstrap::Landed { outcome, stale } => {
+                    if stale {
+                        // The crawl and the close of the stale delivery
+                        // commit TOGETHER: were the crawl to land alone and
+                        // the process die before the close, the retried
+                        // delivery would find a bootstrapped store, skip
+                        // this check, and be handled after all (Codex crawl
+                        // review round 2, P1).
+                        self.store.commit_delivery(
+                            &id,
+                            &outcome.events,
+                            key.as_ref(),
+                            &[],
+                            Utc::now(),
+                        )?;
+                        self.after_bootstrap(outcome)?;
+                        info!(delivery = %id, "closed: the trigger is stale against the crawl");
+                        return Ok(PipelineOutcome::Processed);
+                    }
+                    // The crawl's events and the mark on THIS delivery
+                    // commit together: the crawl judged the delivery
+                    // current by reading GitHub, and if that judgement
+                    // does not survive to the close, the retry must not
+                    // act on it (Codex crawl review round 14, P1).
+                    self.store
+                        .append_batch_marking(&outcome.events, Utc::now(), Some(&id))?;
+                    self.after_bootstrap(outcome)?;
                 }
             }
         }
@@ -810,33 +853,6 @@ impl Processor {
             })
             .collect();
 
-        // A retraction's durable tombstone, captured against the PRE-commit
-        // state (the commit clears the edge). `PredecessorRemoved` is
-        // emitted only when an AUTHORIZED retraction is applied, and the
-        // deletion behind it leaves no trace in GitHub's present — an older
-        // declaration comment on the PR would resurrect the edge in a
-        // lost-DB crawl, whose recovered train could then DRIVE the
-        // descendant the user unstacked (owner ruling 2026-07-18). The
-        // receipt comment outlives the DB; the crawl reads it as a
-        // tombstone for every declaration on the PR up to the RETRACTED
-        // comment's id (its anchor — the receipt's own id would race a
-        // re-declaration posted while this delivery sat in the backlog).
-        // Posted best-effort after the close, like every status update — a
-        // receipt lost to an outage re-opens the window for that one
-        // retraction (documented residual).
-        let retraction_receipts: Vec<(PrNumber, crate::types::CommentId, Option<PrNumber>)> =
-            events
-                .iter()
-                .filter_map(|e| match e {
-                    StateEventPayload::PredecessorRemoved { pr, comment_id } => Some((
-                        *pr,
-                        *comment_id,
-                        self.store.state().prs.get(pr).and_then(|c| c.predecessor),
-                    )),
-                    _ => None,
-                })
-                .collect();
-
         let command_ids =
             self.store
                 .commit_delivery(&id, &events, key.as_ref(), &commands, Utc::now())?;
@@ -869,13 +885,6 @@ impl Processor {
             }
         }
 
-        for (pr, retracted, predecessor) in retraction_receipts {
-            self.best_effort_github(GitHubEffect::PostComment {
-                pr,
-                body: crate::status::format_retraction_receipt(pr, retracted, predecessor),
-            });
-        }
-
         // A handler-committed terminal event (a topology abort) may owe a
         // status sync that no later outcome refers to.
         self.queue_owed_status_syncs()?;
@@ -894,21 +903,18 @@ impl Processor {
                     merged_predecessor,
                     comment_id,
                 } => {
-                    // Detected by M3, answered here: the reconciliation flow
-                    // for late additions is explicitly deferred. The answer
-                    // is a rejection RECEIPT for the declaring comment: live
-                    // recorded nothing for it, and a lost-DB crawl must not
-                    // replay it as a declaration.
+                    // Detected by M3, answered here: the reconciliation
+                    // flow for late additions is explicitly deferred. The
+                    // answer records nothing, and needs to record nothing:
+                    // a declaration with no stack ledger behind it is one
+                    // a crawl will never turn into an edge.
+                    let _ = comment_id;
                     self.best_effort_github(GitHubEffect::PostComment {
                         pr,
-                        body: crate::status::format_rejection_receipt(
-                            pr,
-                            comment_id,
-                            &format!(
-                                "PR #{merged_predecessor} is already merged. Adding a PR onto a \
-                                 merged predecessor (\"late addition\") is not supported yet — \
-                                 rebase onto the default branch, or restart the train."
-                            ),
+                        body: format!(
+                            "PR #{merged_predecessor} is already merged. Adding a PR onto a \
+                             merged predecessor (\"late addition\") is not supported yet — \
+                             rebase onto the default branch, or restart the train."
                         ),
                     });
                 }
@@ -1136,6 +1142,312 @@ impl Processor {
             return;
         }
         self.pending.push_back(work);
+    }
+
+    /// The first-contact crawl (DESIGN §Bootstrap algorithm, Phase 2):
+    /// fetches settings, open + recently merged PRs, and every crawled
+    /// PR's comments, then appends [`super::bootstrap::crawl_events`]'s
+    /// result as ONE atomic batch — a crash or a released retry re-crawls
+    /// from nothing (idempotent reads, no partial state). Adopted ACTIVE
+    /// trains are marked for M6 recovery, deferred behind the backlog
+    /// drain like every other recovery. Returns `false` when GitHub was
+    /// unavailable (any failure: transient, permanent, or a wrong
+    /// variant): the caller releases the delivery and the queue pauses at
+    /// the stall cadence — there is no safe degraded answer at bootstrap.
+    fn bootstrap_crawl(
+        &mut self,
+        seed_prs: &[PrNumber],
+        freshness: Option<TriggerFreshness>,
+        retried: bool,
+    ) -> Result<Bootstrap, StoreError> {
+        /// How many days of merged PRs the crawl considers: predecessor
+        /// targets and mid-cascade roots older than this are treated as
+        /// history (DESIGN bounds the resurrection window the same way).
+        const MERGED_SINCE_DAYS: u32 = 30;
+        /// How many PRs one bootstrap will list comments for. Each listing
+        /// is a paginated API call, and nothing is committed until the
+        /// whole crawl finishes, so an unbounded crawl of a very large
+        /// repository can exhaust the rate-limit window, discard all its
+        /// progress, and never bootstrap at all (Codex crawl review round
+        /// 6, P2). Beyond the cap the crawl proceeds with the PRs it has:
+        /// their cache entries stand, and topology it could not read is
+        /// reported as loudly as we can.
+        const MAX_COMMENT_LISTINGS: usize = 1000;
+        /// How many individually-fetched PRs one bootstrap will pay for.
+        /// Referenced-but-uncrawled PRs cost one `GetPr` each, and a PR
+        /// author can leave arbitrarily many distinct declaration targets;
+        /// unbounded, a long junk history could exhaust the API quota, and
+        /// the crawl abandons all progress on a rate limit and starts over
+        /// — pausing the repo's queue indefinitely (Codex crawl review
+        /// round 3, P1). Beyond the cap the remaining PRs are treated as
+        /// UNFETCHABLE: declaration edges onto them drop, and a train that
+        /// references one aborts loudly rather than recovering broken.
+        const MAX_REFERENCED_FETCHES: usize = 200;
+
+        macro_rules! fetch {
+            ($effect:expr, $expected:pat => $value:expr) => {
+                match self.deps.github.execute($effect) {
+                    Ok($expected) => $value,
+                    Ok(other) => {
+                        error!(?other, "bootstrap fetch answered the wrong variant");
+                        return Ok(Bootstrap::Unavailable);
+                    }
+                    Err(e) => {
+                        warn!(error = ?e, "bootstrap crawl failed; the repo's queue \
+                               pauses until it succeeds");
+                        return Ok(Bootstrap::Unavailable);
+                    }
+                }
+            };
+        }
+
+        let settings = fetch!(
+            GitHubEffect::GetRepoSettings,
+            GitHubResponse::RepoSettings(s) => s
+        );
+        if settings.default_branch.is_empty() {
+            error!("repository settings carry an empty default branch");
+            return Ok(Bootstrap::Unavailable);
+        }
+        let open = fetch!(GitHubEffect::ListOpenPrs, GitHubResponse::PrList(prs) => prs);
+        let (merged, may_be_incomplete) = fetch!(
+            GitHubEffect::ListRecentlyMergedPrs { since_days: MERGED_SINCE_DAYS },
+            GitHubResponse::RecentlyMergedPrList { prs, may_be_incomplete } => (prs, may_be_incomplete)
+        );
+        if may_be_incomplete {
+            warn!(
+                "the recently-merged crawl hit its pagination limit; trains \
+                 rooted at older merged PRs will not be recovered"
+            );
+        }
+        // Discover PRs to a fixpoint. The list endpoints miss a PR closed
+        // *unmerged* during the gap, but the wake-up webhook names some PRs
+        // (`seed_prs`) and the crawl surfaces more — declaration targets and
+        // adopted-train members it referenced but did not fetch. A closed
+        // root reachable only through its descendants' declarations is found
+        // this way: fetch the referenced PRs, list their comments, re-crawl,
+        // repeat until nothing new is referenced (Codex crawl review rounds
+        // 6–7). `attempted` bounds it — every PR is fetched at most once
+        // (a 404 counts), and the PR universe is finite — so it terminates.
+        let mut crawled: Vec<PrData> = open;
+        crawled.extend(merged);
+        let mut attempted: HashSet<PrNumber> = crawled.iter().map(|p| p.number).collect();
+        // Referenced PRs that a permanent `GetPr` failure could not fetch
+        // (deleted, or the token lost access). `crawl_events` aborts a train
+        // that references one rather than recover it into an `UnknownPr`
+        // stall (Codex crawl review round 12).
+        let mut unfetchable: HashSet<PrNumber> = HashSet::new();
+        let mut comments: Vec<(PrNumber, Vec<CommentData>)> = Vec::new();
+        let mut listed: HashSet<PrNumber> = HashSet::new();
+        // Set when the cap stops us reading a crawled PR's comments: a
+        // ledger, or a whole train member, may then be missing from the
+        // crawl, and no train can be recovered from a partial read.
+        let mut comments_truncated = false;
+        let mut pending: Vec<PrNumber> = seed_prs
+            .iter()
+            .copied()
+            .filter(|pr| !attempted.contains(pr))
+            .collect();
+
+        let mut fetched = 0usize;
+        let outcome = loop {
+            for pr in std::mem::take(&mut pending) {
+                if !attempted.insert(pr) {
+                    continue;
+                }
+                if fetched >= MAX_REFERENCED_FETCHES {
+                    warn!(
+                        %pr,
+                        "the bootstrap crawl hit its referenced-PR fetch cap; \
+                         treating the rest as unfetchable"
+                    );
+                    unfetchable.insert(pr);
+                    continue;
+                }
+                fetched += 1;
+                match self.deps.github.execute(GitHubEffect::GetPr { pr }) {
+                    Ok(GitHubResponse::Pr(data)) => crawled.push(data),
+                    Err(e @ EffectError::Transient { .. }) => {
+                        warn!(%pr, error = ?e, "cannot fetch a referenced PR; bootstrap paused");
+                        return Ok(Bootstrap::Unavailable);
+                    }
+                    other => {
+                        warn!(%pr, ?other, "referenced PR unfetchable; skipping it in the crawl");
+                        unfetchable.insert(pr);
+                    }
+                }
+            }
+            // The SEED PRs first. The trigger's freshness is decided by
+            // whether its comment is in its PR's listing, so a cap reached
+            // before that PR would leave the delivery unverifiable — and
+            // the arm below cannot tell "not there" from "never looked"
+            // (Codex crawl review round 10, P1).
+            let mut unlisted: Vec<PrNumber> = crawled
+                .iter()
+                .map(|p| p.number)
+                .filter(|pr| !listed.contains(pr))
+                .collect();
+            unlisted.sort_by_key(|pr| !seed_prs.contains(pr));
+            for pr in unlisted {
+                if listed.len() >= MAX_COMMENT_LISTINGS {
+                    comments_truncated = true;
+                    error!(
+                        %pr, listed = listed.len(),
+                        "the bootstrap crawl hit its comment-listing cap; predecessor \
+                         topology and trains on the remaining PRs cannot be recovered \
+                         — operator action likely required (split the repository, or \
+                         raise the cap)"
+                    );
+                    break;
+                }
+                listed.insert(pr);
+                let pr_comments = fetch!(
+                    GitHubEffect::ListComments { pr },
+                    GitHubResponse::Comments(c) => c
+                );
+                comments.push((pr, pr_comments));
+            }
+            let outcome = super::bootstrap::crawl_events(&CrawlInput {
+                default_branch: &settings.default_branch,
+                crawled_prs: &crawled,
+                comments: &comments,
+                bot_name: &self.deps.bot_name,
+                bot_user_id: self.deps.bot_user_id,
+                unfetchable: &unfetchable,
+                comments_truncated,
+                now: Utc::now(),
+            });
+            let fresh: Vec<PrNumber> = outcome
+                .referenced_uncrawled
+                .iter()
+                .copied()
+                .filter(|pr| !attempted.contains(pr))
+                .collect();
+            if fresh.is_empty() {
+                break outcome;
+            }
+            pending = fresh;
+        };
+        info!(
+            default_branch = %settings.default_branch,
+            crawled_prs = crawled.len(),
+            recovered_trains = outcome.recovered_roots.len(),
+            "bootstrapped the repo from a crawl"
+        );
+        // Is the triggering delivery CURRENT against the present the crawl
+        // just fetched? A comment trigger must still be listed, unedited if
+        // the payload is a `created`, and its body must match the listed
+        // body (an `edited` payload superseded by a later edit is as stale
+        // as a deleted one). A PR trigger must agree with the crawled PR:
+        // an old `closed` redelivered after the PR was reopened would
+        // otherwise close — and abort the recovered train of — a PR the
+        // crawl just cached as open (Codex crawl review round 2, P1s). The
+        // crawl itself stands either way; only the delivery is stale.
+        let stale = match &freshness {
+            Some(TriggerFreshness::Comment {
+                pr,
+                id: trigger_id,
+                body,
+                created,
+            }) => {
+                let listed_comments: Vec<&CommentData> = comments
+                    .iter()
+                    .filter(|(p, _)| p == pr)
+                    .flat_map(|(_, cs)| cs.iter())
+                    .collect();
+                match listed_comments.iter().find(|c| c.id == *trigger_id) {
+                    // Present but MOVED ON: an edit superseded this
+                    // payload, or a `created` payload's comment has since
+                    // been edited. Stale.
+                    Some(c) => (*created && c.edited) || c.body != *body,
+                    // ABSENT. GitHub is not read-after-write consistent, so
+                    // a just-created comment can be missing from a listing
+                    // taken moments later — absence alone is not proof the
+                    // comment was deleted, and closing on it would silently
+                    // lose a valid command (Codex crawl review round 6,
+                    // P1). Release instead: the delivery is retried at the
+                    // stall cadence, by which point the listing has caught
+                    // up or the comment is genuinely gone (the retry runs
+                    // after the crawl landed, so the handler decides).
+                    // ONCE: the listing may simply not have caught up, so
+                    // the delivery is released and re-crawled. If it is
+                    // still absent on that retry, the comment really is
+                    // gone and the delivery is stale.
+                    None if !listed.contains(pr) => {
+                        // The cap bit before this PR's comments were read,
+                        // so the trigger cannot be verified at all. Seeds
+                        // are listed first, so reaching this means the
+                        // repository is past what the bot supports;
+                        // executing an unverifiable command after a DB
+                        // loss is the one thing recovery must not do
+                        // (Codex crawl review round 10, P1).
+                        error!(
+                            %pr, comment = %trigger_id,
+                            "the triggering PR's comments were never listed; refusing to \
+                             act on a delivery the crawl cannot verify"
+                        );
+                        true
+                    }
+                    None if !retried => {
+                        info!(
+                            %pr, comment = %trigger_id,
+                            "the triggering comment is not in the listing yet; retrying once"
+                        );
+                        return Ok(Bootstrap::TriggerAbsent);
+                    }
+                    None => true,
+                }
+            }
+            Some(pr_trigger @ TriggerFreshness::PullRequest { pr, .. }) => crawled
+                .iter()
+                .find(|p| p.number == *pr)
+                .is_some_and(|present| pr_trigger.disagrees_with(present)),
+            None => false,
+        };
+        // The crawl itself does not depend on the trigger — it reads the
+        // bot's own records — so a stale delivery needs no re-crawl: the
+        // same events stand, and only the delivery is closed unhandled.
+        Ok(Bootstrap::Landed { outcome, stale })
+    }
+
+    /// What every landed crawl owes, after its events are committed: the
+    /// inherited markers, the rewrite of any ledger it disbelieved, the
+    /// abort cleanups, and the recovery requeue.
+    fn after_bootstrap(&mut self, outcome: CrawlOutcome) -> Result<(), StoreError> {
+        self.clear_inherited_markers(&outcome.events);
+        // A ledger the crawl did not believe now disagrees with the state
+        // it recovered, and no topology event says so: mark it, and the
+        // worker rewrites it to what the store actually holds.
+        for pr in &outcome.stale_ledgers {
+            self.store.mark_ledger_owed(*pr)?;
+        }
+        // A train the crawl aborted (its stack was extended during the gap)
+        // needs the same worker-side cleanup a handler abort gets — stale
+        // worktree removal + a final status comment (the engine's own
+        // aborts carry cleanup in their plans; this one has no plan).
+        // Captured NOW and queued AHEAD, as everywhere: run later, a
+        // reloaded `start` could replace the aborted record first and
+        // leave a recompute nothing to find (Codex terminal-sync review
+        // round 14, P2).
+        for payload in &outcome.events {
+            if let StateEventPayload::TrainAborted { root_pr, .. } = payload {
+                let effects = cascade::handler_abort_cleanup(self.store.state(), *root_pr);
+                if !effects.is_empty() {
+                    self.pending.push_front(PendingWork::CapturedCleanup {
+                        root: *root_pr,
+                        effects,
+                    });
+                }
+            }
+        }
+        for root in outcome.recovered_roots {
+            self.inherited_mid_flight.insert(root);
+        }
+        // The recoveries defer behind the backlog drain, exactly like
+        // startup evaluations (the round-6/round-20 gating); owed status
+        // syncs (a synthesized completion) queue too.
+        self.requeue_marked_recoveries()?;
+        Ok(())
     }
 
     /// Supplementary GitHub recovery for a train inherited mid-cascade
@@ -3067,6 +3379,125 @@ fn command_in(event: &GitHubEvent, deps: &WorkerDeps) -> Option<(PrNumber, Comma
             matches!(command, Command::Predecessor(_)).then_some((pr, command))
         }
         CommentAction::Deleted => None,
+    }
+}
+
+/// What the first-contact crawl decided about the delivery that woke it.
+enum Bootstrap {
+    /// GitHub was unavailable (any failure): release the delivery; the
+    /// repo's queue pauses at the stall cadence.
+    Unavailable,
+    /// The triggering comment was not in the listing, seen for the first
+    /// time: GitHub is not read-after-write consistent, so the delivery is
+    /// released and re-crawled once before being believed.
+    TriggerAbsent,
+    /// The crawl computed its events (not yet committed — the caller
+    /// commits them, atomically with the delivery's close when the trigger
+    /// is `stale`: a redelivery the present has overtaken).
+    Landed { outcome: CrawlOutcome, stale: bool },
+}
+
+/// The facts a first-contact trigger asserts about the present, checked
+/// against what the crawl fetched: a stale redelivery must not be handled
+/// on top of a fresher crawl.
+enum TriggerFreshness {
+    /// A `created`/`edited` comment: must still be listed with this body,
+    /// and unedited if `created`.
+    Comment {
+        pr: PrNumber,
+        id: crate::types::CommentId,
+        body: String,
+        created: bool,
+    },
+    /// A pull_request event: its claims must match the crawled PR.
+    PullRequest {
+        pr: PrNumber,
+        action: crate::webhooks::events::PrAction,
+        head_sha: crate::types::Sha,
+        head_branch: String,
+        base_branch: String,
+        is_draft: bool,
+        merged: bool,
+    },
+}
+
+impl TriggerFreshness {
+    fn of(event: &GitHubEvent) -> Option<Self> {
+        match event {
+            GitHubEvent::IssueComment(c) => match c.action {
+                CommentAction::Deleted => None,
+                CommentAction::Created | CommentAction::Edited => {
+                    c.pr_number.map(|pr| TriggerFreshness::Comment {
+                        pr,
+                        id: c.comment_id,
+                        body: c.body.clone(),
+                        created: c.action == CommentAction::Created,
+                    })
+                }
+            },
+            GitHubEvent::PullRequest(p) => Some(TriggerFreshness::PullRequest {
+                pr: p.pr_number,
+                action: p.action,
+                head_sha: p.head_sha.clone(),
+                head_branch: p.head_branch.clone(),
+                base_branch: p.base_branch.clone(),
+                is_draft: p.is_draft,
+                merged: matches!(
+                    p.merge_status,
+                    crate::webhooks::events::MergeStatus::Merged { .. }
+                ),
+            }),
+            _ => None,
+        }
+    }
+
+    /// Whether a PR trigger's claims contradict the crawled PR.
+    fn disagrees_with(&self, present: &PrData) -> bool {
+        use crate::webhooks::events::PrAction;
+        let TriggerFreshness::PullRequest {
+            action,
+            head_sha,
+            head_branch,
+            base_branch,
+            is_draft,
+            merged,
+            ..
+        } = self
+        else {
+            return false;
+        };
+        match action {
+            PrAction::Closed => {
+                if *merged {
+                    !matches!(present.state, PrState::Merged { .. })
+                } else {
+                    present.state != PrState::Closed
+                }
+            }
+            // `PrOpened` (and the refresh a reopen drives) writes the
+            // payload's head, base and draft over what the crawl just
+            // fetched, so an old delivery must agree with all three or it
+            // would regress authoritative data (Codex crawl review round
+            // 3, P1).
+            PrAction::Opened | PrAction::Reopened => {
+                present.state != PrState::Open
+                    || present.head_sha != *head_sha
+                    // `PrOpened` writes the payload's head REF over the
+                    // crawled one, so a delayed delivery from before a
+                    // branch rename would restore a branch that no longer
+                    // exists (Codex crawl review round 6, P2).
+                    || present.head_ref != *head_branch
+                    || present.base_ref != *base_branch
+                    || present.is_draft != *is_draft
+            }
+            PrAction::Synchronize => {
+                present.state != PrState::Open || present.head_sha != *head_sha
+            }
+            PrAction::Edited => present.state != PrState::Open || present.base_ref != *base_branch,
+            PrAction::ConvertedToDraft | PrAction::ReadyForReview => {
+                present.state != PrState::Open || present.is_draft != *is_draft
+            }
+        }
     }
 }
 

@@ -153,6 +153,12 @@ pub struct Delivery {
     pub body: Vec<u8>,
     /// When the delivery was received.
     pub received_at: DateTime<Utc>,
+    /// A first-contact crawl already landed FOR this delivery in an
+    /// earlier process. The crawl decided the delivery was current by
+    /// reading GitHub at that moment; that decision did not survive, and
+    /// the comment may have changed since — so the delivery is closed
+    /// unhandled rather than acted on (Codex crawl review round 14, P1).
+    pub crawled: bool,
 }
 
 /// A user command persisted in `pending_commands`: authorized at intake,
@@ -326,7 +332,26 @@ impl Store {
         payloads: &[StateEventPayload],
         ts: DateTime<Utc>,
     ) -> Result<Vec<StateEvent>, StoreError> {
+        self.append_batch_marking(payloads, ts, None)
+    }
+
+    /// `append_batch`, additionally marking one delivery as CRAWLED in the
+    /// same transaction. A crash between the crawl's events and that mark
+    /// would leave the delivery looking un-crawled, and its retry would
+    /// skip the freshness check the crawl performed.
+    pub fn append_batch_marking(
+        &mut self,
+        payloads: &[StateEventPayload],
+        ts: DateTime<Utc>,
+        crawled_delivery: Option<&str>,
+    ) -> Result<Vec<StateEvent>, StoreError> {
         if payloads.is_empty() {
+            if let Some(id) = crawled_delivery {
+                self.conn.execute(
+                    "UPDATE deliveries SET crawled = 1 WHERE delivery_id = ?1",
+                    rusqlite::params![id],
+                )?;
+            }
             return Ok(Vec::new());
         }
 
@@ -346,6 +371,12 @@ impl Store {
             seq += 1;
         }
         upsert_cache(&tx, &next_state, seq, ts)?;
+        if let Some(id) = crawled_delivery {
+            tx.execute(
+                "UPDATE deliveries SET crawled = 1 WHERE delivery_id = ?1",
+                rusqlite::params![id],
+            )?;
+        }
         tx.commit()?;
 
         self.state = next_state;
@@ -413,7 +444,7 @@ impl Store {
         let tx = self.conn.transaction()?;
         let row = tx
             .query_row(
-                "SELECT arrival, delivery_id, event_type, headers, body, received_at
+                "SELECT arrival, delivery_id, event_type, headers, body, received_at, crawled
                  FROM deliveries WHERE status = 'pending' ORDER BY arrival LIMIT 1",
                 [],
                 |r| {
@@ -424,12 +455,13 @@ impl Store {
                         r.get::<_, String>(3)?,
                         r.get::<_, Vec<u8>>(4)?,
                         r.get::<_, String>(5)?,
+                        r.get::<_, i64>(6)? != 0,
                     ))
                 },
             )
             .optional()?;
         let delivery = match row {
-            Some((arrival, delivery_id, event_type, headers, body, received_at)) => {
+            Some((arrival, delivery_id, event_type, headers, body, received_at, crawled)) => {
                 tx.execute(
                     "UPDATE deliveries SET status = 'processing' WHERE arrival = ?1",
                     rusqlite::params![arrival],
@@ -441,6 +473,7 @@ impl Store {
                     headers,
                     body,
                     received_at: parse_ts(&received_at)?,
+                    crawled,
                 })
             }
             None => None,
@@ -1323,7 +1356,14 @@ fn init_schema(conn: &Connection) -> Result<(), StoreError> {
             headers     TEXT NOT NULL,
             body        BLOB NOT NULL,
             status      TEXT NOT NULL,
-            received_at TEXT NOT NULL
+            received_at TEXT NOT NULL,
+            -- Set when a first-contact crawl landed FOR this delivery.
+            -- The crawl decides whether the delivery is still current by
+            -- reading GitHub; if the process then dies before the delivery
+            -- is closed, the retry finds a bootstrapped store, skips that
+            -- check, and would act on a payload whose comment may have
+            -- changed in the meantime (Codex crawl review round 14, P1).
+            crawled     INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX deliveries_drain ON deliveries (status, arrival);
         -- Seen dedupe keys with the time first seen, for TTL pruning.
