@@ -47,6 +47,16 @@ pub struct OwedStatusSync {
     pub comment_id: Option<CommentId>,
     /// The record — as the train ended — to rewrite the comment from.
     pub record: TrainRecord,
+    /// The message the live path meant to leave. Persisted rather than
+    /// rebuilt, because a fan-out's last word names the independent trains
+    /// it spawned and the record alone cannot say which (Codex
+    /// terminal-sync review round 11, P2).
+    pub message: String,
+    /// Consecutive probes that failed to find the comment. GitHub is not
+    /// read-after-write consistent, so a single absent listing is not
+    /// proof of deletion; absence is believed only once it is STABLE —
+    /// which means several probes AND real time between them.
+    pub absent_probes: u32,
 }
 use crate::webhooks::dedupe::DedupeKey;
 
@@ -538,8 +548,8 @@ impl Store {
     /// The terminal status-comment syncs still owed, by root.
     pub fn owed_status_syncs(&self) -> Result<Vec<OwedStatusSync>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT root, started_at, comment_id, record FROM owed_status_syncs \
-             ORDER BY root, started_at",
+            "SELECT root, started_at, comment_id, record, absent_probes, message \
+             FROM owed_status_syncs ORDER BY root, started_at",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok((
@@ -547,11 +557,13 @@ impl Store {
                 row.get::<_, String>(1)?,
                 row.get::<_, Option<i64>>(2)?,
                 row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
             ))
         })?;
         let mut owed = Vec::new();
         for row in rows {
-            let (root, started_at, comment_id, record) = row?;
+            let (root, started_at, comment_id, record, absent_probes, message) = row?;
             let record: TrainRecord = serde_json::from_str(&record)?;
             // The key's timestamp is the record's own, round-tripped
             // through RFC 3339; the record is the authority.
@@ -561,13 +573,17 @@ impl Store {
                 started_at: record.started_at,
                 comment_id: comment_id.map(|id| CommentId(id as u64)),
                 record,
+                message,
+                absent_probes: absent_probes as u32,
             });
         }
         Ok(owed)
     }
 
     /// Records the comment a probe resolved for one owed incarnation, so
-    /// the rewrite's outcome can be matched back to it.
+    /// the rewrite's outcome can be matched back to it. Seeing the comment
+    /// also resets the absence count: only CONSECUTIVE absences count
+    /// towards believing the comment is gone.
     pub fn set_owed_status_comment(
         &mut self,
         root: PrNumber,
@@ -575,10 +591,50 @@ impl Store {
         comment_id: CommentId,
     ) -> Result<(), StoreError> {
         self.conn.execute(
-            "UPDATE owed_status_syncs SET comment_id = ?3 WHERE root = ?1 AND started_at = ?2",
+            "UPDATE owed_status_syncs SET comment_id = ?3, absent_probes = 0, \
+             absent_at = NULL WHERE root = ?1 AND started_at = ?2",
             rusqlite::params![root.0 as i64, started_at.to_rfc3339(), comment_id.0 as i64],
         )?;
         Ok(())
+    }
+
+    /// Records that a probe did not find one incarnation's comment, and
+    /// answers how many consecutive probes have now missed it. A caller
+    /// believes the comment gone only once that count is convincing —
+    /// GitHub can omit a comment it created moments ago.
+    pub fn note_absent_probe(
+        &mut self,
+        root: PrNumber,
+        started_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+        cooldown: chrono::Duration,
+    ) -> Result<u32, StoreError> {
+        let key = rusqlite::params![root.0 as i64, started_at.to_rfc3339()];
+        let (count, last): (i64, Option<String>) = self.conn.query_row(
+            "SELECT absent_probes, absent_at FROM owed_status_syncs \
+             WHERE root = ?1 AND started_at = ?2",
+            key,
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        // Probes closer together than the cooldown are ONE observation of
+        // GitHub, however many requests they took: an unrelated delivery
+        // re-queues the owed syncs, so without this a burst of webhooks
+        // would run the counter up in milliseconds and conclude a deletion
+        // from a listing that had simply not caught up yet (Codex
+        // terminal-sync review round 10, P1).
+        let too_soon = last
+            .as_deref()
+            .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+            .is_some_and(|at| now - at.with_timezone(&Utc) < cooldown);
+        if too_soon {
+            return Ok(count as u32);
+        }
+        self.conn.execute(
+            "UPDATE owed_status_syncs SET absent_probes = absent_probes + 1, absent_at = ?3 \
+             WHERE root = ?1 AND started_at = ?2",
+            rusqlite::params![root.0 as i64, started_at.to_rfc3339(), now.to_rfc3339()],
+        )?;
+        Ok(count as u32 + 1)
     }
 
     /// Clears the owed sync for one train incarnation (idempotent).
@@ -755,14 +811,22 @@ fn insert_and_apply(
         // committed, and that comment is exactly the stale ACTIVE one a
         // later DB loss would resurrect from (Codex terminal-sync review
         // round 4, P1). The retry resolves it by incarnation.
+        // The intended last word, captured here: a fan-out's names the
+        // independent trains it spawned, and the record alone cannot say
+        // which.
+        let fanned_into = match &event.payload {
+            StateEventPayload::FanOutCompleted { new_roots, .. } => new_roots.as_slice(),
+            _ => &[],
+        };
         tx.execute(
             "INSERT OR REPLACE INTO owed_status_syncs \
-             (root, started_at, comment_id, record) VALUES (?1, ?2, ?3, ?4)",
+             (root, started_at, comment_id, record, message) VALUES (?1, ?2, ?3, ?4, ?5)",
             rusqlite::params![
                 root.0 as i64,
                 after.started_at.to_rfc3339(),
                 record.status_comment_id.map(|c| c.0 as i64),
-                serde_json::to_string(&after)?
+                serde_json::to_string(&after)?,
+                crate::status::format::terminal_message(&after, fanned_into),
             ],
         )?;
     }
@@ -861,10 +925,13 @@ fn init_schema(conn: &Connection) -> Result<(), StoreError> {
         -- died before its id committed — so the retry resolves the live
         -- comment by the incarnation embedded in it.
         CREATE TABLE owed_status_syncs (
-            root       INTEGER NOT NULL,
-            started_at TEXT    NOT NULL,
-            comment_id INTEGER,
-            record     TEXT    NOT NULL,
+            root          INTEGER NOT NULL,
+            started_at    TEXT    NOT NULL,
+            comment_id    INTEGER,
+            record        TEXT    NOT NULL,
+            message       TEXT    NOT NULL DEFAULT '',
+            absent_probes INTEGER NOT NULL DEFAULT 0,
+            absent_at     TEXT,
             PRIMARY KEY (root, started_at)
         );",
     )?;
@@ -1321,6 +1388,71 @@ mod tests {
             .map(|o| o.comment_id.map(|c| c.0))
             .collect();
         assert_eq!(left, vec![Some(20)], "clearing one leaves the other owed");
+    }
+
+    /// The absence count is durable, spread out in TIME, and consecutive:
+    /// probes that miss the comment accumulate but only one per cooldown
+    /// (a burst of deliveries re-queues the sync, and back-to-back
+    /// listings are one observation of GitHub, not two), and a probe that
+    /// finds the comment starts the count again.
+    #[test]
+    fn absent_probes_accumulate_once_per_cooldown_and_reset_on_sight() {
+        let dir = tempdir().unwrap();
+        let mut store = open_temp(&dir);
+        let ts = test_timestamp();
+        store
+            .append(
+                StateEventPayload::TrainStarted {
+                    root_pr: PrNumber(1),
+                    current_pr: PrNumber(1),
+                },
+                ts,
+            )
+            .unwrap();
+        store
+            .append(
+                StateEventPayload::TrainStopped {
+                    root_pr: PrNumber(1),
+                },
+                ts + chrono::Duration::hours(1),
+            )
+            .unwrap();
+        let owed = store.owed_status_syncs().unwrap();
+        assert_eq!(owed.len(), 1, "one obligation");
+        assert_eq!(owed[0].absent_probes, 0, "no probe has missed it yet");
+        let started_at = owed[0].started_at;
+
+        let cooldown = chrono::Duration::seconds(30);
+        let t0 = ts + chrono::Duration::hours(2);
+        let probe = |store: &mut Store, at: DateTime<Utc>| {
+            store
+                .note_absent_probe(PrNumber(1), started_at, at, cooldown)
+                .unwrap()
+        };
+        assert_eq!(probe(&mut store, t0), 1);
+        assert_eq!(
+            probe(&mut store, t0 + chrono::Duration::seconds(1)),
+            1,
+            "a second listing within the cooldown is the same observation"
+        );
+        assert_eq!(
+            probe(&mut store, t0 + chrono::Duration::seconds(31)),
+            2,
+            "one taken a cooldown later is a new one"
+        );
+        assert_eq!(store.owed_status_syncs().unwrap()[0].absent_probes, 2);
+
+        store
+            .set_owed_status_comment(PrNumber(1), started_at, CommentId(77))
+            .unwrap();
+        let owed = store.owed_status_syncs().unwrap();
+        assert_eq!(owed[0].comment_id, Some(CommentId(77)));
+        assert_eq!(owed[0].absent_probes, 0, "seeing the comment resets it");
+        assert_eq!(
+            probe(&mut store, t0 + chrono::Duration::seconds(32)),
+            1,
+            "and so does the cooldown clock"
+        );
     }
 
     #[test]

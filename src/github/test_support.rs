@@ -87,6 +87,18 @@ pub struct FakeGitHub {
     /// frontier PR here parks its train `WaitingCi`, so tests can exercise
     /// the missed-webhook polling fallback (clear the set, then poll).
     pub blocked: std::collections::HashSet<PrNumber>,
+    /// Comments that EXIST but are omitted from `ListComments`: GitHub is
+    /// not read-after-write consistent, so a freshly posted comment can be
+    /// missing from a listing that a moment later returns it. Recovery
+    /// paths that read absence as deletion must survive this.
+    pub hidden_from_listings: std::collections::HashSet<CommentId>,
+    /// `UpdateComment` calls that reached a live comment, so a test can
+    /// assert that a satisfied obligation writes nothing further.
+    pub comment_updates: u32,
+    /// While set, `UpdateComment` fails `Permanent` while everything else
+    /// keeps working: the token can still READ comments but has lost the
+    /// right to edit them, so an owed rewrite can never land.
+    pub update_comment_broken: bool,
 }
 
 impl FakeGitHub {
@@ -104,6 +116,9 @@ impl FakeGitHub {
             permission_lookup_broken: false,
             settings_fetches: 0,
             blocked: std::collections::HashSet::new(),
+            hidden_from_listings: std::collections::HashSet::new(),
+            comment_updates: 0,
+            update_comment_broken: false,
         }
     }
 
@@ -141,11 +156,6 @@ impl FakeGitHub {
                 } else {
                     MergeStateStatus::Clean
                 },
-            ),
-            FakePrState::Closed => (
-                PrState::Closed,
-                self.branch_head(&fake.branch),
-                MergeStateStatus::Unknown,
             ),
             FakePrState::Closed => (
                 PrState::Closed,
@@ -302,10 +312,18 @@ impl FakeGitHub {
                 Ok(GitHubResponse::CommentPosted { id })
             }
             GitHubEffect::UpdateComment { comment_id, body } => {
+                if self.update_comment_broken {
+                    return Err(EffectError::Permanent {
+                        kind: TrainErrorKind::ApiError,
+                        detail: format!("cannot edit comment {comment_id} (fake 403)"),
+                    });
+                }
+                let updates = &mut self.comment_updates;
                 match self.comments.get_mut(comment_id) {
                     Some(comment) => {
                         comment.body = body.clone();
                         comment.edited = true;
+                        *updates += 1;
                         Ok(GitHubResponse::CommentUpdated)
                     }
                     // A deleted comment 404s, exactly like GitHub.
@@ -343,7 +361,7 @@ impl FakeGitHub {
             GitHubEffect::ListComments { pr } => Ok(GitHubResponse::Comments(
                 self.comments
                     .iter()
-                    .filter(|(_, c)| c.pr == *pr)
+                    .filter(|(id, c)| c.pr == *pr && !self.hidden_from_listings.contains(id))
                     .map(|(id, c)| crate::effects::github::CommentData {
                         id: *id,
                         author_id: c.author_id,

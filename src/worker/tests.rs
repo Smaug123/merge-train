@@ -485,6 +485,264 @@ fn duplicate_content_under_new_delivery_id_is_skipped() {
     );
 }
 
+/// A retired incarnation's owed sync is discharged BEFORE its successor
+/// starts. Once the successor's saga is running its feedback batches chain
+/// without returning to the pump, so a sync queued behind it can wait out
+/// the whole cascade while the old comment still says ACTIVE — the exact
+/// window the obligation exists to close (Codex terminal-sync review round
+/// 11, P1). The deferral happens once: an obligation that can never be
+/// discharged must not stall the start forever.
+#[test]
+fn an_owed_sync_is_discharged_before_its_roots_next_start() {
+    let (mut world, heads) = World::linear_stack(2);
+    world.github.lock().unwrap().blocked.insert(PrNumber(1));
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    start_command(&mut world, &mut processor, 1);
+    drain(&mut processor);
+
+    // The stop's final update cannot land: the obligation stays owed.
+    world.github.lock().unwrap().update_comment_broken = true;
+    let stop = comment_body(&world.config, 1, "@merge-train stop", AUTHOR, "author", 7);
+    world.enqueue(&mut processor, "issue_comment", stop);
+    drain(&mut processor);
+    assert_eq!(
+        processor.owed_status_comments().len(),
+        1,
+        "precondition: the retired incarnation owes its comment"
+    );
+
+    // The user starts again on the same root.
+    let restart = comment_body(
+        &world.config,
+        1,
+        "@merge-train start",
+        AUTHOR,
+        "author",
+        600,
+    );
+    world.enqueue(&mut processor, "issue_comment", restart);
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+    let first = processor.pump().unwrap().expect("work is queued");
+    assert!(
+        first.effects.iter().any(|e| matches!(
+            e,
+            Effect::GitHub(GitHubEffect::ListComments { pr }) if *pr == PrNumber(1)
+        )),
+        "the owed sync's probe must go first, not the start's preflight: {:?}",
+        first.effects
+    );
+
+    // And the start is not stalled behind an obligation that can never be
+    // discharged: it runs on the next turn.
+    let outcomes = execute(&mut processor, &first);
+    let next = processor
+        .on_outcomes(first.root, outcomes, first.feedback)
+        .unwrap();
+    finish_batches(&mut world, &mut processor, next);
+    drain(&mut processor);
+    assert!(
+        processor.state().active_trains[&PrNumber(1)]
+            .state
+            .is_active(),
+        "the successor train starts anyway"
+    );
+}
+
+/// A fan-out's last word names the independent trains it spawned. The
+/// record alone says only "completed", so the retry must not rebuild the
+/// message from it: the intended text is persisted with the obligation
+/// (Codex terminal-sync review round 11, P2).
+#[test]
+fn a_retried_fan_out_completion_still_names_its_new_roots() {
+    let (mut world, heads) = World::linear_stack(1);
+    world.github.lock().unwrap().blocked.insert(PrNumber(1));
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 1, &heads);
+    start_command(&mut world, &mut processor, 1);
+    drain(&mut processor);
+    let status_id = processor.state().active_trains[&PrNumber(1)]
+        .status_comment_id
+        .expect("the train has a status comment");
+
+    // The fan-out lands, and its own status update never runs.
+    processor
+        .store_mut()
+        .append_batch(
+            &[
+                crate::persistence::event::StateEventPayload::FanOutCompleted {
+                    old_root: PrNumber(1),
+                    new_roots: vec![PrNumber(2), PrNumber(3)],
+                    original_root_pr: PrNumber(1),
+                },
+            ],
+            chrono::Utc::now(),
+        )
+        .unwrap();
+    assert_eq!(
+        processor.owed_status_comments().len(),
+        1,
+        "the fan-out owes the old root's comment its final word"
+    );
+
+    // Any delivery re-queues the owed syncs, as the stall-retry timer does.
+    let remark = comment_body(&world.config, 1, "a remark", AUTHOR, "author", 9100);
+    world.enqueue(&mut processor, "issue_comment", remark);
+    drain(&mut processor);
+    assert!(
+        processor.owed_status_comments().is_empty(),
+        "the retry landed"
+    );
+    let github = world.github.lock().unwrap();
+    let body = &github.comments[&status_id].body;
+    assert!(
+        body.contains("#2") && body.contains("#3"),
+        "the retried final comment must still name the spawned roots: {body}"
+    );
+    assert!(
+        body.contains("independent trains"),
+        "and say what they are: {body}"
+    );
+}
+
+/// `GitEffect::CleanupWorktree` is root-relative — the executor resolves
+/// it against the batch's root — so an abort's cleanup must ride a batch
+/// rooted at ITS train. Anything else cleans one worktree and leaves the
+/// other dirty (Codex terminal-sync review round 12, P2).
+#[test]
+fn abort_cleanup_for_a_foreign_root_is_queued_not_inlined() {
+    let (world, _heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    let cleanup = vec![
+        Effect::Git(crate::effects::GitEffect::CleanupWorktree),
+        Effect::GitHub(GitHubEffect::PostComment {
+            pr: PrNumber(9),
+            body: "aborted".to_owned(),
+        }),
+    ];
+
+    // Its own root: inlined, and nothing is queued.
+    let (mine, roots) =
+        processor.cleanup_for_batch(vec![(PrNumber(9), cleanup.clone())], PrNumber(9));
+    assert_eq!(mine.len(), 2, "the batch's own root runs inline");
+    assert_eq!(roots, [PrNumber(9)].into_iter().collect());
+    assert!(!processor.has_queued_work(), "nothing to defer");
+
+    // A foreign root: nothing inlined, and its own cleanup is queued —
+    // carrying the effects, so a queued `Start` for that root cannot
+    // replace the record they belong to before they run.
+    let (mine, roots) = processor.cleanup_for_batch(vec![(PrNumber(9), cleanup)], PrNumber(1));
+    assert!(
+        mine.is_empty(),
+        "another train's root-relative cleanup must not ride this batch"
+    );
+    assert_eq!(roots, [PrNumber(9)].into_iter().collect());
+    let queued = processor.pump().unwrap().expect("the cleanup is queued");
+    assert_eq!(queued.root, PrNumber(9), "under its own root");
+    assert_eq!(
+        queued.best_effort.len(),
+        2,
+        "with the effects captured when the abort applied: {:?}",
+        queued.best_effort
+    );
+}
+
+/// SEVERAL retired incarnations of one root can owe their comments — a
+/// train stopped, restarted and stopped again while GitHub refused the
+/// updates. The successor's start waits for each of them once, not just
+/// for the oldest, or the newest incarnation's comment stays saying ACTIVE
+/// through the whole cascade (Codex terminal-sync review round 12, P2).
+#[test]
+fn every_owed_incarnation_is_probed_before_the_next_start() {
+    let (mut world, heads) = World::linear_stack(2);
+    world.github.lock().unwrap().blocked.insert(PrNumber(1));
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    drain(&mut processor);
+
+    // Two incarnations, each stopped with its final update refused.
+    world.github.lock().unwrap().update_comment_broken = true;
+    for (start_id, stop_id) in [(501u64, 502u64), (603, 604)] {
+        let start = comment_body(
+            &world.config,
+            1,
+            "@merge-train start",
+            AUTHOR,
+            "author",
+            start_id,
+        );
+        world.enqueue(&mut processor, "issue_comment", start);
+        drain(&mut processor);
+        let stop = comment_body(
+            &world.config,
+            1,
+            "@merge-train stop",
+            AUTHOR,
+            "author",
+            stop_id,
+        );
+        world.enqueue(&mut processor, "issue_comment", stop);
+        drain(&mut processor);
+    }
+    assert_eq!(
+        processor.owed_status_comments().len(),
+        2,
+        "precondition: two incarnations owe their comments"
+    );
+
+    // A third start must probe BOTH before its preflight runs.
+    let restart = comment_body(
+        &world.config,
+        1,
+        "@merge-train start",
+        AUTHOR,
+        "author",
+        705,
+    );
+    world.enqueue(&mut processor, "issue_comment", restart);
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+    // Drive every batch the worker hands back, counting the probes and
+    // stopping at the start's preflight (the settings reads).
+    let mut probes = 0;
+    let mut preflight_after = None;
+    let mut next = processor.pump().unwrap();
+    for step in 0..12 {
+        let Some(batch) = next else {
+            break;
+        };
+        if batch.effects.iter().any(|e| {
+            matches!(e, Effect::GitHub(GitHubEffect::ListComments { pr }) if *pr == PrNumber(1))
+        }) {
+            probes += 1;
+        }
+        if batch
+            .effects
+            .iter()
+            .any(|e| matches!(e, Effect::GitHub(GitHubEffect::GetRepoSettings)))
+        {
+            preflight_after = Some(probes);
+            break;
+        }
+        let outcomes = execute(&mut processor, &batch);
+        next = processor
+            .on_outcomes(batch.root, outcomes, batch.feedback)
+            .unwrap();
+        if next.is_none() {
+            next = processor.pump().unwrap();
+        }
+        let _ = step;
+    }
+    assert_eq!(
+        preflight_after,
+        Some(2),
+        "both retired incarnations are probed before the successor's preflight"
+    );
+}
+
 // ─── Authorization ───
 
 #[test]
@@ -943,10 +1201,11 @@ fn a_failed_completion_status_update_is_owed_until_it_lands() {
 }
 
 /// An owed sync whose comment turns out to be GONE is cleared by the
-/// retry's probe — nothing stale survives — and nothing is reposted. A
+/// retry's probes — nothing stale survives — and nothing is reposted. A
 /// permanent failure of the update itself (revoked credentials, say) does
-/// NOT clear it: only the probe may conclude absence (Codex terminal-sync
-/// review, P1).
+/// NOT clear it: only a probe may conclude absence (Codex terminal-sync
+/// review, P1), and only once that absence is STABLE across two of them
+/// (round 9, P1 — see `a_stably_absent_comment_clears_its_owed_sync`).
 #[test]
 fn an_owed_sync_for_a_deleted_comment_is_cleared_by_the_probe() {
     let (mut world, heads) = World::linear_stack(2);
@@ -991,10 +1250,16 @@ fn an_owed_sync_for_a_deleted_comment_is_cleared_by_the_probe() {
         .on_outcomes(cleanup.root, outcomes, cleanup.feedback)
         .unwrap();
     // The update 404s (permanent) — which never clears the obligation on
-    // its own; only the probe the boundary hands back may conclude the
-    // comment is gone, and it does.
+    // its own; only the probes the boundary hands back may conclude the
+    // comment is gone, and they do, once they agree.
     finish_batches(&mut world, &mut processor, next);
     drain(&mut processor);
+    assert_eq!(
+        processor.owed_status_syncs().len(),
+        1,
+        "one absent listing is not yet proof"
+    );
+    nudge(&mut world, &mut processor, 8);
     assert!(
         processor.owed_status_syncs().is_empty(),
         "confirmed gone: cleared"
@@ -1232,6 +1497,616 @@ fn a_comment_posted_before_the_crash_is_synced_by_incarnation() {
     assert_eq!(
         embedded.started_at, record.started_at,
         "the same incarnation"
+    );
+}
+
+/// The crash window in which `PostComment` landed but
+/// `StatusCommentPosted` never committed: GitHub holds the train's status
+/// comment while the store has no id for it. Returns the live comment.
+fn train_with_orphaned_status_comment() -> (World, Processor, crate::types::CommentId) {
+    let (mut world, heads) = World::linear_stack(1);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 1, &heads);
+    start_command(&mut world, &mut processor, 1);
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+    let mut batch = processor.pump().unwrap().expect("the start's preflight");
+    loop {
+        let posts = batch
+            .effects
+            .iter()
+            .any(|e| matches!(e, Effect::GitHub(GitHubEffect::PostComment { .. })));
+        let outcomes = execute(&mut processor, &batch);
+        if posts {
+            break; // the crash: outcomes never observed
+        }
+        batch = processor
+            .on_outcomes(batch.root, outcomes, batch.feedback)
+            .unwrap()
+            .expect("the train has more to do");
+    }
+    drop(processor);
+    let processor = world.processor();
+    let live = {
+        let github = world.github.lock().unwrap();
+        github
+            .comments
+            .iter()
+            .find(|(_, c)| c.author_id == TEST_BOT_ID && c.pr == PrNumber(1))
+            .map(|(id, _)| *id)
+            .expect("the comment IS on GitHub")
+    };
+    (world, processor, live)
+}
+
+/// Any delivery re-queues the owed syncs, as the worker's stall-retry
+/// timer does: a probe that concluded nothing gets another look. The sleep
+/// clears the absence cooldown — this harness sets the stall delay to
+/// 25ms, and two listings closer together than that count as one.
+fn nudge(world: &mut World, processor: &mut Processor, comment_id: u64) {
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    let body = comment_body(
+        &world.config,
+        1,
+        "just a remark, not a command",
+        AUTHOR,
+        "author",
+        comment_id,
+    );
+    world.enqueue(processor, "issue_comment", body);
+    drain(processor);
+}
+
+/// GitHub is not read-after-write consistent: a comment posted moments ago
+/// can be missing from a listing that later returns it. An owed sync whose
+/// comment id is UNKNOWN resolves the comment by listing, so one absent
+/// listing must not be read as proof of deletion — clearing the obligation
+/// there leaves that comment saying ACTIVE forever, and a later DB loss
+/// resurrects the stopped train (Codex terminal-sync review round 9, P1).
+#[test]
+fn an_eventually_consistent_listing_does_not_clear_an_unknown_id_sync() {
+    let (mut world, mut processor, live) = train_with_orphaned_status_comment();
+    world
+        .github
+        .lock()
+        .unwrap()
+        .hidden_from_listings
+        .insert(live);
+
+    let stop = comment_body(&world.config, 1, "@merge-train stop", AUTHOR, "author", 7);
+    world.enqueue(&mut processor, "issue_comment", stop);
+    drain(&mut processor);
+    assert_eq!(
+        processor.owed_status_comments().len(),
+        1,
+        "one absent listing is not proof of deletion"
+    );
+
+    // The comment becomes visible; the retry rewrites it.
+    world.github.lock().unwrap().hidden_from_listings.clear();
+    nudge(&mut world, &mut processor, 8);
+    assert!(
+        processor.owed_status_comments().is_empty(),
+        "the sync landed once the listing caught up"
+    );
+    let github = world.github.lock().unwrap();
+    let embedded = crate::status::parse_status_comment(&github.comments[&live].body).unwrap();
+    assert!(
+        matches!(embedded.state, crate::types::TrainState::Stopped { .. }),
+        "the orphaned comment must say stopped: {:?}",
+        embedded.state
+    );
+}
+
+/// Absence is believed once it is STABLE: a comment missing from two
+/// consecutive probes really is deleted, and the obligation is cleared
+/// rather than retried forever (bounded uncertainty — an unbounded
+/// obligation is one nobody can characterize).
+#[test]
+fn a_stably_absent_comment_clears_its_owed_sync() {
+    let (mut world, mut processor, live) = train_with_orphaned_status_comment();
+    world.github.lock().unwrap().comments.remove(&live);
+
+    let stop = comment_body(&world.config, 1, "@merge-train stop", AUTHOR, "author", 7);
+    world.enqueue(&mut processor, "issue_comment", stop);
+    drain(&mut processor);
+    assert_eq!(
+        processor.owed_status_comments().len(),
+        1,
+        "the first absence is not yet believed"
+    );
+    let posted_before = world.github.lock().unwrap().posted_comments.len();
+    nudge(&mut world, &mut processor, 8);
+    assert!(
+        processor.owed_status_comments().is_empty(),
+        "a second absent probe confirms the deletion"
+    );
+    assert_eq!(
+        world.github.lock().unwrap().posted_comments.len(),
+        posted_before,
+        "nothing is reposted for a comment the user removed"
+    );
+}
+
+/// The terminal update landed and the process died before its outcomes
+/// were handled, so the obligation survives against a comment that ALREADY
+/// says what it owes. The probe reads that, and clears — it must not issue
+/// another write, which a token that has lost edit rights would fail
+/// forever, retrying an obligation that is already satisfied (Codex
+/// terminal-sync review round 9, P2).
+#[test]
+fn a_probe_that_finds_the_terminal_record_clears_without_rewriting() {
+    let (mut world, heads) = World::linear_stack(2);
+    // The frontier PR is not mergeable, so the train parks `WaitingCi`
+    // rather than running to completion: it is still stoppable.
+    world.github.lock().unwrap().blocked.insert(PrNumber(1));
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    start_command(&mut world, &mut processor, 1);
+    drain(&mut processor);
+
+    // Stop the train, and run the cleanup that carries the terminal
+    // update WITHOUT observing its outcomes: the update lands on GitHub,
+    // the obligation stays owed.
+    let stop = comment_body(&world.config, 1, "@merge-train stop", AUTHOR, "author", 7);
+    world.enqueue(&mut processor, "issue_comment", stop);
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+    let cleanup = processor.pump().unwrap().expect("the stop's cleanup batch");
+    assert!(
+        cleanup
+            .best_effort
+            .iter()
+            .any(|e| matches!(e, Effect::GitHub(GitHubEffect::UpdateComment { .. }))),
+        "the cleanup carries the terminal update"
+    );
+    let interpreter = WorktreeGitInterpreter::new(processor.git_config(), cleanup.root);
+    let _ = execute_batch(&interpreter, processor.github(), &cleanup);
+    drop(processor);
+
+    // Restart: the obligation is durable, and the comment already says it.
+    let mut processor = world.processor();
+    assert_eq!(
+        processor.owed_status_comments().len(),
+        1,
+        "precondition: still owed after the crash"
+    );
+    // The token can still read comments but has lost the right to edit
+    // them: a rewrite would fail forever.
+    let updates_before = {
+        let mut github = world.github.lock().unwrap();
+        github.update_comment_broken = true;
+        github.comment_updates
+    };
+    drain(&mut processor);
+    assert!(
+        processor.owed_status_comments().is_empty(),
+        "an obligation the comment already satisfies is cleared, not retried"
+    );
+    assert_eq!(
+        world.github.lock().unwrap().comment_updates,
+        updates_before,
+        "nothing is rewritten"
+    );
+}
+
+/// A stop queued while a status-sync probe is in flight applies at THAT
+/// boundary. The probe's outcomes are an observation boundary like any
+/// other: nothing is in flight behind them, so letting the rewrite jump
+/// ahead leaves an acknowledged stop unapplied across arbitrarily many
+/// comment-only batches while GitHub retries (Codex terminal-sync review
+/// round 9, P2).
+#[test]
+fn a_queued_stop_preempts_an_owed_sync_probe() {
+    let (mut world, heads) = World::linear_stack(2);
+    // The frontier PR is not mergeable, so the train parks `WaitingCi`
+    // rather than running to completion: it is still stoppable.
+    world.github.lock().unwrap().blocked.insert(PrNumber(1));
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    start_command(&mut world, &mut processor, 1);
+    drain(&mut processor);
+
+    // The token loses the right to edit comments: the first train's stop
+    // owes a terminal update that can never land.
+    world.github.lock().unwrap().update_comment_broken = true;
+    let stop = comment_body(&world.config, 1, "@merge-train stop", AUTHOR, "author", 7);
+    world.enqueue(&mut processor, "issue_comment", stop);
+    drain(&mut processor);
+    assert_eq!(
+        processor.owed_status_comments().len(),
+        1,
+        "precondition: an obligation that keeps retrying"
+    );
+
+    // The user starts a fresh train on the same root (a new comment: the
+    // first `start` is deduped by its id).
+    let restart = comment_body(
+        &world.config,
+        1,
+        "@merge-train start",
+        AUTHOR,
+        "author",
+        600,
+    );
+    world.enqueue(&mut processor, "issue_comment", restart);
+    drain(&mut processor);
+    assert!(
+        processor.state().active_trains[&PrNumber(1)]
+            .state
+            .is_active(),
+        "precondition: the second incarnation is running"
+    );
+
+    // A probe for the old obligation goes in flight (any delivery
+    // re-queues the owed syncs, as the stall-retry timer does)...
+    let remark = comment_body(&world.config, 1, "just a remark", AUTHOR, "author", 8);
+    world.enqueue(&mut processor, "issue_comment", remark);
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+    let probe = loop {
+        let batch = processor.pump().unwrap().expect("the owed sync's probe");
+        if batch
+            .effects
+            .iter()
+            .any(|e| matches!(e, Effect::GitHub(GitHubEffect::ListComments { .. })))
+        {
+            break batch;
+        }
+        let outcomes = execute(&mut processor, &batch);
+        processor
+            .on_outcomes(batch.root, outcomes, batch.feedback)
+            .unwrap();
+    };
+
+    // ... and the user stops the running train while it is out.
+    let stop = comment_body(&world.config, 1, "@merge-train stop", AUTHOR, "author", 9);
+    world.enqueue(&mut processor, "issue_comment", stop);
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+    let outcomes = execute(&mut processor, &probe);
+    let next = processor
+        .on_outcomes(probe.root, outcomes, probe.feedback)
+        .unwrap();
+    assert!(
+        !processor.state().active_trains[&PrNumber(1)]
+            .state
+            .is_active(),
+        "the stop applies at the probe's boundary, not behind its rewrites"
+    );
+    finish_batches(&mut world, &mut processor, next);
+}
+
+/// However many owed syncs fail, the worker arms at most ONE outstanding
+/// stall-retry timer; the timer's landing (`requeue_marked_recoveries`)
+/// re-opens the gate. One timer per failed probe amplified instead: every
+/// `RetryStalled` requeues ALL obligations, each failing probe armed
+/// another timer, and traffic grew with the number of timers in flight
+/// rather than respecting `stall_retry_delay` (Codex terminal-sync review
+/// round 15, P2).
+#[test]
+fn failing_probes_arm_one_stall_timer_not_one_each() {
+    let (mut world, heads) = World::linear_stack(2);
+    {
+        let mut github = world.github.lock().unwrap();
+        github.prs.get_mut(&PrNumber(2)).unwrap().base_ref = "main".to_owned();
+        github.blocked.insert(PrNumber(1));
+        github.blocked.insert(PrNumber(2));
+    }
+    let mut processor = world.processor();
+    // Both PRs are independent roots whose trains park (not mergeable).
+    for i in 1..=2u64 {
+        let body = pr_opened_body(
+            &world.config,
+            i,
+            &heads[(i - 1) as usize],
+            &format!("pr-{i}"),
+            "main",
+        );
+        world.enqueue(&mut processor, "pull_request", body);
+    }
+    start_command(&mut world, &mut processor, 1);
+    start_command(&mut world, &mut processor, 2);
+    drain(&mut processor);
+
+    // Both stops owe terminal updates that cannot land.
+    world.github.lock().unwrap().update_comment_broken = true;
+    let stop = comment_body(&world.config, 1, "@merge-train stop", AUTHOR, "author", 7);
+    world.enqueue(&mut processor, "issue_comment", stop);
+    let stop = comment_body(&world.config, 2, "@merge-train stop", AUTHOR, "author", 76);
+    world.enqueue(&mut processor, "issue_comment", stop);
+    drain(&mut processor);
+    assert_eq!(
+        processor.owed_status_syncs().len(),
+        2,
+        "precondition: two obligations that keep retrying"
+    );
+    assert!(
+        processor.take_retry_request(),
+        "the first request arms the stall timer"
+    );
+
+    // While that timer is outstanding, another delivery re-queues the owed
+    // syncs and both probes fail again: the failures must coalesce into
+    // the timer already out, not arm a second one.
+    let remark = comment_body(&world.config, 1, "just a remark", AUTHOR, "author", 8);
+    world.enqueue(&mut processor, "issue_comment", remark);
+    drain(&mut processor);
+    assert!(
+        !processor.take_retry_request(),
+        "failures while a timer is outstanding must coalesce into it"
+    );
+
+    // The timer lands and its requeued probes fail again: the gate has
+    // re-opened, and exactly one fresh timer is armed.
+    processor.requeue_marked_recoveries().unwrap();
+    drain(&mut processor);
+    assert!(
+        processor.take_retry_request(),
+        "the landed timer's failed probes arm one fresh timer"
+    );
+    assert!(!processor.take_retry_request(), "and only one");
+}
+
+/// A completed terminal REWRITE is an observation boundary like the probe
+/// that preceded it: a deferred abort acts there, before queued work runs.
+/// Pumping straight from the rewrite's `feedback: false` completion let a
+/// queued restart run against a successor train a review dismissal had
+/// already doomed — the start was durably rejected as "already running",
+/// and the abort then left no train at all (Codex terminal-sync review
+/// round 16, P2).
+#[test]
+fn a_rewrite_landing_applies_deferred_aborts_before_queued_starts() {
+    let (mut world, heads) = World::linear_stack(2);
+    world.github.lock().unwrap().blocked.insert(PrNumber(1));
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    start_command(&mut world, &mut processor, 1);
+    drain(&mut processor);
+
+    // The first incarnation's stop owes a terminal update that cannot
+    // land while the token has lost the right to edit comments.
+    world.github.lock().unwrap().update_comment_broken = true;
+    let stop = comment_body(&world.config, 1, "@merge-train stop", AUTHOR, "author", 7);
+    world.enqueue(&mut processor, "issue_comment", stop);
+    drain(&mut processor);
+    assert_eq!(
+        processor.owed_status_comments().len(),
+        1,
+        "precondition: an obligation that keeps retrying"
+    );
+
+    // A second incarnation runs on the same root.
+    let restart = comment_body(
+        &world.config,
+        1,
+        "@merge-train start",
+        AUTHOR,
+        "author",
+        600,
+    );
+    world.enqueue(&mut processor, "issue_comment", restart);
+    drain(&mut processor);
+    assert!(
+        processor.state().active_trains[&PrNumber(1)]
+            .state
+            .is_active(),
+        "precondition: the second incarnation is running"
+    );
+
+    // The old obligation's probe runs, and hands back the REWRITE, which
+    // goes in flight.
+    let remark = comment_body(&world.config, 1, "just a remark", AUTHOR, "author", 8);
+    world.enqueue(&mut processor, "issue_comment", remark);
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+    let probe = loop {
+        let batch = processor.pump().unwrap().expect("the owed sync's probe");
+        if batch
+            .effects
+            .iter()
+            .any(|e| matches!(e, Effect::GitHub(GitHubEffect::ListComments { .. })))
+        {
+            break batch;
+        }
+        let outcomes = execute(&mut processor, &batch);
+        processor
+            .on_outcomes(batch.root, outcomes, batch.feedback)
+            .unwrap();
+    };
+    let outcomes = execute(&mut processor, &probe);
+    let rewrite = processor
+        .on_outcomes(probe.root, outcomes, probe.feedback)
+        .unwrap()
+        .expect("the terminal rewrite batch");
+    assert!(
+        rewrite
+            .best_effort
+            .iter()
+            .any(|e| matches!(e, Effect::GitHub(GitHubEffect::UpdateComment { .. }))),
+        "precondition: the rewrite is what went in flight"
+    );
+
+    // While it is out: the user queues a restart, and a review dismissal
+    // then aborts the second incarnation (deferred — the rewrite holds
+    // this root's saga slot). The outage also ends, so the rewrite lands.
+    world.github.lock().unwrap().update_comment_broken = false;
+    let restart = comment_body(&world.config, 1, "@merge-train start", AUTHOR, "author", 9);
+    world.enqueue(&mut processor, "issue_comment", restart);
+    let dismissal = format!(
+        r#"{{
+            "action": "dismissed",
+            "review": {{
+                "id": 779,
+                "user": {{ "id": 555, "login": "reviewer" }},
+                "state": "dismissed",
+                "body": null
+            }},
+            "pull_request": {{ "number": 1 }},
+            "repository": {repo}
+        }}"#,
+        repo = repo_json(&world.config),
+    );
+    world.enqueue(
+        &mut processor,
+        "pull_request_review",
+        dismissal.into_bytes(),
+    );
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+
+    // The rewrite's completion is the boundary where the abort must act.
+    let outcomes = execute(&mut processor, &rewrite);
+    let next = processor
+        .on_outcomes(rewrite.root, outcomes, rewrite.feedback)
+        .unwrap();
+    finish_batches(&mut world, &mut processor, next);
+    drain(&mut processor);
+
+    assert!(
+        world
+            .github
+            .lock()
+            .unwrap()
+            .posted_comments
+            .iter()
+            .any(|(pr, text)| *pr == PrNumber(1) && text.contains("Merge train aborted")),
+        "the dismissed incarnation still posts its abort notice"
+    );
+    assert!(
+        processor.state().active_trains[&PrNumber(1)]
+            .state
+            .is_active(),
+        "the queued restart must start a fresh incarnation, not be \
+         rejected against the successor the dismissal doomed"
+    );
+}
+
+/// A successor train aborted while an older incarnation's status-sync
+/// probe is in flight must not lose its cleanup to a queued restart. The
+/// probe's boundary applies the deferred abort, and the cleanup computed
+/// there must ride the boundary's own batch: queued as a recompute behind
+/// the waiting `start`, the start replaces the aborted record first and
+/// the recompute then finds nothing — no worktree removal, no abort
+/// notice (Codex terminal-sync review round 14, P2).
+#[test]
+fn an_abort_at_a_probe_boundary_survives_a_queued_restart() {
+    let (mut world, heads) = World::linear_stack(2);
+    world.github.lock().unwrap().blocked.insert(PrNumber(1));
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    start_command(&mut world, &mut processor, 1);
+    drain(&mut processor);
+
+    // The first incarnation's stop owes a terminal update that cannot
+    // land while the token has lost the right to edit comments.
+    world.github.lock().unwrap().update_comment_broken = true;
+    let stop = comment_body(&world.config, 1, "@merge-train stop", AUTHOR, "author", 7);
+    world.enqueue(&mut processor, "issue_comment", stop);
+    drain(&mut processor);
+    assert_eq!(
+        processor.owed_status_comments().len(),
+        1,
+        "precondition: an obligation that keeps retrying"
+    );
+
+    // A second incarnation runs on the same root.
+    let restart = comment_body(
+        &world.config,
+        1,
+        "@merge-train start",
+        AUTHOR,
+        "author",
+        600,
+    );
+    world.enqueue(&mut processor, "issue_comment", restart);
+    drain(&mut processor);
+    assert!(
+        processor.state().active_trains[&PrNumber(1)]
+            .state
+            .is_active(),
+        "precondition: the second incarnation is running"
+    );
+
+    // The old obligation's probe goes in flight.
+    let remark = comment_body(&world.config, 1, "just a remark", AUTHOR, "author", 8);
+    world.enqueue(&mut processor, "issue_comment", remark);
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+    let probe = loop {
+        let batch = processor.pump().unwrap().expect("the owed sync's probe");
+        if batch
+            .effects
+            .iter()
+            .any(|e| matches!(e, Effect::GitHub(GitHubEffect::ListComments { .. })))
+        {
+            break batch;
+        }
+        let outcomes = execute(&mut processor, &batch);
+        processor
+            .on_outcomes(batch.root, outcomes, batch.feedback)
+            .unwrap();
+    };
+
+    // While it is out: a review dismissal aborts the second incarnation
+    // (deferred — the probe holds this root's saga slot), and the user
+    // queues a THIRD start behind it.
+    world.github.lock().unwrap().update_comment_broken = false;
+    let dismissal = format!(
+        r#"{{
+            "action": "dismissed",
+            "review": {{
+                "id": 777,
+                "user": {{ "id": 555, "login": "reviewer" }},
+                "state": "dismissed",
+                "body": null
+            }},
+            "pull_request": {{ "number": 1 }},
+            "repository": {repo}
+        }}"#,
+        repo = repo_json(&world.config),
+    );
+    world.enqueue(
+        &mut processor,
+        "pull_request_review",
+        dismissal.into_bytes(),
+    );
+    let restart = comment_body(&world.config, 1, "@merge-train start", AUTHOR, "author", 9);
+    world.enqueue(&mut processor, "issue_comment", restart);
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+
+    // The probe's boundary applies the abort; everything runs to rest.
+    let outcomes = execute(&mut processor, &probe);
+    let next = processor
+        .on_outcomes(probe.root, outcomes, probe.feedback)
+        .unwrap();
+    finish_batches(&mut world, &mut processor, next);
+    drain(&mut processor);
+
+    assert!(
+        world
+            .github
+            .lock()
+            .unwrap()
+            .posted_comments
+            .iter()
+            .any(|(pr, text)| *pr == PrNumber(1) && text.contains("Merge train aborted")),
+        "the aborted incarnation's notice must not be lost to the queued restart"
+    );
+    assert!(
+        processor.state().active_trains[&PrNumber(1)]
+            .state
+            .is_active(),
+        "the queued start still runs, as a fresh incarnation"
     );
 }
 
@@ -2228,6 +3103,106 @@ fn stop_cancels_a_queued_not_yet_started_start() {
             .iter()
             .any(|(pr, text)| *pr == PrNumber(2) && text.contains("start cancelled")),
         "expected a start-cancelled answer"
+    );
+}
+
+/// A handler abort committed while ANOTHER root's saga holds the slot
+/// must not lose its cleanup to a start already queued for the aborted
+/// root: consumed first, the start replaces the aborted record, and a
+/// recompute queued behind it finds nothing — no worktree removal, no
+/// abort notice. The cleanup is captured when the abort commits and
+/// queued ahead of the waiting start (Codex terminal-sync review round
+/// 14, P2 — the `process_claimed` face of the probe-boundary finding).
+#[test]
+fn a_handler_abort_behind_a_queued_start_still_notifies() {
+    let (mut world, heads) = World::linear_stack(2);
+    {
+        let mut github = world.github.lock().unwrap();
+        github.prs.get_mut(&PrNumber(2)).unwrap().base_ref = "main".to_owned();
+        github.blocked.insert(PrNumber(2));
+    }
+    let mut processor = world.processor();
+    // Announce both PRs as *independent roots*: base `main`, no
+    // predecessors.
+    for i in 1..=2u64 {
+        let body = pr_opened_body(
+            &world.config,
+            i,
+            &heads[(i - 1) as usize],
+            &format!("pr-{i}"),
+            "main",
+        );
+        world.enqueue(&mut processor, "pull_request", body);
+    }
+    // Train 2 runs first and parks (its PR is not mergeable): an active
+    // train that a dismissal can abort.
+    start_command(&mut world, &mut processor, 2);
+    drain(&mut processor);
+    assert!(
+        processor.state().active_trains[&PrNumber(2)]
+            .state
+            .is_active(),
+        "precondition: train 2 is running"
+    );
+
+    // Train 1's preflight occupies the saga slot...
+    start_command(&mut world, &mut processor, 1);
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+    let batch = processor.pump().unwrap().expect("start 1 plans preflight");
+    let outcomes = execute(&mut processor, &batch);
+
+    // ... while a restart of 2 queues behind it, and a review dismissal
+    // then aborts train 2 — committed with its delivery, since root 2's
+    // saga is NOT the one in flight.
+    let restart = comment_body(&world.config, 2, "@merge-train start", AUTHOR, "author", 76);
+    world.enqueue(&mut processor, "issue_comment", restart);
+    let dismissal = format!(
+        r#"{{
+            "action": "dismissed",
+            "review": {{
+                "id": 778,
+                "user": {{ "id": 555, "login": "reviewer" }},
+                "state": "dismissed",
+                "body": null
+            }},
+            "pull_request": {{ "number": 2 }},
+            "repository": {repo}
+        }}"#,
+        repo = repo_json(&world.config),
+    );
+    world.enqueue(
+        &mut processor,
+        "pull_request_review",
+        dismissal.into_bytes(),
+    );
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+
+    // Train 1's outcomes come back; everything runs to rest.
+    let next = processor
+        .on_outcomes(batch.root, outcomes, batch.feedback)
+        .unwrap();
+    finish_batches(&mut world, &mut processor, next);
+    drain(&mut processor);
+
+    assert!(
+        world
+            .github
+            .lock()
+            .unwrap()
+            .posted_comments
+            .iter()
+            .any(|(pr, text)| *pr == PrNumber(2) && text.contains("Merge train aborted")),
+        "the aborted train's notice must not be lost to the queued restart"
+    );
+    assert!(
+        processor.state().active_trains[&PrNumber(2)]
+            .state
+            .is_active(),
+        "the queued start still runs, as a fresh incarnation"
     );
 }
 
@@ -3534,28 +4509,6 @@ mod registry {
     }
 }
 
-// ─── The interleaving model check ───
-
-/// Codex review rounds 1, 2, 6, 7, 8, 10, 13, 15, and 19 were all ordering
-/// bugs in the worker's command/saga/backlog machinery — each round a human
-/// reviewer exploring one more schedule by hand. This harness mechanizes
-/// that: proptest generates schedules interleaving delivery processing,
-/// observation boundaries, command injection, and (in the second property)
-/// crashes, then asserts the invariants every schedule must preserve:
-///
-/// - **≤ 1 squash per PR** — the cascade's core idempotency guarantee;
-/// - **the store is never ahead of reality** — a PR the store calls merged
-///   is merged on (fake) GitHub;
-/// - **every acknowledged command is answered** — `pending_commands` is
-///   empty at quiescence and no train is left active;
-/// - **store and GitHub agree exactly, and every completed train's intent
-///   ledger is fully matched** — for crash schedules too: M6's recovery
-///   (worktree cleanup + supplementary GitHub recovery + the evaluate
-///   path) plus reality's merged-close webhooks must reconcile every
-///   crash window the schedule can produce.
-///
-/// Each case does real git work, so the case counts are deliberately small;
-/// raise them locally (`PROPTEST_CASES`) when touching worker ordering.
 // ─── Polling fallback: missed-webhook recovery ───
 
 /// The production idle wait runs on a plain OS thread and borrows the
@@ -3700,6 +4653,28 @@ fn poll_with_no_active_trains_is_a_noop() {
     );
 }
 
+// ─── The interleaving model check ───
+
+/// Codex review rounds 1, 2, 6, 7, 8, 10, 13, 15, and 19 were all ordering
+/// bugs in the worker's command/saga/backlog machinery — each round a human
+/// reviewer exploring one more schedule by hand. This harness mechanizes
+/// that: proptest generates schedules interleaving delivery processing,
+/// observation boundaries, command injection, and (in the second property)
+/// crashes, then asserts the invariants every schedule must preserve:
+///
+/// - **≤ 1 squash per PR** — the cascade's core idempotency guarantee;
+/// - **the store is never ahead of reality** — a PR the store calls merged
+///   is merged on (fake) GitHub;
+/// - **every acknowledged command is answered** — `pending_commands` is
+///   empty at quiescence and no train is left active;
+/// - **store and GitHub agree exactly, and every completed train's intent
+///   ledger is fully matched** — for crash schedules too: M6's recovery
+///   (worktree cleanup + supplementary GitHub recovery + the evaluate
+///   path) plus reality's merged-close webhooks must reconcile every
+///   crash window the schedule can produce.
+///
+/// Each case does real git work, so the case counts are deliberately small;
+/// raise them locally (`PROPTEST_CASES`) when touching worker ordering.
 mod interleaving {
     use proptest::prelude::*;
 

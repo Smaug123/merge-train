@@ -509,11 +509,13 @@ fn run(
                         Ok(PipelineOutcome::Processed) => {}
                         Ok(PipelineOutcome::Released) => {
                             // The webhook is already acked, so nothing external
-                            // retries this delivery: schedule our own wake-up
+                            // retries this delivery: ask for our own wake-up
                             // (Codex M5 review) rather than waiting for
-                            // unrelated traffic that may never come.
+                            // unrelated traffic that may never come. The ask
+                            // goes through the retry gate below so it shares
+                            // any timer already out (round 15).
                             stalled = true;
-                            schedule_stall_retry(processor.stall_retry_delay(), tx.clone());
+                            processor.request_retry();
                         }
                         Err(e) => return fatal(e),
                     }
@@ -558,8 +560,10 @@ fn run(
         // (3b) Supplementary recovery found GitHub unavailable this turn:
         // arm the stall-retry timer, whose message re-queues the parked
         // recovery — nothing else wakes a traffic-less repo.
-        if processor.take_retry_request() {
-            schedule_stall_retry(processor.stall_retry_delay(), tx.clone());
+        if processor.take_retry_request()
+            && !schedule_stall_retry(processor.stall_retry_delay(), tx.clone())
+        {
+            processor.retry_timer_lost();
         }
 
         // (4) Nothing to do: prune expired intake bookkeeping, then block
@@ -753,10 +757,11 @@ pub(crate) fn timed_recv<T>(
     handle.block_on(async { tokio::time::timeout(wait, rx.recv()).await })
 }
 
-/// Arms a one-shot timer that wakes the worker to retry a released delivery.
-/// One timer per release: a retry that releases again arms the next one, so
-/// the retry cadence is bounded by `delay`.
-fn schedule_stall_retry(delay: std::time::Duration, tx: mpsc::Sender<WorkerMsg>) {
+/// Arms a one-shot timer that wakes the worker to retry whatever stalled.
+/// At most one is outstanding per worker (`Processor::take_retry_request`
+/// gates the arming), so the retry cadence is bounded by `delay` however
+/// many obligations are waiting. Returns whether the timer thread spawned.
+fn schedule_stall_retry(delay: std::time::Duration, tx: mpsc::Sender<WorkerMsg>) -> bool {
     let spawned = std::thread::Builder::new()
         .name("stall-retry-timer".to_owned())
         .spawn(move || {
@@ -764,10 +769,12 @@ fn schedule_stall_retry(delay: std::time::Duration, tx: mpsc::Sender<WorkerMsg>)
             let _ = tx.blocking_send(WorkerMsg::RetryStalled);
         });
     if spawned.is_err() {
-        // The stall then lasts until the next unrelated message; loud but
-        // not fatal.
+        // The stall then lasts until the next unrelated message (or the
+        // next request re-tries the spawn); loud but not fatal.
         error!("failed to spawn the stall-retry timer thread");
+        return false;
     }
+    true
 }
 
 /// Hands a batch to a fresh executor thread. The thread ensures the clone

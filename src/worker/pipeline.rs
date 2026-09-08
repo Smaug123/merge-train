@@ -132,9 +132,17 @@ enum PendingWork {
     /// while it waits out an in-flight saga — Codex M5 round 2, P1). `id` is
     /// the durable row, deleted when the stop applies.
     Stop { id: i64, pr: PrNumber, force: bool },
-    /// Best-effort cleanup for a train the handlers aborted directly
-    /// (worktree + final comment/status), run once the saga slot frees.
-    AbortCleanup { root: PrNumber },
+    /// Best-effort cleanup for a train the handlers aborted (worktree +
+    /// final comment/status), computed WHEN the abort applied and carried
+    /// here rather than recomputed later: by the time it runs, a queued
+    /// `Start` for the same root may have replaced the aborted record,
+    /// and `handler_abort_cleanup` would then return nothing at all —
+    /// losing the worktree removal and the user's abort notice (Codex
+    /// terminal-sync review rounds 13 and 14, both P2).
+    CapturedCleanup {
+        root: PrNumber,
+        effects: Vec<Effect>,
+    },
     /// A TERMINAL train owes its status comment the final word: the
     /// comment is the only recovery source if the state DB is later lost,
     /// and left saying "active" it would resurrect a train the user
@@ -197,10 +205,21 @@ pub(crate) struct Processor {
     /// for the still-marked roots (nothing else may wake a traffic-less
     /// repo).
     retry_requested: bool,
+    /// A stall-retry timer the worker armed that has not yet landed. While
+    /// one is out, further retry requests coalesce into it instead of
+    /// arming more (see [`Self::take_retry_request`]).
+    retry_timer_outstanding: bool,
     /// The incarnation whose obligation the in-flight batch is PROBING
     /// (`ListComments` on the root), keyed by that root: the probe's
     /// outcome decides between the rewrite and clearing the obligation.
     sync_probes: HashMap<PrNumber, chrono::DateTime<Utc>>,
+    /// Which retired incarnations a durable start row has already been
+    /// deferred behind — the row id with the incarnation's key. A start
+    /// waits for each obligation once and no more: several incarnations of
+    /// one root can owe their comments (Codex terminal-sync review round
+    /// 12, P2), and an obligation that can never be discharged must not
+    /// stall the start forever.
+    deferred_for_sync: HashSet<(i64, chrono::DateTime<Utc>)>,
     /// Active-train evaluations owed at startup, queued when the durable
     /// backlog first drains (`Some` until then; see [`Processor::claim`]).
     startup_evaluates: Option<Vec<PrNumber>>,
@@ -208,6 +227,17 @@ pub(crate) struct Processor {
     /// row is deleted when the start is answered (see [`PendingWork::Start`]).
     active_start: Option<(i64, PrNumber)>,
 }
+
+/// How many probes must miss a status comment, at least one stall-retry
+/// delay apart, before its absence is believed and the obligation cleared.
+/// GitHub's listings are eventually consistent, so a comment created
+/// moments earlier can be missing from one and present in the next. The
+/// separation is what makes a second miss evidence rather than a repeat of
+/// the first, and the store enforces it: an unrelated delivery re-queues
+/// the owed syncs, so probes are not otherwise spread out in time at all.
+/// Bounded at two: an obligation nobody can ever discharge is worse than a
+/// rare wasted listing.
+const ABSENT_PROBES_BEFORE_BELIEVED: u32 = 2;
 
 impl Processor {
     pub fn new(store: Store, deps: WorkerDeps) -> Result<Processor, StoreError> {
@@ -289,7 +319,9 @@ impl Processor {
             inherited_mid_flight,
             needs_restart_cleanup: HashSet::new(),
             retry_requested: false,
+            retry_timer_outstanding: false,
             sync_probes: HashMap::new(),
+            deferred_for_sync: HashSet::new(),
             startup_evaluates: Some(startup_evaluates),
             active_start: None,
         })
@@ -606,10 +638,20 @@ impl Processor {
 
         // Handler-terminated trains need worker-side cleanup (the engine's
         // own aborts carry cleanup in their plans; handler aborts have no
-        // plan).
+        // plan). Captured NOW and queued AHEAD: a `start` for the same
+        // root already waiting out an in-flight saga would otherwise run
+        // first, replace the aborted record, and leave a later recompute
+        // nothing to find — no worktree removal, no abort notice (Codex
+        // terminal-sync review round 14, P2).
         for payload in &events {
             if let StateEventPayload::TrainAborted { root_pr, .. } = payload {
-                self.queue(PendingWork::AbortCleanup { root: *root_pr });
+                let effects = cascade::handler_abort_cleanup(self.store.state(), *root_pr);
+                if !effects.is_empty() {
+                    self.pending.push_front(PendingWork::CapturedCleanup {
+                        root: *root_pr,
+                        effects,
+                    });
+                }
             }
         }
 
@@ -871,7 +913,6 @@ impl Processor {
         let idempotent = matches!(
             work,
             PendingWork::Trigger(Trigger::EvaluateTrain { .. })
-                | PendingWork::AbortCleanup { .. }
                 | PendingWork::DeferredAbort { .. }
                 | PendingWork::StatusSync { .. }
         );
@@ -1101,11 +1142,40 @@ impl Processor {
         }
     }
 
+    /// Asks for a stall-retry wake-up (a released delivery: GitHub was
+    /// unreachable for a pre-close step, and nothing external retries an
+    /// acked webhook). Routed through the same gate as every other retry
+    /// so the timers coalesce.
+    pub fn request_retry(&mut self) {
+        self.retry_requested = true;
+    }
+
     /// Whether the worker loop should arm the stall-retry timer (set when
-    /// supplementary recovery found GitHub unavailable, or a terminal
-    /// status-comment sync is owed). Clears on read.
+    /// supplementary recovery found GitHub unavailable, a delivery was
+    /// released, or a terminal status-comment sync is owed). At most one
+    /// timer is ever outstanding: while one is, further requests coalesce
+    /// into it — its `RetryStalled` requeues EVERY owed obligation, so
+    /// nothing is lost. Without the gate, each of N failing probes armed
+    /// its own timer, every firing requeued all N obligations, and the
+    /// probe traffic grew with the number of timers in flight instead of
+    /// respecting `stall_retry_delay` (Codex terminal-sync review round
+    /// 15, P2). The gate re-opens when the timer lands
+    /// ([`Self::requeue_marked_recoveries`]).
     pub fn take_retry_request(&mut self) -> bool {
-        std::mem::take(&mut self.retry_requested)
+        let requested = std::mem::take(&mut self.retry_requested);
+        if !requested || self.retry_timer_outstanding {
+            return false;
+        }
+        self.retry_timer_outstanding = true;
+        true
+    }
+
+    /// The worker could not spawn the timer thread it took
+    /// [`Self::take_retry_request`] for: re-open the gate, so the next
+    /// request tries again rather than a traffic-less repo's obligations
+    /// waiting on a timer that does not exist.
+    pub fn retry_timer_lost(&mut self) {
+        self.retry_timer_outstanding = false;
     }
 
     /// Bookkeeping over a batch's best-effort outcomes: whether an OWED
@@ -1167,13 +1237,14 @@ impl Processor {
         started_at: chrono::DateTime<Utc>,
         outcomes: Vec<crate::cascade::EffectOutcome>,
     ) -> Result<Option<SagaBatch>, StoreError> {
+        let mut cleanup = self.boundary_cleanup(root)?;
         let Some(owed) = self
             .store
             .owed_status_syncs()?
             .into_iter()
             .find(|o| o.root == root && o.started_at == started_at)
         else {
-            return self.pump();
+            return self.finish_boundary(root, cleanup);
         };
         let listing = outcomes.into_iter().find_map(|o| match o.result {
             Ok(crate::cascade::EffectResponse::GitHub(GitHubResponse::Comments(comments))) => {
@@ -1184,7 +1255,7 @@ impl Processor {
         let Some(comments) = listing else {
             warn!(%root, "status-sync probe failed; retrying at the stall cadence");
             self.retry_requested = true;
-            return self.pump();
+            return self.finish_boundary(root, cleanup);
         };
         // The stored id FIRST, whatever the body says: a live comment at
         // that id is this train's backup, and one whose body is mangled or
@@ -1206,34 +1277,135 @@ impl Processor {
                 })
             });
         let Some(live) = live else {
-            info!(%root, "no live status comment for this incarnation; nothing stale survives");
+            // GitHub is not read-after-write consistent: a comment posted
+            // moments ago can be missing from a listing that later
+            // returns it, and an obligation with no id was created in
+            // exactly that window. Reading one absence as deletion drops
+            // the obligation, and the comment then says ACTIVE forever —
+            // the resurrection this whole mechanism exists to prevent
+            // (Codex terminal-sync review round 9, P1). So absence must
+            // be STABLE before it is believed; the count is durable, and
+            // seeing the comment resets it.
+            let cooldown = chrono::Duration::from_std(self.deps.stall_retry_delay)
+                .unwrap_or_else(|_| chrono::Duration::seconds(30));
+            let absences = self
+                .store
+                .note_absent_probe(root, started_at, Utc::now(), cooldown)?;
+            if absences < ABSENT_PROBES_BEFORE_BELIEVED {
+                warn!(
+                    %root, absences,
+                    "status comment missing from the listing; probing again before believing it"
+                );
+                self.retry_requested = true;
+                return self.finish_boundary(root, cleanup);
+            }
+            info!(
+                %root, absences,
+                "no live status comment for this incarnation; nothing stale survives"
+            );
             self.store.delete_owed_status_sync(root, started_at)?;
-            return self.pump();
+            return self.finish_boundary(root, cleanup);
         };
         let comment_id = live.id;
         // Pin the resolved id so the rewrite's outcome matches this
         // obligation (it may have been owed with no id at all).
         self.store
             .set_owed_status_comment(root, started_at, comment_id)?;
-        let message = terminal_message(&owed.record);
-        let body = match crate::status::format_status_comment(&owed.record, &message) {
+        let body = match crate::status::format_status_comment(&owed.record, &owed.message) {
             Ok(body) => body,
             Err(e) => {
                 error!(%root, error = %e, "cannot format the terminal status comment; sync dropped");
                 self.store.delete_owed_status_sync(root, started_at)?;
-                return self.pump();
+                return self.finish_boundary(root, cleanup);
             }
         };
+        // The update may ALREADY have landed: the process can die between
+        // the write and its outcomes, leaving an obligation against a
+        // comment that says exactly what it owes. Writing again would be
+        // pointless, and against a token that has lost the right to edit
+        // comments it fails forever, retrying an obligation that is
+        // already satisfied (Codex terminal-sync review round 9, P2).
+        // The comparison is between the PARSED records: the live path's
+        // prose need not match this reconstruction, and the machine block
+        // is the whole of what recovery reads.
+        if let (Ok(live_record), Ok(owed_record)) = (
+            crate::status::parse_status_comment(&live.body),
+            crate::status::parse_status_comment(&body),
+        ) && live_record == owed_record
+        {
+            info!(%root, "the status comment already carries the terminal record; sync satisfied");
+            self.store.delete_owed_status_sync(root, started_at)?;
+            return self.finish_boundary(root, cleanup);
+        }
+        self.in_flight = Some(root);
+        let mut best_effort = vec![Effect::GitHub(GitHubEffect::UpdateComment {
+            comment_id,
+            body,
+        })];
+        best_effort.append(&mut cleanup);
+        Ok(Some(SagaBatch {
+            root,
+            effects: Vec::new(),
+            best_effort,
+            feedback: false,
+            // As any other batch for this root: a rewrite may be the only
+            // batch it gets, and the worktree cleanup an inherited train
+            // owes must not be dropped because a sync went first.
+            restart_cleanup: self.needs_restart_cleanup.remove(&root),
+        }))
+    }
+
+    /// Applies queued stops and deferred handler aborts at an observation
+    /// boundary — a completed batch, nothing in flight behind it — and
+    /// returns the cleanup that belongs in a batch rooted at `batch_root`.
+    /// A queued stop (or a deferred abort) acts HERE: letting queued work
+    /// jump ahead leaves an acknowledged stop unapplied across however
+    /// many comment-only batches a slow GitHub makes us retry (Codex
+    /// terminal-sync review round 9, P2). The boundary is taken only when
+    /// there is something to apply: `apply_stops` re-queues the owed
+    /// syncs, and doing that unconditionally would re-probe the very
+    /// obligation a probe boundary is settling, forever.
+    ///
+    /// A stop's cleanup names the worktree it removes, so it is safe in
+    /// any batch. An abort's is root-relative, so `cleanup_for_batch`
+    /// keeps `batch_root`'s share in the boundary's own batch and queues
+    /// the rest AHEAD of whatever waits — a `start` queued for an aborted
+    /// root would otherwise run first, replace the record, and leave a
+    /// later recompute nothing to find: no worktree removal, no abort
+    /// notice (Codex terminal-sync review round 14, P2).
+    fn boundary_cleanup(&mut self, batch_root: PrNumber) -> Result<Vec<Effect>, StoreError> {
+        let stops = self.take_queued_stops()?;
+        let aborts = self.take_deferred_aborts();
+        if stops.is_empty() && aborts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (mut cleanup, _) = self.apply_stops(stops)?;
+        let groups = self.apply_deferred_aborts(aborts)?;
+        let (mine, _) = self.cleanup_for_batch(groups, batch_root);
+        cleanup.extend(mine);
+        Ok(cleanup)
+    }
+
+    /// Leaves an observation boundary: runs whatever the stops and aborts
+    /// applied there left behind, or moves on to the next work. Unlike
+    /// `finish_or_pump` this does NOT re-queue the owed syncs — the
+    /// obligation a probe boundary settles is often still owed, and
+    /// re-queueing it here would probe it again immediately, forever.
+    fn finish_boundary(
+        &mut self,
+        root: PrNumber,
+        cleanup: Vec<Effect>,
+    ) -> Result<Option<SagaBatch>, StoreError> {
+        if cleanup.is_empty() {
+            return self.pump();
+        }
         self.in_flight = Some(root);
         Ok(Some(SagaBatch {
             root,
             effects: Vec::new(),
-            best_effort: vec![Effect::GitHub(GitHubEffect::UpdateComment {
-                comment_id,
-                body,
-            })],
+            best_effort: cleanup,
             feedback: false,
-            restart_cleanup: false,
+            restart_cleanup: self.needs_restart_cleanup.remove(&root),
         }))
     }
 
@@ -1288,6 +1460,9 @@ impl Processor {
     /// still sitting in the backlog (Codex M6 review, P1; the round-6 rule
     /// again).
     pub fn requeue_marked_recoveries(&mut self) -> Result<(), StoreError> {
+        // The timer this call answers has landed: the gate re-opens, and
+        // the next failure arms the next one.
+        self.retry_timer_outstanding = false;
         // A store error here would otherwise strand every owed sync
         // silently: this is the only timer that re-arms them (Codex
         // terminal-sync review round 6, P2).
@@ -1377,6 +1552,38 @@ impl Processor {
                 // re-plans it — start_train is a pure decision and preflight
                 // is read-only, so replay is safe.
                 PendingWork::Start { id, pr } => {
+                    // A previous incarnation of THIS root may still owe
+                    // its comment the final word. Discharge that first:
+                    // once the successor's saga starts, its feedback
+                    // batches chain without returning here, and the
+                    // retired incarnation's comment can sit saying ACTIVE
+                    // for the whole of it (Codex terminal-sync review
+                    // round 11, P1). Deferred at most ONCE per start —
+                    // the obligation may be undischargeable (a token that
+                    // cannot edit comments), and a start that waits for
+                    // it forever is a worse failure than a stale comment.
+                    if let Some(owed) = self.store.owed_status_syncs()?.into_iter().find(|o| {
+                        o.root == pr && !self.deferred_for_sync.contains(&(id, o.started_at))
+                    }) {
+                        self.deferred_for_sync.insert((id, owed.started_at));
+                        info!(
+                            %pr,
+                            "discharging a retired incarnation's owed sync before its \
+                             successor starts"
+                        );
+                        self.pending.push_front(PendingWork::Start { id, pr });
+                        self.sync_probes.insert(owed.root, owed.started_at);
+                        self.in_flight = Some(owed.root);
+                        return Ok(Some(SagaBatch {
+                            root: owed.root,
+                            effects: vec![Effect::GitHub(GitHubEffect::ListComments {
+                                pr: owed.root,
+                            })],
+                            best_effort: Vec::new(),
+                            feedback: false,
+                            restart_cleanup: false,
+                        }));
+                    }
                     match cascade::start_train(state, pr, now) {
                         Ok(plan) => {
                             let decided = !matches!(plan.control, Control::Continue);
@@ -1477,8 +1684,7 @@ impl Processor {
                         restart_cleanup: false,
                     }));
                 }
-                PendingWork::AbortCleanup { root } => {
-                    let effects = cascade::handler_abort_cleanup(state, root);
+                PendingWork::CapturedCleanup { root, effects } => {
                     if effects.is_empty() {
                         continue;
                     }
@@ -1495,7 +1701,8 @@ impl Processor {
                 // (e.g. the saga ended on a best-effort batch): no effects
                 // are in flight now, so it applies immediately.
                 PendingWork::DeferredAbort { root, error } => {
-                    let (cleanup, _) = self.apply_deferred_aborts(vec![(root, error)])?;
+                    let groups = self.apply_deferred_aborts(vec![(root, error)])?;
+                    let (cleanup, _) = self.cleanup_for_batch(groups, root);
                     if cleanup.is_empty() {
                         continue;
                     }
@@ -1541,7 +1748,15 @@ impl Processor {
             return self.on_sync_probe(root, started_at, outcomes);
         }
         if !feedback {
-            return self.pump();
+            // A completed best-effort batch is an observation boundary
+            // like any other: nothing is in flight behind it, so queued
+            // stops and deferred aborts act HERE. Pumping straight past it
+            // let a queued restart run against a successor train a review
+            // dismissal had already doomed — durably rejected as "already
+            // running", and the deferred abort then left no train at all
+            // (Codex terminal-sync review round 16, P2).
+            let cleanup = self.boundary_cleanup(root)?;
+            return self.finish_boundary(root, cleanup);
         }
 
         // Observation boundary: queued stops and deferred handler aborts act
@@ -1562,7 +1777,8 @@ impl Processor {
         {
             let (cancels, others): (Vec<_>, Vec<_>) = stops.into_iter().partition(|s| s.pr == root);
             let (mut cleanup, _) = self.apply_stops(others)?;
-            let (mut abort_cleanup, _) = self.apply_deferred_aborts(aborts)?;
+            let groups = self.apply_deferred_aborts(aborts)?;
+            let (mut abort_cleanup, _) = self.cleanup_for_batch(groups, root);
             cleanup.append(&mut abort_cleanup);
             // Cancelling the start IS these stops' application — and the
             // start's own answer, so its row goes too.
@@ -1600,7 +1816,8 @@ impl Processor {
                 self.active_start = None;
             }
             let (mut cleanup, _) = self.apply_stops(stops)?;
-            let (mut abort_cleanup, _) = self.apply_deferred_aborts(aborts)?;
+            let groups = self.apply_deferred_aborts(aborts)?;
+            let (mut abort_cleanup, _) = self.cleanup_for_batch(groups, root);
             cleanup.append(&mut abort_cleanup);
             cleanup.push(Effect::GitHub(GitHubEffect::PostComment {
                 pr: root,
@@ -1682,7 +1899,8 @@ impl Processor {
         };
 
         let (mut cleanup, mut retired) = self.apply_stops(stops)?;
-        let (mut abort_cleanup, aborted) = self.apply_deferred_aborts(aborts)?;
+        let groups = self.apply_deferred_aborts(aborts)?;
+        let (mut abort_cleanup, aborted) = self.cleanup_for_batch(groups, root);
         cleanup.append(&mut abort_cleanup);
         retired.extend(aborted);
         if retired.contains(&root) {
@@ -1781,15 +1999,43 @@ impl Processor {
         aborts
     }
 
-    /// Applies deferred handler aborts now, returning their best-effort
-    /// cleanup and the roots actually retired. Idempotent: a train that
-    /// completed, stopped, or aborted in the meantime is skipped.
+    /// Takes the cleanup an abort produced and returns only what belongs
+    /// in a batch rooted at `batch_root`. Everything else is queued as
+    /// [`PendingWork::CapturedCleanup`] under its own root, AHEAD of the
+    /// queue: `GitEffect::CleanupWorktree` is ROOT-RELATIVE — the executor
+    /// resolves it against the batch's root — so running one train's
+    /// cleanup inside another's batch cleans the wrong worktree and leaves
+    /// the right one dirty (Codex terminal-sync review round 12, P2).
+    pub(super) fn cleanup_for_batch(
+        &mut self,
+        groups: Vec<(PrNumber, Vec<Effect>)>,
+        batch_root: PrNumber,
+    ) -> (Vec<Effect>, HashSet<PrNumber>) {
+        let mut mine = Vec::new();
+        let mut roots = HashSet::new();
+        for (root, effects) in groups {
+            roots.insert(root);
+            if root == batch_root {
+                mine.extend(effects);
+            } else {
+                // AHEAD of whatever is queued: a `Start` for this root
+                // waiting in the queue would otherwise replace the record
+                // this cleanup belongs to.
+                self.pending
+                    .push_front(PendingWork::CapturedCleanup { root, effects });
+            }
+        }
+        (mine, roots)
+    }
+
+    /// Applies deferred handler aborts now, returning each root's
+    /// best-effort cleanup. Idempotent: a train that completed, stopped,
+    /// or aborted in the meantime is skipped.
     fn apply_deferred_aborts(
         &mut self,
         aborts: Vec<(PrNumber, crate::types::TrainError)>,
-    ) -> Result<(Vec<Effect>, HashSet<PrNumber>), StoreError> {
-        let mut cleanup = Vec::new();
-        let mut retired = HashSet::new();
+    ) -> Result<Vec<(PrNumber, Vec<Effect>)>, StoreError> {
+        let mut cleanup: Vec<(PrNumber, Vec<Effect>)> = Vec::new();
         for (root, error) in aborts {
             let still_active = self
                 .store
@@ -1806,15 +2052,17 @@ impl Processor {
             }];
             self.store.append_batch(&events, Utc::now())?;
             self.clear_inherited_markers(&events);
-            cleanup.extend(cascade::handler_abort_cleanup(self.store.state(), root));
-            retired.insert(root);
+            cleanup.push((
+                root,
+                cascade::handler_abort_cleanup(self.store.state(), root),
+            ));
         }
         // Like stops: the terminal event may owe a status sync that no
         // later outcome refers to, and this path can bypass both
         // `integrate_plan` and `finish_or_pump` (Codex terminal-sync
         // review round 6, P1).
         self.queue_owed_status_syncs()?;
-        Ok((cleanup, retired))
+        Ok(cleanup)
     }
 
     /// Applies stops now (terminal events only — cheap and safe at an
@@ -1983,24 +2231,6 @@ fn command_in(event: &GitHubEvent, deps: &WorkerDeps) -> Option<(PrNumber, Comma
             matches!(command, Command::Predecessor(_)).then_some((pr, command))
         }
         CommentAction::Deleted => None,
-    }
-}
-
-/// The human line of a terminal train's final status comment, by state.
-fn terminal_message(record: &crate::types::TrainRecord) -> String {
-    match &record.state {
-        crate::types::TrainState::Stopped { .. } => "🛑 Merge train stopped by request.".to_owned(),
-        crate::types::TrainState::Aborted { error, .. } => format!(
-            "🛑 Merge train aborted: {}\n\nFix the issue and re-issue `@merge-train start`.",
-            error.message
-        ),
-        crate::types::TrainState::Completed { .. } => "🎉 Merge train completed.".to_owned(),
-        crate::types::TrainState::NeedsManualReview => {
-            "⚠️ Merge train needs manual review.".to_owned()
-        }
-        crate::types::TrainState::Running | crate::types::TrainState::WaitingCi => {
-            "Merge train status.".to_owned()
-        }
     }
 }
 
