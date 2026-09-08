@@ -18,10 +18,10 @@ use crate::git::test_support::{
     create_branch_with_file, create_pr_ref, create_test_repo_with_origin,
 };
 use crate::git::{GitConfig, run_git_stdout};
-use crate::github::test_support::{FakeGitHub, FakePr, FakePrState};
+use crate::github::test_support::{FakeComment, FakeGitHub, FakePr, FakePrState};
 use crate::state::RepoState;
 use crate::store::Store;
-use crate::types::{PrNumber, Sha};
+use crate::types::{CommentId, PrNumber, Sha};
 
 use super::executor::{GitHubExec, SagaBatch, execute_batch};
 use super::pipeline::{PipelineOutcome, Processor, WorkerDeps};
@@ -95,6 +95,34 @@ fn pr_merged_body(
                 "base": {{ "sha": "{base_sha}", "ref": "{base}" }},
                 "user": {{ "id": {AUTHOR}, "login": "author" }},
                 "updated_at": "2026-07-01T12:00:00Z"
+            }},
+            "repository": {repo}
+        }}"#,
+        base_sha = "0".repeat(40),
+        repo = repo_json(config),
+    )
+    .into_bytes()
+}
+
+fn pr_closed_body(
+    config: &GitConfig,
+    number: u64,
+    head: &Sha,
+    branch: &str,
+    base: &str,
+) -> Vec<u8> {
+    format!(
+        r#"{{
+            "action": "closed",
+            "pull_request": {{
+                "number": {number},
+                "state": "closed",
+                "draft": false,
+                "merged": false,
+                "head": {{ "sha": "{head}", "ref": "{branch}" }},
+                "base": {{ "sha": "{base_sha}", "ref": "{base}" }},
+                "user": {{ "id": {AUTHOR}, "login": "author" }},
+                "updated_at": "2026-07-01T12:30:00Z"
             }},
             "repository": {repo}
         }}"#,
@@ -268,14 +296,59 @@ impl World {
         Processor::new(Store::open(&self.db_path()).unwrap(), self.deps()).unwrap()
     }
 
-    /// Durably enqueues a raw delivery (as the intake path would).
+    /// Durably enqueues a raw delivery (as the intake path would). A comment
+    /// webhook describes a comment that exists on GitHub at that moment, so
+    /// it is mirrored into the fake's comment store — the crawl and
+    /// recovery list comments, and a `created` delivery for a comment the
+    /// listing cannot see is exactly the stale-redelivery shape the
+    /// pipeline closes.
     fn enqueue(&mut self, processor: &mut Processor, event_type: &str, body: Vec<u8>) {
+        if event_type == "issue_comment" {
+            self.mirror_comment(&body);
+        }
         self.next_delivery += 1;
         let id = format!("delivery-{}", self.next_delivery);
         processor
             .store_mut()
             .enqueue(&id, event_type, "{}", &body, chrono::Utc::now())
             .unwrap();
+    }
+
+    fn mirror_comment(&self, body: &[u8]) {
+        let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) else {
+            return;
+        };
+        let Some(id) = json["comment"]["id"].as_u64() else {
+            return;
+        };
+        let mut github = self.github.lock().unwrap();
+        match json["action"].as_str() {
+            Some("deleted") => {
+                github.comments.remove(&CommentId(id));
+            }
+            Some(action @ ("created" | "edited")) => {
+                let Some(pr) = json["issue"]["number"].as_u64() else {
+                    return;
+                };
+                let author_id = json["comment"]["user"]["id"].as_u64().unwrap_or(0);
+                let text = json["comment"]["body"].as_str().unwrap_or("").to_owned();
+                let edited = action == "edited"
+                    || github
+                        .comments
+                        .get(&CommentId(id))
+                        .is_some_and(|c| c.edited);
+                github.comments.insert(
+                    CommentId(id),
+                    FakeComment {
+                        pr: PrNumber(pr),
+                        author_id,
+                        body: text,
+                        edited,
+                    },
+                );
+            }
+            _ => {}
+        }
     }
 
     /// The standard opening moves: every PR announced, predecessors declared
@@ -3186,6 +3259,1069 @@ fn a_second_train_runs_over_a_compacted_log() {
     assert_eq!(processor.state(), &replayed);
 }
 
+// ─── First-contact bootstrap: the crawl ───
+
+/// Onboarding: a stack that predates the bot — its predecessor declaration
+/// exists only as a comment on GitHub, never delivered as a webhook — is
+/// learned by the first-contact crawl, and a single `start` runs it to
+/// completion.
+#[test]
+fn onboarding_crawl_learns_an_existing_stack() {
+    let (mut world, _heads) = World::linear_stack(2);
+    world.github.lock().unwrap().comments.insert(
+        CommentId(1000),
+        FakeComment {
+            pr: PrNumber(2),
+            author_id: AUTHOR,
+            body: "@merge-train predecessor #1".to_owned(),
+            edited: false,
+        },
+    );
+    let mut processor = world.processor();
+    // The first thing the bot ever hears about this repo is the start.
+    start_command(&mut world, &mut processor, 1);
+    drive_to_completion(&mut world, &mut processor);
+    for i in 1..=2u64 {
+        assert!(
+            processor.state().prs[&PrNumber(i)].state.is_merged(),
+            "PR #{i} must merge off crawl-learned topology"
+        );
+    }
+}
+
+/// Announces `n` open PRs (a linear stack by base branch) WITHOUT declaring
+/// predecessors — for tests that place the declaration comments on GitHub
+/// themselves.
+fn enqueue_pr_opens(world: &mut World, processor: &mut Processor, n: usize, heads: &[Sha]) {
+    let config = world.config.clone();
+    for i in 1..=n {
+        let base = if i == 1 {
+            "main".to_owned()
+        } else {
+            format!("pr-{}", i - 1)
+        };
+        let body = pr_opened_body(&config, i as u64, &heads[i - 1], &format!("pr-{i}"), &base);
+        world.enqueue(processor, "pull_request", body);
+    }
+}
+
+/// The disaster: the state DB (and its WAL) is gone; the clone survives.
+fn destroy_state_db(world: &World) {
+    let db = world.db_path();
+    for path in [
+        db.clone(),
+        db.with_extension("db-wal"),
+        db.with_extension("db-shm"),
+        db.with_extension("lock"),
+    ] {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// An issue_comment payload with an exact comment id (no `% 10`) and a
+/// separate sender: `text` is `None` for a deletion.
+#[allow(clippy::too_many_arguments)]
+fn raw_comment_json(
+    config: &GitConfig,
+    pr: u64,
+    text: Option<&str>,
+    author_id: u64,
+    author_login: &str,
+    sender_id: u64,
+    sender_login: &str,
+    id: u64,
+    action: &str,
+) -> Vec<u8> {
+    let body = match text {
+        Some(t) => format!("\"{t}\""),
+        None => "null".to_owned(),
+    };
+    format!(
+        r#"{{
+            "action": "{action}",
+            "comment": {{
+                "id": {id},
+                "body": {body},
+                "user": {{ "id": {author_id}, "login": "{author_login}" }},
+                "updated_at": "2026-07-01T13:00:00Z"
+            }},
+            "issue": {{
+                "number": {pr},
+                "pull_request": {{ "url": "..." }},
+                "user": {{ "id": {AUTHOR}, "login": "author" }}
+            }},
+            "repository": {repo},
+            "sender": {{ "id": {sender_id}, "login": "{sender_login}" }}
+        }}"#,
+        repo = repo_json(config),
+    )
+    .into_bytes()
+}
+
+fn retraction_receipts_on(world: &World, pr: u64) -> Vec<CommentId> {
+    world
+        .github
+        .lock()
+        .unwrap()
+        .posted_comments
+        .iter()
+        .filter(|(p, _)| *p == PrNumber(pr))
+        .filter_map(|(_, text)| match crate::status::parse_receipt(text) {
+            Some(crate::status::Receipt::Retraction { retracted, .. }) => Some(retracted),
+            _ => None,
+        })
+        .collect()
+}
+
+/// After a DB loss, a redelivered `created` webhook for a comment that has
+/// SINCE BEEN DELETED must not be handled: the crawl cannot see the comment,
+/// so nothing would stop the handler recreating a retracted declaration
+/// (monolith review, P1). But absence is believed only on the SECOND look:
+/// GitHub is not read-after-write consistent, so the first attempt
+/// releases and re-crawls, and only a comment still missing then is
+/// treated as gone (Codex crawl review round 6, P1). The crawl itself
+/// lands on the first attempt.
+#[test]
+fn a_redelivered_created_webhook_for_a_deleted_comment_is_not_handled() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    enqueue_pr_opens(&mut world, &mut processor, 2, &heads);
+    drain(&mut processor);
+    destroy_state_db(&world);
+
+    let mut processor = world.processor();
+    let body = raw_comment_json(
+        &world.config,
+        2,
+        Some("@merge-train predecessor #1"),
+        AUTHOR,
+        "author",
+        AUTHOR,
+        "author",
+        777,
+        "created",
+    );
+    world.enqueue(&mut processor, "issue_comment", body);
+    // The comment was deleted after this delivery was first made (its
+    // deletion was processed before the loss); the redelivery describes a
+    // comment GitHub no longer has.
+    world
+        .github
+        .lock()
+        .unwrap()
+        .comments
+        .remove(&CommentId(777));
+
+    // First attempt: the crawl lands, and the delivery is RELEASED — the
+    // listing may simply not have caught up yet.
+    let delivery = processor.claim().unwrap().expect("the redelivery");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Released,
+        "an absent trigger is retried once, not believed"
+    );
+    // The retry finds it absent again: now it is stale, so the crawl
+    // lands and the delivery closes unhandled.
+    drain(&mut processor);
+    assert_eq!(processor.state().default_branch, "main", "the crawl landed");
+
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor,
+        None,
+        "no declaration survives on GitHub; the stale redelivery must not recreate one"
+    );
+}
+
+/// A redelivered `created` webhook for a comment that has SINCE BEEN EDITED
+/// is equally stale: its body is no longer the comment's, and the crawl
+/// refuses the edited comment as unattributable, so handling the original
+/// payload would record a declaration nothing on GitHub attributes to the
+/// author (lost_db envelope finding). Closed unhandled; an `edited`
+/// delivery for the same comment is current and handled.
+#[test]
+fn a_redelivered_created_webhook_for_an_edited_comment_is_not_handled() {
+    for (action, edge_expected) in [("created", false), ("edited", true)] {
+        let (mut world, heads) = World::linear_stack(2);
+        let mut processor = world.processor();
+        enqueue_pr_opens(&mut world, &mut processor, 2, &heads);
+        drain(&mut processor);
+        destroy_state_db(&world);
+
+        let mut processor = world.processor();
+        let body = raw_comment_json(
+            &world.config,
+            2,
+            Some("@merge-train predecessor #1"),
+            AUTHOR,
+            "author",
+            AUTHOR,
+            "author",
+            777,
+            action,
+        );
+        world.enqueue(&mut processor, "issue_comment", body);
+        // The comment was edited after the `created` delivery was first
+        // made (to the same text — GitHub records the edit regardless).
+        world
+            .github
+            .lock()
+            .unwrap()
+            .comments
+            .get_mut(&CommentId(777))
+            .unwrap()
+            .edited = true;
+        drain(&mut processor);
+
+        assert_eq!(
+            processor.state().prs[&PrNumber(2)].predecessor.is_some(),
+            edge_expected,
+            "action {action}"
+        );
+    }
+}
+
+/// An `edited` redelivery whose body the comment has since moved past is
+/// as stale as a deleted one: the crawl saw the current body, and handling
+/// the old payload would record what the comment no longer says (Codex
+/// crawl review round 2, P1). A matching `edited` payload is current.
+#[test]
+fn a_superseded_edited_redelivery_is_not_handled() {
+    for (current_body, edge_expected) in [
+        ("(edited away)", false),
+        ("@merge-train predecessor #1", true),
+    ] {
+        let (mut world, heads) = World::linear_stack(2);
+        let mut processor = world.processor();
+        enqueue_pr_opens(&mut world, &mut processor, 2, &heads);
+        drain(&mut processor);
+        destroy_state_db(&world);
+
+        let mut processor = world.processor();
+        let body = raw_comment_json(
+            &world.config,
+            2,
+            Some("@merge-train predecessor #1"),
+            AUTHOR,
+            "author",
+            AUTHOR,
+            "author",
+            777,
+            "edited",
+        );
+        world.enqueue(&mut processor, "issue_comment", body);
+        {
+            let mut github = world.github.lock().unwrap();
+            let comment = github.comments.get_mut(&CommentId(777)).unwrap();
+            comment.body = current_body.to_owned();
+            comment.edited = true;
+        }
+        drain(&mut processor);
+        assert_eq!(
+            processor.state().prs[&PrNumber(2)].predecessor.is_some(),
+            edge_expected,
+            "current body {current_body:?}"
+        );
+    }
+}
+
+/// A stale PR webhook redelivered after a DB loss — here an unmerged
+/// `closed` for a member the crawl just found OPEN (it was reopened) —
+/// must not be handled: it would close the PR in the store and abort the
+/// train the crawl just recovered (Codex crawl review round 2, P1). The
+/// train resumes and completes exactly once.
+#[test]
+fn a_stale_pr_close_redelivered_after_a_db_loss_is_not_handled() {
+    let (mut world, heads) = World::linear_stack(2);
+    world.github.lock().unwrap().comments.insert(
+        CommentId(1000),
+        FakeComment {
+            pr: PrNumber(2),
+            author_id: AUTHOR,
+            body: "@merge-train predecessor #1".to_owned(),
+            edited: false,
+        },
+    );
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    start_command(&mut world, &mut processor, 1);
+    run_batches_then_crash(&mut world, processor, 4);
+    destroy_state_db(&world);
+
+    let mut processor = world.processor();
+    let (head, branch, base) = {
+        let github = world.github.lock().unwrap();
+        let fake = &github.prs[&PrNumber(2)];
+        (
+            github.branch_head(&fake.branch),
+            fake.branch.clone(),
+            fake.base_ref.clone(),
+        )
+    };
+    // The PR is open on GitHub; this `closed` is an old redelivery.
+    let body = pr_closed_body(&world.config, 2, &head, &branch, &base);
+    world.enqueue(&mut processor, "pull_request", body);
+    drive_to_completion(&mut world, &mut processor);
+    assert!(
+        processor.state().prs[&PrNumber(2)].state.is_merged(),
+        "the stale close must not have closed #2: {:?}",
+        processor.state().prs[&PrNumber(2)].state
+    );
+    assert_recovered_exactly_once(&world, &mut processor, "stale-close");
+}
+
+/// A stale ACTIVE status comment of a train that actually finished is
+/// adopted and COMPLETED by a real event, so the store owes the comment
+/// its final word and the retry rewrites it: after recovery the comment
+/// says completed, not active (Codex crawl review round 2, P2).
+#[test]
+fn a_synthesized_completion_rewrites_the_stale_status_comment() {
+    let (mut world, heads) = World::linear_stack(2);
+    world.github.lock().unwrap().comments.insert(
+        CommentId(1000),
+        FakeComment {
+            pr: PrNumber(2),
+            author_id: AUTHOR,
+            body: "@merge-train predecessor #1".to_owned(),
+            edited: false,
+        },
+    );
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    start_command(&mut world, &mut processor, 1);
+    drive_to_completion(&mut world, &mut processor);
+    // The completion update never landed: the comment still embeds the
+    // mid-phase ACTIVE record.
+    let status_id = {
+        let github = world.github.lock().unwrap();
+        *github
+            .comments
+            .iter()
+            .find(|(_, c)| c.author_id == TEST_BOT_ID && c.pr == PrNumber(1))
+            .map(|(id, _)| id)
+            .expect("the status comment")
+    };
+    {
+        let mut github = world.github.lock().unwrap();
+        let comment = github.comments.get_mut(&status_id).unwrap();
+        let mut record = crate::status::parse_status_comment(&comment.body).unwrap();
+        record.state = crate::types::TrainState::Running;
+        record.cascade_phase = crate::types::CascadePhase::Reconciling {
+            progress: crate::types::DescendantProgress::new(vec![PrNumber(2)]),
+            squash_sha: Sha::parse("a".repeat(40)).unwrap(),
+        };
+        comment.body = crate::status::format_status_comment(&record, "stale").unwrap();
+    }
+    drop(processor);
+    destroy_state_db(&world);
+
+    let mut processor = world.processor();
+    let head = world.github.lock().unwrap().branch_head("pr-1");
+    let body = check_suite_green_body(&world.config, &head, &[1], world.next_delivery + 900);
+    world.enqueue(&mut processor, "check_suite", body);
+    drive_to_completion(&mut world, &mut processor);
+    let github = world.github.lock().unwrap();
+    let record = crate::status::parse_status_comment(&github.comments[&status_id].body).unwrap();
+    assert!(
+        matches!(record.state, crate::types::TrainState::Completed { .. }),
+        "the comment must say completed: {:?}",
+        record.state
+    );
+    assert!(
+        github.squash_count.values().all(|n| *n == 1),
+        "nothing squashed twice: {:?}",
+        github.squash_count
+    );
+}
+
+/// The first delivery after a DB loss is a DELETION of the comment that
+/// owned #2's declaration, while an older comment declaring the same
+/// predecessor survives. The handler cannot retract (the crawl would have
+/// promoted the older comment as owner), so the crawl applies the
+/// author's deletion as a tombstone and the worker posts a receipt for
+/// the next crawl. A stranger's deletion is not a retraction: the older
+/// declaration stands and no receipt is posted (Codex crawl review, P1).
+#[test]
+fn a_triggering_deletion_after_a_db_loss_retracts_and_leaves_a_receipt() {
+    for (sender, login, edge_survives) in [(STRANGER, "stranger", true), (AUTHOR, "author", false)]
+    {
+        let (mut world, heads) = World::linear_stack(2);
+        let mut processor = world.processor();
+        enqueue_pr_opens(&mut world, &mut processor, 2, &heads);
+        drain(&mut processor);
+        // The older declaration (id 500) survives on GitHub; the owner (id
+        // 900) is what the trigger deletes.
+        world.github.lock().unwrap().comments.insert(
+            CommentId(500),
+            FakeComment {
+                pr: PrNumber(2),
+                author_id: AUTHOR,
+                body: "@merge-train predecessor #1".to_owned(),
+                edited: false,
+            },
+        );
+        destroy_state_db(&world);
+
+        let mut processor = world.processor();
+        let body = raw_comment_json(
+            &world.config,
+            2,
+            None,
+            AUTHOR,
+            "author",
+            sender,
+            login,
+            900,
+            "deleted",
+        );
+        world.enqueue(&mut processor, "issue_comment", body);
+        drain(&mut processor);
+
+        assert_eq!(
+            processor.state().prs[&PrNumber(2)].predecessor.is_some(),
+            edge_survives,
+            "sender {login}"
+        );
+        let expected = if edge_survives {
+            vec![]
+        } else {
+            vec![CommentId(900)]
+        };
+        assert_eq!(
+            retraction_receipts_on(&world, 2),
+            expected,
+            "sender {login}"
+        );
+    }
+}
+
+/// During the gap the author UNSTACKS a frozen member — deletes #2's
+/// declaration — and a new PR is stacked onto it. Live would have aborted
+/// the train on the removal (`topology_change_abort`); after a DB loss the
+/// crawl cannot see the deletion, but it can see that a frozen member no
+/// longer has any recorded predecessor: the frozen set is stale, and
+/// driving it would merge a PR the user unstacked (the lost_db envelope's
+/// finding). Recovery must abort, and squash nothing.
+#[test]
+fn a_frozen_member_unstacked_during_the_gap_aborts_the_train() {
+    let (mut world, heads) = World::linear_stack(2);
+    world.github.lock().unwrap().comments.insert(
+        CommentId(1000),
+        FakeComment {
+            pr: PrNumber(2),
+            author_id: AUTHOR,
+            body: "@merge-train predecessor #1".to_owned(),
+            edited: false,
+        },
+    );
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    start_command(&mut world, &mut processor, 1);
+    // Mid-`Preparing` (frozen [#2]), status comment live on the fake.
+    run_batches_then_crash(&mut world, processor, 4);
+    destroy_state_db(&world);
+
+    // The gap: #2 is unstacked, and #3 appears stacked on #2.
+    {
+        let mut github = world.github.lock().unwrap();
+        github.comments.retain(|_, c| c.author_id != AUTHOR);
+    }
+    let head3 = create_branch_with_file(&world.config, "pr-3", "pr-3.txt", "three", "pr-2");
+    create_pr_ref(&world.config, 3, &head3);
+    {
+        let mut github = world.github.lock().unwrap();
+        github.prs.insert(
+            PrNumber(3),
+            FakePr {
+                branch: "pr-3".to_owned(),
+                base_ref: "pr-2".to_owned(),
+                state: FakePrState::Open,
+                author_id: AUTHOR,
+            },
+        );
+        github.comments.insert(
+            CommentId(3000),
+            FakeComment {
+                pr: PrNumber(3),
+                author_id: AUTHOR,
+                body: "@merge-train predecessor #2".to_owned(),
+                edited: false,
+            },
+        );
+    }
+
+    let mut processor = world.processor();
+    let head = world.github.lock().unwrap().branch_head("pr-1");
+    let body = check_suite_green_body(&world.config, &head, &[1], world.next_delivery + 900);
+    world.enqueue(&mut processor, "check_suite", body);
+    drive_to_completion(&mut world, &mut processor);
+
+    let github = world.github.lock().unwrap();
+    assert!(
+        github.squash_count.values().all(|n| *n == 0),
+        "nothing may be squashed: {:?}",
+        github.squash_count
+    );
+    assert!(
+        processor
+            .state()
+            .active_trains
+            .get(&PrNumber(1))
+            .is_some_and(|t| matches!(t.state, crate::types::TrainState::Aborted { .. })),
+        "the train must abort: {:?}",
+        processor.state().active_trains.get(&PrNumber(1))
+    );
+}
+
+/// The terminal-sync guarantee seen from the crawl: a train stopped while
+/// GitHub was down had its final status update OWED and retried; once it
+/// lands, a later DB loss adopts the STOPPED record — nothing resumes,
+/// nothing squashes. (Before the sync, the comment still said "active"
+/// and recovery drove the stopped train — monolith review, P1.)
+#[test]
+fn a_synced_stopped_train_is_not_resurrected_by_a_later_db_loss() {
+    let (mut world, heads) = World::linear_stack(2);
+    world.github.lock().unwrap().comments.insert(
+        CommentId(1000),
+        FakeComment {
+            pr: PrNumber(2),
+            author_id: AUTHOR,
+            body: "@merge-train predecessor #1".to_owned(),
+            edited: false,
+        },
+    );
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    start_command(&mut world, &mut processor, 1);
+    let claim_all = |p: &mut Processor| {
+        while let Some(delivery) = p.claim().unwrap() {
+            p.process_claimed(delivery).unwrap();
+        }
+    };
+    claim_all(&mut processor);
+    let preflight = processor.pump().unwrap().expect("the start's preflight");
+    let outcomes = execute(&mut processor, &preflight);
+    let step = processor
+        .on_outcomes(preflight.root, outcomes, preflight.feedback)
+        .unwrap()
+        .expect("the first cascade step");
+    let stop = comment_body(&world.config, 1, "@merge-train stop", AUTHOR, "author", 7);
+    world.enqueue(&mut processor, "issue_comment", stop);
+    claim_all(&mut processor);
+    let outcomes = execute(&mut processor, &step);
+    let cleanup = processor
+        .on_outcomes(step.root, outcomes, step.feedback)
+        .unwrap()
+        .expect("the stop's cleanup batch");
+    // The final update fails; the sync is owed, then lands when the
+    // outage ends.
+    world.github.lock().unwrap().unavailable = true;
+    let outcomes = execute(&mut processor, &cleanup);
+    let next = processor
+        .on_outcomes(cleanup.root, outcomes, cleanup.feedback)
+        .unwrap();
+    finish_batches(&mut world, &mut processor, next);
+    assert_eq!(processor.owed_status_syncs(), vec![PrNumber(1)]);
+    world.github.lock().unwrap().unavailable = false;
+    processor.requeue_marked_recoveries().unwrap();
+    drain(&mut processor);
+    assert!(processor.owed_status_syncs().is_empty());
+    drop(processor);
+
+    destroy_state_db(&world);
+    let mut processor = world.processor();
+    let head = world.github.lock().unwrap().branch_head("pr-1");
+    let body = check_suite_green_body(&world.config, &head, &[1], world.next_delivery + 900);
+    world.enqueue(&mut processor, "check_suite", body);
+    drive_to_completion(&mut world, &mut processor);
+    assert!(
+        matches!(
+            processor
+                .state()
+                .active_trains
+                .get(&PrNumber(1))
+                .map(|t| &t.state),
+            Some(crate::types::TrainState::Stopped { .. })
+        ),
+        "the crawl adopts the STOPPED record: {:?}",
+        processor.state().active_trains.get(&PrNumber(1))
+    );
+    let github = world.github.lock().unwrap();
+    assert!(
+        github.squash_count.values().all(|n| *n == 0),
+        "a stopped train stays stopped: {:?}",
+        github.squash_count
+    );
+}
+
+/// The disaster the crawl exists for: the state DB is DESTROYED while a
+/// train is mid-cascade. The next webhook triggers the crawl, which
+/// rebuilds the cache and topology and adopts the train from the bot's
+/// status comment; M6 recovery then resumes it to exactly-once completion.
+#[test]
+fn a_lost_state_db_is_rebuilt_by_the_crawl_and_the_train_resumes() {
+    let (mut world, heads) = World::linear_stack(2);
+    // The declaration comment exists on (fake) GitHub, as it would in
+    // reality — the crawl must rebuild topology from it.
+    world.github.lock().unwrap().comments.insert(
+        CommentId(1000),
+        FakeComment {
+            pr: PrNumber(2),
+            author_id: AUTHOR,
+            body: "@merge-train predecessor #1".to_owned(),
+            edited: false,
+        },
+    );
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    start_command(&mut world, &mut processor, 1);
+    // Mid-`Preparing`, with the status comment live on the fake.
+    run_batches_then_crash(&mut world, processor, 4);
+
+    // The disaster: the state DB (and its WAL) is gone; the clone survives.
+    let db = world.db_path();
+    for path in [
+        db.clone(),
+        db.with_extension("db-wal"),
+        db.with_extension("db-shm"),
+        db.with_extension("lock"),
+    ] {
+        let _ = std::fs::remove_file(path);
+    }
+
+    let mut processor = world.processor();
+    assert!(
+        processor.state().default_branch.is_empty(),
+        "precondition: the store really is fresh"
+    );
+    // Any webhook wakes the repo; the crawl rebuilds everything first.
+    let head = {
+        let github = world.github.lock().unwrap();
+        github.branch_head("pr-1")
+    };
+    let body = check_suite_green_body(&world.config, &head, &[1], world.next_delivery + 900);
+    world.enqueue(&mut processor, "check_suite", body);
+    drive_to_completion(&mut world, &mut processor);
+    assert_recovered_exactly_once(&world, &mut processor, "lost-db");
+}
+
+/// A THREE-deep chain interrupted mid-cascade must also resume after a
+/// quiet DB loss (found by the lost_db differential property). The cascade
+/// freezes only the CURRENT phase's direct descendants, so a mid-
+/// `Preparing` status comment for 1←2←3 carries `frozen: [2]` — and the
+/// crawl's extension check, walking the full descendant closure, saw the
+/// legitimately-pre-declared #3 outside the frozen set and falsely aborted
+/// the train as "extended", in a gap where NOTHING happened. The record
+/// alone cannot distinguish that shape from a genuine gap extension; the
+/// train's own status-comment id can: GitHub comment ids are globally
+/// monotonic, so a non-edited declaration with a LOWER id than the status
+/// comment provably predates the train and is baseline, never extension.
+#[test]
+fn a_three_deep_stack_resumes_after_a_quiet_db_loss() {
+    let (mut world, heads) = World::linear_stack(3);
+    {
+        let mut github = world.github.lock().unwrap();
+        for (pr, target, id) in [(2u64, 1u64, 1000u64), (3, 2, 1001)] {
+            github.comments.insert(
+                CommentId(id),
+                FakeComment {
+                    pr: PrNumber(pr),
+                    author_id: AUTHOR,
+                    body: format!("@merge-train predecessor #{target}"),
+                    edited: false,
+                },
+            );
+        }
+    }
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 3, &heads);
+    start_command(&mut world, &mut processor, 1);
+    // Mid-`Preparing`: the status comment freezes only the direct child.
+    run_batches_then_crash(&mut world, processor, 5);
+
+    let db = world.db_path();
+    for path in [
+        db.clone(),
+        db.with_extension("db-wal"),
+        db.with_extension("db-shm"),
+        db.with_extension("lock"),
+    ] {
+        let _ = std::fs::remove_file(path);
+    }
+
+    let mut processor = world.processor();
+    let head = {
+        let github = world.github.lock().unwrap();
+        github.branch_head("pr-1")
+    };
+    let body = check_suite_green_body(&world.config, &head, &[1], world.next_delivery + 900);
+    world.enqueue(&mut processor, "check_suite", body);
+    drive_to_completion(&mut world, &mut processor);
+
+    let github = world.github.lock().unwrap();
+    for i in 1..=3u64 {
+        assert!(
+            matches!(
+                github.prs.get(&PrNumber(i)).map(|f| &f.state),
+                Some(FakePrState::Merged { .. })
+            ),
+            "PR #{i} must merge after quiet-gap recovery (falsely-aborted \
+             trains leave the tail open)"
+        );
+    }
+    for (pr, count) in &github.squash_count {
+        assert!(*count <= 1, "PR #{pr} squashed {count} times");
+    }
+}
+
+/// A frozen descendant CLOSED (unmerged) during the DB-loss gap is neither
+/// open nor recently merged — the crawl fetches it individually so the
+/// resumed train sees the topology and aborts CLEANLY instead of erroring
+/// on a PR it cannot see (Codex crawl review, P2).
+#[test]
+fn a_member_closed_during_the_db_loss_gap_aborts_the_train_cleanly() {
+    let (mut world, heads) = World::linear_stack(2);
+    world.github.lock().unwrap().comments.insert(
+        CommentId(1000),
+        FakeComment {
+            pr: PrNumber(2),
+            author_id: AUTHOR,
+            body: "@merge-train predecessor #1".to_owned(),
+            edited: false,
+        },
+    );
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    start_command(&mut world, &mut processor, 1);
+    run_batches_then_crash(&mut world, processor, 4);
+
+    // The gap: the DB dies AND the frozen descendant is closed unmerged.
+    let db = world.db_path();
+    for path in [
+        db.clone(),
+        db.with_extension("db-wal"),
+        db.with_extension("db-shm"),
+        db.with_extension("lock"),
+    ] {
+        let _ = std::fs::remove_file(path);
+    }
+    world
+        .github
+        .lock()
+        .unwrap()
+        .prs
+        .get_mut(&PrNumber(2))
+        .unwrap()
+        .state = FakePrState::Closed;
+
+    // The wake-up IS the close webhook for the descendant.
+    let mut processor = world.processor();
+    let head = {
+        let github = world.github.lock().unwrap();
+        github.branch_head("pr-2")
+    };
+    let body = pr_closed_body(&world.config, 2, &head, "pr-2", "pr-1");
+    world.enqueue(&mut processor, "pull_request", body);
+    drain(&mut processor);
+    // Give recovery its evaluation rounds (CI nudges are irrelevant here).
+    for _ in 0..5 {
+        drain(&mut processor);
+    }
+
+    assert!(
+        processor
+            .state()
+            .active_trains
+            .values()
+            .all(|t| !t.state.is_active()),
+        "the train must end cleanly (aborted on the closed member), not sit \
+         stuck active: {:?}",
+        processor.state().active_trains
+    );
+    assert!(
+        processor.state().prs.contains_key(&PrNumber(2)),
+        "the closed member was fetched into the cache"
+    );
+}
+
+/// A stack EXTENDED during a DB-loss gap must abort on recovery, matching
+/// the live topology-change abort: a new PR declaring a stack member as its
+/// predecessor appears during the outage, the crawl records it as baseline,
+/// and the adopted train aborts instead of silently resuming over changed
+/// topology (Codex crawl review round 4, P1).
+#[test]
+fn a_stack_extended_during_a_db_loss_gap_aborts_on_recovery() {
+    let (mut world, heads) = World::linear_stack(2);
+    world.github.lock().unwrap().comments.insert(
+        CommentId(1000),
+        FakeComment {
+            pr: PrNumber(2),
+            author_id: AUTHOR,
+            body: "@merge-train predecessor #1".to_owned(),
+            edited: false,
+        },
+    );
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    start_command(&mut world, &mut processor, 1);
+    run_batches_then_crash(&mut world, processor, 4);
+
+    // The DB dies.
+    let db = world.db_path();
+    for path in [
+        db.clone(),
+        db.with_extension("db-wal"),
+        db.with_extension("db-shm"),
+        db.with_extension("lock"),
+    ] {
+        let _ = std::fs::remove_file(path);
+    }
+    // During the gap a NEW PR #3 is opened declaring #2 — the stack grew
+    // under the interrupted train.
+    let head3 = create_branch_with_file(&world.config, "pr-3", "pr-3.txt", "content 3", "pr-2");
+    create_pr_ref(&world.config, 3, &head3);
+    {
+        let mut github = world.github.lock().unwrap();
+        github.prs.insert(
+            PrNumber(3),
+            FakePr {
+                author_id: AUTHOR,
+                branch: "pr-3".to_owned(),
+                base_ref: "pr-2".to_owned(),
+                state: FakePrState::Open,
+            },
+        );
+        // Far above every earlier id: the gap comment postdates the bot's
+        // status comment (ids are globally monotonic on GitHub), which is
+        // exactly what marks it a possible extension rather than baseline.
+        github.comments.insert(
+            CommentId(5001),
+            FakeComment {
+                pr: PrNumber(3),
+                author_id: AUTHOR,
+                body: "@merge-train predecessor #2".to_owned(),
+                edited: false,
+            },
+        );
+    }
+
+    // The wake-up webhook triggers the crawl, which must abort the train.
+    let mut processor = world.processor();
+    let head = {
+        let github = world.github.lock().unwrap();
+        github.branch_head("pr-1")
+    };
+    let body = check_suite_green_body(&world.config, &head, &[1], world.next_delivery + 900);
+    world.enqueue(&mut processor, "check_suite", body);
+    drain(&mut processor);
+
+    assert!(
+        processor
+            .state()
+            .active_trains
+            .values()
+            .all(|t| !t.state.is_active()),
+        "the extended-stack train must not resume active: {:?}",
+        processor.state().active_trains
+    );
+    assert!(
+        matches!(
+            processor
+                .state()
+                .active_trains
+                .get(&PrNumber(1))
+                .map(|t| &t.state),
+            Some(crate::types::TrainState::Aborted { .. })
+        ),
+        "train #1 must be aborted (topology changed under it)"
+    );
+    assert_eq!(
+        world
+            .github
+            .lock()
+            .unwrap()
+            .squash_count
+            .values()
+            .sum::<u32>(),
+        0,
+        "an aborted train must not squash anything"
+    );
+}
+
+/// A train's root closed UNMERGED during a DB-loss gap is invisible to
+/// both crawl list endpoints, so its status comment would never be seen —
+/// leaving the train orphaned with no abort, cleanup, or final status. The
+/// wake-up webhook that names it (its own `pull_request.closed`) seeds the
+/// crawl, so the train is adopted and then aborted by the close (Codex
+/// crawl review round 6, P2).
+#[test]
+fn a_root_closed_unmerged_during_the_gap_is_seeded_and_aborted() {
+    let (mut world, heads) = World::linear_stack(2);
+    world.github.lock().unwrap().comments.insert(
+        CommentId(1000),
+        FakeComment {
+            pr: PrNumber(2),
+            author_id: AUTHOR,
+            body: "@merge-train predecessor #1".to_owned(),
+            edited: false,
+        },
+    );
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    start_command(&mut world, &mut processor, 1);
+    run_batches_then_crash(&mut world, processor, 4);
+
+    // The DB dies AND the root #1 is closed unmerged.
+    let db = world.db_path();
+    for path in [
+        db.clone(),
+        db.with_extension("db-wal"),
+        db.with_extension("db-shm"),
+        db.with_extension("lock"),
+    ] {
+        let _ = std::fs::remove_file(path);
+    }
+    let head1 = {
+        let mut github = world.github.lock().unwrap();
+        github.prs.get_mut(&PrNumber(1)).unwrap().state = FakePrState::Closed;
+        github.branch_head("pr-1")
+    };
+
+    // The wake-up IS the close webhook for the root: it seeds the crawl
+    // with #1, whose status comment is then found.
+    let mut processor = world.processor();
+    let body = pr_closed_body(&world.config, 1, &head1, "pr-1", "main");
+    world.enqueue(&mut processor, "pull_request", body);
+    drain(&mut processor);
+
+    assert!(
+        matches!(
+            processor
+                .state()
+                .active_trains
+                .get(&PrNumber(1))
+                .map(|t| &t.state),
+            Some(crate::types::TrainState::Aborted { .. })
+        ),
+        "the train whose root closed must be adopted and aborted, not orphaned: {:?}",
+        processor.state().active_trains
+    );
+    assert_eq!(
+        world
+            .github
+            .lock()
+            .unwrap()
+            .squash_count
+            .values()
+            .sum::<u32>(),
+        0,
+        "a train aborted on a closed root must not squash"
+    );
+}
+
+/// The general closed-root case: the root is closed unmerged and the
+/// wake-up webhook does NOT name it — only its open descendant's
+/// predecessor declaration does. The crawl must follow that declaration to
+/// the closed root, find its status comment, and adopt+abort the train
+/// (Codex crawl review round 7, P2 — the fixpoint expansion).
+#[test]
+fn a_closed_root_reached_only_via_a_descendant_declaration_is_recovered() {
+    let (mut world, heads) = World::linear_stack(2);
+    world.github.lock().unwrap().comments.insert(
+        CommentId(1000),
+        FakeComment {
+            pr: PrNumber(2),
+            author_id: AUTHOR,
+            body: "@merge-train predecessor #1".to_owned(),
+            edited: false,
+        },
+    );
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    start_command(&mut world, &mut processor, 1);
+    run_batches_then_crash(&mut world, processor, 4);
+
+    let db = world.db_path();
+    for path in [
+        db.clone(),
+        db.with_extension("db-wal"),
+        db.with_extension("db-shm"),
+        db.with_extension("lock"),
+    ] {
+        let _ = std::fs::remove_file(path);
+    }
+    world
+        .github
+        .lock()
+        .unwrap()
+        .prs
+        .get_mut(&PrNumber(1))
+        .unwrap()
+        .state = FakePrState::Closed;
+
+    // The wake-up is a check_suite on the OPEN descendant #2 — it names #2,
+    // not the closed root #1. Only #2's declaration reaches #1.
+    let mut processor = world.processor();
+    let head2 = {
+        let github = world.github.lock().unwrap();
+        github.branch_head("pr-2")
+    };
+    let body = check_suite_green_body(&world.config, &head2, &[2], world.next_delivery + 900);
+    world.enqueue(&mut processor, "check_suite", body);
+    drain(&mut processor);
+
+    assert!(
+        matches!(
+            processor
+                .state()
+                .active_trains
+                .get(&PrNumber(1))
+                .map(|t| &t.state),
+            Some(crate::types::TrainState::Aborted { .. })
+        ),
+        "the crawl must follow the descendant's declaration to the closed root \
+         and abort its train: {:?}",
+        processor.state().active_trains
+    );
+    assert_eq!(
+        world
+            .github
+            .lock()
+            .unwrap()
+            .squash_count
+            .values()
+            .sum::<u32>(),
+        0
+    );
+}
+
+/// GitHub down at first contact: the delivery releases (nothing can be
+/// processed without the bootstrap) and succeeds when retried.
+#[test]
+fn bootstrap_outage_releases_and_retries() {
+    let (mut world, heads) = World::linear_stack(1);
+    world.github.lock().unwrap().unavailable = true;
+    let mut processor = world.processor();
+    let body = pr_opened_body(&world.config, 1, &heads[0], "pr-1", "main");
+    world.enqueue(&mut processor, "pull_request", body);
+    let delivery = processor.claim().unwrap().expect("queued");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Released
+    );
+    assert!(processor.state().default_branch.is_empty());
+
+    world.github.lock().unwrap().unavailable = false;
+    let delivery = processor
+        .claim()
+        .unwrap()
+        .expect("released back to pending");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Processed
+    );
+    assert_eq!(processor.state().default_branch, "main");
+}
+
 // ─── cache_fill_events: the unknown-PR upsert oracle ───
 
 mod cache_fill {
@@ -3919,3 +5055,5 @@ mod interleaving {
         }
     }
 }
+
+// ─── The lost-DB crawl conformance harness ───
