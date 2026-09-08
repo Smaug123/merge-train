@@ -33,6 +33,10 @@ struct Config {
     /// deploys this as a GitHub App.
     github_token: String,
 
+    /// How often each worker re-evaluates its active trains as a fallback
+    /// for missed webhooks. Zero disables polling.
+    poll_interval: std::time::Duration,
+
     /// Overrides for the git commit identity (defaults derive from the bot's
     /// GitHub identity at startup).
     git_user_name: Option<String>,
@@ -109,12 +113,16 @@ impl Config {
         let webhook_secret = webhook_secret_from(std::env::var("WEBHOOK_SECRET").ok())?;
         let github_token = github_token_from(std::env::var("GITHUB_TOKEN").ok())?;
 
+        let poll_interval =
+            poll_interval_from(std::env::var("MERGE_TRAIN_POLL_INTERVAL_MINS").ok())?;
+
         Ok(Config {
             listen_addr,
             state_dir,
             repos_dir,
             webhook_secret,
             github_token,
+            poll_interval,
             git_user_name: std::env::var("GIT_USER_NAME").ok(),
             git_user_email: std::env::var("GIT_USER_EMAIL").ok(),
             git_signing_key: std::env::var("GIT_SIGNING_KEY").ok(),
@@ -217,6 +225,7 @@ async fn main() {
         bot_user_id: identity.user_id,
         bot_name: identity.login,
         stall_retry_delay: std::time::Duration::from_secs(30),
+        poll_interval: config.poll_interval,
     };
 
     // Create application state
@@ -241,9 +250,64 @@ async fn main() {
         .expect("Server failed to start");
 }
 
+/// The longest accepted poll interval: a year. Anything longer is a
+/// misconfiguration, and bounding it keeps every deadline computed from it
+/// (`Instant + interval`, the stagger's millisecond arithmetic) safely
+/// representable (Codex polling review round 3, P3).
+const MAX_POLL_INTERVAL_MINS: u64 = 366 * 24 * 60;
+
+/// Missed-webhook polling cadence (DESIGN §Polling fallback) from
+/// `MERGE_TRAIN_POLL_INTERVAL_MINS`. Default 10 minutes; `0` disables
+/// polling (webhooks + restart recovery remain). A malformed value falls
+/// back to the default rather than refusing to start; a value above
+/// [`MAX_POLL_INTERVAL_MINS`] is refused.
+fn poll_interval_from(value: Option<String>) -> Result<std::time::Duration, &'static str> {
+    let mins = match value {
+        None => 10,
+        Some(v) => match v.parse::<u64>() {
+            Ok(mins) => mins,
+            // All digits but too large for `u64` is an out-of-range
+            // CONFIGURATION, not a typo: it must be refused, not silently
+            // defaulted (Codex polling review round 6, P3).
+            Err(_) if v.chars().all(|c| c.is_ascii_digit()) && !v.is_empty() => {
+                return Err("MERGE_TRAIN_POLL_INTERVAL_MINS is above the maximum of a year");
+            }
+            Err(_) => 10,
+        },
+    };
+    if mins > MAX_POLL_INTERVAL_MINS {
+        return Err("MERGE_TRAIN_POLL_INTERVAL_MINS is above the maximum of a year");
+    }
+    Ok(std::time::Duration::from_secs(mins * 60))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn poll_interval_defaults_disables_and_refuses_overflow() {
+        let mins = |v: Option<&str>| poll_interval_from(v.map(str::to_owned));
+        assert_eq!(mins(None).unwrap(), std::time::Duration::from_secs(600));
+        assert_eq!(
+            mins(Some("garbage")).unwrap(),
+            std::time::Duration::from_secs(600)
+        );
+        assert_eq!(mins(Some("0")).unwrap(), std::time::Duration::ZERO);
+        assert_eq!(
+            mins(Some("7")).unwrap(),
+            std::time::Duration::from_secs(420)
+        );
+        assert!(mins(Some(&u64::MAX.to_string())).is_err());
+        // All digits but beyond u64: out of range, not a typo.
+        assert!(mins(Some("99999999999999999999999")).is_err());
+        assert_eq!(
+            mins(Some("12x")).unwrap(),
+            std::time::Duration::from_secs(600)
+        );
+        assert!(mins(Some(&(MAX_POLL_INTERVAL_MINS + 1).to_string())).is_err());
+        assert!(mins(Some(&MAX_POLL_INTERVAL_MINS.to_string())).is_ok());
+    }
 
     /// Git resolves path *arguments* against the subprocess cwd, which for
     /// clone/worktree commands is already inside the repos tree — a relative

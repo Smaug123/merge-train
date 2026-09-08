@@ -83,6 +83,10 @@ pub struct FakeGitHub {
     /// `GetRepoSettings` attempts (including failed ones), for asserting the
     /// worker's stall-retry behaviour.
     pub settings_fetches: u32,
+    /// Open PRs that report `Blocked` mergeability instead of `Clean` — a
+    /// frontier PR here parks its train `WaitingCi`, so tests can exercise
+    /// the missed-webhook polling fallback (clear the set, then poll).
+    pub blocked: std::collections::HashSet<PrNumber>,
 }
 
 impl FakeGitHub {
@@ -99,6 +103,7 @@ impl FakeGitHub {
             unavailable: false,
             permission_lookup_broken: false,
             settings_fetches: 0,
+            blocked: std::collections::HashSet::new(),
         }
     }
 
@@ -131,7 +136,16 @@ impl FakeGitHub {
             FakePrState::Open => (
                 PrState::Open,
                 self.branch_head(&fake.branch),
-                MergeStateStatus::Clean,
+                if self.blocked.contains(&pr) {
+                    MergeStateStatus::Blocked
+                } else {
+                    MergeStateStatus::Clean
+                },
+            ),
+            FakePrState::Closed => (
+                PrState::Closed,
+                self.branch_head(&fake.branch),
+                MergeStateStatus::Unknown,
             ),
             FakePrState::Closed => (
                 PrState::Closed,
