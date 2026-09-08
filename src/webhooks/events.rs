@@ -61,6 +61,23 @@ impl GitHubEvent {
             GitHubEvent::PullRequestReview(e) => &e.repo,
         }
     }
+
+    /// The PRs this event directly names. First-contact bootstrap seeds its
+    /// crawl with these so a PR the list endpoints miss — most importantly a
+    /// train's root closed *unmerged* during a DB-loss gap, which appears in
+    /// neither `ListOpenPrs` nor `ListRecentlyMergedPrs` — is still fetched,
+    /// its bot status comment found, and its train adopted+aborted rather
+    /// than silently orphaned (Codex crawl review round 6). A `Status` event
+    /// names a commit SHA, not a PR, so it seeds nothing.
+    pub fn referenced_prs(&self) -> Vec<PrNumber> {
+        match self {
+            GitHubEvent::IssueComment(e) => e.pr_number.into_iter().collect(),
+            GitHubEvent::PullRequest(e) => vec![e.pr_number],
+            GitHubEvent::CheckSuite(e) => e.pull_requests.clone(),
+            GitHubEvent::Status(_) => Vec::new(),
+            GitHubEvent::PullRequestReview(e) => vec![e.pr_number],
+        }
+    }
 }
 
 /// Action performed on an issue comment.

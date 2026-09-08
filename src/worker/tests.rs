@@ -217,6 +217,7 @@ impl World {
                     branch,
                     base_ref: base,
                     state: FakePrState::Open,
+                    author_id: AUTHOR,
                 },
             );
             heads.push(head);
@@ -1897,6 +1898,7 @@ fn stop_on_the_root_retires_fanned_out_trains_at_every_boundary() {
             world.github.lock().unwrap().prs.insert(
                 PrNumber(i),
                 FakePr {
+                    author_id: AUTHOR,
                     branch: format!("pr-{i}"),
                     base_ref: "pr-1".to_owned(),
                     state: FakePrState::Open,
@@ -2597,6 +2599,7 @@ fn a_second_train_runs_over_a_compacted_log() {
     world.github.lock().unwrap().prs.insert(
         PrNumber(3),
         FakePr {
+            author_id: AUTHOR,
             branch: "pr-3".to_owned(),
             base_ref: "main".to_owned(),
             state: FakePrState::Open,
@@ -2659,6 +2662,7 @@ mod cache_fill {
                 base_ref: "main".to_owned(),
                 state: state.clone(),
                 is_draft,
+                author_id: 7,
             };
             let mut repo = RepoState::from_snapshot(PersistedRepoSnapshot::new("main"));
             for (i, payload) in cache_fill_events(pr, &data, MergeStateStatus::Clean)
