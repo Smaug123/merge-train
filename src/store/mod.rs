@@ -636,14 +636,14 @@ impl Store {
         Ok(Some(count))
     }
 
-    /// Replays the entire `events` log from an empty state — the equivalence
-    /// oracle for the cache. While all state is event-derived (i.e. before a
-    /// later stage's bootstrap introduces non-event state), `replay() ==
-    /// state()`.
+    /// Replays the entire `events` log from an EMPTY state — the equivalence
+    /// oracle for the cache: all state is event-derived (the default branch
+    /// included, via `DefaultBranchSet`), so `replay() == state()`. Seeding
+    /// anything here would let the cache and the replay disagree about
+    /// values derived from earlier state, which the train record's captured
+    /// default branch made visible.
     pub fn replay(&self) -> Result<RepoState, StoreError> {
-        let mut state = RepoState::from_snapshot(PersistedRepoSnapshot::new(
-            self.state.default_branch.clone(),
-        ));
+        let mut state = RepoState::from_snapshot(PersistedRepoSnapshot::new(String::new()));
         for event in self.events()? {
             state.apply_event(&event);
         }

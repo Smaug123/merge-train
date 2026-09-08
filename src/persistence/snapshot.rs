@@ -23,7 +23,15 @@ use crate::types::{CachedPr, PrNumber, TrainRecord};
 /// Bumped to 3 by the cascade worker (M5): dedupe keys live solely in the
 /// Store's `dedupe_keys` table, so `seen_dedupe_keys` is gone, along with the
 /// vestigial filesystem-log fields `log_generation`/`log_position`.
-pub const SCHEMA_VERSION: u32 = 3;
+///
+/// Bumped to 4 by train-record provenance (`parent`, `default_branch`,
+/// `watermark`). The fields deserialize with defaults, but a cached snapshot
+/// holding an ACTIVE train from before them would carry empty provenance
+/// while a replay of the retained log reconstructs the real values — the
+/// cache and the replay oracle would disagree, and the train's later status
+/// updates would publish the empty provenance. Refusing the old cache is the
+/// honest answer (the store's replay rebuilds everything from the log).
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Persisted state snapshot — the serialized `RepoState` the Store caches.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

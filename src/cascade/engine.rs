@@ -416,7 +416,8 @@ fn on_preflight(
 
     // The status comment is created from the record TrainStarted will
     // materialize (same modulo the store-stamped timestamp).
-    let record = TrainRecord::new(root, now);
+    let mut record = TrainRecord::new(root, now);
+    record.default_branch = state.default_branch.clone();
     let body = match format_status_comment(&record, "🚂 Merge train starting.") {
         Ok(body) => body,
         Err(_) => {

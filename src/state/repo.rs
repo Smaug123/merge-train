@@ -37,7 +37,9 @@ use chrono::{DateTime, Utc};
 
 use crate::persistence::event::{StateEvent, StateEventPayload};
 use crate::persistence::snapshot::{PersistedRepoSnapshot, SCHEMA_VERSION};
-use crate::types::{CachedPr, MergeStateStatus, PrNumber, PrState, TrainRecord, TrainState};
+use crate::types::{
+    CachedPr, MergeStateStatus, PrNumber, PrState, TrainLineage, TrainRecord, TrainState,
+};
 
 use super::descendants::build_descendants_index;
 
@@ -152,6 +154,7 @@ impl RepoState {
             } => {
                 let mut train = TrainRecord::new(*root_pr, event.ts);
                 train.current_pr = *current_pr;
+                train.default_branch = self.default_branch.clone();
                 self.active_trains.insert(*root_pr, train);
             }
 
@@ -193,6 +196,11 @@ impl RepoState {
             } => {
                 if let Some(train) = self.active_trains.get_mut(root_pr) {
                     train.status_comment_id = Some(*comment_id);
+                    // The first post is the watermark; a repost after the
+                    // comment was deleted moves only `status_comment_id`.
+                    if train.watermark.is_none() {
+                        train.watermark = Some(*comment_id);
+                    }
                 }
             }
 
@@ -207,7 +215,19 @@ impl RepoState {
                 if matches!(record.state, TrainState::Completed { .. }) {
                     self.active_trains.remove(root_pr);
                 } else {
-                    self.active_trains.insert(*root_pr, record.clone());
+                    let mut adopted = record.clone();
+                    // The watermark is the FIRST status comment's id. A
+                    // record adopted from a comment that does not embed one
+                    // (the initial post, written before its own id was
+                    // known) is adopted WITH that comment's id, which is
+                    // therefore the watermark — set it here, or a later
+                    // repost's `StatusCommentPosted` would claim the role
+                    // and declarations between the two comments would pass
+                    // as pre-train (Codex provenance review, P2).
+                    if adopted.watermark.is_none() {
+                        adopted.watermark = adopted.status_comment_id;
+                    }
+                    self.active_trains.insert(*root_pr, adopted);
                 }
             }
 
@@ -416,10 +436,37 @@ impl RepoState {
                 new_roots,
                 ..
             } => {
+                let lineage = self.active_trains.get(old_root).map(|t| TrainLineage {
+                    root: *old_root,
+                    started_at: t.started_at,
+                });
                 self.active_trains.remove(old_root);
                 for root in new_roots {
-                    self.active_trains
-                        .insert(*root, TrainRecord::new(*root, event.ts));
+                    // Never clobber THIS fan-out's own child: unreachable in
+                    // normal operation (a fan-out's new roots were members,
+                    // and members cannot have trains), but a crawl-resurrected
+                    // stale parent replaying its fan-out must not reset
+                    // children adopted from their own newer comments — active
+                    // ones (their progress) OR terminal ones (resurrecting a
+                    // stopped child undoes the user's stop). Kinship is the
+                    // child's LINEAGE naming this parent incarnation, compared
+                    // by equality — never clock order, which a backwards
+                    // clock step breaks. Any other record on a new root is
+                    // stale history, replaced as usual. A parentless replay
+                    // (no record to identify the fan-out by) conservatively
+                    // protects whatever exists (Codex crawl review rounds
+                    // 2–3; fan-out review P2).
+                    if self
+                        .active_trains
+                        .get(root)
+                        .is_some_and(|t| lineage.is_none() || t.parent == lineage)
+                    {
+                        continue;
+                    }
+                    let mut child = TrainRecord::new(*root, event.ts);
+                    child.parent = lineage.clone();
+                    child.default_branch = self.default_branch.clone();
+                    self.active_trains.insert(*root, child);
                 }
             }
 
@@ -477,7 +524,7 @@ mod tests {
     use super::*;
     use crate::persistence::event::StateEvent;
     use crate::test_utils::{arb_datetime, arb_sha};
-    use crate::types::{CommentId, MergeStateStatus, Sha, TrainError};
+    use crate::types::{CommentId, MergeStateStatus, Sha, TrainError, TrainLineage};
     use proptest::prelude::*;
 
     // ─── Generators ───
@@ -1360,6 +1407,190 @@ mod tests {
             !state.active_trains.contains_key(&PrNumber(1)),
             "a completed record must never sit in active_trains"
         );
+    }
+
+    fn lineage(root: u64, started_at: chrono::DateTime<chrono::Utc>) -> TrainLineage {
+        TrainLineage {
+            root: PrNumber(root),
+            started_at,
+        }
+    }
+
+    fn adopt(state: &mut RepoState, record: TrainRecord) {
+        state.apply_event(&event(StateEventPayload::TrainRecordAdopted {
+            root_pr: record.original_root_pr,
+            record,
+        }));
+    }
+
+    /// A replayed fan-out (a crawl-resurrected stale parent) must not reset
+    /// a child adopted from its own — newer — status comment. Kinship is
+    /// LINEAGE: the child's record names this parent incarnation. It is not
+    /// clock order: a child whose `started_at` is EARLIER than its parent's
+    /// (the clock stepped backwards between the two) is still this
+    /// cascade's child and survives (Codex fan-out review, P2).
+    #[test]
+    fn fan_out_preserves_its_own_children_by_lineage_not_clock_order() {
+        let ts = crate::test_utils::test_timestamp();
+        let mut state = RepoState::from_snapshot(PersistedRepoSnapshot::new("main".to_string()));
+        let mut parent = TrainRecord::new(PrNumber(1), ts);
+        parent.recovery_seq = 3;
+        adopt(&mut state, parent);
+
+        // Child 2: this fan-out's own child, with progress; born "before"
+        // the parent by the clock.
+        let mut child = TrainRecord::new(PrNumber(2), ts - chrono::Duration::hours(1));
+        child.parent = Some(lineage(1, ts));
+        child.recovery_seq = 9;
+        adopt(&mut state, child);
+        // Child 3: this fan-out's own child, STOPPED by the user.
+        let mut stopped = TrainRecord::new(PrNumber(3), ts + chrono::Duration::hours(1));
+        stopped.parent = Some(lineage(1, ts));
+        stopped.state = crate::types::TrainState::Stopped {
+            ended_at: ts + chrono::Duration::hours(2),
+        };
+        adopt(&mut state, stopped);
+
+        state.apply_event(&event(StateEventPayload::FanOutCompleted {
+            old_root: PrNumber(1),
+            new_roots: vec![PrNumber(2), PrNumber(3), PrNumber(4)],
+            original_root_pr: PrNumber(1),
+        }));
+        assert_eq!(
+            state.active_trains[&PrNumber(2)].recovery_seq,
+            9,
+            "the child's own adopted record survives the replayed fan-out"
+        );
+        assert!(
+            !state.active_trains[&PrNumber(3)].state.is_active(),
+            "the user's stop stands: the stopped child is not resurrected"
+        );
+        let fresh = &state.active_trains[&PrNumber(4)];
+        assert!(
+            fresh.state.is_active(),
+            "roots without a record are created as usual"
+        );
+        assert_eq!(
+            fresh.parent,
+            Some(lineage(1, ts)),
+            "a fresh child names its parent"
+        );
+        assert_eq!(fresh.default_branch, "main");
+    }
+
+    /// Records on a new root that do NOT name this parent incarnation are
+    /// stale history, replaced as usual — however recent they are: a
+    /// previous incarnation's child, an unrelated train started later, or
+    /// a record with no lineage at all (Codex crawl review round 3, P2;
+    /// round 13 residual (b) closed by lineage).
+    #[test]
+    fn fan_out_replaces_records_of_other_lineages() {
+        let ts = crate::test_utils::test_timestamp();
+        let mut state = RepoState::from_snapshot(PersistedRepoSnapshot::new("main".to_string()));
+        adopt(&mut state, TrainRecord::new(PrNumber(1), ts));
+
+        // #2: a child of the parent's PREVIOUS incarnation, stopped.
+        let mut old_child = TrainRecord::new(PrNumber(2), ts + chrono::Duration::hours(1));
+        old_child.parent = Some(lineage(1, ts - chrono::Duration::days(30)));
+        old_child.state = crate::types::TrainState::Stopped {
+            ended_at: ts + chrono::Duration::hours(2),
+        };
+        adopt(&mut state, old_child);
+        // #3: an unrelated train with no lineage, born after the parent.
+        let mut unrelated = TrainRecord::new(PrNumber(3), ts + chrono::Duration::hours(1));
+        unrelated.recovery_seq = 7;
+        adopt(&mut state, unrelated);
+
+        state.apply_event(&event(StateEventPayload::FanOutCompleted {
+            old_root: PrNumber(1),
+            new_roots: vec![PrNumber(2), PrNumber(3)],
+            original_root_pr: PrNumber(1),
+        }));
+        for root in [2, 3] {
+            let record = &state.active_trains[&PrNumber(root)];
+            assert!(record.state.is_active(), "#{root} is a fresh child");
+            assert_eq!(record.recovery_seq, 0, "#{root} was replaced, not kept");
+            assert_eq!(record.parent, Some(lineage(1, ts)));
+        }
+    }
+
+    /// A parentless replay — no record to identify the fan-out by — cannot
+    /// tell kin from history, so it conservatively protects whatever
+    /// exists and creates only the missing roots.
+    #[test]
+    fn a_parentless_fan_out_replay_protects_existing_records() {
+        let ts = crate::test_utils::test_timestamp();
+        let mut state = RepoState::from_snapshot(PersistedRepoSnapshot::new("main".to_string()));
+        let mut existing = TrainRecord::new(PrNumber(2), ts);
+        existing.recovery_seq = 5;
+        adopt(&mut state, existing);
+
+        state.apply_event(&event(StateEventPayload::FanOutCompleted {
+            old_root: PrNumber(1),
+            new_roots: vec![PrNumber(2), PrNumber(3)],
+            original_root_pr: PrNumber(1),
+        }));
+        assert_eq!(state.active_trains[&PrNumber(2)].recovery_seq, 5);
+        assert_eq!(state.active_trains[&PrNumber(3)].parent, None);
+    }
+
+    /// A started train records the default branch it was created against.
+    #[test]
+    fn train_started_records_the_default_branch() {
+        let mut state = RepoState::from_snapshot(PersistedRepoSnapshot::new("trunk".to_string()));
+        state.apply_event(&event(StateEventPayload::TrainStarted {
+            root_pr: PrNumber(1),
+            current_pr: PrNumber(1),
+        }));
+        assert_eq!(state.active_trains[&PrNumber(1)].default_branch, "trunk");
+        assert_eq!(state.active_trains[&PrNumber(1)].parent, None);
+    }
+
+    /// A record adopted with a comment id but no embedded watermark takes
+    /// that comment as its watermark; a later repost does not move it.
+    #[test]
+    fn adoption_backfills_the_watermark_from_the_adopted_comment() {
+        let mut state = RepoState::from_snapshot(PersistedRepoSnapshot::new("main".to_string()));
+        let mut record = TrainRecord::new(PrNumber(1), crate::test_utils::test_timestamp());
+        record.status_comment_id = Some(CommentId(5));
+        adopt(&mut state, record);
+        assert_eq!(
+            state.active_trains[&PrNumber(1)].watermark,
+            Some(CommentId(5))
+        );
+        state.apply_event(&event(StateEventPayload::StatusCommentPosted {
+            root_pr: PrNumber(1),
+            comment_id: CommentId(99),
+        }));
+        let train = &state.active_trains[&PrNumber(1)];
+        assert_eq!(train.status_comment_id, Some(CommentId(99)));
+        assert_eq!(
+            train.watermark,
+            Some(CommentId(5)),
+            "the repost does not move it"
+        );
+    }
+
+    /// The watermark is the FIRST posted status comment's id and never
+    /// moves: a later `StatusCommentPosted` (a repost after the comment was
+    /// deleted) updates `status_comment_id` only.
+    #[test]
+    fn the_watermark_is_the_first_status_comment_and_never_moves() {
+        let mut state = RepoState::from_snapshot(PersistedRepoSnapshot::new("main".to_string()));
+        state.apply_event(&event(StateEventPayload::TrainStarted {
+            root_pr: PrNumber(1),
+            current_pr: PrNumber(1),
+        }));
+        assert_eq!(state.active_trains[&PrNumber(1)].watermark, None);
+        for id in [42, 99] {
+            state.apply_event(&event(StateEventPayload::StatusCommentPosted {
+                root_pr: PrNumber(1),
+                comment_id: CommentId(id),
+            }));
+        }
+        let train = &state.active_trains[&PrNumber(1)];
+        assert_eq!(train.status_comment_id, Some(CommentId(99)));
+        assert_eq!(train.watermark, Some(CommentId(42)));
     }
 
     /// Mergeability observations enter the cache through the log.

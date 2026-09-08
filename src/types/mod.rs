@@ -14,5 +14,5 @@ pub use pr::{CachedPr, MergeStateStatus, PrState};
 pub use stack::{AbortReason, BlockReason, CascadeStepOutcome};
 pub use train::{
     CascadePhase, DescendantProgress, PhaseKind, ProgressError, TrainError, TrainErrorKind,
-    TrainRecord, TrainState,
+    TrainLineage, TrainRecord, TrainState,
 };
