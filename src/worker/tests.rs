@@ -27,6 +27,8 @@ use super::executor::{GitHubExec, SagaBatch, execute_batch};
 use super::pipeline::{PipelineOutcome, Processor, WorkerDeps};
 use super::test_support::TEST_BOT_ID;
 use super::{GitSettings, IntakeDelivery, WorkerMsg};
+use crate::effects::Effect;
+use crate::effects::github::GitHubEffect;
 
 // ─── Identities ───
 
@@ -306,9 +308,26 @@ impl World {
 // ─── The synchronous drive loop (the worker thread, minus the threads) ───
 
 /// Executes one batch exactly as the executor thread would.
-fn execute(processor: &Processor, batch: &SagaBatch) -> Vec<EffectOutcome> {
+fn execute(processor: &mut Processor, batch: &SagaBatch) -> Vec<EffectOutcome> {
     let interpreter = WorktreeGitInterpreter::new(processor.git_config(), batch.root);
-    execute_batch(&interpreter, processor.github(), batch)
+    let result = execute_batch(&interpreter, processor.github(), batch);
+    // As the worker does on `SagaOutcomes`: bookkeeping before the boundary.
+    processor.note_best_effort(&result.best_effort).unwrap();
+    result.observed
+}
+
+/// Executes the batches a boundary handed back, to quiescence — what the
+/// worker loop does with `on_outcomes`' return value.
+fn finish_batches(_world: &mut World, processor: &mut Processor, mut next: Option<SagaBatch>) {
+    let mut steps = 0;
+    while let Some(batch) = next {
+        steps += 1;
+        assert!(steps < 200, "batches did not settle");
+        let outcomes = execute(processor, &batch);
+        next = processor
+            .on_outcomes(batch.root, outcomes, batch.feedback)
+            .unwrap();
+    }
 }
 
 /// Runs queued sagas to quiescence (Park/Done and no pending work).
@@ -766,6 +785,455 @@ fn an_authorized_retraction_posts_a_receipt_naming_the_retracted_comment() {
     );
 }
 
+/// A terminal train's status comment is the off-disk backup's last word:
+/// left saying "active" because a GitHub outage swallowed the final
+/// update, a later DB loss would resurrect the train the user stopped
+/// (monolith review, P1). So the update is OWED — written with the
+/// terminal event, surviving a restart — and retried at the stall cadence
+/// until it is confirmed to have landed.
+#[test]
+fn a_failed_terminal_status_update_is_owed_until_it_lands() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    start_command(&mut world, &mut processor, 1);
+    let claim_all = |p: &mut Processor| {
+        while let Some(delivery) = p.claim().unwrap() {
+            p.process_claimed(delivery).unwrap();
+        }
+    };
+    claim_all(&mut processor);
+    // Preflight lands the train and its status comment.
+    let preflight = processor.pump().unwrap().expect("the start's preflight");
+    let outcomes = execute(&mut processor, &preflight);
+    let step = processor
+        .on_outcomes(preflight.root, outcomes, preflight.feedback)
+        .unwrap()
+        .expect("the first cascade step");
+    assert!(
+        processor.state().active_trains[&PrNumber(1)]
+            .state
+            .is_active()
+    );
+
+    // The user stops while that step is in flight; it applies at the
+    // boundary, whose cleanup batch carries the final status update.
+    let stop = comment_body(&world.config, 1, "@merge-train stop", AUTHOR, "author", 7);
+    world.enqueue(&mut processor, "issue_comment", stop);
+    claim_all(&mut processor);
+    let outcomes = execute(&mut processor, &step);
+    let cleanup = processor
+        .on_outcomes(step.root, outcomes, step.feedback)
+        .unwrap()
+        .expect("the stop's cleanup batch");
+    assert!(cleanup.effects.is_empty(), "cleanup is best-effort only");
+    assert!(
+        !processor.state().active_trains[&PrNumber(1)]
+            .state
+            .is_active()
+    );
+
+    // GitHub is down when the cleanup runs: the update fails.
+    world.github.lock().unwrap().unavailable = true;
+    let outcomes = execute(&mut processor, &cleanup);
+    processor
+        .on_outcomes(cleanup.root, outcomes, cleanup.feedback)
+        .unwrap();
+    let embedded = |world: &World| -> crate::types::TrainState {
+        let github = world.github.lock().unwrap();
+        let record = github
+            .comments
+            .values()
+            .filter(|c| c.author_id == TEST_BOT_ID && c.pr == PrNumber(1))
+            .find_map(|c| crate::status::parse_status_comment(&c.body).ok())
+            .expect("the status comment");
+        record.state
+    };
+    assert!(
+        embedded(&world).is_active(),
+        "precondition: the comment still says active — what a lost-DB crawl would resurrect"
+    );
+    assert_eq!(processor.owed_status_syncs(), vec![PrNumber(1)]);
+    assert!(
+        processor.take_retry_request(),
+        "the worker must arm the stall timer for the retry"
+    );
+
+    // The owed sync survives a restart.
+    drop(processor);
+    let mut processor = world.processor();
+    assert_eq!(processor.owed_status_syncs(), vec![PrNumber(1)]);
+
+    // The outage ends; the timer's retry lands the update.
+    world.github.lock().unwrap().unavailable = false;
+    processor.requeue_marked_recoveries().unwrap();
+    drain(&mut processor);
+    assert!(
+        matches!(embedded(&world), crate::types::TrainState::Stopped { .. }),
+        "the comment must now say stopped"
+    );
+    assert!(processor.owed_status_syncs().is_empty());
+    drop(processor);
+    assert!(
+        world.processor().owed_status_syncs().is_empty(),
+        "nothing owed after a restart"
+    );
+}
+
+/// Completion REMOVES the train's record from the state, so the owed sync
+/// must carry the record as the train ended: a completion update lost to
+/// an outage is still retried and lands (Codex terminal-sync review, P1).
+#[test]
+fn a_failed_completion_status_update_is_owed_until_it_lands() {
+    let (mut world, _heads) = World::linear_stack(1);
+    let mut processor = world.processor();
+    start_command(&mut world, &mut processor, 1);
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+    // Step until the batch that carries the completion update: effects
+    // empty, and the train already gone from the state.
+    let mut batch = processor.pump().unwrap().expect("the start's preflight");
+    let cleanup = loop {
+        let outcomes = execute(&mut processor, &batch);
+        let next = processor
+            .on_outcomes(batch.root, outcomes, batch.feedback)
+            .unwrap()
+            .expect("the train has more to do");
+        if next.effects.is_empty() && !processor.state().active_trains.contains_key(&PrNumber(1)) {
+            break next;
+        }
+        batch = next;
+    };
+    assert_eq!(
+        processor.owed_status_syncs(),
+        vec![PrNumber(1)],
+        "owed with the completion"
+    );
+    world.github.lock().unwrap().unavailable = true;
+    let outcomes = execute(&mut processor, &cleanup);
+    let next = processor
+        .on_outcomes(cleanup.root, outcomes, cleanup.feedback)
+        .unwrap();
+    // The worker executes whatever the boundary hands back (here the owed
+    // sync's probe, which fails in the outage); a test that drops it would
+    // leave the saga slot occupied.
+    finish_batches(&mut world, &mut processor, next);
+    assert_eq!(processor.owed_status_syncs(), vec![PrNumber(1)]);
+    assert!(processor.take_retry_request());
+
+    world.github.lock().unwrap().unavailable = false;
+    processor.requeue_marked_recoveries().unwrap();
+    drain(&mut processor);
+    let github = world.github.lock().unwrap();
+    let record = github
+        .comments
+        .values()
+        .filter(|c| c.author_id == TEST_BOT_ID && c.pr == PrNumber(1))
+        .find_map(|c| crate::status::parse_status_comment(&c.body).ok())
+        .expect("the status comment");
+    assert!(
+        matches!(record.state, crate::types::TrainState::Completed { .. }),
+        "the comment must now say completed: {:?}",
+        record.state
+    );
+    drop(github);
+    assert!(processor.owed_status_syncs().is_empty());
+}
+
+/// An owed sync whose comment turns out to be GONE is cleared by the
+/// retry's probe — nothing stale survives — and nothing is reposted. A
+/// permanent failure of the update itself (revoked credentials, say) does
+/// NOT clear it: only the probe may conclude absence (Codex terminal-sync
+/// review, P1).
+#[test]
+fn an_owed_sync_for_a_deleted_comment_is_cleared_by_the_probe() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    start_command(&mut world, &mut processor, 1);
+    let claim_all = |p: &mut Processor| {
+        while let Some(delivery) = p.claim().unwrap() {
+            p.process_claimed(delivery).unwrap();
+        }
+    };
+    claim_all(&mut processor);
+    let preflight = processor.pump().unwrap().expect("the start's preflight");
+    let outcomes = execute(&mut processor, &preflight);
+    let step = processor
+        .on_outcomes(preflight.root, outcomes, preflight.feedback)
+        .unwrap()
+        .expect("the first cascade step");
+    let stop = comment_body(&world.config, 1, "@merge-train stop", AUTHOR, "author", 7);
+    world.enqueue(&mut processor, "issue_comment", stop);
+    claim_all(&mut processor);
+    let outcomes = execute(&mut processor, &step);
+    let cleanup = processor
+        .on_outcomes(step.root, outcomes, step.feedback)
+        .unwrap()
+        .expect("the stop's cleanup batch");
+    // The user deleted the bot's status comment before the update ran:
+    // the update 404s (permanent), and the obligation stays owed.
+    let status_id = {
+        let github = world.github.lock().unwrap();
+        *github
+            .comments
+            .iter()
+            .find(|(_, c)| c.author_id == TEST_BOT_ID && c.pr == PrNumber(1))
+            .map(|(id, _)| id)
+            .expect("the status comment")
+    };
+    world.github.lock().unwrap().comments.remove(&status_id);
+    let posted_before = world.github.lock().unwrap().posted_comments.len();
+    let outcomes = execute(&mut processor, &cleanup);
+    let next = processor
+        .on_outcomes(cleanup.root, outcomes, cleanup.feedback)
+        .unwrap();
+    // The update 404s (permanent) — which never clears the obligation on
+    // its own; only the probe the boundary hands back may conclude the
+    // comment is gone, and it does.
+    finish_batches(&mut world, &mut processor, next);
+    drain(&mut processor);
+    assert!(
+        processor.owed_status_syncs().is_empty(),
+        "confirmed gone: cleared"
+    );
+    assert_eq!(
+        world.github.lock().unwrap().posted_comments.len(),
+        posted_before,
+        "nothing is reposted for a comment the user removed"
+    );
+}
+
+/// An owed update's outcome is matched by COMMENT, never by the batch it
+/// rode: an observation boundary appends one train's terminal cleanup to
+/// whichever batch is in flight, so the update can arrive under a foreign
+/// root — or, as here, under no batch at all (Codex terminal-sync review
+/// round 3, P1). Per-incarnation independence is pinned by the store's own
+/// `a_second_incarnation_does_not_overwrite_the_first_obligation`.
+#[test]
+fn an_owed_update_is_matched_by_comment_not_by_batch_root() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    start_command(&mut world, &mut processor, 1);
+    let claim_all = |p: &mut Processor| {
+        while let Some(delivery) = p.claim().unwrap() {
+            p.process_claimed(delivery).unwrap();
+        }
+    };
+    claim_all(&mut processor);
+    let preflight = processor.pump().unwrap().expect("the start's preflight");
+    let outcomes = execute(&mut processor, &preflight);
+    let step = processor
+        .on_outcomes(preflight.root, outcomes, preflight.feedback)
+        .unwrap()
+        .expect("the first cascade step");
+    let stop = comment_body(&world.config, 1, "@merge-train stop", AUTHOR, "author", 7);
+    world.enqueue(&mut processor, "issue_comment", stop);
+    claim_all(&mut processor);
+    let outcomes = execute(&mut processor, &step);
+    let cleanup = processor
+        .on_outcomes(step.root, outcomes, step.feedback)
+        .unwrap()
+        .expect("the stop's cleanup batch");
+
+    // The terminal update fails in an outage: owed, with its comment.
+    world.github.lock().unwrap().unavailable = true;
+    let outcomes = execute(&mut processor, &cleanup);
+    let next = processor
+        .on_outcomes(cleanup.root, outcomes, cleanup.feedback)
+        .unwrap();
+    finish_batches(&mut world, &mut processor, next);
+    let owed = processor.owed_status_comments();
+    assert_eq!(owed.len(), 1, "one obligation");
+    let comment_id = owed[0].expect("its comment id is known");
+
+    // A successful update for that comment, arriving with no batch of its
+    // own, clears the obligation; one for another comment does not.
+    processor
+        .note_best_effort(&[crate::cascade::EffectOutcome {
+            effect: Effect::GitHub(GitHubEffect::UpdateComment {
+                comment_id: crate::types::CommentId(comment_id.0 + 1000),
+                body: "someone else's".to_owned(),
+            }),
+            result: Ok(crate::cascade::EffectResponse::GitHub(
+                crate::effects::GitHubResponse::CommentUpdated,
+            )),
+        }])
+        .unwrap();
+    assert_eq!(
+        processor.owed_status_comments(),
+        vec![Some(comment_id)],
+        "an unrelated comment's update clears nothing"
+    );
+    processor
+        .note_best_effort(&[crate::cascade::EffectOutcome {
+            effect: Effect::GitHub(GitHubEffect::UpdateComment {
+                comment_id,
+                body: "the owed rewrite".to_owned(),
+            }),
+            result: Ok(crate::cascade::EffectResponse::GitHub(
+                crate::effects::GitHubResponse::CommentUpdated,
+            )),
+        }])
+        .unwrap();
+    assert!(
+        processor.owed_status_comments().is_empty(),
+        "the owed comment's update clears it, whatever batch it rode"
+    );
+}
+
+/// A live comment at the OWED id whose body someone mangled is still this
+/// train's backup: the retry rewrites it rather than reading it as gone
+/// (the M6 recovery path calls this `RefreshComment`). Reading it as
+/// absent would skip the final update forever (Codex terminal-sync review
+/// round 6, P2).
+#[test]
+fn an_owed_sync_rewrites_a_mangled_comment_at_the_known_id() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    start_command(&mut world, &mut processor, 1);
+    let claim_all = |p: &mut Processor| {
+        while let Some(delivery) = p.claim().unwrap() {
+            p.process_claimed(delivery).unwrap();
+        }
+    };
+    claim_all(&mut processor);
+    let preflight = processor.pump().unwrap().expect("the start's preflight");
+    let outcomes = execute(&mut processor, &preflight);
+    let step = processor
+        .on_outcomes(preflight.root, outcomes, preflight.feedback)
+        .unwrap()
+        .expect("the first cascade step");
+    let stop = comment_body(&world.config, 1, "@merge-train stop", AUTHOR, "author", 7);
+    world.enqueue(&mut processor, "issue_comment", stop);
+    claim_all(&mut processor);
+    let outcomes = execute(&mut processor, &step);
+    let cleanup = processor
+        .on_outcomes(step.root, outcomes, step.feedback)
+        .unwrap()
+        .expect("the stop's cleanup batch");
+
+    let status_id = processor.state().active_trains[&PrNumber(1)]
+        .status_comment_id
+        .expect("a status comment");
+    world.github.lock().unwrap().unavailable = true;
+    let outcomes = execute(&mut processor, &cleanup);
+    let next = processor
+        .on_outcomes(cleanup.root, outcomes, cleanup.feedback)
+        .unwrap();
+    finish_batches(&mut world, &mut processor, next);
+    assert_eq!(processor.owed_status_syncs(), vec![PrNumber(1)]);
+
+    // Someone mangles the comment's body: no parseable record at all.
+    world.github.lock().unwrap().unavailable = false;
+    world
+        .github
+        .lock()
+        .unwrap()
+        .comments
+        .get_mut(&status_id)
+        .unwrap()
+        .body = "(mangled)".to_owned();
+    processor.requeue_marked_recoveries().unwrap();
+    drain(&mut processor);
+
+    assert!(processor.owed_status_syncs().is_empty(), "the sync landed");
+    let github = world.github.lock().unwrap();
+    let record = crate::status::parse_status_comment(&github.comments[&status_id].body)
+        .expect("the mangled comment was rewritten from the record");
+    assert!(matches!(
+        record.state,
+        crate::types::TrainState::Stopped { .. }
+    ));
+}
+
+/// The crash window between `PostComment` succeeding and its
+/// `StatusCommentPosted` committing: the comment is LIVE on GitHub while
+/// the record has no id for it. A terminal event there still owes a sync,
+/// and the retry resolves the comment by the INCARNATION embedded in it —
+/// otherwise that comment stays saying active and a later DB loss
+/// resurrects the stopped train (Codex terminal-sync review round 4, P1).
+#[test]
+fn a_comment_posted_before_the_crash_is_synced_by_incarnation() {
+    let (mut world, heads) = World::linear_stack(1);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 1, &heads);
+    start_command(&mut world, &mut processor, 1);
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+    // Run until the batch that POSTS the status comment, execute it, and
+    // die before observing it: GitHub has the comment, the store does not.
+    let mut batch = processor.pump().unwrap().expect("the start's preflight");
+    loop {
+        let posts = batch
+            .effects
+            .iter()
+            .any(|e| matches!(e, Effect::GitHub(GitHubEffect::PostComment { .. })));
+        let outcomes = execute(&mut processor, &batch);
+        if posts {
+            break; // the crash: outcomes never observed
+        }
+        batch = processor
+            .on_outcomes(batch.root, outcomes, batch.feedback)
+            .unwrap()
+            .expect("the train has more to do");
+    }
+    drop(processor);
+
+    let mut processor = world.processor();
+    let record = processor.state().active_trains[&PrNumber(1)].clone();
+    assert_eq!(
+        record.status_comment_id, None,
+        "precondition: the id never committed"
+    );
+    let live = {
+        let github = world.github.lock().unwrap();
+        github
+            .comments
+            .iter()
+            .find(|(_, c)| c.author_id == TEST_BOT_ID && c.pr == PrNumber(1))
+            .map(|(id, _)| *id)
+            .expect("precondition: the comment IS on GitHub")
+    };
+
+    // The user stops the train. The obligation is owed with no id.
+    let stop = comment_body(&world.config, 1, "@merge-train stop", AUTHOR, "author", 7);
+    world.enqueue(&mut processor, "issue_comment", stop);
+    drain(&mut processor);
+    assert!(
+        !processor.state().active_trains[&PrNumber(1)]
+            .state
+            .is_active(),
+        "the train is stopped"
+    );
+
+    // The obligation was created mid-process by the terminal event, and
+    // its cleanup carried no `UpdateComment` (the record had no id), so
+    // NOTHING refers to it: the worker must schedule it anyway, without a
+    // restart or a stall-timer nudge (Codex terminal-sync review round 5,
+    // P1). `drain` alone must land it.
+    drain(&mut processor);
+    assert!(
+        processor.owed_status_comments().is_empty(),
+        "the sync landed"
+    );
+    let github = world.github.lock().unwrap();
+    let embedded = crate::status::parse_status_comment(&github.comments[&live].body).unwrap();
+    assert!(
+        matches!(embedded.state, crate::types::TrainState::Stopped { .. }),
+        "the orphaned comment must say stopped: {:?}",
+        embedded.state
+    );
+    assert_eq!(
+        embedded.started_at, record.started_at,
+        "the same incarnation"
+    );
+}
+
 /// A comment event *performed by the bot* (sender == bot) must not reach
 /// the handler at all: the handler's self-guard keys off the comment
 /// author, so a bot-performed edit of a USER's comment (author == user)
@@ -957,7 +1425,7 @@ fn failed_start_preflight_answers_the_user_instead_of_vanishing() {
 
     // GitHub goes down for the preflight execution, then recovers.
     world.github.lock().unwrap().unavailable = true;
-    let outcomes = execute(&processor, &batch);
+    let outcomes = execute(&mut processor, &batch);
     assert!(outcomes.iter().any(|o| o.result.is_err()));
     world.github.lock().unwrap().unavailable = false;
 
@@ -965,7 +1433,7 @@ fn failed_start_preflight_answers_the_user_instead_of_vanishing() {
         .on_outcomes(batch.root, outcomes, batch.feedback)
         .unwrap();
     while let Some(batch) = next {
-        let outcomes = execute(&processor, &batch);
+        let outcomes = execute(&mut processor, &batch);
         next = processor
             .on_outcomes(batch.root, outcomes, batch.feedback)
             .unwrap();
@@ -1006,7 +1474,7 @@ fn stop_mid_saga_takes_effect_at_the_next_observation_boundary() {
         processor.process_claimed(delivery).unwrap();
     }
     let batch = processor.pump().unwrap().expect("start plans a saga");
-    let outcomes = execute(&processor, &batch);
+    let outcomes = execute(&mut processor, &batch);
 
     // The author's stop arrives while those effects execute.
     let body = comment_body(&world.config, 1, "@merge-train stop", AUTHOR, "author", 66);
@@ -1029,7 +1497,7 @@ fn stop_mid_saga_takes_effect_at_the_next_observation_boundary() {
              the stop, got {:?}",
             batch.effects
         );
-        let outcomes = execute(&processor, &batch);
+        let outcomes = execute(&mut processor, &batch);
         next = processor
             .on_outcomes(batch.root, outcomes, batch.feedback)
             .unwrap();
@@ -1074,7 +1542,7 @@ fn stop_during_inflight_squash_records_the_merge_before_stopping() {
     let mut next = processor.pump().unwrap();
     let mut in_flight = None;
     while let Some(batch) = next {
-        let outcomes = execute(&processor, &batch);
+        let outcomes = execute(&mut processor, &batch);
         let squashed = world
             .github
             .lock()
@@ -1105,7 +1573,7 @@ fn stop_during_inflight_squash_records_the_merge_before_stopping() {
         .on_outcomes(batch.root, outcomes, batch.feedback)
         .unwrap();
     while let Some(batch) = next {
-        let outcomes = execute(&processor, &batch);
+        let outcomes = execute(&mut processor, &batch);
         next = processor
             .on_outcomes(batch.root, outcomes, batch.feedback)
             .unwrap();
@@ -1157,7 +1625,7 @@ fn handler_abort_during_inflight_squash_records_the_merge_first() {
     let mut next = processor.pump().unwrap();
     let mut in_flight = None;
     while let Some(batch) = next {
-        let outcomes = execute(&processor, &batch);
+        let outcomes = execute(&mut processor, &batch);
         let squashed = world
             .github
             .lock()
@@ -1202,7 +1670,7 @@ fn handler_abort_during_inflight_squash_records_the_merge_first() {
         .on_outcomes(batch.root, outcomes, batch.feedback)
         .unwrap();
     while let Some(batch) = next {
-        let outcomes = execute(&processor, &batch);
+        let outcomes = execute(&mut processor, &batch);
         next = processor
             .on_outcomes(batch.root, outcomes, batch.feedback)
             .unwrap();
@@ -1246,7 +1714,7 @@ fn stop_mid_saga_on_an_existing_train_suppresses_the_continuation() {
     // Complete the preflight so the train record exists, leaving the next
     // batch (preparation work) in flight.
     let preflight = processor.pump().unwrap().expect("start plans preflight");
-    let outcomes = execute(&processor, &preflight);
+    let outcomes = execute(&mut processor, &preflight);
     let batch = processor
         .on_outcomes(preflight.root, outcomes, preflight.feedback)
         .unwrap()
@@ -1255,7 +1723,7 @@ fn stop_mid_saga_on_an_existing_train_suppresses_the_continuation() {
         processor.state().active_trains.contains_key(&PrNumber(1)),
         "the train must exist before the stop for this test to bite"
     );
-    let outcomes = execute(&processor, &batch);
+    let outcomes = execute(&mut processor, &batch);
     let remote_head_before = world.github.lock().unwrap().branch_head("pr-2");
 
     // The author's stop lands while that batch's outcomes are in flight.
@@ -1277,7 +1745,7 @@ fn stop_mid_saga_on_an_existing_train_suppresses_the_continuation() {
             "no observed effects may run after the stop, got {:?}",
             batch.effects
         );
-        let outcomes = execute(&processor, &batch);
+        let outcomes = execute(&mut processor, &batch);
         next = processor
             .on_outcomes(batch.root, outcomes, batch.feedback)
             .unwrap();
@@ -1318,7 +1786,7 @@ fn acknowledged_stop_survives_a_crash_before_its_boundary() {
     // Preflight completes (the train now exists); the next batch is in
     // flight when the stop arrives, so the stop queues for the boundary.
     let preflight = processor.pump().unwrap().expect("start plans preflight");
-    let outcomes = execute(&processor, &preflight);
+    let outcomes = execute(&mut processor, &preflight);
     let _batch = processor
         .on_outcomes(preflight.root, outcomes, preflight.feedback)
         .unwrap()
@@ -1385,7 +1853,7 @@ fn acknowledged_start_survives_a_crash_while_queued() {
     // Train 1's preflight occupies the saga slot; start 2 is acked and
     // closed while it runs, waiting in the queue.
     let batch = processor.pump().unwrap().expect("start 1 plans preflight");
-    let _outcomes = execute(&processor, &batch);
+    let _outcomes = execute(&mut processor, &batch);
     let body = comment_body(&world.config, 2, "@merge-train start", AUTHOR, "author", 3);
     world.enqueue(&mut processor, "issue_comment", body);
     while let Some(delivery) = processor.claim().unwrap() {
@@ -1716,7 +2184,7 @@ fn stop_cancels_a_queued_not_yet_started_start() {
 
     // Train 1's preflight saga occupies the slot.
     let batch = processor.pump().unwrap().expect("start 1 plans preflight");
-    let outcomes = execute(&processor, &batch);
+    let outcomes = execute(&mut processor, &batch);
 
     // While it runs: start 2 (queues behind the slot), then stop 2.
     start_command(&mut world, &mut processor, 2);
@@ -1731,7 +2199,7 @@ fn stop_cancels_a_queued_not_yet_started_start() {
         .on_outcomes(batch.root, outcomes, batch.feedback)
         .unwrap();
     while let Some(batch) = next {
-        let outcomes = execute(&processor, &batch);
+        let outcomes = execute(&mut processor, &batch);
         next = processor
             .on_outcomes(batch.root, outcomes, batch.feedback)
             .unwrap();
@@ -1797,7 +2265,7 @@ fn start_stop_start_sequence_runs_the_final_start() {
 
     // Train 1's preflight saga occupies the slot.
     let batch = processor.pump().unwrap().expect("start 1 plans preflight");
-    let outcomes = execute(&processor, &batch);
+    let outcomes = execute(&mut processor, &batch);
 
     // While it runs: start 2, stop 2, start 2 again. (Distinct single-digit
     // comment ids: comment_body takes them mod 10, and a collision would
@@ -1819,7 +2287,7 @@ fn start_stop_start_sequence_runs_the_final_start() {
         .on_outcomes(batch.root, outcomes, batch.feedback)
         .unwrap();
     while let Some(batch) = next {
-        let outcomes = execute(&processor, &batch);
+        let outcomes = execute(&mut processor, &batch);
         next = processor
             .on_outcomes(batch.root, outcomes, batch.feedback)
             .unwrap();
@@ -1850,7 +2318,7 @@ fn saga_outcomes_park_until_the_backlog_drains() {
         processor.process_claimed(delivery).unwrap();
     }
     let batch = processor.pump().unwrap().expect("start plans preflight");
-    let outcomes = execute(&processor, &batch);
+    let outcomes = execute(&mut processor, &batch);
 
     // An acked delivery (a stranger's stop, which will need GitHub when
     // processed) is still waiting when the outcomes arrive.
@@ -1870,6 +2338,7 @@ fn saga_outcomes_park_until_the_backlog_drains() {
         WorkerMsg::SagaOutcomes {
             root: batch.root,
             outcomes,
+            best_effort: Vec::new(),
             feedback: batch.feedback,
         },
         &mut parked,
@@ -2219,7 +2688,7 @@ fn run_batches_then_crash(world: &mut World, processor: Processor, depth: usize)
             Some(first) => {
                 let mut batch = first;
                 loop {
-                    let outcomes = execute(&processor, &batch);
+                    let outcomes = execute(&mut processor, &batch);
                     executed += 1;
                     if executed >= depth {
                         break 'outer; // crash: outcomes never observed
@@ -2398,7 +2867,7 @@ fn recovery_parks_and_retries_when_github_is_unavailable() {
 
     // The outage lifts and the timer fires (`WorkerMsg::RetryStalled`).
     world.github.lock().unwrap().unavailable = false;
-    processor.requeue_marked_recoveries();
+    processor.requeue_marked_recoveries().unwrap();
     drive_to_completion(&mut world, &mut processor);
     assert_recovered_exactly_once(&world, &mut processor, "outage-then-retry");
 }
@@ -2439,7 +2908,7 @@ fn recovery_retry_does_not_overtake_the_acked_backlog() {
 
     // GitHub returns; the stall-retry timer fires.
     world.github.lock().unwrap().unavailable = false;
-    processor.requeue_marked_recoveries();
+    processor.requeue_marked_recoveries().unwrap();
 
     // The worker loop pumps BEFORE it re-claims the released delivery: the
     // retried recovery must not produce work ahead of the acked stop.
@@ -2545,17 +3014,17 @@ fn recovery_refreshes_a_stale_status_comment_before_resuming() {
     // boundary 3 plan the Preparing phase: its PhaseTransition (seq bump)
     // is appended, but the batch — carrying the status update — never runs.
     let b1 = processor.pump().unwrap().expect("preflight");
-    let o1 = execute(&processor, &b1);
+    let o1 = execute(&mut processor, &b1);
     let b2 = processor
         .on_outcomes(b1.root, o1, b1.feedback)
         .unwrap()
         .expect("status post");
-    let o2 = execute(&processor, &b2);
+    let o2 = execute(&mut processor, &b2);
     let b3 = processor
         .on_outcomes(b2.root, o2, b2.feedback)
         .unwrap()
         .expect("refetch");
-    let o3 = execute(&processor, &b3);
+    let o3 = execute(&mut processor, &b3);
     let _unexecuted = processor
         .on_outcomes(b3.root, o3, b3.feedback)
         .unwrap()
@@ -3157,7 +3626,7 @@ mod interleaving {
 
         /// Executes `batch` against reality now; holds the outcomes.
         fn dispatch(&mut self, batch: SagaBatch) {
-            let outcomes = execute(self.processor.as_ref().unwrap(), &batch);
+            let outcomes = execute(self.processor.as_mut().unwrap(), &batch);
             self.held = Some((batch, outcomes));
         }
 

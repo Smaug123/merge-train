@@ -40,6 +40,7 @@
 //! (correctness over availability; the durable queue bounds the loss to
 //! latency).
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -131,6 +132,22 @@ enum PendingWork {
     /// Best-effort cleanup for a train the handlers aborted directly
     /// (worktree + final comment/status), run once the saga slot frees.
     AbortCleanup { root: PrNumber },
+    /// A TERMINAL train owes its status comment the final word: the
+    /// comment is the only recovery source if the state DB is later lost,
+    /// and left saying "active" it would resurrect a train the user
+    /// stopped (monolith review, P1). The obligation is written by the
+    /// store in the terminal event's own transaction and cleared only once
+    /// an update is confirmed to have landed or the comment confirmed
+    /// gone; this work item is the retry — a probe of the PR's comments,
+    /// then the rewrite — queued at startup and at the stall cadence.
+    StatusSync {
+        root: PrNumber,
+        /// The train INCARNATION whose comment is owed the final word: the
+        /// stored comment id can be absent (posted, id not yet committed)
+        /// or stale (a repost), so the retry resolves the live comment by
+        /// the incarnation embedded in it.
+        started_at: chrono::DateTime<Utc>,
+    },
     /// A handler `TrainAborted` for the root whose saga is in flight,
     /// deferred to the observation boundary: committed mid-saga it would
     /// make `advance` see an inactive train and discard the outcomes of
@@ -177,6 +194,10 @@ pub(crate) struct Processor {
     /// for the still-marked roots (nothing else may wake a traffic-less
     /// repo).
     retry_requested: bool,
+    /// The incarnation whose obligation the in-flight batch is PROBING
+    /// (`ListComments` on the root), keyed by that root: the probe's
+    /// outcome decides between the rewrite and clearing the obligation.
+    sync_probes: HashMap<PrNumber, chrono::DateTime<Utc>>,
     /// Active-train evaluations owed at startup, queued when the durable
     /// backlog first drains (`Some` until then; see [`Processor::claim`]).
     startup_evaluates: Option<Vec<PrNumber>>,
@@ -223,7 +244,7 @@ impl Processor {
         // observation boundary (which the worker runs against the drained
         // backlog), and a stop appends terminal events valid at any
         // staleness.
-        let pending: VecDeque<PendingWork> = store
+        let mut pending: VecDeque<PendingWork> = store
             .pending_commands()?
             .into_iter()
             .map(|(id, command)| match command {
@@ -233,6 +254,15 @@ impl Processor {
                 }
             })
             .collect();
+        // Terminal status-comment updates a previous process never
+        // confirmed: owed until they land (cheap, GitHub-only,
+        // order-independent).
+        pending.extend(store.owed_status_syncs()?.into_iter().map(|owed| {
+            PendingWork::StatusSync {
+                root: owed.root,
+                started_at: owed.started_at,
+            }
+        }));
         // Startup *evaluations* of active trains (so an acknowledged CI
         // success whose trigger died with the process still resumes a
         // parked train) are computed here but queue only once the durable
@@ -256,6 +286,7 @@ impl Processor {
             inherited_mid_flight,
             needs_restart_cleanup: HashSet::new(),
             retry_requested: false,
+            sync_probes: HashMap::new(),
             startup_evaluates: Some(startup_evaluates),
             active_start: None,
         })
@@ -564,6 +595,10 @@ impl Processor {
             });
         }
 
+        // A handler-committed terminal event (a topology abort) may owe a
+        // status sync that no later outcome refers to.
+        self.queue_owed_status_syncs()?;
+
         // Handler effects are cosmetic-or-cache: ack reactions, rejection
         // comments, and the cold-start `GetPr` fallback (whose response is
         // persisted as cache-fill events).
@@ -813,6 +848,7 @@ impl Processor {
             PendingWork::Trigger(Trigger::EvaluateTrain { .. })
                 | PendingWork::AbortCleanup { .. }
                 | PendingWork::DeferredAbort { .. }
+                | PendingWork::StatusSync { .. }
         );
         if idempotent && self.pending.contains(&work) {
             return;
@@ -1041,9 +1077,178 @@ impl Processor {
     }
 
     /// Whether the worker loop should arm the stall-retry timer (set when
-    /// supplementary recovery found GitHub unavailable). Clears on read.
+    /// supplementary recovery found GitHub unavailable, or a terminal
+    /// status-comment sync is owed). Clears on read.
     pub fn take_retry_request(&mut self) -> bool {
         std::mem::take(&mut self.retry_requested)
+    }
+
+    /// Bookkeeping over a batch's best-effort outcomes: whether an OWED
+    /// terminal status-comment update landed. Status updates are
+    /// best-effort by design (a slow GitHub must not stall the cascade),
+    /// but for a terminal train the comment is the only recovery source
+    /// should the state DB be lost, and a comment left saying "active"
+    /// would resurrect a train the user stopped or that already finished
+    /// (monolith review, P1). The store wrote the obligation with the
+    /// terminal event; a confirmed success clears it, and any failure —
+    /// transient, or permanent such as revoked credentials — leaves it
+    /// owed and arms the stall-retry timer. Only the retry's probe may
+    /// conclude the comment is gone. The residual is a DB loss during the
+    /// same outage: documented, bounded by the outage.
+    pub fn note_best_effort(
+        &mut self,
+        outcomes: &[crate::cascade::EffectOutcome],
+    ) -> Result<(), StoreError> {
+        // Matched by COMMENT, never by the batch's root: an observation
+        // boundary appends another train's terminal cleanup to whichever
+        // batch is in flight, so its update rides a foreign root (Codex
+        // terminal-sync review round 3, P1).
+        let owed = self.store.owed_status_syncs()?;
+        if owed.is_empty() {
+            return Ok(());
+        }
+        for outcome in outcomes {
+            let Effect::GitHub(GitHubEffect::UpdateComment { comment_id, .. }) = &outcome.effect
+            else {
+                continue;
+            };
+            let Some(sync) = owed.iter().find(|o| o.comment_id == Some(*comment_id)) else {
+                continue;
+            };
+            match &outcome.result {
+                Ok(_) => self
+                    .store
+                    .delete_owed_status_sync(sync.root, sync.started_at)?,
+                Err(e) => {
+                    warn!(
+                        root = %sync.root, comment = %comment_id,
+                        error = ?e, "terminal status comment update failed; sync owed"
+                    );
+                    self.retry_requested = true;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The outcome of a status-sync probe (`ListComments` on the root): the
+    /// comment is there — rewrite it from the owed record, as a batch whose
+    /// best-effort outcome `note_best_effort` confirms; gone — nothing
+    /// stale survives, clear the obligation; unknown (the listing failed)
+    /// — keep it and retry at the stall cadence.
+    fn on_sync_probe(
+        &mut self,
+        root: PrNumber,
+        started_at: chrono::DateTime<Utc>,
+        outcomes: Vec<crate::cascade::EffectOutcome>,
+    ) -> Result<Option<SagaBatch>, StoreError> {
+        let Some(owed) = self
+            .store
+            .owed_status_syncs()?
+            .into_iter()
+            .find(|o| o.root == root && o.started_at == started_at)
+        else {
+            return self.pump();
+        };
+        let listing = outcomes.into_iter().find_map(|o| match o.result {
+            Ok(crate::cascade::EffectResponse::GitHub(GitHubResponse::Comments(comments))) => {
+                Some(comments)
+            }
+            _ => None,
+        });
+        let Some(comments) = listing else {
+            warn!(%root, "status-sync probe failed; retrying at the stall cadence");
+            self.retry_requested = true;
+            return self.pump();
+        };
+        // The stored id FIRST, whatever the body says: a live comment at
+        // that id is this train's backup, and one whose body is mangled or
+        // behind needs the rewrite most (the M6 recovery path calls that
+        // `RefreshComment`) — reading it as "gone" would skip the final
+        // update forever (Codex terminal-sync review round 6, P2). Only an
+        // absent or stale id falls back to matching the INCARNATION
+        // embedded in the bot's comments, which covers a post whose
+        // `StatusCommentPosted` never committed (round 4, P1).
+        let live = owed
+            .comment_id
+            .and_then(|id| comments.iter().find(|c| c.id == id))
+            .or_else(|| {
+                comments.iter().find(|c| {
+                    c.author_id == self.deps.bot_user_id
+                        && crate::status::parse_status_comment(&c.body).is_ok_and(|r| {
+                            r.original_root_pr == root && r.started_at == owed.started_at
+                        })
+                })
+            });
+        let Some(live) = live else {
+            info!(%root, "no live status comment for this incarnation; nothing stale survives");
+            self.store.delete_owed_status_sync(root, started_at)?;
+            return self.pump();
+        };
+        let comment_id = live.id;
+        // Pin the resolved id so the rewrite's outcome matches this
+        // obligation (it may have been owed with no id at all).
+        self.store
+            .set_owed_status_comment(root, started_at, comment_id)?;
+        let message = terminal_message(&owed.record);
+        let body = match crate::status::format_status_comment(&owed.record, &message) {
+            Ok(body) => body,
+            Err(e) => {
+                error!(%root, error = %e, "cannot format the terminal status comment; sync dropped");
+                self.store.delete_owed_status_sync(root, started_at)?;
+                return self.pump();
+            }
+        };
+        self.in_flight = Some(root);
+        Ok(Some(SagaBatch {
+            root,
+            effects: Vec::new(),
+            best_effort: vec![Effect::GitHub(GitHubEffect::UpdateComment {
+                comment_id,
+                body,
+            })],
+            feedback: false,
+            restart_cleanup: false,
+        }))
+    }
+
+    /// The comments whose terminal sync is owed, in obligation order.
+    #[cfg(test)]
+    pub fn owed_status_comments(&self) -> Vec<Option<crate::types::CommentId>> {
+        self.store
+            .owed_status_syncs()
+            .unwrap()
+            .into_iter()
+            .map(|o| o.comment_id)
+            .collect()
+    }
+
+    /// Queues a probe for every terminal status-comment sync the store
+    /// owes. Called wherever a terminal event may have just created one:
+    /// the obligation is written by the EVENT, and the cleanup that
+    /// follows carries an `UpdateComment` only when the record knew its
+    /// comment id — otherwise nothing would ever refer to it and only a
+    /// restart would pick it up (Codex terminal-sync review round 5, P1).
+    /// Idempotent: `queue` coalesces status syncs.
+    fn queue_owed_status_syncs(&mut self) -> Result<(), StoreError> {
+        for sync in self.store.owed_status_syncs()? {
+            self.queue(PendingWork::StatusSync {
+                root: sync.root,
+                started_at: sync.started_at,
+            });
+        }
+        Ok(())
+    }
+
+    /// Roots whose terminal status-comment sync is owed.
+    #[cfg(test)]
+    pub fn owed_status_syncs(&self) -> Vec<PrNumber> {
+        self.store
+            .owed_status_syncs()
+            .unwrap()
+            .into_iter()
+            .map(|o| o.root)
+            .collect()
     }
 
     /// Re-owes an evaluation for every root still awaiting recovery —
@@ -1057,9 +1262,13 @@ impl Processor {
     /// recovery act (and push) ahead of an acked stop or topology change
     /// still sitting in the backlog (Codex M6 review, P1; the round-6 rule
     /// again).
-    pub fn requeue_marked_recoveries(&mut self) {
+    pub fn requeue_marked_recoveries(&mut self) -> Result<(), StoreError> {
+        // A store error here would otherwise strand every owed sync
+        // silently: this is the only timer that re-arms them (Codex
+        // terminal-sync review round 6, P2).
+        self.queue_owed_status_syncs()?;
         if self.inherited_mid_flight.is_empty() {
-            return;
+            return Ok(());
         }
         let owed = self.startup_evaluates.get_or_insert_with(Vec::new);
         for root in &self.inherited_mid_flight {
@@ -1067,6 +1276,7 @@ impl Processor {
                 owed.push(*root);
             }
         }
+        Ok(())
     }
 
     /// Inherited-marker upkeep: a root stays marked for recovery only while
@@ -1191,6 +1401,27 @@ impl Processor {
                 PendingWork::Trigger(Trigger::LateAddition { .. }) => {
                     unreachable!("LateAddition is answered in the pipeline, never queued")
                 }
+                PendingWork::StatusSync { root, started_at } => {
+                    if !self
+                        .store
+                        .owed_status_syncs()?
+                        .iter()
+                        .any(|o| o.root == root && o.started_at == started_at)
+                    {
+                        continue; // confirmed meanwhile
+                    }
+                    // The probe: does this incarnation's comment still
+                    // exist? Its outcome (`on_outcomes`) rewrites or clears.
+                    self.sync_probes.insert(root, started_at);
+                    self.in_flight = Some(root);
+                    return Ok(Some(SagaBatch {
+                        root,
+                        effects: vec![Effect::GitHub(GitHubEffect::ListComments { pr: root })],
+                        best_effort: Vec::new(),
+                        feedback: false,
+                        restart_cleanup: false,
+                    }));
+                }
                 PendingWork::AbortCleanup { root } => {
                     let effects = cascade::handler_abort_cleanup(state, root);
                     if effects.is_empty() {
@@ -1251,6 +1482,9 @@ impl Processor {
         debug_assert_eq!(self.in_flight, Some(root), "outcomes for a foreign saga");
         self.in_flight = None;
 
+        if let Some(started_at) = self.sync_probes.remove(&root) {
+            return self.on_sync_probe(root, started_at, outcomes);
+        }
         if !feedback {
             return self.pump();
         }
@@ -1422,6 +1656,9 @@ impl Processor {
         root: PrNumber,
         cleanup: Vec<Effect>,
     ) -> Result<Option<SagaBatch>, StoreError> {
+        // Terminal events applied at this boundary (a stop, an abort, a
+        // completion) may have created obligations nothing else refers to.
+        self.queue_owed_status_syncs()?;
         if cleanup.is_empty() {
             return self.pump();
         }
@@ -1517,6 +1754,11 @@ impl Processor {
             cleanup.extend(cascade::handler_abort_cleanup(self.store.state(), root));
             retired.insert(root);
         }
+        // Like stops: the terminal event may owe a status sync that no
+        // later outcome refers to, and this path can bypass both
+        // `integrate_plan` and `finish_or_pump` (Codex terminal-sync
+        // review round 6, P1).
+        self.queue_owed_status_syncs()?;
         Ok((cleanup, retired))
     }
 
@@ -1524,6 +1766,9 @@ impl Processor {
     /// observation boundary), returning their best-effort cleanup and the
     /// roots whose trains were actually retired. Each stop's durable row is
     /// deleted after its append (a crash in between replays it harmlessly).
+    /// Applies queued stops. Terminal events here may create status-sync
+    /// obligations nothing else refers to, so they are scheduled before
+    /// returning (Codex terminal-sync review round 5, P1).
     fn apply_stops(
         &mut self,
         stops: Vec<QueuedStop>,
@@ -1569,6 +1814,7 @@ impl Processor {
             }
             self.store.delete_pending_command(id)?;
         }
+        self.queue_owed_status_syncs()?;
         Ok((cleanup, stopped_roots))
     }
 
@@ -1596,6 +1842,9 @@ impl Processor {
         } = plan;
         self.store.append_batch(&events, now)?;
         self.clear_inherited_markers(&events);
+        // A terminal plan (a stop, an abort, a completion) may have just
+        // created a status-sync obligation nothing else refers to.
+        self.queue_owed_status_syncs()?;
 
         // TrainStarted answers the in-flight start: its durable row is
         // consumed. (Delete-after-append: a crash in between reloads the
@@ -1679,6 +1928,24 @@ fn command_in(event: &GitHubEvent, deps: &WorkerDeps) -> Option<(PrNumber, Comma
             matches!(command, Command::Predecessor(_)).then_some((pr, command))
         }
         CommentAction::Deleted => None,
+    }
+}
+
+/// The human line of a terminal train's final status comment, by state.
+fn terminal_message(record: &crate::types::TrainRecord) -> String {
+    match &record.state {
+        crate::types::TrainState::Stopped { .. } => "🛑 Merge train stopped by request.".to_owned(),
+        crate::types::TrainState::Aborted { error, .. } => format!(
+            "🛑 Merge train aborted: {}\n\nFix the issue and re-issue `@merge-train start`.",
+            error.message
+        ),
+        crate::types::TrainState::Completed { .. } => "🎉 Merge train completed.".to_owned(),
+        crate::types::TrainState::NeedsManualReview => {
+            "⚠️ Merge train needs manual review.".to_owned()
+        }
+        crate::types::TrainState::Running | crate::types::TrainState::WaitingCi => {
+            "Merge train status.".to_owned()
+        }
     }
 }
 

@@ -66,6 +66,36 @@ pub struct RepoState {
     pub descendants: HashMap<PrNumber, HashSet<PrNumber>>,
 }
 
+/// The record a TERMINAL event turns `record` into — the same transition
+/// [`RepoState::apply_event`] performs, exposed so the store can capture a
+/// train's final record in the transaction that retires it (completion
+/// REMOVES the record from `active_trains`, so it cannot be read back
+/// afterwards). `None` for events that are not terminal for this record.
+pub fn terminal_record_after(
+    record: &TrainRecord,
+    payload: &StateEventPayload,
+    ts: DateTime<Utc>,
+) -> Option<TrainRecord> {
+    let root = record.original_root_pr;
+    let mut after = record.clone();
+    match payload {
+        StateEventPayload::TrainStopped { root_pr } if *root_pr == root => after.stop(ts),
+        StateEventPayload::TrainAborted { root_pr, error } if *root_pr == root => {
+            after.abort(error.clone(), ts)
+        }
+        StateEventPayload::TrainCompleted { root_pr } if *root_pr == root => {
+            after.state = TrainState::Completed { ended_at: ts };
+            after.increment_seq();
+        }
+        StateEventPayload::FanOutCompleted { old_root, .. } if *old_root == root => {
+            after.state = TrainState::Completed { ended_at: ts };
+            after.increment_seq();
+        }
+        _ => return None,
+    }
+    Some(after)
+}
+
 impl RepoState {
     /// Materializes a `RepoState` from a persisted snapshot, rebuilding the
     /// derived descendants index from the snapshot's PRs.
@@ -1568,6 +1598,73 @@ mod tests {
             train.watermark,
             Some(CommentId(5)),
             "the repost does not move it"
+        );
+    }
+
+    /// `terminal_record_after` is exactly `apply_event`'s transition on the
+    /// record — for every terminal event, and `None` otherwise.
+    #[test]
+    fn terminal_record_after_matches_apply_event() {
+        let ts = crate::test_utils::test_timestamp();
+        let later = ts + chrono::Duration::hours(1);
+        let mut state = RepoState::from_snapshot(PersistedRepoSnapshot::new("main".to_string()));
+        state.apply_event(&event(StateEventPayload::TrainStarted {
+            root_pr: PrNumber(1),
+            current_pr: PrNumber(1),
+        }));
+        let record = state.active_trains[&PrNumber(1)].clone();
+        let terminal = [
+            StateEventPayload::TrainStopped {
+                root_pr: PrNumber(1),
+            },
+            StateEventPayload::TrainAborted {
+                root_pr: PrNumber(1),
+                error: TrainError::new(crate::types::TrainErrorKind::ApiError, "boom"),
+            },
+        ];
+        for payload in terminal {
+            let mut replay = state.clone();
+            replay.apply_event(&StateEvent {
+                seq: 1,
+                ts: later,
+                payload: payload.clone(),
+            });
+            assert_eq!(
+                terminal_record_after(&record, &payload, later).as_ref(),
+                replay.active_trains.get(&PrNumber(1)),
+                "{payload:?}"
+            );
+        }
+        let completed = terminal_record_after(
+            &record,
+            &StateEventPayload::TrainCompleted {
+                root_pr: PrNumber(1),
+            },
+            later,
+        )
+        .expect("completion is terminal");
+        assert_eq!(completed.state, TrainState::Completed { ended_at: later });
+        assert_eq!(completed.recovery_seq, record.recovery_seq + 1);
+        assert!(
+            terminal_record_after(
+                &record,
+                &StateEventPayload::TrainStopped {
+                    root_pr: PrNumber(2)
+                },
+                later
+            )
+            .is_none(),
+            "another root's event is not terminal for this record"
+        );
+        assert!(
+            terminal_record_after(
+                &record,
+                &StateEventPayload::DefaultBranchSet {
+                    branch: "x".to_owned()
+                },
+                later
+            )
+            .is_none()
         );
     }
 

@@ -31,14 +31,30 @@ use thiserror::Error;
 use crate::persistence::event::{StateEvent, StateEventPayload};
 use crate::persistence::snapshot::{PersistedRepoSnapshot, SCHEMA_VERSION};
 use crate::state::RepoState;
-use crate::types::PrNumber;
+use crate::types::{CommentId, PrNumber, TrainRecord};
+
+/// A terminal status-comment update still owed, keyed by the train
+/// INCARNATION (root + `started_at`): a root can retire twice under two
+/// different comments, and each owes its own final word. `comment_id` is
+/// the id the store knew, which may be `None` (the comment was posted but
+/// the process died before `StatusCommentPosted` committed) or stale (a
+/// recovery repost); the retry resolves the live comment by matching the
+/// incarnation embedded in the bot's comments, so neither wedges it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwedStatusSync {
+    pub root: PrNumber,
+    pub started_at: DateTime<Utc>,
+    pub comment_id: Option<CommentId>,
+    /// The record — as the train ended — to rewrite the comment from.
+    pub record: TrainRecord,
+}
 use crate::webhooks::dedupe::DedupeKey;
 
 /// Schema version for the SQLite store. Bump on a breaking schema change; a DB
 /// at a different version is rejected loudly rather than mis-read.
 ///
 /// v2 added the `deliveries` and `dedupe_keys` tables (the webhook queue).
-const STORE_SCHEMA_VERSION: i64 = 4;
+const STORE_SCHEMA_VERSION: i64 = 5;
 
 /// Errors from the store.
 #[derive(Debug, Error)]
@@ -519,6 +535,65 @@ impl Store {
     /// command's durable answer means a crash in between replays it, which
     /// is harmless: stopping a stopped train answers "no active train", and
     /// starting an already-started one is rejected as already running.
+    /// The terminal status-comment syncs still owed, by root.
+    pub fn owed_status_syncs(&self) -> Result<Vec<OwedStatusSync>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT root, started_at, comment_id, record FROM owed_status_syncs \
+             ORDER BY root, started_at",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut owed = Vec::new();
+        for row in rows {
+            let (root, started_at, comment_id, record) = row?;
+            let record: TrainRecord = serde_json::from_str(&record)?;
+            // The key's timestamp is the record's own, round-tripped
+            // through RFC 3339; the record is the authority.
+            debug_assert_eq!(record.started_at.to_rfc3339(), started_at);
+            owed.push(OwedStatusSync {
+                root: PrNumber(root as u64),
+                started_at: record.started_at,
+                comment_id: comment_id.map(|id| CommentId(id as u64)),
+                record,
+            });
+        }
+        Ok(owed)
+    }
+
+    /// Records the comment a probe resolved for one owed incarnation, so
+    /// the rewrite's outcome can be matched back to it.
+    pub fn set_owed_status_comment(
+        &mut self,
+        root: PrNumber,
+        started_at: DateTime<Utc>,
+        comment_id: CommentId,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE owed_status_syncs SET comment_id = ?3 WHERE root = ?1 AND started_at = ?2",
+            rusqlite::params![root.0 as i64, started_at.to_rfc3339(), comment_id.0 as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Clears the owed sync for one train incarnation (idempotent).
+    pub fn delete_owed_status_sync(
+        &mut self,
+        root: PrNumber,
+        started_at: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM owed_status_syncs WHERE root = ?1 AND started_at = ?2",
+            rusqlite::params![root.0 as i64, started_at.to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
     pub fn delete_pending_command(&mut self, id: i64) -> Result<(), StoreError> {
         self.conn.execute(
             "DELETE FROM pending_commands WHERE id = ?1",
@@ -667,6 +742,30 @@ fn insert_and_apply(
     state: &mut RepoState,
     event: &StateEvent,
 ) -> Result<(), StoreError> {
+    // A terminal event owes its train's status comment the final word —
+    // captured here, before completion removes the record, and in this
+    // transaction, so a crash between the commit and the update cannot
+    // lose it. Only a train with a comment owes anything.
+    if let Some(root) = terminal_root(&event.payload)
+        && let Some(record) = state.active_trains.get(&root)
+        && let Some(after) = crate::state::terminal_record_after(record, &event.payload, event.ts)
+    {
+        // Owed even when the id is unknown: `PostComment` may have
+        // succeeded with the process dying before `StatusCommentPosted`
+        // committed, and that comment is exactly the stale ACTIVE one a
+        // later DB loss would resurrect from (Codex terminal-sync review
+        // round 4, P1). The retry resolves it by incarnation.
+        tx.execute(
+            "INSERT OR REPLACE INTO owed_status_syncs \
+             (root, started_at, comment_id, record) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                root.0 as i64,
+                after.started_at.to_rfc3339(),
+                record.status_comment_id.map(|c| c.0 as i64),
+                serde_json::to_string(&after)?
+            ],
+        )?;
+    }
     state.apply_event(event);
     tx.execute(
         "INSERT INTO events (seq, ts, payload) VALUES (?1, ?2, ?3)",
@@ -677,6 +776,17 @@ fn insert_and_apply(
         ],
     )?;
     Ok(())
+}
+
+/// The root a terminal event retires, if any.
+fn terminal_root(payload: &StateEventPayload) -> Option<PrNumber> {
+    match payload {
+        StateEventPayload::TrainStopped { root_pr }
+        | StateEventPayload::TrainAborted { root_pr, .. }
+        | StateEventPayload::TrainCompleted { root_pr } => Some(*root_pr),
+        StateEventPayload::FanOutCompleted { old_root, .. } => Some(*old_root),
+        _ => None,
+    }
 }
 
 /// Upserts the single-row materialized cache from `state`, within `tx`.
@@ -736,6 +846,26 @@ fn init_schema(conn: &Connection) -> Result<(), StoreError> {
             kind       TEXT NOT NULL,
             pr         INTEGER NOT NULL,
             force_stop INTEGER NOT NULL
+        );
+        -- A train retired by a TERMINAL event owes its status comment the
+        -- final word: the comment is the only recovery source if this
+        -- database is later lost, and left saying active it would
+        -- resurrect the train. Written in the SAME transaction as the
+        -- terminal event (with the record as it ends, captured before
+        -- completion removes it), deleted only once the update is
+        -- confirmed to have landed or the comment confirmed gone.
+        -- Keyed by the train INCARNATION, not the root: a root can retire
+        -- twice (a stopped train is restarted and stops again), and each
+        -- incarnation owes its own comment a final word until confirmed.
+        -- `comment_id` may be NULL — the comment was posted but the process
+        -- died before its id committed — so the retry resolves the live
+        -- comment by the incarnation embedded in it.
+        CREATE TABLE owed_status_syncs (
+            root       INTEGER NOT NULL,
+            started_at TEXT    NOT NULL,
+            comment_id INTEGER,
+            record     TEXT    NOT NULL,
+            PRIMARY KEY (root, started_at)
         );",
     )?;
     // `user_version` is a transactional header write, so the DDL above and this
@@ -1032,6 +1162,165 @@ mod tests {
         drop(Store::open(&path).unwrap());
         // Lock released on drop ⇒ a fresh open succeeds.
         let _again = Store::open(&path).unwrap();
+    }
+
+    /// Every terminal event owes a sync, written with the event: the
+    /// record as the train ends (captured before completion removes it),
+    /// durable across a reopen, cleared only explicitly. A train whose
+    /// comment id was never committed owes one too, with no id — the post
+    /// may have landed before the crash, and only a probe can tell.
+    #[test]
+    fn terminal_events_owe_a_status_sync_transactionally() {
+        use crate::types::{TrainError, TrainErrorKind, TrainState};
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let ts = test_timestamp();
+        let start = |store: &mut Store, root: u64| {
+            store
+                .append(
+                    StateEventPayload::TrainStarted {
+                        root_pr: PrNumber(root),
+                        current_pr: PrNumber(root),
+                    },
+                    ts,
+                )
+                .unwrap();
+        };
+        {
+            let mut store = Store::open(&path).unwrap();
+            // #1 completes (removed from the state), #2 aborts, #3 stops —
+            // all with comments; #4 stops without one.
+            for root in 1..=4 {
+                start(&mut store, root);
+            }
+            for root in 1..=3 {
+                store
+                    .append(
+                        StateEventPayload::StatusCommentPosted {
+                            root_pr: PrNumber(root),
+                            comment_id: CommentId(100 + root),
+                        },
+                        ts,
+                    )
+                    .unwrap();
+            }
+            let later = ts + chrono::Duration::hours(1);
+            store
+                .append(
+                    StateEventPayload::TrainCompleted {
+                        root_pr: PrNumber(1),
+                    },
+                    later,
+                )
+                .unwrap();
+            store
+                .append(
+                    StateEventPayload::TrainAborted {
+                        root_pr: PrNumber(2),
+                        error: TrainError::new(TrainErrorKind::ApiError, "boom"),
+                    },
+                    later,
+                )
+                .unwrap();
+            for root in [3, 4] {
+                store
+                    .append(
+                        StateEventPayload::TrainStopped {
+                            root_pr: PrNumber(root),
+                        },
+                        later,
+                    )
+                    .unwrap();
+            }
+            assert!(
+                !store.state().active_trains.contains_key(&PrNumber(1)),
+                "completion removed the record"
+            );
+            let owed = store.owed_status_syncs().unwrap();
+            let roots: Vec<u64> = owed.iter().map(|o| o.root.0).collect();
+            assert_eq!(roots, vec![1, 2, 3, 4], "every terminal event owes");
+            assert_eq!(owed[0].comment_id, Some(CommentId(101)));
+            assert_eq!(
+                owed[3].comment_id, None,
+                "#4's id was never committed; the retry probes for it"
+            );
+            assert_eq!(
+                owed[0].record.state,
+                TrainState::Completed { ended_at: later }
+            );
+            assert!(matches!(owed[1].record.state, TrainState::Aborted { .. }));
+            assert_eq!(
+                owed[2].record.state,
+                TrainState::Stopped { ended_at: later }
+            );
+            let second = owed[1].started_at;
+            store.delete_owed_status_sync(PrNumber(2), second).unwrap();
+            store.delete_owed_status_sync(PrNumber(2), second).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let roots: Vec<u64> = store
+            .owed_status_syncs()
+            .unwrap()
+            .iter()
+            .map(|o| o.root.0)
+            .collect();
+        assert_eq!(roots, vec![1, 3, 4], "owed syncs survive a reopen");
+    }
+
+    /// A root that retires TWICE under two different status comments owes
+    /// BOTH: the second terminal event must not overwrite the first
+    /// comment's obligation, or that comment stays saying active forever
+    /// (Codex terminal-sync review round 3, P1).
+    #[test]
+    fn a_second_incarnation_does_not_overwrite_the_first_obligation() {
+        let dir = tempdir().unwrap();
+        let mut store = open_temp(&dir);
+        let ts = test_timestamp();
+        for (comment, at) in [(10u64, ts), (20, ts + chrono::Duration::hours(2))] {
+            store
+                .append(
+                    StateEventPayload::TrainStarted {
+                        root_pr: PrNumber(1),
+                        current_pr: PrNumber(1),
+                    },
+                    at,
+                )
+                .unwrap();
+            store
+                .append(
+                    StateEventPayload::StatusCommentPosted {
+                        root_pr: PrNumber(1),
+                        comment_id: CommentId(comment),
+                    },
+                    at,
+                )
+                .unwrap();
+            store
+                .append(
+                    StateEventPayload::TrainStopped {
+                        root_pr: PrNumber(1),
+                    },
+                    at + chrono::Duration::hours(1),
+                )
+                .unwrap();
+        }
+        let owed = store.owed_status_syncs().unwrap();
+        let comments: Vec<Option<u64>> = owed.iter().map(|o| o.comment_id.map(|c| c.0)).collect();
+        assert_eq!(
+            comments,
+            vec![Some(10), Some(20)],
+            "both incarnations owe their comment"
+        );
+        assert!(owed.iter().all(|o| o.root == PrNumber(1)));
+        let first = owed[0].started_at;
+        store.delete_owed_status_sync(PrNumber(1), first).unwrap();
+        let left: Vec<Option<u64>> = store
+            .owed_status_syncs()
+            .unwrap()
+            .iter()
+            .map(|o| o.comment_id.map(|c| c.0))
+            .collect();
+        assert_eq!(left, vec![Some(20)], "clearing one leaves the other owed");
     }
 
     #[test]

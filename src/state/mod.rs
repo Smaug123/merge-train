@@ -12,7 +12,7 @@ pub mod validation;
 
 // Re-export commonly used types and functions
 pub use descendants::{build_descendants_index, remaining_descendants};
-pub use repo::RepoState;
+pub use repo::{RepoState, terminal_record_after};
 pub use topology::{MergeStack, compute_stacks, detect_cycle, is_root};
 pub use transitions::{PhaseOutcome, next_phase};
 pub use validation::{PredecessorValidationError, validate_predecessor_declaration};
