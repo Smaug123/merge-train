@@ -82,6 +82,9 @@ pub enum Trigger {
     LateAddition {
         pr: PrNumber,
         merged_predecessor: PrNumber,
+        /// The declaring comment: the answer carries a rejection receipt
+        /// naming it, so a lost-DB crawl does not replay it as a declaration.
+        comment_id: CommentId,
     },
 }
 
@@ -282,13 +285,28 @@ fn handle_predecessor_command(
         return HandlerOutput::default();
     }
 
-    // Re-stating the current declaration from a *new* comment transfers
+    // Re-stating the current declaration from a *newer* comment transfers
     // ownership to it — the topology is unchanged, so nothing to validate.
     // This is also the recovery path after a refused unauthorized
     // retraction (Codex M5 round 3): if the owning comment was deleted on
     // GitHub but the bot kept the declaration, the author re-states it in a
     // live comment and can then edit or delete *that* one.
+    //
+    // Ownership only ever moves FORWARD in comment id. Webhooks can arrive
+    // out of order (and old ones are redelivered), so an OLDER restatement
+    // may be processed after a newer one; letting it take ownership would
+    // break the invariant the retraction receipt relies on — "every
+    // declaration at or below the owner's id is superseded" — and a
+    // receipt anchored at the older comment would leave the newer one
+    // standing for a lost-DB crawl to resurrect (Codex receipts review
+    // round 2, P1). An older restatement is idempotent.
     if !declared_by_this_comment && cached.predecessor == Some(predecessor) {
+        if cached
+            .predecessor_comment_id
+            .is_some_and(|owner| owner >= comment_id)
+        {
+            return HandlerOutput::default();
+        }
         return HandlerOutput::event(StateEventPayload::PredecessorDeclared {
             pr,
             predecessor,
@@ -311,7 +329,7 @@ fn handle_predecessor_command(
     if let Err(e) = validation {
         return HandlerOutput {
             events: vec![],
-            effects: vec![reject(pr, &predecessor_rejection_message(&e))],
+            effects: vec![reject(pr, comment_id, &predecessor_rejection_message(&e))],
             triggers: vec![],
         };
     }
@@ -331,19 +349,31 @@ fn handle_predecessor_command(
             triggers: vec![Trigger::LateAddition {
                 pr,
                 merged_predecessor: predecessor,
+                comment_id,
             }],
         };
     }
 
     let mut out = HandlerOutput {
-        events: vec![StateEventPayload::PredecessorDeclared {
-            pr,
-            predecessor,
-            comment_id,
-        }],
+        events: Vec::new(),
         effects: vec![ack(comment_id)],
         triggers: vec![],
     };
+    // An edit that moves the declaration to a DIFFERENT predecessor retracts
+    // the old edge first (the same-predecessor cases returned above). The
+    // retraction is what the worker posts a receipt for: without one, an
+    // older surviving comment declaring the old predecessor would be
+    // replayed by a lost-DB crawl — which refuses edited comments — and the
+    // retracted edge would come back (Codex receipts review, P1).
+    if declared_by_this_comment {
+        out.events
+            .push(StateEventPayload::PredecessorRemoved { pr, comment_id });
+    }
+    out.events.push(StateEventPayload::PredecessorDeclared {
+        pr,
+        predecessor,
+        comment_id,
+    });
     // Changing the stack under an active train is unsafe to cascade.
     out.events.extend(topology_change_abort(state, pr));
     out
@@ -441,15 +471,15 @@ fn handle_pr_edited(pr: PrNumber, new_base: &str, state: &RepoState) -> HandlerO
         && pred.state == PrState::Open
         && pred.head_ref != new_base
     {
-        out.effects.push(reject(
+        out.effects.push(Effect::GitHub(GitHubEffect::PostComment {
             pr,
-            &format!(
+            body: format!(
                 "Heads up: retargeting PR #{pr} to `{new_base}` no longer matches its \
                  predecessor #{pred_num}'s head `{}`, so they are no longer stacked. \
                  Re-declare the predecessor or restart the train.",
                 pred.head_ref
             ),
-        ));
+        }));
     }
     out
 }
@@ -616,10 +646,14 @@ fn ack(comment_id: CommentId) -> Effect {
     })
 }
 
-fn reject(pr: PrNumber, body: &str) -> Effect {
+/// A rejection of the declaration in `comment_id`: the human message plus
+/// a rejection RECEIPT naming the comment, so a lost-DB crawl — which can
+/// only see that the comment survives — knows live refused it and does not
+/// re-validate it against a present in which it might pass.
+fn reject(pr: PrNumber, comment_id: CommentId, body: &str) -> Effect {
     Effect::GitHub(GitHubEffect::PostComment {
         pr,
-        body: body.to_owned(),
+        body: crate::status::format_rejection_receipt(pr, comment_id, body),
     })
 }
 
@@ -915,6 +949,42 @@ mod tests {
         assert_eq!(state.prs[&PrNumber(2)].predecessor, Some(PrNumber(1)));
     }
 
+    /// Ownership of a declaration moves only FORWARD in comment id: a
+    /// newer restatement takes it, an older one (a delayed or redelivered
+    /// webhook) is idempotent. The retraction receipt's "at or below the
+    /// owner" tombstone depends on it (Codex receipts review round 2, P1).
+    #[test]
+    fn restatement_ownership_moves_only_forward() {
+        let mut pr2 = open_pr(2, "feature-1", Some(1));
+        pr2.predecessor_comment_id = Some(CommentId(20));
+        let state = state_with(vec![open_pr(1, "main", None), pr2]);
+        let restate = |id: u64| {
+            let mut event = comment(
+                CommentAction::Created,
+                Some(2),
+                "@merge-train predecessor #1",
+                1,
+            );
+            if let GitHubEvent::IssueComment(c) = &mut event {
+                c.comment_id = CommentId(id);
+            }
+            handle_event(&event, &state, &ctx())
+        };
+        assert!(
+            restate(10).events.is_empty(),
+            "an older restatement is a no-op"
+        );
+        assert!(restate(20).events.is_empty(), "the owner itself is a no-op");
+        assert_eq!(
+            restate(30).events,
+            vec![StateEventPayload::PredecessorDeclared {
+                pr: PrNumber(2),
+                predecessor: PrNumber(1),
+                comment_id: CommentId(30),
+            }]
+        );
+    }
+
     #[test]
     fn invalid_predecessor_rejects_with_comment() {
         // Predecessor #1 does not exist.
@@ -931,13 +1001,25 @@ mod tests {
             &ctx(),
         );
         assert!(out.events.is_empty());
-        assert!(matches!(
-            out.effects.as_slice(),
-            [Effect::GitHub(GitHubEffect::PostComment {
+        let [
+            Effect::GitHub(GitHubEffect::PostComment {
                 pr: PrNumber(2),
-                ..
-            })]
-        ));
+                body,
+            }),
+        ] = out.effects.as_slice()
+        else {
+            panic!("expected one rejection comment, got {:?}", out.effects);
+        };
+        assert!(body.starts_with("Cannot declare predecessor"), "{body}");
+        // The rejection is durable evidence: a lost-DB crawl must not
+        // re-validate this comment against the present and accept it.
+        assert_eq!(
+            crate::status::parse_receipt(body),
+            Some(crate::status::Receipt::Rejection {
+                pr: PrNumber(2),
+                rejected: CommentId(7),
+            })
+        );
     }
 
     #[test]
@@ -1212,7 +1294,11 @@ mod tests {
             }]
         );
 
-        // Edit changes the predecessor → update (not an AlreadyHasPredecessor reject).
+        // Edit changes the predecessor → update (not an AlreadyHasPredecessor
+        // reject). The old edge is RETRACTED first: the retraction is what
+        // the worker posts a receipt for, and without one a lost-DB crawl
+        // would replay an older surviving `predecessor #1` comment
+        // (Codex receipts review, P1).
         let updated = handle_event(
             &comment(
                 CommentAction::Edited,
@@ -1225,11 +1311,17 @@ mod tests {
         );
         assert_eq!(
             updated.events,
-            vec![StateEventPayload::PredecessorDeclared {
-                pr: PrNumber(2),
-                predecessor: PrNumber(3),
-                comment_id: CommentId(7),
-            }]
+            vec![
+                StateEventPayload::PredecessorRemoved {
+                    pr: PrNumber(2),
+                    comment_id: CommentId(7),
+                },
+                StateEventPayload::PredecessorDeclared {
+                    pr: PrNumber(2),
+                    predecessor: PrNumber(3),
+                    comment_id: CommentId(7),
+                },
+            ]
         );
     }
 
@@ -1532,6 +1624,7 @@ mod tests {
             vec![Trigger::LateAddition {
                 pr: PrNumber(2),
                 merged_predecessor: PrNumber(1),
+                comment_id: CommentId(7),
             }]
         );
         assert!(out.events.is_empty());

@@ -670,6 +670,102 @@ fn stranger_cannot_retract_a_predecessor_declaration() {
     );
 }
 
+/// An authorized retraction leaves no trace in GitHub's present — the
+/// declaring comment is gone — so the worker posts a durable RECEIPT on
+/// the PR naming the retracted comment's id. A lost-DB crawl reads it as
+/// a tombstone for that declaration and everything it had superseded. A
+/// denied retraction posts none: nothing was retracted.
+#[test]
+fn an_authorized_retraction_posts_a_receipt_naming_the_retracted_comment() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    drain(&mut processor);
+
+    let repo = repo_json(&world.config);
+    let delete_body = move |comment_id: u64, sender_id: u64, sender_login: &str| {
+        format!(
+            r#"{{
+                "action": "deleted",
+                "comment": {{
+                    "id": {comment_id},
+                    "body": null,
+                    "user": {{ "id": {AUTHOR}, "login": "author" }},
+                    "updated_at": "2026-07-01T13:00:00Z"
+                }},
+                "issue": {{
+                    "number": 2,
+                    "pull_request": {{ "url": "..." }},
+                    "user": {{ "id": {AUTHOR}, "login": "author" }}
+                }},
+                "repository": {repo},
+                "sender": {{ "id": {sender_id}, "login": "{sender_login}" }}
+            }}"#,
+        )
+        .into_bytes()
+    };
+    let receipts = |world: &World| -> Vec<(PrNumber, crate::types::CommentId)> {
+        world
+            .github
+            .lock()
+            .unwrap()
+            .posted_comments
+            .iter()
+            .filter_map(|(pr, text)| match crate::status::parse_receipt(text) {
+                Some(crate::status::Receipt::Retraction {
+                    pr: named,
+                    retracted,
+                }) => {
+                    assert_eq!(*pr, named, "a receipt sits on the PR it names");
+                    Some((named, retracted))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+
+    // A stranger's deletion is denied: no retraction, no receipt.
+    world.enqueue(
+        &mut processor,
+        "issue_comment",
+        delete_body(0, STRANGER, "stranger"),
+    );
+    drain(&mut processor);
+    assert_eq!(
+        receipts(&world),
+        vec![],
+        "a denied retraction posts no receipt"
+    );
+
+    // The author re-declares in a fresh comment (id 5) and deletes it.
+    let body = comment_body(
+        &world.config,
+        2,
+        "@merge-train predecessor #1",
+        AUTHOR,
+        "author",
+        5,
+    );
+    world.enqueue(&mut processor, "issue_comment", body);
+    drain(&mut processor);
+    world.enqueue(
+        &mut processor,
+        "issue_comment",
+        delete_body(5, AUTHOR, "author"),
+    );
+    drain(&mut processor);
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor,
+        None,
+        "the author's own deletion retracts the declaration"
+    );
+    assert_eq!(
+        receipts(&world),
+        vec![(PrNumber(2), crate::types::CommentId(5))],
+        "exactly one receipt, on the retracting PR, anchored at the RETRACTED comment"
+    );
+}
+
 /// A comment event *performed by the bot* (sender == bot) must not reach
 /// the handler at all: the handler's self-guard keys off the comment
 /// author, so a bot-performed edit of a USER's comment (author == user)
