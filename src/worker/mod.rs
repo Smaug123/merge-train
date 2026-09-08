@@ -118,6 +118,9 @@ pub enum WorkerMsg {
         root: PrNumber,
         /// The observed effects' outcomes (empty for best-effort-only batches).
         outcomes: Vec<EffectOutcome>,
+        /// The best-effort effects' outcomes: bookkeeping only (a terminal
+        /// train's status-comment sync), never fed to the engine.
+        best_effort: Vec<EffectOutcome>,
         /// Whether the outcomes feed `observe` → `advance`.
         feedback: bool,
     },
@@ -717,9 +720,12 @@ fn handle_msg(
         WorkerMsg::SagaOutcomes {
             root,
             outcomes,
+            best_effort,
             feedback,
         } => {
             debug_assert!(parked.is_none(), "one saga, one parked slot");
+            // Bookkeeping, not an observation: it needs no boundary.
+            processor.note_best_effort(&best_effort)?;
             *parked = Some((root, outcomes, feedback));
             Ok(None)
         }
@@ -727,7 +733,7 @@ fn handle_msg(
         // retries any recovery that parked on GitHub unavailability: the
         // re-queued evaluations pump on the next turn.
         WorkerMsg::RetryStalled => {
-            processor.requeue_marked_recoveries();
+            processor.requeue_marked_recoveries()?;
             Ok(None)
         }
     }
@@ -790,13 +796,25 @@ fn dispatch(processor: &Processor, batch: SagaBatch, tx: mpsc::Sender<WorkerMsg>
                 warn!(error = %e, "repo clone unavailable; failing the batch as transient");
                 // Best-effort effects fail independently: the API-only ones
                 // (comments, status updates) do not need the clone, so a
-                // clone failure must not suppress them (Codex M5 round 10).
+                // clone failure must not suppress them (Codex M5 round 10) —
+                // and their outcomes are reported like any other batch's,
+                // or a terminal status update failing in the same outage
+                // would go unnoticed (Codex terminal-sync review, P1).
+                let mut best_effort = Vec::new();
                 for effect in &batch.best_effort {
-                    if let Effect::GitHub(api) = effect
-                        && let Err(e) = github.execute(api.clone())
-                    {
+                    let Effect::GitHub(api) = effect else {
+                        continue;
+                    };
+                    let result = github
+                        .execute(api.clone())
+                        .map(crate::cascade::EffectResponse::GitHub);
+                    if let Err(e) = &result {
                         warn!(?effect, error = ?e, "best-effort effect failed (ignored)");
                     }
+                    best_effort.push(EffectOutcome {
+                        effect: effect.clone(),
+                        result,
+                    });
                 }
                 // Fail the first observed effect so the engine parks and
                 // re-derives; a best-effort-only batch just reports empty.
@@ -815,15 +833,17 @@ fn dispatch(processor: &Processor, batch: SagaBatch, tx: mpsc::Sender<WorkerMsg>
                 let _ = tx.blocking_send(WorkerMsg::SagaOutcomes {
                     root: batch.root,
                     outcomes,
+                    best_effort,
                     feedback: batch.feedback,
                 });
                 return;
             }
             let interpreter = WorktreeGitInterpreter::new(config, batch.root);
-            let outcomes = execute_batch(&interpreter, &github, &batch);
+            let result = execute_batch(&interpreter, &github, &batch);
             let _ = tx.blocking_send(WorkerMsg::SagaOutcomes {
                 root: batch.root,
-                outcomes,
+                outcomes: result.observed,
+                best_effort: result.best_effort,
                 feedback: batch.feedback,
             });
         });
