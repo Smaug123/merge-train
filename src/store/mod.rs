@@ -33,6 +33,19 @@ use crate::persistence::snapshot::{PersistedRepoSnapshot, SCHEMA_VERSION};
 use crate::state::RepoState;
 use crate::types::{CommentId, PrNumber, TrainRecord};
 
+/// A PR whose stack-ledger comment no longer matches what the store holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwedLedger {
+    pub pr: PrNumber,
+    /// The generation this obligation was raised at. A write clears the
+    /// generation it read, and no other.
+    pub generation: u64,
+    /// Probes that found no ledger at all. A replacement is posted only
+    /// once that absence is STABLE: GitHub's listings are eventually
+    /// consistent, and posting on the first miss leaves a duplicate.
+    pub absent_probes: u32,
+}
+
 /// A terminal status-comment update still owed, keyed by the train
 /// INCARNATION (root + `started_at`): a root can retire twice under two
 /// different comments, and each owes its own final word. `comment_id` is
@@ -64,7 +77,7 @@ use crate::webhooks::dedupe::DedupeKey;
 /// at a different version is rejected loudly rather than mis-read.
 ///
 /// v2 added the `deliveries` and `dedupe_keys` tables (the webhook queue).
-const STORE_SCHEMA_VERSION: i64 = 5;
+const STORE_SCHEMA_VERSION: i64 = 6;
 
 /// Errors from the store.
 #[derive(Debug, Error)]
@@ -637,6 +650,101 @@ impl Store {
         Ok(count as u32 + 1)
     }
 
+    /// The PRs whose stack ledger is out of date, oldest change first.
+    pub fn owed_stack_ledgers(&self) -> Result<Vec<OwedLedger>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT pr, generation, absent_probes FROM owed_stack_ledgers ORDER BY generation, pr",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut owed = Vec::new();
+        for row in rows {
+            let (pr, generation, absent_probes) = row?;
+            owed.push(OwedLedger {
+                pr: PrNumber(pr as u64),
+                generation: generation as u64,
+                absent_probes: absent_probes as u32,
+            });
+        }
+        Ok(owed)
+    }
+
+    /// Forgets that any probe has missed this PR's ledger. Called when a
+    /// replacement is POSTED: absence must become stable again relative to
+    /// that attempt, or one stale listing after a post whose response was
+    /// lost would immediately post another (Codex ledger review round 13,
+    /// P2).
+    pub fn reset_absent_ledger(&mut self, pr: PrNumber) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE owed_stack_ledgers SET absent_probes = 0, absent_at = NULL WHERE pr = ?1",
+            rusqlite::params![pr.0 as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Records that a probe found no ledger on `pr`, and answers how many
+    /// probes at least `cooldown` apart have now missed it. GitHub's
+    /// listings are eventually consistent, so a ledger posted moments ago
+    /// can be absent from one and present in the next — and posting a
+    /// replacement on the first miss leaves a permanent duplicate.
+    pub fn note_absent_ledger(
+        &mut self,
+        pr: PrNumber,
+        now: DateTime<Utc>,
+        cooldown: chrono::Duration,
+    ) -> Result<u32, StoreError> {
+        let (count, last): (i64, Option<String>) = self.conn.query_row(
+            "SELECT absent_probes, absent_at FROM owed_stack_ledgers WHERE pr = ?1",
+            rusqlite::params![pr.0 as i64],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let too_soon = last
+            .as_deref()
+            .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+            .is_some_and(|at| now - at.with_timezone(&Utc) < cooldown);
+        if too_soon {
+            return Ok(count as u32);
+        }
+        self.conn.execute(
+            "UPDATE owed_stack_ledgers SET absent_probes = absent_probes + 1, absent_at = ?2 \
+             WHERE pr = ?1",
+            rusqlite::params![pr.0 as i64, now.to_rfc3339()],
+        )?;
+        Ok(count as u32 + 1)
+    }
+
+    /// Marks a PR's stack ledger out of date. Used where the ledger is
+    /// lost rather than changed — somebody deleted the comment — since the
+    /// topology events that normally dirty it did not happen.
+    pub fn mark_ledger_owed(&mut self, pr: PrNumber) -> Result<(), StoreError> {
+        let tx = self.conn.transaction()?;
+        mark_ledger_owed_in(&tx, pr)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Clears the obligation a write was made FOR — identified by the
+    /// generation it read. Anything that dirtied the ledger since (a
+    /// declaration, a retraction, a maintainer editing the comment) holds
+    /// a newer generation and survives it (Codex ledger review round 13,
+    /// P1).
+    pub fn clear_owed_stack_ledger(
+        &mut self,
+        pr: PrNumber,
+        generation: u64,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM owed_stack_ledgers WHERE pr = ?1 AND generation = ?2",
+            rusqlite::params![pr.0 as i64, generation as i64],
+        )?;
+        Ok(())
+    }
+
     /// Clears the owed sync for one train incarnation (idempotent).
     pub fn delete_owed_status_sync(
         &mut self,
@@ -792,6 +900,47 @@ impl Drop for Store {
     }
 }
 
+/// Dirties a PR's ledger at a FRESH generation, inside `tx`.
+fn mark_ledger_owed_in(tx: &rusqlite::Transaction<'_>, pr: PrNumber) -> Result<(), StoreError> {
+    tx.execute(
+        "UPDATE counters SET value = value + 1 WHERE name = 'ledger_gen'",
+        [],
+    )?;
+    let generation: i64 = tx.query_row(
+        "SELECT value FROM counters WHERE name = 'ledger_gen'",
+        [],
+        |row| row.get(0),
+    )?;
+    // The absence streak restarts with the obligation: what a probe saw of
+    // the old one says nothing about this.
+    tx.execute(
+        "INSERT INTO owed_stack_ledgers (pr, generation, absent_probes, absent_at) \
+         VALUES (?1, ?2, 0, NULL) \
+         ON CONFLICT(pr) DO UPDATE SET generation = ?2, absent_probes = 0, absent_at = NULL",
+        rusqlite::params![pr.0 as i64, generation],
+    )?;
+    Ok(())
+}
+
+/// What a PR's ledger states: the declaration in force, if any.
+fn declaration_of(state: &RepoState, pr: PrNumber) -> Option<(PrNumber, CommentId)> {
+    state
+        .prs
+        .get(&pr)
+        .and_then(|p| p.predecessor.zip(p.predecessor_comment_id))
+}
+
+/// The PR whose declaration an event may change: the two events that carry
+/// one, and nothing else. `StackLedgerPosted` records where the ledger
+/// lives rather than what it says, so it does not dirty it.
+fn ledger_declaration_events(payload: &StateEventPayload) -> Option<PrNumber> {
+    match payload {
+        StateEventPayload::PredecessorDeclared { pr, .. }
+        | StateEventPayload::PredecessorRemoved { pr, .. } => Some(*pr),
+        _ => None,
+    }
+}
+
 /// Inserts `event` into the log and applies it to `state`, within `tx`.
 fn insert_and_apply(
     tx: &rusqlite::Transaction,
@@ -830,7 +979,21 @@ fn insert_and_apply(
             ],
         )?;
     }
+    // A topology change owes its PR's ledger comment a rewrite — in this
+    // transaction, so a crash between the commit and the write cannot lose
+    // it. The obligation names only the PR: what to write is read from the
+    // state at write time, which is what makes repeated changes coalesce
+    // into one correct write (`status::ledger`). Only a change that the
+    // state actually took counts: a removal naming a comment that no
+    // longer owns the declaration changes nothing, and owes nothing.
+    let ledger_pr = ledger_declaration_events(&event.payload);
+    let declaration_before = ledger_pr.map(|pr| declaration_of(state, pr));
     state.apply_event(event);
+    if let Some(pr) = ledger_pr
+        && declaration_before != Some(declaration_of(state, pr))
+    {
+        mark_ledger_owed_in(tx, pr)?;
+    }
     tx.execute(
         "INSERT INTO events (seq, ts, payload) VALUES (?1, ?2, ?3)",
         rusqlite::params![
@@ -933,7 +1096,28 @@ fn init_schema(conn: &Connection) -> Result<(), StoreError> {
             absent_probes INTEGER NOT NULL DEFAULT 0,
             absent_at     TEXT,
             PRIMARY KEY (root, started_at)
-        );",
+        );
+
+        -- PRs whose stack-ledger comment no longer matches what the store
+        -- holds. A dirty set, not a queue of payloads: the write states the
+        -- CURRENT declaration, so several changes in a row need one write
+        -- and it always converges on the truth. `generation` is strictly
+        -- increasing across the store's whole life: a write clears the
+        -- obligation it READ, so anything that dirties the ledger while
+        -- that write is in flight holds a newer generation and survives.
+        CREATE TABLE owed_stack_ledgers (
+            pr            INTEGER PRIMARY KEY,
+            generation           INTEGER NOT NULL,
+            absent_probes INTEGER NOT NULL DEFAULT 0,
+            absent_at     TEXT
+        );
+
+        -- Monotone counters that are not event sequence numbers.
+        CREATE TABLE counters (
+            name  TEXT PRIMARY KEY,
+            value INTEGER NOT NULL
+        );
+        INSERT INTO counters (name, value) VALUES ('ledger_gen', 0);",
     )?;
     // `user_version` is a transactional header write, so the DDL above and this
     // bump commit together — a crash can't leave a partial schema at version 0.

@@ -336,6 +336,15 @@ impl RepoState {
                 }
             }
 
+            // The ledger comment's id, so the next write edits it in place
+            // rather than posting a second record of the same PR.
+            StateEventPayload::StackLedgerPosted { pr, comment_id } => {
+                if let Some(p) = self.prs.get_mut(pr) {
+                    p.ledger_comment_id = Some(*comment_id);
+                    prs_mutated = true;
+                }
+            }
+
             StateEventPayload::PredecessorDeclared {
                 pr,
                 predecessor,
@@ -344,6 +353,11 @@ impl RepoState {
                 if let Some(p) = self.prs.get_mut(pr) {
                     p.predecessor = Some(*predecessor);
                     p.predecessor_comment_id = Some(*comment_id);
+                    // Monotone: webhooks can arrive out of order, and a
+                    // settled watermark that moved backwards would make a
+                    // crawl read already-settled comments as new evidence.
+                    p.declarations_settled_through =
+                        p.declarations_settled_through.max(Some(*comment_id));
                     prs_mutated = true;
                 }
             }
@@ -359,6 +373,8 @@ impl RepoState {
                 {
                     p.predecessor = None;
                     p.predecessor_comment_id = None;
+                    p.declarations_settled_through =
+                        p.declarations_settled_through.max(Some(*comment_id));
                     prs_mutated = true;
                 }
             }

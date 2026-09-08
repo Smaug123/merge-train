@@ -31,7 +31,7 @@ use crate::types::{CachedPr, PrNumber, TrainRecord};
 /// cache and the replay oracle would disagree, and the train's later status
 /// updates would publish the empty provenance. Refusing the old cache is the
 /// honest answer (the store's replay rebuilds everything from the log).
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// Persisted state snapshot — the serialized `RepoState` the Store caches.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
