@@ -147,6 +147,11 @@ impl FakeGitHub {
                 self.branch_head(&fake.branch),
                 MergeStateStatus::Unknown,
             ),
+            FakePrState::Closed => (
+                PrState::Closed,
+                self.branch_head(&fake.branch),
+                MergeStateStatus::Unknown,
+            ),
             FakePrState::Merged { squash_sha } => {
                 // The frozen PR ref names the squashed head.
                 let head = run_git_stdout(
