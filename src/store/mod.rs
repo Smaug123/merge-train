@@ -675,10 +675,11 @@ impl Store {
     }
 
     /// Forgets that any probe has missed this PR's ledger. Called when a
-    /// replacement is POSTED: absence must become stable again relative to
-    /// that attempt, or one stale listing after a post whose response was
-    /// lost would immediately post another (Codex ledger review round 13,
-    /// P2).
+    /// replacement is POSTED — absence must become stable again relative
+    /// to that attempt, or one stale listing after a post whose response
+    /// was lost would immediately post another (Codex ledger review round
+    /// 13, P2) — and when a probe FINDS the ledger, since a streak broken
+    /// by a positive observation starts over (round 14, P2).
     pub fn reset_absent_ledger(&mut self, pr: PrNumber) -> Result<(), StoreError> {
         self.conn.execute(
             "UPDATE owed_stack_ledgers SET absent_probes = 0, absent_at = NULL WHERE pr = ?1",

@@ -1432,6 +1432,226 @@ fn a_ledger_dirtied_mid_write_is_not_cleared_by_it() {
     );
 }
 
+/// A probe's listing is evidence about the moment it was TAKEN, not the
+/// moment it is processed. If a maintainer doctors the ledger while the
+/// listing is in flight — the "changed under us" webhook bumps the
+/// obligation's generation — the pre-edit body that listing shows must
+/// not discharge the newer obligation, or the corruption is never
+/// repaired (Codex ledger review round 14, P1).
+#[test]
+fn a_stale_probe_listing_does_not_satisfy_a_newer_invalidation() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    drain(&mut processor);
+    let ledger_id = ledgers_on(&world, 2)[0].0;
+
+    // Something dirties the obligation while the comment still matches,
+    // and the probe's listing is taken in that state.
+    processor.store_mut().mark_ledger_owed(PrNumber(2)).unwrap();
+    let remark = comment_body(&world.config, 2, "a remark", AUTHOR, "author", 9001);
+    world.enqueue(&mut processor, "issue_comment", remark);
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+    let probe = processor.pump().unwrap().expect("the ledger probe");
+    let outcomes = execute(&mut processor, &probe);
+
+    // The maintainer doctors the comment while that listing is in
+    // flight, and the webhook's `mark_ledger_owed` lands first.
+    world
+        .github
+        .lock()
+        .unwrap()
+        .comments
+        .get_mut(&ledger_id)
+        .unwrap()
+        .body = "doctored".to_string();
+    processor.store_mut().mark_ledger_owed(PrNumber(2)).unwrap();
+
+    let next = processor
+        .on_outcomes(probe.root, outcomes, probe.feedback)
+        .unwrap();
+    assert_eq!(
+        processor
+            .store_mut()
+            .owed_stack_ledgers()
+            .unwrap()
+            .iter()
+            .map(|o| o.pr)
+            .collect::<Vec<_>>(),
+        vec![PrNumber(2)],
+        "a listing taken before the invalidation must not discharge it"
+    );
+
+    // And the repair itself lands: the stale listing still names the
+    // right comment, so the fall-through write fixes it in place.
+    finish_batches(&mut world, &mut processor, next);
+    let after = ledgers_on(&world, 2);
+    assert_eq!(after.len(), 1, "repaired in place, not duplicated");
+    assert_eq!(after[0].0, ledger_id);
+    assert_ledgers_match_store(&world, &processor);
+    assert!(
+        processor
+            .store_mut()
+            .owed_stack_ledgers()
+            .unwrap()
+            .is_empty(),
+        "the repair discharged the obligation it was made for"
+    );
+}
+
+/// `ledger_posts_attempted` guards the absence heuristic: a PR a post may
+/// already have happened for needs STABLE absence before another. An id
+/// the store RECORDED is the strongest such evidence there is — but a
+/// clean restart used to forget it, because only open obligations seeded
+/// the set. One transiently-short listing after the next topology change
+/// then posted a second ledger (Codex ledger review round 14, P2).
+#[test]
+fn a_recorded_ledger_guards_reposting_across_a_restart() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    drain(&mut processor);
+    let recorded = ledgers_on(&world, 2)[0].0;
+
+    // A clean restart: every obligation discharged, the id recorded.
+    drop(processor);
+    let mut processor = world.processor();
+
+    // The ledger is dirtied again, and the next listing happens not to
+    // show the recorded comment yet.
+    processor.store_mut().mark_ledger_owed(PrNumber(2)).unwrap();
+    world
+        .github
+        .lock()
+        .unwrap()
+        .hidden_from_listings
+        .insert(recorded);
+    let remark = comment_body(&world.config, 2, "a remark", AUTHOR, "author", 9001);
+    world.enqueue(&mut processor, "issue_comment", remark);
+    drain(&mut processor);
+    assert_eq!(
+        ledgers_on(&world, 2).len(),
+        1,
+        "one absent listing after a clean restart must not produce a second ledger"
+    );
+    assert!(
+        !processor
+            .store_mut()
+            .owed_stack_ledgers()
+            .unwrap()
+            .is_empty(),
+        "the obligation is kept for another look"
+    );
+
+    // Once the listing shows it again, the recorded ledger satisfies the
+    // obligation — still exactly one comment.
+    world.github.lock().unwrap().hidden_from_listings.clear();
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    let remark = comment_body(&world.config, 2, "another remark", AUTHOR, "author", 9002);
+    world.enqueue(&mut processor, "issue_comment", remark);
+    drain(&mut processor);
+    let after = ledgers_on(&world, 2);
+    assert_eq!(after.len(), 1, "still exactly one");
+    assert_eq!(after[0].0, recorded, "the original, not a replacement");
+    assert!(
+        processor
+            .store_mut()
+            .owed_stack_ledgers()
+            .unwrap()
+            .is_empty(),
+        "the recorded ledger discharged the obligation"
+    );
+}
+
+/// One missed listing, then a probe that FINDS the ledger (whose repair
+/// write fails, keeping the obligation open), then another miss: two
+/// misses in total, but the find in between proved the comment exists.
+/// The absence streak must restart at every find, or the second miss
+/// counts as "stable absence" and posts a duplicate over a comment that
+/// was seen alive in between (Codex ledger review round 14, P2).
+#[test]
+fn a_found_ledger_resets_the_absence_streak() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    drain(&mut processor);
+    let ledger_id = ledgers_on(&world, 2)[0].0;
+
+    // Owed again, and the first listing misses the comment.
+    processor.store_mut().mark_ledger_owed(PrNumber(2)).unwrap();
+    world
+        .github
+        .lock()
+        .unwrap()
+        .hidden_from_listings
+        .insert(ledger_id);
+    let remark = comment_body(&world.config, 2, "a remark", AUTHOR, "author", 9001);
+    world.enqueue(&mut processor, "issue_comment", remark);
+    drain(&mut processor);
+    assert_eq!(
+        ledgers_on(&world, 2).len(),
+        1,
+        "one miss: waiting, not posting"
+    );
+
+    // The second listing shows it — forged, so a repair is needed — but
+    // the repair write fails, leaving the obligation open.
+    let forged = crate::status::format_stack_ledger(&crate::status::StackLedger {
+        pr: PrNumber(2),
+        declared: Some(crate::status::Declaration {
+            predecessor: PrNumber(9),
+            owner: crate::types::CommentId(1),
+        }),
+        seq: 9999,
+        settled_through: None,
+    });
+    {
+        let mut github = world.github.lock().unwrap();
+        github.hidden_from_listings.clear();
+        github.comments.get_mut(&ledger_id).unwrap().body = forged;
+        github.update_comment_broken = true;
+    }
+    let remark = comment_body(&world.config, 2, "another remark", AUTHOR, "author", 9002);
+    world.enqueue(&mut processor, "issue_comment", remark);
+    drain(&mut processor);
+    assert!(
+        !processor
+            .store_mut()
+            .owed_stack_ledgers()
+            .unwrap()
+            .is_empty(),
+        "the failed repair keeps the obligation open"
+    );
+
+    // A third listing misses it again, past the absence cooldown.
+    {
+        let mut github = world.github.lock().unwrap();
+        github.hidden_from_listings.insert(ledger_id);
+        github.update_comment_broken = false;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    let remark = comment_body(&world.config, 2, "a third remark", AUTHOR, "author", 9003);
+    world.enqueue(&mut processor, "issue_comment", remark);
+    drain(&mut processor);
+    let after = ledgers_on(&world, 2);
+    assert_eq!(
+        after.len(),
+        1,
+        "an intervening find restarts the absence count; no replacement is posted"
+    );
+    assert_eq!(after[0].0, ledger_id);
+    assert!(
+        !processor
+            .store_mut()
+            .owed_stack_ledgers()
+            .unwrap()
+            .is_empty(),
+        "still owed: the repair has yet to land"
+    );
+}
+
 /// A doctored ledger that also LOOKS like a command must still be
 /// repaired. Command authorization rejects the apparent command and
 /// returns early, so the repair has to happen before it (Codex ledger

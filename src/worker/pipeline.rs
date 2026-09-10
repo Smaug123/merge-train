@@ -227,8 +227,11 @@ pub(crate) struct Processor {
     /// 12, P2), and an obligation that can never be discharged must not
     /// stall the start forever.
     deferred_for_sync: HashSet<(i64, chrono::DateTime<Utc>)>,
-    /// PRs whose ledger probe (`ListComments`) is in flight.
-    ledger_probes: HashSet<PrNumber>,
+    /// PRs whose ledger probe (`ListComments`) is in flight, each with
+    /// the obligation generation it was dispatched for. A listing is
+    /// evidence about the moment it was taken, so it may satisfy that
+    /// generation and no newer one (Codex ledger review round 14, P1).
+    ledger_probes: HashMap<PrNumber, u64>,
     /// The obligation generation each in-flight ledger write was made
     /// for. The write clears THAT generation and no other, so anything
     /// that dirtied the ledger while it was out survives it.
@@ -331,11 +334,23 @@ impl Processor {
         // deliveries (Codex M5 round 6, P1: e.g. a queued topology-change
         // abort overtaken by a squash).
         // Conservative: an obligation that outlived a process may have had
-        // its post land unobserved.
+        // its post land unobserved — and a RECORDED comment id is proof
+        // one landed. Without it, a clean restart forgets every prior
+        // post, and one transiently-short listing after the next topology
+        // change posts a second ledger next to the recorded one (Codex
+        // ledger review round 14, P2).
         let ledger_posts_attempted: HashSet<PrNumber> = store
             .owed_stack_ledgers()?
             .into_iter()
             .map(|owed| owed.pr)
+            .chain(
+                store
+                    .state()
+                    .prs
+                    .iter()
+                    .filter(|(_, cached)| cached.ledger_comment_id.is_some())
+                    .map(|(pr, _)| *pr),
+            )
             .collect();
         let startup_evaluates = store
             .state()
@@ -356,7 +371,7 @@ impl Processor {
             retry_timer_outstanding: false,
             sync_probes: HashMap::new(),
             deferred_for_sync: HashSet::new(),
-            ledger_probes: HashSet::new(),
+            ledger_probes: HashMap::new(),
             ledger_write_gen: HashMap::new(),
             ledger_posts_attempted,
             startup_evaluates: Some(startup_evaluates),
@@ -1546,6 +1561,7 @@ impl Processor {
     fn on_ledger_probe(
         &mut self,
         pr: PrNumber,
+        probe_generation: u64,
         outcomes: Vec<crate::cascade::EffectOutcome>,
     ) -> Result<Option<SagaBatch>, StoreError> {
         let mut cleanup = self.boundary_cleanup(pr)?;
@@ -1615,6 +1631,13 @@ impl Processor {
         let body = crate::status::format_stack_ledger(&desired);
         let write = match live {
             Some((comment_id, parsed)) => {
+                // The listing SHOWS the ledger: any absence streak an
+                // earlier listing started is over. Without this, a miss,
+                // a find whose repair write fails, and a second miss add
+                // up to "stable absence" and post a duplicate over a
+                // comment that was seen alive in between (Codex ledger
+                // review round 14, P2).
+                self.store.reset_absent_ledger(pr)?;
                 if cached.ledger_comment_id != Some(comment_id) {
                     // Found one the store did not know about: record where
                     // it lives before writing to it, or the next crash
@@ -1637,12 +1660,20 @@ impl Processor {
                 // number no higher than the state it states — a tampered
                 // one would win a crawl's duplicate arbitration for ever
                 // (Codex ledger review round 13, P1).
-                let satisfied = parsed.is_some_and(|l| {
-                    l.pr == desired.pr
-                        && l.declared == desired.declared
-                        && l.settled_through == desired.settled_through
-                        && l.seq <= desired.seq
-                });
+                // And only for the obligation the listing was taken FOR:
+                // an edit that lands while the listing is in flight bumps
+                // the generation, and the pre-edit body this listing
+                // shows would otherwise discharge it, leaving the edit
+                // unrepaired for ever (Codex ledger review round 14, P1).
+                // On a mismatch, fall through to the write: it repairs
+                // the comment and is generation-bound itself.
+                let satisfied = owed.generation == probe_generation
+                    && parsed.is_some_and(|l| {
+                        l.pr == desired.pr
+                            && l.declared == desired.declared
+                            && l.settled_through == desired.settled_through
+                            && l.seq <= desired.seq
+                    });
                 if satisfied {
                     // It already says what the store holds. Rewriting it
                     // would be a write that can only fail.
@@ -1977,15 +2008,20 @@ impl Processor {
                     unreachable!("LateAddition is answered in the pipeline, never queued")
                 }
                 PendingWork::LedgerSync { pr } => {
-                    if !self.store.owed_stack_ledgers()?.iter().any(|o| o.pr == pr) {
+                    let Some(owed) = self
+                        .store
+                        .owed_stack_ledgers()?
+                        .into_iter()
+                        .find(|o| o.pr == pr)
+                    else {
                         continue; // written meanwhile
-                    }
+                    };
                     // The probe. Always taken, even when the store knows
                     // the ledger's id: one listing per topology change
                     // buys a single code path that also heals a ledger
                     // somebody deleted, and topology changes are rare
                     // next to the cascade's own traffic.
-                    self.ledger_probes.insert(pr);
+                    self.ledger_probes.insert(pr, owed.generation);
                     self.in_flight = Some(pr);
                     return Ok(Some(SagaBatch {
                         root: pr,
@@ -2079,8 +2115,8 @@ impl Processor {
         if let Some(started_at) = self.sync_probes.remove(&root) {
             return self.on_sync_probe(root, started_at, outcomes);
         }
-        if self.ledger_probes.remove(&root) {
-            return self.on_ledger_probe(root, outcomes);
+        if let Some(probe_generation) = self.ledger_probes.remove(&root) {
+            return self.on_ledger_probe(root, probe_generation, outcomes);
         }
         if !feedback {
             // A completed best-effort batch is an observation boundary
