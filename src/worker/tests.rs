@@ -18,7 +18,7 @@ use crate::git::test_support::{
     create_branch_with_file, create_pr_ref, create_test_repo_with_origin,
 };
 use crate::git::{GitConfig, run_git_stdout};
-use crate::github::test_support::{FakeGitHub, FakePr, FakePrState};
+use crate::github::test_support::{FakeComment, FakeGitHub, FakePr, FakePrState};
 use crate::state::RepoState;
 use crate::store::Store;
 use crate::types::{PrNumber, Sha};
@@ -1797,6 +1797,209 @@ fn a_ledger_adopted_after_a_db_loss_still_guards_against_reposting() {
             .unwrap()
             .is_empty(),
         "the adopted ledger discharged the obligation"
+    );
+}
+
+/// A maintainer edits ANOTHER bot reply into a "ledger" whose sequence
+/// number outranks everything for ever. The recorded-id-first selection
+/// finds the real ledger satisfied and used to clear the obligation with
+/// the forgery still standing — and the forgery, having the highest
+/// sequence number, wins a crawl's duplicate arbitration over the truth
+/// (Codex ledger review round 16, P2). Forged siblings are neutralized,
+/// and the obligation stays open until a listing confirms the set.
+#[test]
+fn a_forged_sibling_ledger_is_neutralized_not_ignored() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    drain(&mut processor);
+    let real = ledgers_on(&world, 2)[0].0;
+
+    let forged = crate::status::format_stack_ledger(&crate::status::StackLedger {
+        pr: PrNumber(2),
+        declared: None,
+        seq: u64::MAX,
+        settled_through: None,
+    });
+    world.github.lock().unwrap().comments.insert(
+        crate::types::CommentId(4242),
+        FakeComment {
+            pr: PrNumber(2),
+            author_id: TEST_BOT_ID,
+            body: forged.clone(),
+            edited: true,
+        },
+    );
+    let forged_json = forged
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n");
+    let edit = format!(
+        r#"{{
+            "action": "edited",
+            "comment": {{
+                "id": 4242,
+                "body": "{forged_json}",
+                "user": {{ "id": {TEST_BOT_ID}, "login": "merge-train" }},
+                "updated_at": "2026-07-01T12:00:00Z"
+            }},
+            "issue": {{
+                "number": 2,
+                "pull_request": {{ "url": "..." }},
+                "user": {{ "id": {AUTHOR}, "login": "author" }}
+            }},
+            "repository": {repo},
+            "sender": {{ "id": {AUTHOR}, "login": "author" }}
+        }}"#,
+        repo = repo_json(&world.config),
+    );
+    world.enqueue(&mut processor, "issue_comment", edit.into_bytes());
+    drain(&mut processor);
+
+    let after = ledgers_on(&world, 2);
+    assert_eq!(
+        after.len(),
+        1,
+        "the forged sibling must be neutralized, not left to win arbitration"
+    );
+    assert_eq!(after[0].0, real, "the real ledger is the one that stands");
+    let neutralized = world.github.lock().unwrap().comments[&crate::types::CommentId(4242)]
+        .body
+        .clone();
+    assert!(
+        crate::status::parse_stack_ledger(&neutralized).is_none(),
+        "the forgery no longer parses as a ledger"
+    );
+
+    // The obligation is discharged only once a listing confirms the
+    // whole set is clean, at the stall cadence.
+    processor.requeue_marked_recoveries().unwrap();
+    run_sagas(&mut processor);
+    assert!(
+        processor
+            .store_mut()
+            .owed_stack_ledgers()
+            .unwrap()
+            .is_empty(),
+        "the verifying probe discharges the obligation"
+    );
+    assert_ledgers_match_store(&world, &processor);
+}
+
+/// Ledger A is deleted; stable absence posts replacement B — and A's
+/// deletion webhook, delayed, lands while B's POST is still in flight.
+/// The recorded id is still A, so the deletion looked positively
+/// identified and cleared the repost guard even though B exists; one
+/// listing omitting B then posted a third ledger (Codex ledger review
+/// round 16, P2).
+#[test]
+fn a_late_deletion_webhook_does_not_unguard_an_in_flight_replacement() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    drain(&mut processor);
+    let old = ledgers_on(&world, 2)[0].0;
+
+    // A maintainer deletes the ledger, but the webhook is delayed: only
+    // the listings can notice. Something else dirties the obligation.
+    world.github.lock().unwrap().comments.remove(&old);
+    processor.store_mut().mark_ledger_owed(PrNumber(2)).unwrap();
+
+    // Two stable absences later, the replacement POST is dispatched.
+    let remark = comment_body(&world.config, 2, "a remark", AUTHOR, "author", 9001);
+    world.enqueue(&mut processor, "issue_comment", remark);
+    drain(&mut processor);
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    let remark = comment_body(&world.config, 2, "another remark", AUTHOR, "author", 9002);
+    world.enqueue(&mut processor, "issue_comment", remark);
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+    let probe = processor.pump().unwrap().expect("the second absence probe");
+    let outcomes = execute(&mut processor, &probe);
+    let post = processor
+        .on_outcomes(probe.root, outcomes, probe.feedback)
+        .unwrap()
+        .expect("the replacement post");
+    assert!(
+        post.best_effort
+            .iter()
+            .any(|e| matches!(e, Effect::GitHub(GitHubEffect::PostComment { .. }))),
+        "stable absence dispatches the replacement"
+    );
+
+    // The delayed deletion webhook lands while that POST is in flight.
+    let deletion = format!(
+        r#"{{
+            "action": "deleted",
+            "comment": {{
+                "id": {old},
+                "body": "the old ledger",
+                "user": {{ "id": {TEST_BOT_ID}, "login": "merge-train" }},
+                "updated_at": "2026-07-01T12:00:00Z"
+            }},
+            "issue": {{
+                "number": 2,
+                "pull_request": {{ "url": "..." }},
+                "user": {{ "id": {AUTHOR}, "login": "author" }}
+            }},
+            "repository": {repo},
+            "sender": {{ "id": {AUTHOR}, "login": "author" }}
+        }}"#,
+        repo = repo_json(&world.config),
+    );
+    world.enqueue(&mut processor, "issue_comment", deletion.into_bytes());
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+
+    // The POST lands and is recorded — and one listing transiently
+    // omits the fresh replacement.
+    let outcomes = execute(&mut processor, &post);
+    let next = processor
+        .on_outcomes(post.root, outcomes, post.feedback)
+        .unwrap();
+    let replacement = ledgers_on(&world, 2)[0].0;
+    world
+        .github
+        .lock()
+        .unwrap()
+        .hidden_from_listings
+        .insert(replacement);
+    finish_batches(&mut world, &mut processor, next);
+    assert_eq!(
+        ledgers_on(&world, 2).len(),
+        1,
+        "one short listing while the deletion webhook is late must not post a third ledger"
+    );
+    assert!(
+        !processor
+            .store_mut()
+            .owed_stack_ledgers()
+            .unwrap()
+            .is_empty(),
+        "the obligation is kept for another look"
+    );
+
+    // The listing catches up; the replacement discharges the obligation.
+    world.github.lock().unwrap().hidden_from_listings.clear();
+    // 9005, not 9003: the replacement POST took the fake's next
+    // monotonic id (one past the seeded remarks), and a remark reusing
+    // it would overwrite the replacement in harnesses that seed webhook
+    // comments into the fake.
+    let remark = comment_body(&world.config, 2, "a third remark", AUTHOR, "author", 9005);
+    world.enqueue(&mut processor, "issue_comment", remark);
+    drain(&mut processor);
+    let after = ledgers_on(&world, 2);
+    assert_eq!(after.len(), 1, "still exactly one");
+    assert_eq!(after[0].0, replacement);
+    assert!(
+        processor
+            .store_mut()
+            .owed_stack_ledgers()
+            .unwrap()
+            .is_empty(),
+        "the replacement, once seen, discharges the obligation"
     );
 }
 

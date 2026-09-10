@@ -260,6 +260,13 @@ pub(crate) struct Processor {
 /// rare wasted listing.
 const ABSENT_PROBES_BEFORE_BELIEVED: u32 = 2;
 
+/// What a forged or stale-duplicate stack-ledger comment is rewritten
+/// to. Inert on purpose: it must parse as neither a ledger nor a
+/// command (Codex ledger review round 16, P2).
+const NEUTRALIZED_LEDGER_BODY: &str = "This comment matched the format of the bot's stack-ledger records without \
+     being the one the bot maintains for this pull request, so it has been \
+     cleared. The authoritative ledger lives in its own comment.";
+
 impl Processor {
     pub fn new(store: Store, deps: WorkerDeps) -> Result<Processor, StoreError> {
         // Every inherited active train runs recovery at its first
@@ -580,8 +587,19 @@ impl Processor {
                 // return early (an apparent command that authorization
                 // refuses), and nothing later would queue it.
                 self.queue(PendingWork::LedgerSync { pr });
+                // Whether the deletion took the LIVE ledger with it:
+                // the recorded comment when there is one — a deleted
+                // ledger-shaped body that is NOT the recorded comment
+                // was a stale duplicate or a neutralized forgery, and
+                // its death says nothing about the ledger itself.
+                let deleted_the_live_ledger = match recorded {
+                    Some(recorded_id) => recorded_id == comment.comment_id,
+                    None => crate::status::parse_stack_ledger(&comment.body)
+                        .is_some_and(|ledger| ledger.pr == pr),
+                };
                 if comment.action == crate::webhooks::events::CommentAction::Deleted
-                    && positively_ours
+                    && deleted_the_live_ledger
+                    && !self.ledger_write_gen.contains_key(&pr)
                 {
                     // The webhook itself proves the old ledger is gone, so
                     // a replacement needs no listing to confirm it. Only
@@ -590,7 +608,12 @@ impl Processor {
                     // unrelated bot reply, say — proves nothing about the
                     // ledger, and dropping the guard on it let one short
                     // listing post a duplicate (Codex ledger review round
-                    // 15, P2).
+                    // 15, P2). And only with no ledger write in flight:
+                    // with one out, the recorded id lags the truth — this
+                    // webhook describes the PREDECESSOR of the comment
+                    // the in-flight write creates, and dropping the guard
+                    // here let one short listing post a third (round 16,
+                    // P2).
                     self.ledger_posts_attempted.remove(&pr);
                 }
             }
@@ -1639,8 +1662,22 @@ impl Processor {
                     .max_by_key(|(id, l)| (l.seq, *id))
                     .map(|(id, l)| (id, Some(l)))
             });
+        // Every OTHER comment of ours that claims to be this PR's ledger
+        // is a forgery or a stale duplicate. Left alone, one with a
+        // doctored high sequence number wins a crawl's duplicate
+        // arbitration over the real ledger for ever, even repaired — so
+        // each is rewritten into inert text, and the obligation stays
+        // open until a listing confirms the whole set is clean (Codex
+        // ledger review round 16, P2).
+        let extras: Vec<crate::types::CommentId> = comments
+            .iter()
+            .filter(|c| Some(c.id) != live.as_ref().map(|(id, _)| *id))
+            .filter(|c| c.author_id == self.deps.bot_user_id)
+            .filter(|c| crate::status::parse_stack_ledger(&c.body).is_some_and(|l| l.pr == pr))
+            .map(|c| c.id)
+            .collect();
         let body = crate::status::format_stack_ledger(&desired);
-        let write = match live {
+        let write: Option<Effect> = match live {
             Some((comment_id, parsed)) => {
                 // The listing SHOWS the ledger: any absence streak an
                 // earlier listing started is over. Without this, a miss,
@@ -1691,13 +1728,22 @@ impl Processor {
                             && l.settled_through == desired.settled_through
                             && l.seq <= desired.seq
                     });
-                if satisfied {
+                if satisfied && extras.is_empty() {
                     // It already says what the store holds. Rewriting it
                     // would be a write that can only fail.
                     self.store.clear_owed_stack_ledger(pr, owed.generation)?;
                     return self.finish_boundary(pr, cleanup);
                 }
-                Effect::GitHub(GitHubEffect::UpdateComment { comment_id, body })
+                if satisfied {
+                    // The live ledger is already right; only the forged
+                    // siblings need writes.
+                    None
+                } else {
+                    Some(Effect::GitHub(GitHubEffect::UpdateComment {
+                        comment_id,
+                        body,
+                    }))
+                }
             }
             None => {
                 // Nothing of ours on the PR. If a post may ALREADY have
@@ -1728,12 +1774,25 @@ impl Processor {
                 // if its response is lost, one stale listing must not
                 // immediately produce a second comment.
                 self.store.reset_absent_ledger(pr)?;
-                Effect::GitHub(GitHubEffect::PostComment { pr, body })
+                Some(Effect::GitHub(GitHubEffect::PostComment { pr, body }))
             }
         };
         self.in_flight = Some(pr);
-        self.ledger_write_gen.insert(pr, owed.generation);
-        let mut best_effort = vec![write];
+        if extras.is_empty() {
+            self.ledger_write_gen.insert(pr, owed.generation);
+        } else {
+            // With forged siblings in play, no write here discharges the
+            // obligation: it stays open until a fresh listing (at the
+            // stall cadence) confirms the set is clean.
+            self.retry_requested = true;
+        }
+        let mut best_effort: Vec<Effect> = write.into_iter().collect();
+        best_effort.extend(extras.into_iter().map(|comment_id| {
+            Effect::GitHub(GitHubEffect::UpdateComment {
+                comment_id,
+                body: NEUTRALIZED_LEDGER_BODY.to_owned(),
+            })
+        }));
         best_effort.append(&mut cleanup);
         Ok(Some(SagaBatch {
             root: pr,
