@@ -4,6 +4,7 @@
 //! human-readable status. The JSON contains the `TrainRecord` for disaster recovery
 //! (excluding `status_comment_id`, with error text possibly truncated for size).
 
+use crate::types::PrNumber;
 use crate::types::train::{TrainRecord, TrainState};
 use thiserror::Error;
 
@@ -43,6 +44,35 @@ pub const STATUS_COMMENT_START: &str = "<!-- merge-train-state\n";
 
 /// The marker that ends a status comment JSON block.
 pub const STATUS_COMMENT_END: &str = "\n-->";
+
+/// The last thing a train's status comment says. Shared by the engine,
+/// which posts it when the train retires, and by the retry that owes that
+/// update until it lands — so a rewrite cannot quietly say something
+/// weaker than the original. `fanned_into` names the independent trains a
+/// fan-out spawned; it is empty for every other ending.
+pub fn terminal_message(record: &TrainRecord, fanned_into: &[PrNumber]) -> String {
+    if !fanned_into.is_empty() {
+        return format!(
+            "🎉 Train completed. Descendants {} are now independent trains.",
+            // `PrNumber` displays its own `#`.
+            fanned_into
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    match &record.state {
+        TrainState::Stopped { .. } => "🛑 Merge train stopped by request.".to_owned(),
+        TrainState::Aborted { error, .. } => format!(
+            "🛑 Merge train aborted: {}\n\nFix the issue and re-issue `@merge-train start`.",
+            error.message
+        ),
+        TrainState::Completed { .. } => "🎉 Merge train completed.".to_owned(),
+        TrainState::NeedsManualReview => "⚠️ Merge train needs manual review.".to_owned(),
+        TrainState::Running | TrainState::WaitingCi => "Merge train status.".to_owned(),
+    }
+}
 
 /// Formats a status comment containing machine-readable JSON and human-readable text.
 ///

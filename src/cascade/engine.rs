@@ -1925,14 +1925,7 @@ fn end_of_step(
             let mut best_effort = vec![Effect::Git(GitEffect::RemoveWorktree {
                 name: worktree_name(ctx.root()),
             })];
-            let msg = format!(
-                "🎉 Train completed. Descendants {} are now independent trains.",
-                new_roots
-                    .iter()
-                    .map(|p| format!("#{p}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
+            let msg = crate::status::format::terminal_message(&record, &new_roots);
             if let Ok(Some(update)) = status_effect(&record, &msg) {
                 best_effort.push(update);
             }
