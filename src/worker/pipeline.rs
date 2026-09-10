@@ -554,19 +554,22 @@ impl Processor {
             )
             && let Some(pr) = comment.pr_number
         {
-            // Ours if the store knows it as this PR's ledger, if a post
-            // for that PR may still be unrecorded (its id never committed
-            // — round 13, P1), or if what is there now parses as one.
+            // POSITIVELY ours if the store knows it as this PR's
+            // ledger or what is there now parses as one; POSSIBLY ours
+            // if a post for that PR may still be unrecorded (its id
+            // never committed — round 13, P1). Both dirty the ledger,
+            // but only the positive identification may clear the
+            // duplicate-post guard below.
             let recorded = self
                 .store
                 .state()
                 .prs
                 .get(&pr)
                 .and_then(|cached| cached.ledger_comment_id);
-            let is_our_ledger = recorded == Some(comment.comment_id)
-                || self.ledger_posts_attempted.contains(&pr)
+            let positively_ours = recorded == Some(comment.comment_id)
                 || crate::status::parse_stack_ledger(&comment.body)
                     .is_some_and(|ledger| ledger.pr == pr);
+            let is_our_ledger = positively_ours || self.ledger_posts_attempted.contains(&pr);
             if is_our_ledger {
                 info!(
                     %pr, comment = %comment.comment_id, action = ?comment.action,
@@ -577,9 +580,17 @@ impl Processor {
                 // return early (an apparent command that authorization
                 // refuses), and nothing later would queue it.
                 self.queue(PendingWork::LedgerSync { pr });
-                if comment.action == crate::webhooks::events::CommentAction::Deleted {
+                if comment.action == crate::webhooks::events::CommentAction::Deleted
+                    && positively_ours
+                {
                     // The webhook itself proves the old ledger is gone, so
-                    // a replacement needs no listing to confirm it.
+                    // a replacement needs no listing to confirm it. Only
+                    // when the deleted comment IS the ledger, though: a
+                    // deletion the catch-all merely GUESSED to be one — an
+                    // unrelated bot reply, say — proves nothing about the
+                    // ledger, and dropping the guard on it let one short
+                    // listing post a duplicate (Codex ledger review round
+                    // 15, P2).
                     self.ledger_posts_attempted.remove(&pr);
                 }
             }
@@ -1638,6 +1649,12 @@ impl Processor {
                 // comment that was seen alive in between (Codex ledger
                 // review round 14, P2).
                 self.store.reset_absent_ledger(pr)?;
+                // ...and PROOF a post of ours landed, whoever made it: a
+                // ledger ADOPTED after a database loss went unguarded —
+                // this process never posted, so nothing had registered
+                // the PR — and the next transiently-short listing posted
+                // a duplicate (Codex ledger review round 15, P2).
+                self.ledger_posts_attempted.insert(pr);
                 if cached.ledger_comment_id != Some(comment_id) {
                     // Found one the store did not know about: record where
                     // it lives before writing to it, or the next crash

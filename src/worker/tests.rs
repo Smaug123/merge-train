@@ -1652,6 +1652,154 @@ fn a_found_ledger_resets_the_absence_streak() {
     );
 }
 
+/// Deleting an UNRELATED bot reply on a PR that has a ledger must not
+/// clear the duplicate-post guard: the `ledger_posts_attempted`
+/// catch-all classifies any deleted bot comment on the PR as
+/// possibly-the-ledger, and dropping the guard on that guess let one
+/// transiently-short listing post a second ledger (Codex ledger review
+/// round 15, P2).
+#[test]
+fn deleting_an_unrelated_bot_reply_does_not_license_an_immediate_repost() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    drain(&mut processor);
+    let ledger_id = ledgers_on(&world, 2)[0].0;
+
+    // The next listing happens not to show the ledger...
+    world
+        .github
+        .lock()
+        .unwrap()
+        .hidden_from_listings
+        .insert(ledger_id);
+    // ...while a maintainer deletes some OTHER bot comment on the PR.
+    let deletion = format!(
+        r#"{{
+            "action": "deleted",
+            "comment": {{
+                "id": 4242,
+                "body": "An old train notice.",
+                "user": {{ "id": {TEST_BOT_ID}, "login": "merge-train" }},
+                "updated_at": "2026-07-01T12:00:00Z"
+            }},
+            "issue": {{
+                "number": 2,
+                "pull_request": {{ "url": "..." }},
+                "user": {{ "id": {AUTHOR}, "login": "author" }}
+            }},
+            "repository": {repo},
+            "sender": {{ "id": {AUTHOR}, "login": "author" }}
+        }}"#,
+        repo = repo_json(&world.config),
+    );
+    world.enqueue(&mut processor, "issue_comment", deletion.into_bytes());
+    drain(&mut processor);
+
+    assert_eq!(
+        ledgers_on(&world, 2).len(),
+        1,
+        "an unidentifiable deletion plus one short listing must not post a second ledger"
+    );
+    assert!(
+        !processor
+            .store_mut()
+            .owed_stack_ledgers()
+            .unwrap()
+            .is_empty(),
+        "the conservative re-probe stays owed until the ledger is seen"
+    );
+
+    // The listing catches up: the untouched ledger discharges the probe.
+    world.github.lock().unwrap().hidden_from_listings.clear();
+    let remark = comment_body(&world.config, 2, "a remark", AUTHOR, "author", 9001);
+    world.enqueue(&mut processor, "issue_comment", remark);
+    drain(&mut processor);
+    let after = ledgers_on(&world, 2);
+    assert_eq!(after.len(), 1, "still exactly one");
+    assert_eq!(after[0].0, ledger_id);
+    assert!(
+        processor
+            .store_mut()
+            .owed_stack_ledgers()
+            .unwrap()
+            .is_empty(),
+        "the real ledger, once seen, discharges the obligation"
+    );
+}
+
+/// After a database loss, the probe ADOPTS the ledger it finds on
+/// GitHub — but nothing put the PR in `ledger_posts_attempted`, so the
+/// next obligation treated absence as "simply new" and posted on the
+/// first short listing (Codex ledger review round 15, P2). An adoption
+/// is proof a post landed; it must guard like one.
+#[test]
+fn a_ledger_adopted_after_a_db_loss_still_guards_against_reposting() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    drain(&mut processor);
+    let ledger_id = ledgers_on(&world, 2)[0].0;
+
+    // The database is lost; the declarations are redelivered, and the
+    // probe adopts the ledger the previous life posted.
+    let db = world.db_path();
+    drop(processor);
+    std::fs::remove_file(&db).unwrap();
+    for sidecar in ["state.db-wal", "state.db-shm"] {
+        let _ = std::fs::remove_file(db.with_file_name(sidecar));
+    }
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    drain(&mut processor);
+    let adopted = ledgers_on(&world, 2);
+    assert_eq!(adopted.len(), 1, "adopted, not duplicated");
+    assert_eq!(adopted[0].0, ledger_id);
+
+    // The ledger is dirtied again, and the next listing happens not to
+    // show the adopted comment yet.
+    processor.store_mut().mark_ledger_owed(PrNumber(2)).unwrap();
+    world
+        .github
+        .lock()
+        .unwrap()
+        .hidden_from_listings
+        .insert(ledger_id);
+    let remark = comment_body(&world.config, 2, "a remark", AUTHOR, "author", 9001);
+    world.enqueue(&mut processor, "issue_comment", remark);
+    drain(&mut processor);
+    assert_eq!(
+        ledgers_on(&world, 2).len(),
+        1,
+        "one short listing after an adoption must not produce a second ledger"
+    );
+    assert!(
+        !processor
+            .store_mut()
+            .owed_stack_ledgers()
+            .unwrap()
+            .is_empty(),
+        "the obligation is kept for another look"
+    );
+
+    // Once the listing shows it again, the adopted ledger discharges it.
+    world.github.lock().unwrap().hidden_from_listings.clear();
+    let remark = comment_body(&world.config, 2, "another remark", AUTHOR, "author", 9002);
+    world.enqueue(&mut processor, "issue_comment", remark);
+    drain(&mut processor);
+    let after = ledgers_on(&world, 2);
+    assert_eq!(after.len(), 1, "still exactly one");
+    assert_eq!(after[0].0, ledger_id);
+    assert!(
+        processor
+            .store_mut()
+            .owed_stack_ledgers()
+            .unwrap()
+            .is_empty(),
+        "the adopted ledger discharged the obligation"
+    );
+}
+
 /// A doctored ledger that also LOOKS like a command must still be
 /// repaired. Command authorization rejects the apparent command and
 /// returns early, so the repair has to happen before it (Codex ledger
