@@ -1410,6 +1410,13 @@ impl Processor {
                         pr = %ledger.pr, error = ?e,
                         "stack ledger write failed; the ledger is still owed"
                     );
+                    // The binding dies with the attempt: left in place, a
+                    // LATER write landing amid duplicate cleanup — which
+                    // deliberately binds no generation — would clear the
+                    // obligation through this stale entry, abandoning any
+                    // duplicate the cleanup had not yet seen (Codex
+                    // ledger review round 17, P2).
+                    self.ledger_write_gen.remove(&ledger.pr);
                     self.retry_requested = true;
                 }
             }
@@ -1623,11 +1630,50 @@ impl Processor {
         // sequence number, so it survives this write's acknowledgement.
         let written_through = self.store.next_seq().saturating_sub(1);
         let Some(cached) = self.store.state().prs.get(&pr).cloned() else {
-            // The PR left the cache (closed long enough to be pruned):
-            // there is no declaration left to record.
-            info!(%pr, "no cached PR for an owed stack ledger; dropping the obligation");
-            self.store.clear_owed_stack_ledger(pr, owed.generation)?;
-            return self.finish_boundary(pr, cleanup);
+            // The PR left the cache (closed long enough to be pruned) or
+            // never entered it (the bot replies on PRs it never cached:
+            // authorization rejections land before precaching). There is
+            // no declaration to RECORD — but a bot comment doctored into
+            // a ledger for this PR is still a forgery a crawl would
+            // believe, and dropping the obligation with one standing
+            // leaves it for ever (Codex ledger review round 17, P2).
+            // Neutralize what the listing shows; only a listing with
+            // nothing ledger-shaped left clears the obligation.
+            let forged: Vec<crate::types::CommentId> = comments
+                .iter()
+                .filter(|c| c.author_id == self.deps.bot_user_id)
+                .filter(|c| crate::status::parse_stack_ledger(&c.body).is_some_and(|l| l.pr == pr))
+                .map(|c| c.id)
+                .collect();
+            if forged.is_empty() {
+                info!(%pr, "no cached PR for an owed stack ledger; dropping the obligation");
+                self.store.clear_owed_stack_ledger(pr, owed.generation)?;
+                return self.finish_boundary(pr, cleanup);
+            }
+            info!(
+                %pr, count = forged.len(),
+                "neutralizing forged ledgers on an uncached PR"
+            );
+            self.ledger_write_gen.remove(&pr);
+            self.retry_requested = true;
+            self.in_flight = Some(pr);
+            let mut best_effort: Vec<Effect> = forged
+                .into_iter()
+                .map(|comment_id| {
+                    Effect::GitHub(GitHubEffect::UpdateComment {
+                        comment_id,
+                        body: NEUTRALIZED_LEDGER_BODY.to_owned(),
+                    })
+                })
+                .collect();
+            best_effort.append(&mut cleanup);
+            return Ok(Some(SagaBatch {
+                root: pr,
+                effects: Vec::new(),
+                best_effort,
+                feedback: false,
+                restart_cleanup: self.needs_restart_cleanup.remove(&pr),
+            }));
         };
         let desired = crate::status::StackLedger {
             pr,
@@ -1783,7 +1829,10 @@ impl Processor {
         } else {
             // With forged siblings in play, no write here discharges the
             // obligation: it stays open until a fresh listing (at the
-            // stall cadence) confirms the set is clean.
+            // stall cadence) confirms the set is clean — and a binding
+            // left over from an earlier failed attempt is dead for the
+            // same reason (Codex ledger review round 17, P2).
+            self.ledger_write_gen.remove(&pr);
             self.retry_requested = true;
         }
         let mut best_effort: Vec<Effect> = write.into_iter().collect();

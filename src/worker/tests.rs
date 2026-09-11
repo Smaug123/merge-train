@@ -2003,6 +2003,190 @@ fn a_late_deletion_webhook_does_not_unguard_an_in_flight_replacement() {
     );
 }
 
+/// A rewrite fails; the retry discovers a previously hidden duplicate
+/// and enters duplicate cleanup, which deliberately binds no generation
+/// — but the FAILED attempt's `ledger_write_gen` entry was still there,
+/// so the successful rewrite inside the cleanup batch cleared the
+/// obligation through it, abandoning any duplicate the cleanup had not
+/// yet seen (Codex ledger review round 17, P2).
+#[test]
+fn a_stale_write_binding_does_not_discharge_duplicate_cleanup() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    drain(&mut processor);
+    let real = ledgers_on(&world, 2)[0].0;
+
+    // Two duplicates exist but are hidden from listings; the real
+    // ledger is doctored, so a rewrite is owed — and the first attempt
+    // fails.
+    {
+        let mut github = world.github.lock().unwrap();
+        for (id, seq) in [(4242u64, 5u64), (4243, 6)] {
+            github.comments.insert(
+                crate::types::CommentId(id),
+                FakeComment {
+                    pr: PrNumber(2),
+                    author_id: TEST_BOT_ID,
+                    body: crate::status::format_stack_ledger(&crate::status::StackLedger {
+                        pr: PrNumber(2),
+                        declared: None,
+                        seq,
+                        settled_through: None,
+                    }),
+                    edited: true,
+                },
+            );
+            github
+                .hidden_from_listings
+                .insert(crate::types::CommentId(id));
+        }
+        github.comments.get_mut(&real).unwrap().body = "doctored".to_string();
+        github.update_comment_broken = true;
+    }
+    processor.store_mut().mark_ledger_owed(PrNumber(2)).unwrap();
+    let remark = comment_body(&world.config, 2, "a remark", AUTHOR, "author", 9001);
+    world.enqueue(&mut processor, "issue_comment", remark);
+    drain(&mut processor);
+    assert!(
+        !processor
+            .store_mut()
+            .owed_stack_ledgers()
+            .unwrap()
+            .is_empty(),
+        "the failed rewrite keeps the obligation open"
+    );
+
+    // The retry finds ONE of the duplicates; its cleanup batch lands —
+    // the rewrite and the neutralization both succeed.
+    {
+        let mut github = world.github.lock().unwrap();
+        github.update_comment_broken = false;
+        github
+            .hidden_from_listings
+            .remove(&crate::types::CommentId(4242));
+    }
+    let remark = comment_body(&world.config, 2, "another remark", AUTHOR, "author", 9002);
+    world.enqueue(&mut processor, "issue_comment", remark);
+    drain(&mut processor);
+    assert!(
+        !processor
+            .store_mut()
+            .owed_stack_ledgers()
+            .unwrap()
+            .is_empty(),
+        "a rewrite landing amid duplicate cleanup must not clear the obligation \
+         through the failed attempt's stale binding"
+    );
+
+    // The second duplicate surfaces; the still-open obligation cleans
+    // it up too, and only a clean listing discharges it.
+    world.github.lock().unwrap().hidden_from_listings.clear();
+    processor.requeue_marked_recoveries().unwrap();
+    run_sagas(&mut processor);
+    processor.requeue_marked_recoveries().unwrap();
+    run_sagas(&mut processor);
+    let after = ledgers_on(&world, 2);
+    assert_eq!(after.len(), 1, "both duplicates neutralized");
+    assert_eq!(after[0].0, real);
+    assert!(
+        processor
+            .store_mut()
+            .owed_stack_ledgers()
+            .unwrap()
+            .is_empty(),
+        "a clean listing discharges the obligation"
+    );
+    assert_ledgers_match_store(&world, &processor);
+}
+
+/// The bot can have replies on a PR it never cached (authorization
+/// rejections land before precaching). A maintainer edits such a reply
+/// into a forged ledger; the tampering webhook schedules repair — and
+/// the probe used to drop the obligation because the PR was not in the
+/// cache, leaving a bot-authored forgery standing for ever (Codex
+/// ledger review round 17, P2). No cache entry means nothing to record,
+/// not nothing to repair.
+#[test]
+fn a_forged_ledger_on_an_uncached_pr_is_neutralized_not_abandoned() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    drain(&mut processor);
+
+    // PR 3 was never opened here: the bot's reply on it predates this
+    // process. A maintainer edits that reply into a "ledger".
+    let forged = crate::status::format_stack_ledger(&crate::status::StackLedger {
+        pr: PrNumber(3),
+        declared: Some(crate::status::Declaration {
+            predecessor: PrNumber(1),
+            owner: crate::types::CommentId(1),
+        }),
+        seq: 9999,
+        settled_through: None,
+    });
+    world.github.lock().unwrap().comments.insert(
+        crate::types::CommentId(4242),
+        FakeComment {
+            pr: PrNumber(3),
+            author_id: TEST_BOT_ID,
+            body: forged.clone(),
+            edited: true,
+        },
+    );
+    let forged_json = forged
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n");
+    let edit = format!(
+        r#"{{
+            "action": "edited",
+            "comment": {{
+                "id": 4242,
+                "body": "{forged_json}",
+                "user": {{ "id": {TEST_BOT_ID}, "login": "merge-train" }},
+                "updated_at": "2026-07-01T12:00:00Z"
+            }},
+            "issue": {{
+                "number": 3,
+                "pull_request": {{ "url": "..." }},
+                "user": {{ "id": {AUTHOR}, "login": "author" }}
+            }},
+            "repository": {repo},
+            "sender": {{ "id": {AUTHOR}, "login": "author" }}
+        }}"#,
+        repo = repo_json(&world.config),
+    );
+    world.enqueue(&mut processor, "issue_comment", edit.into_bytes());
+    drain(&mut processor);
+
+    assert_eq!(
+        ledgers_on(&world, 3).len(),
+        0,
+        "a forged ledger on an uncached PR is neutralized, not abandoned"
+    );
+    assert!(
+        !processor
+            .store_mut()
+            .owed_stack_ledgers()
+            .unwrap()
+            .is_empty(),
+        "the obligation waits for a listing that confirms nothing is left"
+    );
+
+    // The verifying probe finds nothing ledger-shaped and lets go.
+    processor.requeue_marked_recoveries().unwrap();
+    run_sagas(&mut processor);
+    assert!(
+        processor
+            .store_mut()
+            .owed_stack_ledgers()
+            .unwrap()
+            .is_empty(),
+        "a clean listing discharges the obligation"
+    );
+}
+
 /// A doctored ledger that also LOOKS like a command must still be
 /// repaired. Command authorization rejects the apparent command and
 /// returns early, so the repair has to happen before it (Codex ledger
