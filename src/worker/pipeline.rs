@@ -591,7 +591,10 @@ impl Processor {
                 // the recorded comment when there is one — a deleted
                 // ledger-shaped body that is NOT the recorded comment
                 // was a stale duplicate or a neutralized forgery, and
-                // its death says nothing about the ledger itself.
+                // its death says nothing about the ledger itself. (The
+                // parser blanks a deleted comment's body, so for
+                // deletions only the recorded id can in fact match; the
+                // body arm is live for edits and future-proofing.)
                 let deleted_the_live_ledger = match recorded {
                     Some(recorded_id) => recorded_id == comment.comment_id,
                     None => crate::status::parse_stack_ledger(&comment.body)
@@ -1646,8 +1649,17 @@ impl Processor {
                 .map(|c| c.id)
                 .collect();
             if forged.is_empty() {
-                info!(%pr, "no cached PR for an owed stack ledger; dropping the obligation");
-                self.store.clear_owed_stack_ledger(pr, owed.generation)?;
+                if owed.generation == probe_generation {
+                    info!(%pr, "no cached PR for an owed stack ledger; dropping the obligation");
+                    self.store.clear_owed_stack_ledger(pr, probe_generation)?;
+                } else {
+                    // The obligation moved while this listing was in
+                    // flight: a forgery may have appeared after it was
+                    // taken. Only a fresh listing may discharge the
+                    // newer generation (Codex ledger review round 18,
+                    // P2).
+                    self.retry_requested = true;
+                }
                 return self.finish_boundary(pr, cleanup);
             }
             info!(
@@ -1824,14 +1836,17 @@ impl Processor {
             }
         };
         self.in_flight = Some(pr);
-        if extras.is_empty() {
-            self.ledger_write_gen.insert(pr, owed.generation);
+        if extras.is_empty() && owed.generation == probe_generation {
+            self.ledger_write_gen.insert(pr, probe_generation);
         } else {
-            // With forged siblings in play, no write here discharges the
-            // obligation: it stays open until a fresh listing (at the
-            // stall cadence) confirms the set is clean — and a binding
-            // left over from an earlier failed attempt is dead for the
-            // same reason (Codex ledger review round 17, P2).
+            // With forged siblings in play — or an obligation that moved
+            // while the listing was in flight, so a forgery may exist
+            // this listing never saw (Codex ledger review round 18, P2)
+            // — no write here discharges the obligation: it stays open
+            // until a fresh listing (at the stall cadence, or via the
+            // sync the advancing webhook queued) confirms the set is
+            // clean. A binding left over from an earlier failed attempt
+            // is dead for the same reason (round 17, P2).
             self.ledger_write_gen.remove(&pr);
             self.retry_requested = true;
         }

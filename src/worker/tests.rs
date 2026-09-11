@@ -790,6 +790,14 @@ fn every_owed_incarnation_is_probed_before_the_next_start() {
 // ─── The stack ledger: the topology's off-disk backup ───
 
 /// Every stack-ledger comment the bot has on `pr`, newest first.
+/// Escapes `s` for embedding inside a JSON string literal in a raw
+/// webhook body.
+fn json_escaped(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
 fn ledgers_on(
     world: &World,
     pr: u64,
@@ -1485,19 +1493,31 @@ fn a_stale_probe_listing_does_not_satisfy_a_newer_invalidation() {
     );
 
     // And the repair itself lands: the stale listing still names the
-    // right comment, so the fall-through write fixes it in place.
+    // right comment, so the fall-through write fixes it in place — but
+    // only a FRESH listing may discharge the newer obligation (Codex
+    // ledger review round 18, P2).
     finish_batches(&mut world, &mut processor, next);
     let after = ledgers_on(&world, 2);
     assert_eq!(after.len(), 1, "repaired in place, not duplicated");
     assert_eq!(after[0].0, ledger_id);
     assert_ledgers_match_store(&world, &processor);
     assert!(
+        !processor
+            .store_mut()
+            .owed_stack_ledgers()
+            .unwrap()
+            .is_empty(),
+        "the newer invalidation still wants a fresh look"
+    );
+    processor.requeue_marked_recoveries().unwrap();
+    run_sagas(&mut processor);
+    assert!(
         processor
             .store_mut()
             .owed_stack_ledgers()
             .unwrap()
             .is_empty(),
-        "the repair discharged the obligation it was made for"
+        "the fresh listing discharges it"
     );
 }
 
@@ -1830,10 +1850,7 @@ fn a_forged_sibling_ledger_is_neutralized_not_ignored() {
             edited: true,
         },
     );
-    let forged_json = forged
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n");
+    let forged_json = json_escaped(&forged);
     let edit = format!(
         r#"{{
             "action": "edited",
@@ -2134,10 +2151,7 @@ fn a_forged_ledger_on_an_uncached_pr_is_neutralized_not_abandoned() {
             edited: true,
         },
     );
-    let forged_json = forged
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n");
+    let forged_json = json_escaped(&forged);
     let edit = format!(
         r#"{{
             "action": "edited",
@@ -2184,6 +2198,216 @@ fn a_forged_ledger_on_an_uncached_pr_is_neutralized_not_abandoned() {
             .unwrap()
             .is_empty(),
         "a clean listing discharges the obligation"
+    );
+}
+
+/// A rewrite is owed and its probe's listing shows no siblings — and
+/// while that listing is in flight, another bot reply is edited into a
+/// forged ledger, advancing the obligation. Binding the rewrite to the
+/// ADVANCED generation let its success discharge the obligation without
+/// the forgery ever being seen: queued retries found nothing owed, and
+/// the forgery stood for ever (Codex ledger review round 18, P2).
+#[test]
+fn a_write_from_a_stale_listing_does_not_discharge_the_newer_obligation() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    drain(&mut processor);
+    let real = ledgers_on(&world, 2)[0].0;
+
+    // The real ledger is doctored, so a rewrite is owed; the probe's
+    // listing is taken while no sibling exists yet.
+    world
+        .github
+        .lock()
+        .unwrap()
+        .comments
+        .get_mut(&real)
+        .unwrap()
+        .body = "doctored".to_string();
+    processor.store_mut().mark_ledger_owed(PrNumber(2)).unwrap();
+    let remark = comment_body(&world.config, 2, "a remark", AUTHOR, "author", 9001);
+    world.enqueue(&mut processor, "issue_comment", remark);
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+    let probe = processor.pump().unwrap().expect("the ledger probe");
+    let outcomes = execute(&mut processor, &probe);
+
+    // While that listing is in flight, another bot reply becomes a
+    // forged ledger; its webhook advances the obligation.
+    let forged = crate::status::format_stack_ledger(&crate::status::StackLedger {
+        pr: PrNumber(2),
+        declared: None,
+        seq: u64::MAX,
+        settled_through: None,
+    });
+    world.github.lock().unwrap().comments.insert(
+        crate::types::CommentId(4242),
+        FakeComment {
+            pr: PrNumber(2),
+            author_id: TEST_BOT_ID,
+            body: forged.clone(),
+            edited: true,
+        },
+    );
+    let edit = format!(
+        r#"{{
+            "action": "edited",
+            "comment": {{
+                "id": 4242,
+                "body": "{body}",
+                "user": {{ "id": {TEST_BOT_ID}, "login": "merge-train" }},
+                "updated_at": "2026-07-01T12:00:00Z"
+            }},
+            "issue": {{
+                "number": 2,
+                "pull_request": {{ "url": "..." }},
+                "user": {{ "id": {AUTHOR}, "login": "author" }}
+            }},
+            "repository": {repo},
+            "sender": {{ "id": {AUTHOR}, "login": "author" }}
+        }}"#,
+        body = json_escaped(&forged),
+        repo = repo_json(&world.config),
+    );
+    world.enqueue(&mut processor, "issue_comment", edit.into_bytes());
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+
+    // The stale-listing callback dispatches the rewrite; it and
+    // everything it queues run to quiescence.
+    let next = processor
+        .on_outcomes(probe.root, outcomes, probe.feedback)
+        .unwrap();
+    finish_batches(&mut world, &mut processor, next);
+    assert_eq!(
+        ledgers_on(&world, 2).len(),
+        1,
+        "the forgery created mid-probe must be neutralized, not stranded by \
+         the stale write's discharge"
+    );
+    assert_eq!(ledgers_on(&world, 2)[0].0, real);
+    assert!(
+        !processor
+            .store_mut()
+            .owed_stack_ledgers()
+            .unwrap()
+            .is_empty(),
+        "only a fresh listing discharges the newer obligation"
+    );
+
+    processor.requeue_marked_recoveries().unwrap();
+    run_sagas(&mut processor);
+    assert!(
+        processor
+            .store_mut()
+            .owed_stack_ledgers()
+            .unwrap()
+            .is_empty(),
+        "the fresh listing discharges it"
+    );
+    assert_ledgers_match_store(&world, &processor);
+}
+
+/// The uncached-PR face of the same race: the obligation's probe sees an
+/// EMPTY listing, and while it is in flight a bot reply is edited into a
+/// forged ledger, advancing the obligation. Clearing the advanced
+/// generation on the stale empty listing stranded the forgery for ever
+/// (Codex ledger review round 18, P2).
+#[test]
+fn a_stale_empty_listing_on_an_uncached_pr_keeps_the_newer_obligation() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    drain(&mut processor);
+
+    let forged = crate::status::format_stack_ledger(&crate::status::StackLedger {
+        pr: PrNumber(3),
+        declared: Some(crate::status::Declaration {
+            predecessor: PrNumber(1),
+            owner: crate::types::CommentId(1),
+        }),
+        seq: 9999,
+        settled_through: None,
+    });
+    // PR 3 owes a ledger look from an earlier life; the probe's listing
+    // will show nothing at all. (A deletion webhook cannot carry the
+    // dirtying here: the parser blanks a deleted comment's body.)
+    processor.store_mut().mark_ledger_owed(PrNumber(3)).unwrap();
+    let remark = comment_body(&world.config, 2, "a remark", AUTHOR, "author", 9001);
+    world.enqueue(&mut processor, "issue_comment", remark);
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+    let probe = processor.pump().unwrap().expect("the ledger probe");
+    let outcomes = execute(&mut processor, &probe);
+
+    // While it is in flight, ANOTHER bot reply on PR 3 is edited into a
+    // forged ledger; its webhook advances the obligation.
+    world.github.lock().unwrap().comments.insert(
+        crate::types::CommentId(4242),
+        FakeComment {
+            pr: PrNumber(3),
+            author_id: TEST_BOT_ID,
+            body: forged.clone(),
+            edited: true,
+        },
+    );
+    let edit = format!(
+        r#"{{
+            "action": "edited",
+            "comment": {{
+                "id": 4242,
+                "body": "{body}",
+                "user": {{ "id": {TEST_BOT_ID}, "login": "merge-train" }},
+                "updated_at": "2026-07-01T12:00:00Z"
+            }},
+            "issue": {{
+                "number": 3,
+                "pull_request": {{ "url": "..." }},
+                "user": {{ "id": {AUTHOR}, "login": "author" }}
+            }},
+            "repository": {repo},
+            "sender": {{ "id": {AUTHOR}, "login": "author" }}
+        }}"#,
+        body = json_escaped(&forged),
+        repo = repo_json(&world.config),
+    );
+    world.enqueue(&mut processor, "issue_comment", edit.into_bytes());
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+
+    let next = processor
+        .on_outcomes(probe.root, outcomes, probe.feedback)
+        .unwrap();
+    finish_batches(&mut world, &mut processor, next);
+    assert_eq!(
+        ledgers_on(&world, 3).len(),
+        0,
+        "the forgery created mid-probe must be neutralized, not stranded by \
+         the stale empty listing's discharge"
+    );
+    assert!(
+        !processor
+            .store_mut()
+            .owed_stack_ledgers()
+            .unwrap()
+            .is_empty(),
+        "only a fresh listing discharges the newer obligation"
+    );
+
+    processor.requeue_marked_recoveries().unwrap();
+    run_sagas(&mut processor);
+    assert!(
+        processor
+            .store_mut()
+            .owed_stack_ledgers()
+            .unwrap()
+            .is_empty(),
+        "the fresh listing discharges it"
     );
 }
 
