@@ -349,6 +349,70 @@ fn finish_batches(_world: &mut World, processor: &mut Processor, mut next: Optio
     }
 }
 
+/// One stall cycle: time passes beyond the absence cooldown, the retry
+/// timer fires, and the machinery gets its look.
+fn tick(world: &World, processor: &mut Processor) {
+    world.advance_past_cooldown();
+    processor.requeue_marked_recoveries().unwrap();
+    run_sagas(processor);
+}
+
+/// A distinct `updated_at` per call: GitHub's edit webhooks carry the
+/// comment's last-updated time, and the dedupe key includes it, so two
+/// identical edits of one comment must not look like one redelivered.
+fn unique_updated_at() -> String {
+    static NEXT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    chrono::DateTime::<chrono::Utc>::from_timestamp(1_780_000_000 + n, 0)
+        .unwrap()
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+/// Whether a batch is stack-ledger bookkeeping rather than cascade work:
+/// the probe that finds a PR's ledger comment, or the write that states
+/// its declaration. Tests that step a saga by hand care about neither.
+fn is_ledger_bookkeeping(processor: &mut Processor, batch: &SagaBatch) -> bool {
+    let writes_a_ledger = batch.best_effort.iter().any(|e| match e {
+        Effect::GitHub(
+            GitHubEffect::PostComment { body, .. } | GitHubEffect::UpdateComment { body, .. },
+        ) => crate::status::parse_stack_ledger(body).is_some(),
+        _ => false,
+    });
+    let probes_a_ledger = batch.effects.len() == 1
+        && matches!(
+            &batch.effects[0],
+            Effect::GitHub(GitHubEffect::ListComments { pr }) if *pr == batch.root
+        )
+        && processor
+            .store_mut()
+            .owed_stack_ledgers()
+            .unwrap()
+            .iter()
+            .any(|o| o.pr == batch.root);
+    writes_a_ledger || probes_a_ledger
+}
+
+/// Pumps to the next batch the CASCADE asked for, running any stack-ledger
+/// bookkeeping it meets on the way. The ledger is written by the same
+/// worker loop as everything else, so a test that steps a saga by hand
+/// would otherwise have to hand-hold those batches too.
+fn pump_cascade(processor: &mut Processor) -> Option<SagaBatch> {
+    let mut next = processor.pump().unwrap();
+    loop {
+        let batch = next?;
+        if !is_ledger_bookkeeping(processor, &batch) {
+            return Some(batch);
+        }
+        let outcomes = execute(processor, &batch);
+        next = processor
+            .on_outcomes(batch.root, outcomes, batch.feedback)
+            .unwrap();
+        if next.is_none() {
+            next = processor.pump().unwrap();
+        }
+    }
+}
+
 /// Runs queued sagas to quiescence (Park/Done and no pending work).
 fn run_sagas(processor: &mut Processor) {
     let mut steps = 0;
@@ -761,6 +825,1337 @@ fn every_owed_incarnation_is_probed_before_the_next_start() {
     );
 }
 
+// ─── The stack ledger: the topology's off-disk backup ───
+
+/// Every stack-ledger comment the bot has on `pr`, newest first.
+fn ledgers_on(
+    world: &World,
+    pr: u64,
+) -> Vec<(crate::types::CommentId, crate::status::StackLedger)> {
+    let github = world.github.lock().unwrap();
+    let mut found: Vec<(crate::types::CommentId, crate::status::StackLedger)> = github
+        .comments
+        .iter()
+        .filter(|(_, c)| c.pr == PrNumber(pr) && c.author_id == TEST_BOT_ID)
+        .filter_map(|(id, c)| crate::status::parse_stack_ledger(&c.body).map(|l| (*id, l)))
+        .collect();
+    found.sort_by_key(|(id, l)| (l.seq, *id));
+    found.reverse();
+    found
+}
+
+/// The ledger a PR's comments say it has, if exactly one is there.
+fn ledger_on(world: &World, pr: u64) -> Option<crate::status::StackLedger> {
+    let found = ledgers_on(world, pr);
+    assert!(found.len() <= 1, "PR {pr} has {} ledgers", found.len());
+    found.first().map(|(_, l)| *l)
+}
+
+/// The invariant the ledger exists for: at quiescence, every PR's ledger
+/// comment says exactly what the store holds for that PR — and a PR with a
+/// declaration has one. (A PR that never had a declaration has no ledger:
+/// there is nothing to state, and no obligation was ever created.)
+fn assert_ledgers_match_store(world: &World, processor: &Processor) {
+    for (pr, cached) in &processor.state().prs {
+        let found = ledgers_on(world, pr.0);
+        assert!(
+            found.len() <= 1,
+            "PR {pr} carries {} ledgers; one is a duplicate a crawl would have \
+             to arbitrate",
+            found.len()
+        );
+        let expected = cached.predecessor.zip(cached.predecessor_comment_id);
+        match found.first() {
+            Some((id, ledger)) => {
+                assert_eq!(
+                    ledger.declared.map(|d| (d.predecessor, d.owner)),
+                    expected,
+                    "PR {pr}'s ledger disagrees with the store"
+                );
+                assert_eq!(
+                    cached.ledger_comment_id,
+                    Some(*id),
+                    "PR {pr}'s store does not know where its ledger lives"
+                );
+            }
+            None => assert_eq!(
+                expected, None,
+                "PR {pr} holds a declaration the ledger does not record"
+            ),
+        }
+    }
+}
+
+/// A recorded declaration is written to the PR's ledger comment: the whole
+/// point — a crawl reads this back instead of re-deriving the edge from the
+/// user's comment.
+#[test]
+fn a_declaration_writes_its_stack_ledger() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    drain(&mut processor);
+
+    let ledger = ledger_on(&world, 2).expect("PR 2's ledger");
+    assert_eq!(ledger.pr, PrNumber(2));
+    assert_eq!(
+        ledger.declared.map(|d| d.predecessor),
+        Some(PrNumber(1)),
+        "the ledger names the predecessor"
+    );
+    assert_eq!(
+        ledger.declared.map(|d| d.owner),
+        processor.state().prs[&PrNumber(2)].predecessor_comment_id,
+        "and the comment that declared it"
+    );
+    assert_ledgers_match_store(&world, &processor);
+    assert!(
+        ledger_on(&world, 1).is_none(),
+        "a PR that declares nothing has nothing to record"
+    );
+    assert!(
+        processor
+            .store_mut()
+            .owed_stack_ledgers()
+            .unwrap()
+            .is_empty(),
+        "the obligation is discharged"
+    );
+}
+
+/// A retraction rewrites the SAME comment to say the PR is not stacked. The
+/// ledger is state, not a log: there is one per PR, and it is the answer.
+#[test]
+fn a_retraction_rewrites_the_ledger_in_place() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    drain(&mut processor);
+    let before = ledgers_on(&world, 2);
+    assert_eq!(before.len(), 1);
+    let comment_id = before[0].0;
+
+    let deletion = comment_body_with_action(
+        &world.config,
+        2,
+        "@merge-train predecessor #1",
+        AUTHOR,
+        "author",
+        20,
+        "deleted",
+    );
+    world.enqueue(&mut processor, "issue_comment", deletion);
+    drain(&mut processor);
+
+    let after = ledgers_on(&world, 2);
+    assert_eq!(after.len(), 1, "still exactly one ledger");
+    assert_eq!(after[0].0, comment_id, "the same comment, rewritten");
+    assert_eq!(
+        after[0].1.declared, None,
+        "the ledger now says the PR declares no predecessor"
+    );
+    assert!(
+        after[0].1.seq > before[0].1.seq,
+        "and says so more recently"
+    );
+    // The watermark is what tells a crawl that the declaration comment
+    // still sitting on this PR is one the bot has already settled — not a
+    // change that appeared while it was away.
+    assert_eq!(
+        after[0].1.settled_through,
+        processor.state().prs[&PrNumber(2)].declarations_settled_through,
+        "the ledger carries the settled watermark"
+    );
+    assert!(
+        after[0].1.settled_through >= before[0].1.settled_through,
+        "which only ever moves forward"
+    );
+    assert_eq!(
+        after[0].1.settled_through,
+        Some(crate::types::CommentId(20)),
+        "and names the declaration it settled"
+    );
+}
+
+/// A declaration the live path REFUSES leaves no ledger: nothing was
+/// decided, so there is nothing to record — and a crawl reading ledgers can
+/// never resurrect what was refused.
+#[test]
+fn a_rejected_declaration_writes_no_ledger() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    drain(&mut processor);
+
+    // PR 1 is based on the default branch, so declaring PR 2 as its
+    // predecessor is refused (the base does not match PR 2's branch).
+    let body = comment_body(
+        &world.config,
+        1,
+        "@merge-train predecessor #2",
+        AUTHOR,
+        "author",
+        44,
+    );
+    world.enqueue(&mut processor, "issue_comment", body);
+    drain(&mut processor);
+
+    assert_eq!(
+        processor.state().prs[&PrNumber(1)].predecessor,
+        None,
+        "precondition: the declaration was refused"
+    );
+    assert!(
+        ledger_on(&world, 1).is_none(),
+        "a refused declaration records nothing"
+    );
+}
+
+/// The ledger write is best-effort like every other status write, so it is
+/// OWED until it lands: an outage during the write leaves the obligation in
+/// the store, and the retry discharges it without a restart.
+#[test]
+fn a_ledger_write_lost_to_an_outage_is_owed_and_lands_later() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    for i in 1..=2u64 {
+        let base = if i == 1 { "main" } else { "pr-1" };
+        let body = pr_opened_body(
+            &world.config,
+            i,
+            &heads[i as usize - 1],
+            &format!("pr-{i}"),
+            base,
+        );
+        world.enqueue(&mut processor, "pull_request", body);
+    }
+    drain(&mut processor);
+
+    world.github.lock().unwrap().unavailable = true;
+    let body = comment_body(
+        &world.config,
+        2,
+        "@merge-train predecessor #1",
+        AUTHOR,
+        "author",
+        20,
+    );
+    world.enqueue(&mut processor, "issue_comment", body);
+    drain(&mut processor);
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor,
+        Some(PrNumber(1)),
+        "the edge is recorded even though the ledger write failed"
+    );
+    assert_eq!(
+        processor
+            .store_mut()
+            .owed_stack_ledgers()
+            .unwrap()
+            .iter()
+            .map(|o| o.pr)
+            .collect::<Vec<_>>(),
+        vec![PrNumber(2)],
+        "the ledger is owed"
+    );
+
+    world.github.lock().unwrap().unavailable = false;
+    let remark = comment_body(&world.config, 2, "a remark", AUTHOR, "author", 21);
+    world.enqueue(&mut processor, "issue_comment", remark);
+    drain(&mut processor);
+
+    assert_eq!(
+        ledger_on(&world, 2)
+            .and_then(|l| l.declared)
+            .map(|d| d.predecessor),
+        Some(PrNumber(1)),
+        "the retry wrote the ledger"
+    );
+    assert!(
+        processor
+            .store_mut()
+            .owed_stack_ledgers()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A crash between posting the ledger and recording where it went leaves
+/// an orphan the store has never heard of. The next write must ADOPT it,
+/// not post a second: two ledgers on one PR is a duplicate a crawl would
+/// then have to arbitrate.
+#[test]
+fn an_orphaned_ledger_comment_is_adopted_not_duplicated() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    for i in 1..=2u64 {
+        let base = if i == 1 { "main" } else { "pr-1" };
+        let body = pr_opened_body(
+            &world.config,
+            i,
+            &heads[i as usize - 1],
+            &format!("pr-{i}"),
+            base,
+        );
+        world.enqueue(&mut processor, "pull_request", body);
+    }
+    drain(&mut processor);
+
+    // Declare, and run as far as the batch that POSTS the ledger — then
+    // die without observing its outcome: GitHub has the comment, the store
+    // has no id for it.
+    let body = comment_body(
+        &world.config,
+        2,
+        "@merge-train predecessor #1",
+        AUTHOR,
+        "author",
+        20,
+    );
+    world.enqueue(&mut processor, "issue_comment", body);
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+    let probe = processor.pump().unwrap().expect("the ledger probe");
+    let outcomes = execute(&mut processor, &probe);
+    let post = processor
+        .on_outcomes(probe.root, outcomes, probe.feedback)
+        .unwrap()
+        .expect("the batch that posts the ledger");
+    let interpreter = WorktreeGitInterpreter::new(processor.git_config(), post.root);
+    let _ = execute_batch(&interpreter, processor.github(), &post);
+    drop(processor);
+
+    let orphan = {
+        let found = ledgers_on(&world, 2);
+        assert_eq!(found.len(), 1, "precondition: the comment IS on GitHub");
+        found[0].0
+    };
+    let mut processor = world.processor();
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].ledger_comment_id,
+        None,
+        "precondition: the store never learned where it went"
+    );
+    assert_eq!(
+        processor
+            .store_mut()
+            .owed_stack_ledgers()
+            .unwrap()
+            .iter()
+            .map(|o| o.pr)
+            .collect::<Vec<_>>(),
+        vec![PrNumber(2)],
+        "precondition: still owed"
+    );
+
+    let remark = comment_body(&world.config, 2, "a remark", AUTHOR, "author", 21);
+    world.enqueue(&mut processor, "issue_comment", remark);
+    drain(&mut processor);
+
+    let after = ledgers_on(&world, 2);
+    assert_eq!(after.len(), 1, "the orphan was adopted, not duplicated");
+    assert_eq!(after[0].0, orphan);
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].ledger_comment_id,
+        Some(orphan),
+        "and the store now knows where its ledger lives"
+    );
+    assert!(
+        processor
+            .store_mut()
+            .owed_stack_ledgers()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A maintainer deletes the bot's ledger comment. No topology event says
+/// so, and the ledger is the topology's only off-disk backup — so the
+/// deletion itself dirties it, and the bot posts a fresh one.
+#[test]
+fn a_deleted_ledger_comment_is_written_again() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    drain(&mut processor);
+    let original = ledgers_on(&world, 2)[0].0;
+
+    // The comment is gone from GitHub, and the webhook says so: authored
+    // by the bot, deleted by a person.
+    world.github.lock().unwrap().comments.remove(&original);
+    let body = format!(
+        r#"{{
+            "action": "deleted",
+            "comment": {{
+                "id": {original},
+                "body": "",
+                "user": {{ "id": {TEST_BOT_ID}, "login": "merge-train" }},
+                "updated_at": "2026-07-01T12:00:00Z"
+            }},
+            "issue": {{
+                "number": 2,
+                "pull_request": {{ "url": "..." }},
+                "user": {{ "id": {AUTHOR}, "login": "author" }}
+            }},
+            "repository": {repo},
+            "sender": {{ "id": {AUTHOR}, "login": "author" }}
+        }}"#,
+        repo = repo_json(&world.config),
+    );
+    world.enqueue(&mut processor, "issue_comment", body.into_bytes());
+    drain(&mut processor);
+
+    let after = ledgers_on(&world, 2);
+    assert_eq!(after.len(), 1, "a fresh ledger was posted");
+    assert_ne!(after[0].0, original, "at a new comment");
+    assert_eq!(
+        after[0].1.declared.map(|d| d.predecessor),
+        Some(PrNumber(1)),
+        "saying what the store still holds"
+    );
+    assert_ledgers_match_store(&world, &processor);
+}
+
+/// The post landed, and a maintainer deleted the new comment before the
+/// post's acknowledgement was processed. The id is not recorded yet, so
+/// the deletion names nothing the store knows — but ignoring it lets the
+/// acknowledgement record a dead comment and clear the obligation, and
+/// the ledger stays missing for good. A change to any bot comment while
+/// the ledger is owed re-owes it at a fresh generation, which the
+/// in-flight acknowledgement cannot clear.
+#[test]
+fn a_deletion_racing_the_posts_acknowledgement_is_not_discharged_by_it() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    for i in 1..=2u64 {
+        let base = if i == 1 { "main" } else { "pr-1" };
+        let body = pr_opened_body(
+            &world.config,
+            i,
+            &heads[i as usize - 1],
+            &format!("pr-{i}"),
+            base,
+        );
+        world.enqueue(&mut processor, "pull_request", body);
+    }
+    drain(&mut processor);
+
+    // Declare, and run as far as the batch that POSTS the ledger; execute
+    // it without observing its outcome yet.
+    let body = comment_body(
+        &world.config,
+        2,
+        "@merge-train predecessor #1",
+        AUTHOR,
+        "author",
+        20,
+    );
+    world.enqueue(&mut processor, "issue_comment", body);
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+    let probe = processor.pump().unwrap().expect("the ledger probe");
+    let outcomes = execute(&mut processor, &probe);
+    let post = processor
+        .on_outcomes(probe.root, outcomes, probe.feedback)
+        .unwrap()
+        .expect("the batch that posts the ledger");
+    let interpreter = WorktreeGitInterpreter::new(processor.git_config(), post.root);
+    let landed = execute_batch(&interpreter, processor.github(), &post);
+    let (posted, _) = ledgers_on(&world, 2)[0];
+
+    // The deletion webhook for the new comment is processed BEFORE the
+    // post's acknowledgement.
+    world.github.lock().unwrap().comments.remove(&posted);
+    let deletion = format!(
+        r#"{{
+            "action": "deleted",
+            "comment": {{
+                "id": {posted},
+                "body": "",
+                "user": {{ "id": {TEST_BOT_ID}, "login": "merge-train" }},
+                "updated_at": "2026-07-01T12:00:00Z"
+            }},
+            "issue": {{
+                "number": 2,
+                "pull_request": {{ "url": "..." }},
+                "user": {{ "id": {AUTHOR}, "login": "author" }}
+            }},
+            "repository": {repo},
+            "sender": {{ "id": {AUTHOR}, "login": "author" }}
+        }}"#,
+        repo = repo_json(&world.config),
+    );
+    world.enqueue(&mut processor, "issue_comment", deletion.into_bytes());
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+    // Now the acknowledgement.
+    processor.note_best_effort(&landed.best_effort).unwrap();
+    assert!(
+        !processor
+            .store_mut()
+            .owed_stack_ledgers()
+            .unwrap()
+            .is_empty(),
+        "the acknowledgement of a post deleted under it must not discharge the ledger"
+    );
+
+    // The boundary completes; the retry writes to the recorded (dead)
+    // comment, 404s, and posts afresh.
+    let next = processor
+        .on_outcomes(post.root, landed.observed, post.feedback)
+        .unwrap();
+    finish_batches(&mut world, &mut processor, next);
+    drain(&mut processor);
+    tick(&world, &mut processor);
+    let after = ledgers_on(&world, 2);
+    assert_eq!(after.len(), 1, "a fresh ledger");
+    assert_ne!(after[0].0, posted);
+    assert_ledgers_match_store(&world, &processor);
+    assert!(
+        processor
+            .store_mut()
+            .owed_stack_ledgers()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// An obligation that outlived the process is picked up at construction.
+/// On a quiet repository nothing else would ever ask — no delivery, no
+/// saga, no train — and the topology's backup would stay missing
+/// indefinitely (Codex ledger review round 1, P1).
+#[test]
+fn owed_ledgers_are_seeded_when_the_processor_starts() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    for i in 1..=2u64 {
+        let base = if i == 1 { "main" } else { "pr-1" };
+        let body = pr_opened_body(
+            &world.config,
+            i,
+            &heads[i as usize - 1],
+            &format!("pr-{i}"),
+            base,
+        );
+        world.enqueue(&mut processor, "pull_request", body);
+    }
+    drain(&mut processor);
+
+    // The declaration lands; its ledger write does not.
+    world.github.lock().unwrap().unavailable = true;
+    let body = comment_body(
+        &world.config,
+        2,
+        "@merge-train predecessor #1",
+        AUTHOR,
+        "author",
+        20,
+    );
+    world.enqueue(&mut processor, "issue_comment", body);
+    drain(&mut processor);
+    assert_eq!(
+        processor
+            .store_mut()
+            .owed_stack_ledgers()
+            .unwrap()
+            .iter()
+            .map(|o| o.pr)
+            .collect::<Vec<_>>(),
+        vec![PrNumber(2)],
+        "precondition: the ledger is owed"
+    );
+    drop(processor);
+
+    // A fresh process, a healthy GitHub, and NOTHING else happening: the
+    // obligation is picked up at construction and written straight away.
+    world.github.lock().unwrap().unavailable = false;
+    let mut processor = world.processor();
+    drain(&mut processor);
+    assert_eq!(
+        ledger_on(&world, 2)
+            .and_then(|l| l.declared)
+            .map(|d| d.predecessor),
+        Some(PrNumber(1)),
+        "the restart wrote the ledger with no traffic to prompt it"
+    );
+    assert!(
+        processor
+            .store_mut()
+            .owed_stack_ledgers()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A maintainer can EDIT the bot's own comment, and GitHub reports the bot
+/// as its author — so the handler's self-guard ignores the event and a
+/// doctored machine block would stay trusted until a crawl read it. The
+/// edit re-owes the ledger, exactly as a deletion does (Codex ledger
+/// review round 1, P1).
+#[test]
+fn an_edited_ledger_comment_is_rewritten() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    drain(&mut processor);
+    let ledger_id = ledgers_on(&world, 2)[0].0;
+
+    // Someone rewrites the machine block to claim a different edge.
+    let forged = crate::status::format_stack_ledger(&crate::status::StackLedger {
+        pr: PrNumber(2),
+        declared: Some(crate::status::Declaration {
+            predecessor: PrNumber(9),
+            owner: crate::types::CommentId(1),
+        }),
+        seq: 9999,
+        settled_through: Some(crate::types::CommentId(1)),
+    });
+    world
+        .github
+        .lock()
+        .unwrap()
+        .comments
+        .get_mut(&ledger_id)
+        .unwrap()
+        .body = forged;
+    let body = format!(
+        r#"{{
+            "action": "edited",
+            "comment": {{
+                "id": {ledger_id},
+                "body": "doctored",
+                "user": {{ "id": {TEST_BOT_ID}, "login": "merge-train" }},
+                "updated_at": "2026-07-01T12:00:00Z"
+            }},
+            "issue": {{
+                "number": 2,
+                "pull_request": {{ "url": "..." }},
+                "user": {{ "id": {AUTHOR}, "login": "author" }}
+            }},
+            "repository": {repo},
+            "sender": {{ "id": {AUTHOR}, "login": "author" }}
+        }}"#,
+        repo = repo_json(&world.config),
+    );
+    world.enqueue(&mut processor, "issue_comment", body.into_bytes());
+    drain(&mut processor);
+
+    let after = ledgers_on(&world, 2);
+    assert_eq!(after.len(), 1, "still one ledger, rewritten in place");
+    assert_eq!(after[0].0, ledger_id);
+    assert_eq!(
+        after[0].1.declared.map(|d| d.predecessor),
+        Some(PrNumber(1)),
+        "the forged edge is overwritten with what the store holds"
+    );
+    assert_ledgers_match_store(&world, &processor);
+}
+
+/// An editor reapplies the SAME tampered body within a second of the
+/// repair. GitHub's `updated_at` is second-resolution, so the two edit
+/// webhooks share a dedupe key — and the second must still re-owe the
+/// ledger, or the corruption stands with nothing owed. The invalidation
+/// is idempotent, so it runs before the duplicate-content check.
+#[test]
+fn a_repeated_identical_edit_within_one_second_is_still_repaired() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    drain(&mut processor);
+    let ledger_id = ledgers_on(&world, 2)[0].0;
+    let forged = crate::status::format_stack_ledger(&crate::status::StackLedger {
+        pr: PrNumber(2),
+        declared: Some(crate::status::Declaration {
+            predecessor: PrNumber(9),
+            owner: crate::types::CommentId(1),
+        }),
+        seq: 9999,
+        settled_through: None,
+    });
+    let webhook = {
+        format!(
+            r#"{{
+                "action": "edited",
+                "comment": {{
+                    "id": {ledger_id},
+                    "body": "doctored",
+                    "user": {{ "id": {TEST_BOT_ID}, "login": "merge-train" }},
+                    "updated_at": "2026-07-01T12:00:00Z"
+                }},
+                "issue": {{
+                    "number": 2,
+                    "pull_request": {{ "url": "..." }},
+                    "user": {{ "id": {AUTHOR}, "login": "author" }}
+                }},
+                "repository": {repo},
+                "sender": {{ "id": {AUTHOR}, "login": "author" }}
+            }}"#,
+            repo = repo_json(&world.config),
+        )
+        .into_bytes()
+    };
+    for round in 1..=2 {
+        world
+            .github
+            .lock()
+            .unwrap()
+            .comments
+            .get_mut(&ledger_id)
+            .unwrap()
+            .body = forged.clone();
+        world.enqueue(&mut processor, "issue_comment", webhook.clone());
+        drain(&mut processor);
+        assert_eq!(
+            ledger_on(&world, 2)
+                .and_then(|l| l.declared)
+                .map(|d| d.predecessor),
+            Some(PrNumber(1)),
+            "round {round}: the forged edge is overwritten"
+        );
+    }
+    assert_ledgers_match_store(&world, &processor);
+}
+
+/// A ledger dirtied WHILE a write is in flight is not discharged by that
+/// write: the write clears the obligation it was made for, and anything
+/// later holds a newer generation (Codex ledger review round 13, P1).
+#[test]
+fn a_ledger_dirtied_mid_write_is_not_cleared_by_it() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    drain(&mut processor);
+
+    // Doctor the comment so a write is actually needed, then dirty it and
+    // run as far as the batch that writes it.
+    let ledger_id = ledgers_on(&world, 2)[0].0;
+    world
+        .github
+        .lock()
+        .unwrap()
+        .comments
+        .get_mut(&ledger_id)
+        .unwrap()
+        .body = crate::status::format_stack_ledger(&crate::status::StackLedger {
+        pr: PrNumber(2),
+        declared: None,
+        seq: 1,
+        settled_through: None,
+    });
+    processor.store_mut().mark_ledger_owed(PrNumber(2)).unwrap();
+    let remark = comment_body(&world.config, 2, "a remark", AUTHOR, "author", 9001);
+    world.enqueue(&mut processor, "issue_comment", remark);
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+    // The store knows the comment, so the write needs no probe first.
+    let write = processor.pump().unwrap().expect("the ledger write");
+    assert!(
+        matches!(
+            write.best_effort.first(),
+            Some(Effect::GitHub(GitHubEffect::UpdateComment { comment_id, .. })) if *comment_id == ledger_id
+        ),
+        "a rewrite at the recorded id: {:?}",
+        write.best_effort
+    );
+
+    // A maintainer edits the comment while that write is out.
+    processor.store_mut().mark_ledger_owed(PrNumber(2)).unwrap();
+    let outcomes = execute(&mut processor, &write);
+    processor
+        .on_outcomes(write.root, outcomes, write.feedback)
+        .unwrap();
+    assert_eq!(
+        processor
+            .store_mut()
+            .owed_stack_ledgers()
+            .unwrap()
+            .iter()
+            .map(|o| o.pr)
+            .collect::<Vec<_>>(),
+        vec![PrNumber(2)],
+        "the newer invalidation outlives the write that was already in flight"
+    );
+}
+
+/// A doctored ledger that also LOOKS like a command must still be
+/// repaired. Command authorization rejects the apparent command and
+/// returns early, so the repair has to happen before it (Codex ledger
+/// review round 13, P1).
+#[test]
+fn a_doctored_ledger_carrying_a_command_is_still_repaired() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    drain(&mut processor);
+    let ledger_id = ledgers_on(&world, 2)[0].0;
+
+    let forged = format!(
+        "{}\n@merge-train predecessor #9",
+        crate::status::format_stack_ledger(&crate::status::StackLedger {
+            pr: PrNumber(2),
+            declared: Some(crate::status::Declaration {
+                predecessor: PrNumber(9),
+                owner: crate::types::CommentId(1),
+            }),
+            seq: 9999,
+            settled_through: Some(crate::types::CommentId(1)),
+        })
+    );
+    world
+        .github
+        .lock()
+        .unwrap()
+        .comments
+        .get_mut(&ledger_id)
+        .unwrap()
+        .body = forged.clone();
+    // Edited by a STRANGER: the apparent command is unauthorized.
+    let body = format!(
+        r#"{{
+            "action": "edited",
+            "comment": {{
+                "id": {ledger_id},
+                "body": "@merge-train predecessor #9",
+                "user": {{ "id": {TEST_BOT_ID}, "login": "merge-train" }},
+                "updated_at": "2026-07-01T12:00:00Z"
+            }},
+            "issue": {{
+                "number": 2,
+                "pull_request": {{ "url": "..." }},
+                "user": {{ "id": {AUTHOR}, "login": "author" }}
+            }},
+            "repository": {repo},
+            "sender": {{ "id": {STRANGER}, "login": "stranger" }}
+        }}"#,
+        repo = repo_json(&world.config),
+    );
+    world.enqueue(&mut processor, "issue_comment", body.into_bytes());
+    drain(&mut processor);
+
+    assert_eq!(
+        ledger_on(&world, 2)
+            .and_then(|l| l.declared)
+            .map(|d| d.predecessor),
+        Some(PrNumber(1)),
+        "the forged edge is overwritten even though the command was refused"
+    );
+    assert_ledgers_match_store(&world, &processor);
+}
+
+/// A ledger whose DECLARATION still matches but whose other
+/// recovery-significant fields were changed is rewritten: a bogus `seq`
+/// would win a crawl's duplicate arbitration for ever, and a changed `pr`
+/// makes the comment meaningless where it sits (Codex ledger review round
+/// 13, P1).
+#[test]
+fn a_tampered_sequence_number_is_rewritten() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    drain(&mut processor);
+    let (ledger_id, before) = ledgers_on(&world, 2)[0];
+
+    let doctored = crate::status::StackLedger {
+        seq: u64::MAX,
+        ..before
+    };
+    world
+        .github
+        .lock()
+        .unwrap()
+        .comments
+        .get_mut(&ledger_id)
+        .unwrap()
+        .body = crate::status::format_stack_ledger(&doctored);
+    processor.store_mut().mark_ledger_owed(PrNumber(2)).unwrap();
+    let remark = comment_body(&world.config, 2, "a remark", AUTHOR, "author", 9002);
+    world.enqueue(&mut processor, "issue_comment", remark);
+    drain(&mut processor);
+
+    let after = ledger_on(&world, 2).expect("still one ledger");
+    assert_eq!(
+        after.declared, before.declared,
+        "the declaration is unchanged"
+    );
+    assert!(
+        after.seq < u64::MAX,
+        "but the sequence number is back to something the store could have written"
+    );
+}
+
+/// The ledger's convergence property: whatever the users do to their
+/// declarations and to the ledger comments themselves, whatever GitHub
+/// refuses along the way, and however often the process dies between a
+/// write landing and its acknowledgement, the ledger comments end up
+/// stating exactly what the store holds — one per PR.
+mod ledger_property {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    /// One change to the declared topology or to a ledger comment, as a
+    /// user makes it.
+    #[derive(Debug, Clone, Copy)]
+    enum TopologyAction {
+        /// PR `pr` declares `target` as its predecessor, in a fresh comment.
+        Declare { pr: u64, target: u64 },
+        /// The author deletes the comment that last declared on `pr`.
+        Retract { pr: u64 },
+        /// The author edits that comment into something that declares nothing.
+        EditAway { pr: u64 },
+        /// A maintainer deletes the bot's ledger comment on `pr`. Without
+        /// the webhook, the store learns of it only when a write to it
+        /// 404s — so a silent deletion is restored by the NEXT write to
+        /// that PR, not before, and the generator does not produce one:
+        /// the property's premise is that webhooks arrive. The pinned case
+        /// below follows a silent deletion with the declaration that
+        /// heals it.
+        DeleteLedger { pr: u64, webhook: bool },
+        /// A maintainer edits the bot's ledger comment on `pr` into a forgery.
+        EditLedger { pr: u64 },
+    }
+
+    /// What goes wrong while an action is processed.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Fault {
+        None,
+        /// GitHub refuses comment edits: the ledger write fails and stays owed.
+        RefusedWrites,
+        /// The ledger write LANDS, and the process dies before observing its
+        /// outcome: the obligation is still on the books, and a post's
+        /// comment id was never recorded.
+        CrashBeforeAck,
+        /// The ledger write LANDS, and a maintainer deletes the comment it
+        /// wrote — webhook processed — before its outcome is observed.
+        DeleteBeforeAck,
+    }
+
+    fn arb_step() -> impl Strategy<Value = (TopologyAction, Fault)> {
+        let action = prop_oneof![
+            // Weighted towards the edge that VALIDATES (a PR's base is its
+            // predecessor's branch), or nothing downstream ever holds a
+            // declaration for a retraction to retract.
+            3 => (2u64..=3).prop_map(|pr| TopologyAction::Declare { pr, target: pr - 1 }),
+            1 => (2u64..=3, 1u64..=3)
+                .prop_map(|(pr, target)| TopologyAction::Declare { pr, target }),
+            2 => (2u64..=3).prop_map(|pr| TopologyAction::Retract { pr }),
+            1 => (2u64..=3).prop_map(|pr| TopologyAction::EditAway { pr }),
+            1 => (2u64..=3).prop_map(|pr| TopologyAction::DeleteLedger { pr, webhook: true }),
+            1 => (2u64..=3).prop_map(|pr| TopologyAction::EditLedger { pr }),
+        ];
+        let fault = prop_oneof![
+            3 => Just(Fault::None),
+            1 => Just(Fault::RefusedWrites),
+            2 => Just(Fault::CrashBeforeAck),
+            2 => Just(Fault::DeleteBeforeAck),
+        ];
+        (action, fault)
+    }
+
+    /// A comment webhook with an EXACT id, by the author.
+    fn topology_comment(
+        config: &GitConfig,
+        pr: u64,
+        text: &str,
+        comment_id: u64,
+        action: &str,
+    ) -> Vec<u8> {
+        comment_webhook(config, pr, text, comment_id, action, AUTHOR, AUTHOR)
+    }
+
+    /// A comment webhook for a comment AUTHORED by `author_id`, whose change
+    /// `sender_id` made — GitHub reports the bot as the author of its own
+    /// comments however a maintainer edits them.
+    fn comment_webhook(
+        config: &GitConfig,
+        pr: u64,
+        text: &str,
+        comment_id: u64,
+        action: &str,
+        author_id: u64,
+        sender_id: u64,
+    ) -> Vec<u8> {
+        format!(
+            r#"{{
+                "action": "{action}",
+                "comment": {{
+                    "id": {comment_id},
+                    "body": "{text}",
+                    "user": {{ "id": {author_id}, "login": "someone" }},
+                    "updated_at": "{updated_at}"
+                }},
+                "issue": {{
+                    "number": {pr},
+                    "pull_request": {{ "url": "..." }},
+                    "user": {{ "id": {AUTHOR}, "login": "author" }}
+                }},
+                "repository": {repo},
+                "sender": {{ "id": {sender_id}, "login": "someone" }}
+            }}"#,
+            updated_at = unique_updated_at(),
+            repo = repo_json(config),
+        )
+        .into_bytes()
+    }
+
+    /// Processes everything queued, but dies the moment a batch that writes
+    /// a ledger has EXECUTED — before its outcome is observed. Returns the
+    /// successor process. With no ledger write on the way, this is `drain`.
+    fn drain_crashing_before_ledger_ack(world: &World, mut processor: Processor) -> Processor {
+        while let Some(delivery) = processor.claim().unwrap() {
+            processor.process_claimed(delivery).unwrap();
+        }
+        let mut next = processor.pump().unwrap();
+        let mut steps = 0;
+        while let Some(batch) = next {
+            steps += 1;
+            assert!(steps < 500, "saga did not terminate");
+            let writes_a_ledger = batch.best_effort.iter().any(|e| match e {
+                Effect::GitHub(
+                    GitHubEffect::PostComment { body, .. }
+                    | GitHubEffect::UpdateComment { body, .. },
+                ) => crate::status::parse_stack_ledger(body).is_some(),
+                _ => false,
+            });
+            if writes_a_ledger {
+                let interpreter = WorktreeGitInterpreter::new(processor.git_config(), batch.root);
+                let _ = execute_batch(&interpreter, processor.github(), &batch);
+                drop(processor);
+                let mut successor = world.processor();
+                drain(&mut successor);
+                return successor;
+            }
+            let outcomes = execute(&mut processor, &batch);
+            next = processor
+                .on_outcomes(batch.root, outcomes, batch.feedback)
+                .unwrap();
+            if next.is_none() {
+                next = processor.pump().unwrap();
+            }
+        }
+        processor
+    }
+
+    /// Processes everything queued, but the moment a batch that writes a
+    /// ledger has EXECUTED, a maintainer deletes the comment it wrote and
+    /// that webhook is processed — only then is the batch's outcome
+    /// observed. With no such write on the way, this is `drain`.
+    fn drain_deleting_before_ack(world: &mut World, processor: &mut Processor) {
+        while let Some(delivery) = processor.claim().unwrap() {
+            processor.process_claimed(delivery).unwrap();
+        }
+        let mut next = processor.pump().unwrap();
+        let mut steps = 0;
+        // The maintainer acts ONCE, on the first ledger write; the
+        // replacement that follows is left alone, or the two would chase
+        // each other for ever.
+        let mut deleted = false;
+        while let Some(batch) = next {
+            steps += 1;
+            assert!(steps < 500, "saga did not terminate");
+            let writes_a_ledger = batch.best_effort.iter().any(|e| match e {
+                Effect::GitHub(
+                    GitHubEffect::PostComment { body, .. }
+                    | GitHubEffect::UpdateComment { body, .. },
+                ) => crate::status::parse_stack_ledger(body).is_some(),
+                _ => false,
+            });
+            if !writes_a_ledger || deleted {
+                let outcomes = execute(processor, &batch);
+                next = processor
+                    .on_outcomes(batch.root, outcomes, batch.feedback)
+                    .unwrap();
+                if next.is_none() {
+                    next = processor.pump().unwrap();
+                }
+                continue;
+            }
+            deleted = true;
+            let interpreter = WorktreeGitInterpreter::new(processor.git_config(), batch.root);
+            let landed = execute_batch(&interpreter, processor.github(), &batch);
+            // Whatever ledger the batch wrote, delete it and process the
+            // webhook before the outcome is observed.
+            if let Some((id, _)) = ledgers_on(world, batch.root.0).into_iter().next() {
+                world.github.lock().unwrap().comments.remove(&id);
+                let hook = comment_webhook(
+                    &world.config,
+                    batch.root.0,
+                    "",
+                    id.0,
+                    "deleted",
+                    TEST_BOT_ID,
+                    AUTHOR,
+                );
+                world.enqueue(processor, "issue_comment", hook);
+                while let Some(delivery) = processor.claim().unwrap() {
+                    processor.process_claimed(delivery).unwrap();
+                }
+            }
+            processor.note_best_effort(&landed.best_effort).unwrap();
+            next = processor
+                .on_outcomes(batch.root, landed.observed, batch.feedback)
+                .unwrap();
+            if next.is_none() {
+                next = processor.pump().unwrap();
+            }
+        }
+        drain(processor);
+    }
+
+    /// Runs one generated history and asserts the ledger invariant at the
+    /// end of it.
+    fn ledger_property_case(steps: &[(TopologyAction, Fault)]) {
+        let (mut world, heads) = World::linear_stack(3);
+        let mut processor = world.processor();
+        for i in 1..=3u64 {
+            let base = if i == 1 {
+                "main".to_owned()
+            } else {
+                format!("pr-{}", i - 1)
+            };
+            let body = pr_opened_body(
+                &world.config,
+                i,
+                &heads[i as usize - 1],
+                &format!("pr-{i}"),
+                &base,
+            );
+            world.enqueue(&mut processor, "pull_request", body);
+        }
+        drain(&mut processor);
+
+        // The comment each PR last declared in, so retractions and edits have
+        // something real to name.
+        let mut last_comment: HashMap<u64, u64> = HashMap::new();
+        let mut next_comment = 500u64;
+        for (action, fault) in steps {
+            world.github.lock().unwrap().update_comment_broken = *fault == Fault::RefusedWrites;
+            let delivery = match *action {
+                TopologyAction::Declare { pr, target } => {
+                    next_comment += 10;
+                    last_comment.insert(pr, next_comment);
+                    Some(topology_comment(
+                        &world.config,
+                        pr,
+                        &format!("@merge-train predecessor #{target}"),
+                        next_comment,
+                        "created",
+                    ))
+                }
+                TopologyAction::Retract { pr } => last_comment.get(&pr).map(|id| {
+                    topology_comment(
+                        &world.config,
+                        pr,
+                        "@merge-train predecessor #1",
+                        *id,
+                        "deleted",
+                    )
+                }),
+                TopologyAction::EditAway { pr } => last_comment
+                    .get(&pr)
+                    .map(|id| topology_comment(&world.config, pr, "never mind", *id, "edited")),
+                TopologyAction::DeleteLedger { pr, webhook } => {
+                    ledgers_on(&world, pr).first().and_then(|(id, _)| {
+                        world.github.lock().unwrap().comments.remove(id);
+                        webhook.then(|| {
+                            comment_webhook(
+                                &world.config,
+                                pr,
+                                "",
+                                id.0,
+                                "deleted",
+                                TEST_BOT_ID,
+                                AUTHOR,
+                            )
+                        })
+                    })
+                }
+                TopologyAction::EditLedger { pr } => {
+                    ledgers_on(&world, pr).first().map(|(id, _)| {
+                        let forged =
+                            crate::status::format_stack_ledger(&crate::status::StackLedger {
+                                pr: PrNumber(pr),
+                                declared: Some(crate::status::Declaration {
+                                    predecessor: PrNumber(9),
+                                    owner: crate::types::CommentId(1),
+                                }),
+                                seq: u64::MAX,
+                                settled_through: None,
+                            });
+                        world
+                            .github
+                            .lock()
+                            .unwrap()
+                            .comments
+                            .get_mut(id)
+                            .unwrap()
+                            .body = forged;
+                        comment_webhook(
+                            &world.config,
+                            pr,
+                            "doctored",
+                            id.0,
+                            "edited",
+                            TEST_BOT_ID,
+                            AUTHOR,
+                        )
+                    })
+                }
+            };
+            if let Some(body) = delivery {
+                world.enqueue(&mut processor, "issue_comment", body);
+                match fault {
+                    Fault::CrashBeforeAck => {
+                        processor = drain_crashing_before_ledger_ack(&world, processor);
+                    }
+                    Fault::DeleteBeforeAck => {
+                        drain_deleting_before_ack(&mut world, &mut processor);
+                    }
+                    Fault::None | Fault::RefusedWrites => drain(&mut processor),
+                }
+            }
+        }
+
+        // The worker restarts — obligations are durable, so a ledger owed
+        // when the process died is still owed when it comes back — GitHub
+        // answers again, and it gets its retries: whatever the failures
+        // were, the ledgers must converge on what the store holds.
+        drop(processor);
+        let mut processor = world.processor();
+        world.github.lock().unwrap().update_comment_broken = false;
+        next_comment += 10;
+        let remark = topology_comment(&world.config, 2, "a remark", next_comment, "created");
+        world.enqueue(&mut processor, "issue_comment", remark);
+        drain(&mut processor);
+        for _ in 0..4 {
+            if processor
+                .store_mut()
+                .owed_stack_ledgers()
+                .unwrap()
+                .is_empty()
+            {
+                break;
+            }
+            tick(&world, &mut processor);
+        }
+
+        assert!(
+            processor
+                .store_mut()
+                .owed_stack_ledgers()
+                .unwrap()
+                .is_empty(),
+            "every ledger obligation is discharged once GitHub answers"
+        );
+        assert_ledgers_match_store(&world, &processor);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 24,
+            ..ProptestConfig::default()
+        })]
+
+        /// However the declarations are made, retracted, edited away and
+        /// remade, however the ledger comments are deleted or doctored, and
+        /// however many writes GitHub refuses or the process fails to
+        /// acknowledge while it happens — once GitHub answers again every
+        /// PR's ledger comment states exactly the declaration the store
+        /// holds, and there is exactly one of them per PR.
+        ///
+        /// This is the property a lost-DB crawl depends on: it READS these
+        /// comments instead of re-deriving the topology from the users'.
+        #[test]
+        fn ledgers_converge_on_the_declarations_the_store_holds(
+            steps in proptest::collection::vec(arb_step(), 1..7),
+        ) {
+            ledger_property_case(&steps);
+        }
+    }
+
+    /// The shrunk cases worth keeping as examples: a declaration remade after
+    /// a retraction; a write that fails before the one that lands; a post
+    /// whose acknowledgement the crash ate (the orphan is adopted); a
+    /// deletion whose replacement post is likewise unacknowledged; a
+    /// deletion whose webhook never comes (the next write's 404 heals it);
+    /// and a doctored ledger behind refused writes.
+    #[test]
+    fn ledger_property_fixed_cases() {
+        ledger_property_case(&[
+            (TopologyAction::Declare { pr: 2, target: 1 }, Fault::None),
+            (TopologyAction::Retract { pr: 2 }, Fault::None),
+            (TopologyAction::Declare { pr: 2, target: 1 }, Fault::None),
+        ]);
+        ledger_property_case(&[
+            (TopologyAction::Declare { pr: 2, target: 1 }, Fault::None),
+            (TopologyAction::Retract { pr: 2 }, Fault::RefusedWrites),
+            (
+                TopologyAction::Declare { pr: 3, target: 2 },
+                Fault::RefusedWrites,
+            ),
+        ]);
+        ledger_property_case(&[
+            (TopologyAction::Declare { pr: 3, target: 2 }, Fault::None),
+            (TopologyAction::EditAway { pr: 3 }, Fault::None),
+        ]);
+        ledger_property_case(&[
+            (
+                TopologyAction::Declare { pr: 2, target: 1 },
+                Fault::CrashBeforeAck,
+            ),
+            (TopologyAction::Retract { pr: 2 }, Fault::CrashBeforeAck),
+        ]);
+        ledger_property_case(&[
+            (TopologyAction::Declare { pr: 2, target: 1 }, Fault::None),
+            (
+                TopologyAction::DeleteLedger {
+                    pr: 2,
+                    webhook: true,
+                },
+                Fault::CrashBeforeAck,
+            ),
+            (TopologyAction::Declare { pr: 3, target: 2 }, Fault::None),
+        ]);
+        ledger_property_case(&[
+            (TopologyAction::Declare { pr: 2, target: 1 }, Fault::None),
+            (
+                TopologyAction::DeleteLedger {
+                    pr: 2,
+                    webhook: false,
+                },
+                Fault::None,
+            ),
+            (TopologyAction::Declare { pr: 2, target: 1 }, Fault::None),
+        ]);
+        ledger_property_case(&[
+            (TopologyAction::Declare { pr: 2, target: 1 }, Fault::None),
+            (TopologyAction::EditLedger { pr: 2 }, Fault::RefusedWrites),
+        ]);
+        // Two identical edits of one comment are two edits, not a
+        // redelivery: the harness gives them distinct timestamps, as
+        // GitHub does.
+        ledger_property_case(&[
+            (TopologyAction::Declare { pr: 2, target: 1 }, Fault::None),
+            (TopologyAction::EditLedger { pr: 2 }, Fault::CrashBeforeAck),
+            (TopologyAction::EditLedger { pr: 2 }, Fault::None),
+        ]);
+        // The history CI drew (nix-build, 2026-09-13): a deletion before
+        // the acknowledgement on one PR, then on another.
+        ledger_property_case(&[
+            (TopologyAction::Declare { pr: 2, target: 1 }, Fault::None),
+            (
+                TopologyAction::Declare { pr: 3, target: 2 },
+                Fault::DeleteBeforeAck,
+            ),
+            (TopologyAction::Retract { pr: 2 }, Fault::DeleteBeforeAck),
+        ]);
+    }
+}
+
 // ─── Authorization ───
 
 #[test]
@@ -1081,7 +2476,7 @@ fn a_failed_terminal_status_update_is_owed_until_it_lands() {
     };
     claim_all(&mut processor);
     // Preflight lands the train and its status comment.
-    let preflight = processor.pump().unwrap().expect("the start's preflight");
+    let preflight = pump_cascade(&mut processor).expect("the start's preflight");
     let outcomes = execute(&mut processor, &preflight);
     let step = processor
         .on_outcomes(preflight.root, outcomes, preflight.feedback)
@@ -1170,7 +2565,7 @@ fn a_failed_completion_status_update_is_owed_until_it_lands() {
     }
     // Step until the batch that carries the completion update: effects
     // empty, and the train already gone from the state.
-    let mut batch = processor.pump().unwrap().expect("the start's preflight");
+    let mut batch = pump_cascade(&mut processor).expect("the start's preflight");
     let cleanup = loop {
         let outcomes = execute(&mut processor, &batch);
         let next = processor
@@ -1236,7 +2631,7 @@ fn an_owed_sync_for_a_deleted_comment_is_cleared_by_the_probe() {
         }
     };
     claim_all(&mut processor);
-    let preflight = processor.pump().unwrap().expect("the start's preflight");
+    let preflight = pump_cascade(&mut processor).expect("the start's preflight");
     let outcomes = execute(&mut processor, &preflight);
     let step = processor
         .on_outcomes(preflight.root, outcomes, preflight.feedback)
@@ -1307,7 +2702,7 @@ fn an_owed_update_is_matched_by_comment_not_by_batch_root() {
         }
     };
     claim_all(&mut processor);
-    let preflight = processor.pump().unwrap().expect("the start's preflight");
+    let preflight = pump_cascade(&mut processor).expect("the start's preflight");
     let outcomes = execute(&mut processor, &preflight);
     let step = processor
         .on_outcomes(preflight.root, outcomes, preflight.feedback)
@@ -1385,7 +2780,7 @@ fn an_owed_sync_rewrites_a_mangled_comment_at_the_known_id() {
         }
     };
     claim_all(&mut processor);
-    let preflight = processor.pump().unwrap().expect("the start's preflight");
+    let preflight = pump_cascade(&mut processor).expect("the start's preflight");
     let outcomes = execute(&mut processor, &preflight);
     let step = processor
         .on_outcomes(preflight.root, outcomes, preflight.feedback)
@@ -1451,7 +2846,7 @@ fn a_comment_posted_before_the_crash_is_synced_by_incarnation() {
     }
     // Run until the batch that POSTS the status comment, execute it, and
     // die before observing it: GitHub has the comment, the store does not.
-    let mut batch = processor.pump().unwrap().expect("the start's preflight");
+    let mut batch = pump_cascade(&mut processor).expect("the start's preflight");
     loop {
         let posts = batch
             .effects
@@ -1529,7 +2924,7 @@ fn train_with_orphaned_status_comment() -> (World, Processor, crate::types::Comm
     while let Some(delivery) = processor.claim().unwrap() {
         processor.process_claimed(delivery).unwrap();
     }
-    let mut batch = processor.pump().unwrap().expect("the start's preflight");
+    let mut batch = pump_cascade(&mut processor).expect("the start's preflight");
     loop {
         let posts = batch
             .effects
@@ -1672,7 +3067,7 @@ fn a_probe_that_finds_the_terminal_record_clears_without_rewriting() {
     while let Some(delivery) = processor.claim().unwrap() {
         processor.process_claimed(delivery).unwrap();
     }
-    let cleanup = processor.pump().unwrap().expect("the stop's cleanup batch");
+    let cleanup = pump_cascade(&mut processor).expect("the stop's cleanup batch");
     assert!(
         cleanup
             .best_effort
@@ -2315,7 +3710,7 @@ fn failed_start_preflight_answers_the_user_instead_of_vanishing() {
     while let Some(delivery) = processor.claim().unwrap() {
         processor.process_claimed(delivery).unwrap();
     }
-    let batch = processor.pump().unwrap().expect("start plans preflight");
+    let batch = pump_cascade(&mut processor).expect("start plans preflight");
 
     // GitHub goes down for the preflight execution, then recovers.
     world.github.lock().unwrap().unavailable = true;
@@ -2367,7 +3762,7 @@ fn stop_mid_saga_takes_effect_at_the_next_observation_boundary() {
     while let Some(delivery) = processor.claim().unwrap() {
         processor.process_claimed(delivery).unwrap();
     }
-    let batch = processor.pump().unwrap().expect("start plans a saga");
+    let batch = pump_cascade(&mut processor).expect("start plans a saga");
     let outcomes = execute(&mut processor, &batch);
 
     // The author's stop arrives while those effects execute.
@@ -2607,7 +4002,7 @@ fn stop_mid_saga_on_an_existing_train_suppresses_the_continuation() {
 
     // Complete the preflight so the train record exists, leaving the next
     // batch (preparation work) in flight.
-    let preflight = processor.pump().unwrap().expect("start plans preflight");
+    let preflight = pump_cascade(&mut processor).expect("start plans preflight");
     let outcomes = execute(&mut processor, &preflight);
     let batch = processor
         .on_outcomes(preflight.root, outcomes, preflight.feedback)
@@ -2679,7 +4074,7 @@ fn acknowledged_stop_survives_a_crash_before_its_boundary() {
 
     // Preflight completes (the train now exists); the next batch is in
     // flight when the stop arrives, so the stop queues for the boundary.
-    let preflight = processor.pump().unwrap().expect("start plans preflight");
+    let preflight = pump_cascade(&mut processor).expect("start plans preflight");
     let outcomes = execute(&mut processor, &preflight);
     let _batch = processor
         .on_outcomes(preflight.root, outcomes, preflight.feedback)
@@ -2746,7 +4141,7 @@ fn acknowledged_start_survives_a_crash_while_queued() {
 
     // Train 1's preflight occupies the saga slot; start 2 is acked and
     // closed while it runs, waiting in the queue.
-    let batch = processor.pump().unwrap().expect("start 1 plans preflight");
+    let batch = pump_cascade(&mut processor).expect("start 1 plans preflight");
     let _outcomes = execute(&mut processor, &batch);
     let body = comment_body(&world.config, 2, "@merge-train start", AUTHOR, "author", 3);
     world.enqueue(&mut processor, "issue_comment", body);
@@ -3077,7 +4472,7 @@ fn stop_cancels_a_queued_not_yet_started_start() {
     }
 
     // Train 1's preflight saga occupies the slot.
-    let batch = processor.pump().unwrap().expect("start 1 plans preflight");
+    let batch = pump_cascade(&mut processor).expect("start 1 plans preflight");
     let outcomes = execute(&mut processor, &batch);
 
     // While it runs: start 2 (queues behind the slot), then stop 2.
@@ -3258,7 +4653,7 @@ fn start_stop_start_sequence_runs_the_final_start() {
     }
 
     // Train 1's preflight saga occupies the slot.
-    let batch = processor.pump().unwrap().expect("start 1 plans preflight");
+    let batch = pump_cascade(&mut processor).expect("start 1 plans preflight");
     let outcomes = execute(&mut processor, &batch);
 
     // While it runs: start 2, stop 2, start 2 again. (Distinct single-digit
@@ -3311,7 +4706,7 @@ fn saga_outcomes_park_until_the_backlog_drains() {
     while let Some(delivery) = processor.claim().unwrap() {
         processor.process_claimed(delivery).unwrap();
     }
-    let batch = processor.pump().unwrap().expect("start plans preflight");
+    let batch = pump_cascade(&mut processor).expect("start plans preflight");
     let outcomes = execute(&mut processor, &batch);
 
     // An acked delivery (a stranger's stop, which will need GitHub when
@@ -3682,8 +5077,14 @@ fn run_batches_then_crash(world: &mut World, processor: Processor, depth: usize)
             Some(first) => {
                 let mut batch = first;
                 loop {
+                    // Stack-ledger bookkeeping runs but does not COUNT: a
+                    // depth names a step of the cascade, and the comments
+                    // that pick depths describe those steps.
+                    let counts = !is_ledger_bookkeeping(&mut processor, &batch);
                     let outcomes = execute(&mut processor, &batch);
-                    executed += 1;
+                    if counts {
+                        executed += 1;
+                    }
                     if executed >= depth {
                         break 'outer; // crash: outcomes never observed
                     }
@@ -4007,7 +5408,7 @@ fn recovery_refreshes_a_stale_status_comment_before_resuming() {
     // Execute through batch 3 (preflight → status post → refetch), then let
     // boundary 3 plan the Preparing phase: its PhaseTransition (seq bump)
     // is appended, but the batch — carrying the status update — never runs.
-    let b1 = processor.pump().unwrap().expect("preflight");
+    let b1 = pump_cascade(&mut processor).expect("preflight");
     let o1 = execute(&mut processor, &b1);
     let b2 = processor
         .on_outcomes(b1.root, o1, b1.feedback)

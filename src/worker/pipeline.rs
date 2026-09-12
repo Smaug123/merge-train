@@ -185,6 +185,13 @@ enum PendingWork {
     /// an update is confirmed to have landed or the comment confirmed
     /// gone; this work item is the retry — a probe of the PR's comments,
     /// then the rewrite — queued at startup and at the stall cadence.
+    /// A PR whose stack-ledger comment no longer matches the declaration
+    /// the store holds. The ledger is the topology's off-disk backup —
+    /// what a crawl READS instead of re-deriving the graph from the users'
+    /// comments — so it is owed a write until one lands. This is the
+    /// retry: the write itself when the store knows the comment's id, and
+    /// otherwise a probe of the PR's comments first, then the write.
+    LedgerSync { pr: PrNumber },
     StatusSync {
         root: PrNumber,
         /// The train INCARNATION whose comment is owed the final word: the
@@ -254,6 +261,14 @@ pub(crate) struct Processor {
     /// 12, P2), and an obligation that can never be discharged must not
     /// stall the start forever.
     deferred_for_sync: HashSet<(i64, chrono::DateTime<Utc>)>,
+    /// PRs whose ledger probe (`ListComments`) is in flight.
+    ledger_probes: HashSet<PrNumber>,
+    /// The obligation generation each in-flight ledger write was made
+    /// for. The write clears THAT generation and no other, so anything
+    /// that dirtied the ledger while it was out survives it. In memory
+    /// only: a restart loses it, the obligation stands, and the next sync
+    /// writes again — which is idempotent.
+    ledger_write_gen: HashMap<PrNumber, u64>,
     /// Active-train evaluations owed at startup, queued when the durable
     /// backlog first drains (`Some` until then; see [`Processor::claim`]).
     startup_evaluates: Option<Vec<PrNumber>>,
@@ -330,6 +345,15 @@ impl Processor {
                 started_at: owed.started_at,
             }
         }));
+        // Stack ledgers a previous process never wrote: owed until they
+        // land, and on a quiet repository nothing else would ever ask
+        // (Codex ledger review round 1, P1).
+        pending.extend(
+            store
+                .owed_stack_ledgers()?
+                .into_iter()
+                .map(|owed| PendingWork::LedgerSync { pr: owed.pr }),
+        );
         // Startup *evaluations* of active trains (so an acknowledged CI
         // success whose trigger died with the process still resumes a
         // parked train) are computed here but queue only once the durable
@@ -356,6 +380,8 @@ impl Processor {
             retry_timer_outstanding: false,
             sync_probes: HashMap::new(),
             deferred_for_sync: HashSet::new(),
+            ledger_probes: HashSet::new(),
+            ledger_write_gen: HashMap::new(),
             startup_evaluates: Some(startup_evaluates),
             active_start: None,
         })
@@ -469,6 +495,14 @@ impl Processor {
                 return self.close(&id, None, "malformed");
             }
         };
+
+        // A change to one of the bot's own stack-ledger comments is noted
+        // BEFORE the duplicate-content check: the note is idempotent (it
+        // owes a rewrite that states the truth, however often), while
+        // the dedupe key is second-resolution — an editor reapplying the
+        // same tampered body within a second of the repair would
+        // otherwise be dropped as a redelivery, corruption and all.
+        self.note_bot_comment_change(&event)?;
 
         // Dedupe: identical content already handled under a different
         // delivery id (GitHub redelivers with fresh ids).
@@ -747,6 +781,83 @@ impl Processor {
         Ok(PipelineOutcome::Processed)
     }
 
+    /// A change to one of the bot's OWN stack-ledger comments — an edit
+    /// or a deletion by anyone with rights — invalidates the topology's
+    /// off-disk backup for that PR, and no topology event will say so. It
+    /// is noted before anything in the pipeline can return early: the
+    /// duplicate-content check (second-resolution keys), command
+    /// authorization and precaching all can, and a doctored ledger
+    /// carrying a `predecessor` line would otherwise be rejected as an
+    /// unauthorized command with the tampering left in place (Codex
+    /// ledger review round 13, P1). The bot's own writes are excluded by
+    /// the sender, or every write would re-dirty what it just wrote.
+    fn note_bot_comment_change(&mut self, event: &GitHubEvent) -> Result<(), StoreError> {
+        if let GitHubEvent::IssueComment(comment) = event
+            && comment.sender_id != self.deps.bot_user_id
+            && comment.author_id == self.deps.bot_user_id
+            && comment.author_id != 0
+            && matches!(
+                comment.action,
+                crate::webhooks::events::CommentAction::Deleted
+                    | crate::webhooks::events::CommentAction::Edited
+            )
+            && let Some(pr) = comment.pr_number
+        {
+            // The comment the store RECORDS as this PR's ledger, changed
+            // under us: owed again. Any other bot comment that happens to
+            // read as a ledger is not something this change can repair —
+            // it assumes bot comments are the bot's, and says so.
+            //
+            // But a change to ANY bot comment on a PR whose ledger is
+            // owed may be a change to the ledger: a post can have landed
+            // and not yet acknowledged, so its id is not recorded — and a
+            // deletion in that window, ignored, would let the
+            // acknowledgement record a dead comment and clear the
+            // obligation for good. Re-owing bumps the generation, which
+            // is exactly what an in-flight write's acknowledgement cannot
+            // clear; the next sync then writes to the recorded id, and a
+            // 404 retires it.
+            let recorded = self
+                .store
+                .state()
+                .prs
+                .get(&pr)
+                .and_then(|cached| cached.ledger_comment_id);
+            let owed = self.store.owed_stack_ledgers()?.iter().any(|o| o.pr == pr);
+            if recorded == Some(comment.comment_id) {
+                info!(
+                    %pr, comment = %comment.comment_id, action = ?comment.action,
+                    "the stack ledger comment changed under us; owed again"
+                );
+                if comment.action == crate::webhooks::events::CommentAction::Deleted {
+                    // The recorded comment is GONE: forget its id, so the
+                    // sync posts a fresh one instead of writing to
+                    // nothing — and owe the ledger in the same
+                    // transaction, or a crash between the two leaves the
+                    // id forgotten with nothing owed, and the redelivered
+                    // webhook no longer names a recorded comment.
+                    self.store
+                        .retire_stack_ledger(pr, comment.comment_id, Utc::now())?;
+                } else {
+                    self.store.mark_ledger_owed(pr)?;
+                }
+                // Scheduled HERE, where it is created: this delivery may
+                // return early (an apparent command that authorization
+                // refuses), and nothing later would queue it.
+                self.queue(PendingWork::LedgerSync { pr });
+            } else if owed {
+                info!(
+                    %pr, comment = %comment.comment_id, action = ?comment.action,
+                    "a bot comment changed while the stack ledger was owed; owed afresh"
+                );
+                self.store.mark_ledger_owed(pr)?;
+                self.queue(PendingWork::LedgerSync { pr });
+            }
+        }
+
+        Ok(())
+    }
+
     /// Closes a delivery with no state events.
     fn close(
         &mut self,
@@ -955,6 +1066,7 @@ impl Processor {
             PendingWork::Trigger(Trigger::EvaluateTrain { .. })
                 | PendingWork::DeferredAbort { .. }
                 | PendingWork::StatusSync { .. }
+                | PendingWork::LedgerSync { .. }
         );
         if idempotent && self.pending.contains(&work) {
             return;
@@ -1234,6 +1346,7 @@ impl Processor {
         &mut self,
         outcomes: &[crate::cascade::EffectOutcome],
     ) -> Result<(), StoreError> {
+        self.note_ledger_writes(outcomes)?;
         // Matched by COMMENT, never by the batch's root: an observation
         // boundary appends another train's terminal cleanup to whichever
         // batch is in flight, so its update rides a foreign root (Codex
@@ -1259,6 +1372,80 @@ impl Processor {
                         root = %sync.root, comment = %comment_id,
                         error = ?e, "terminal status comment update failed; sync owed"
                     );
+                    self.retry_requested = true;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Bookkeeping over a batch's best-effort outcomes: whether an owed
+    /// STACK LEDGER write landed. The write identifies itself — its body
+    /// is a ledger, naming the PR it is about and the sequence number it
+    /// states — so an outcome needs no side table to be matched back, and
+    /// a change made while the write was in flight (a higher sequence
+    /// number) is not discharged by it.
+    fn note_ledger_writes(
+        &mut self,
+        outcomes: &[crate::cascade::EffectOutcome],
+    ) -> Result<(), StoreError> {
+        for outcome in outcomes {
+            let (posted_to, body) = match &outcome.effect {
+                Effect::GitHub(GitHubEffect::UpdateComment { body, .. }) => (None, body),
+                Effect::GitHub(GitHubEffect::PostComment { pr, body }) => (Some(*pr), body),
+                _ => continue,
+            };
+            let Some(ledger) = crate::status::parse_stack_ledger(body) else {
+                continue;
+            };
+            if posted_to.is_some_and(|pr| pr != ledger.pr) {
+                continue; // not a ledger of ours, whatever it looks like
+            }
+            match &outcome.result {
+                Ok(crate::cascade::EffectResponse::GitHub(GitHubResponse::CommentPosted {
+                    id,
+                })) => {
+                    // Record where the ledger lives BEFORE clearing the
+                    // obligation: a crash in between re-writes the ledger,
+                    // which is idempotent, while the reverse order could
+                    // post a second one.
+                    self.store.append_batch(
+                        &[StateEventPayload::StackLedgerPosted {
+                            pr: ledger.pr,
+                            comment_id: *id,
+                        }],
+                        Utc::now(),
+                    )?;
+                    self.clear_written_ledger(ledger.pr)?;
+                }
+                Ok(_) => self.clear_written_ledger(ledger.pr)?,
+                Err(e) => {
+                    warn!(
+                        pr = %ledger.pr, error = ?e,
+                        "stack ledger write failed; the ledger is still owed"
+                    );
+                    // A rewrite that found nothing at the recorded id: the
+                    // comment was deleted and its webhook has not arrived
+                    // (or never will). Forget the id, so the next sync
+                    // probes the PR and posts afresh — or adopts the
+                    // comment after all, if the 404 was GitHub's passing
+                    // mood rather than a deletion. (The obligation is
+                    // still owed — this write failed — so re-owing it is
+                    // idempotent here.)
+                    if let (
+                        Effect::GitHub(GitHubEffect::UpdateComment { comment_id, .. }),
+                        crate::cascade::EffectError::Permanent {
+                            kind: crate::types::TrainErrorKind::NotFound,
+                            ..
+                        },
+                    ) = (&outcome.effect, e)
+                    {
+                        self.store
+                            .retire_stack_ledger(ledger.pr, *comment_id, Utc::now())?;
+                    }
+                    // The binding dies with the attempt: the next write
+                    // binds the generation IT reads.
+                    self.ledger_write_gen.remove(&ledger.pr);
                     self.retry_requested = true;
                 }
             }
@@ -1426,6 +1613,127 @@ impl Processor {
         Ok(cleanup)
     }
 
+    /// Clears the obligation the in-flight write for `pr` was made for.
+    /// Nothing is cleared when the generation is unknown (a restart lost
+    /// it) or has moved on (the ledger was dirtied again while the write
+    /// was out): the obligation stands, and the next probe settles it.
+    fn clear_written_ledger(&mut self, pr: PrNumber) -> Result<(), StoreError> {
+        if let Some(generation) = self.ledger_write_gen.remove(&pr) {
+            self.store.clear_owed_stack_ledger(pr, generation)?;
+        }
+        Ok(())
+    }
+
+    /// What `pr`'s ledger comment should say right now, or `None` when
+    /// the PR left the cache and there is nothing to state. The sequence
+    /// number is the state's own: an event appended while the write is in
+    /// flight carries a higher one, so it survives this write.
+    fn desired_ledger(&self, pr: PrNumber) -> Option<crate::status::StackLedger> {
+        let cached = self.store.state().prs.get(&pr)?;
+        Some(crate::status::StackLedger {
+            pr,
+            declared: cached
+                .predecessor
+                .zip(cached.predecessor_comment_id)
+                .map(|(predecessor, owner)| crate::status::Declaration { predecessor, owner }),
+            seq: self.store.next_seq().saturating_sub(1),
+            settled_through: cached.declarations_settled_through,
+        })
+    }
+
+    /// The batch that writes `pr`'s ledger — `write` is the post or the
+    /// rewrite — bound to the obligation generation it was made for.
+    fn ledger_write_batch(
+        &mut self,
+        pr: PrNumber,
+        generation: u64,
+        write: Effect,
+        mut cleanup: Vec<Effect>,
+    ) -> SagaBatch {
+        self.in_flight = Some(pr);
+        self.ledger_write_gen.insert(pr, generation);
+        let mut best_effort = vec![write];
+        best_effort.append(&mut cleanup);
+        SagaBatch {
+            root: pr,
+            effects: Vec::new(),
+            best_effort,
+            feedback: false,
+            restart_cleanup: self.needs_restart_cleanup.remove(&pr),
+        }
+    }
+
+    /// The outcome of a ledger probe (`ListComments` on a PR whose ledger
+    /// id the store does not know): adopt a ledger of ours if one is
+    /// there — a crash between the post and the event that records its id
+    /// leaves one the store has never heard of — and rewrite it; post the
+    /// first otherwise.
+    fn on_ledger_probe(
+        &mut self,
+        pr: PrNumber,
+        outcomes: Vec<crate::cascade::EffectOutcome>,
+    ) -> Result<Option<SagaBatch>, StoreError> {
+        let cleanup = self.boundary_cleanup(pr)?;
+        let Some(owed) = self
+            .store
+            .owed_stack_ledgers()?
+            .into_iter()
+            .find(|o| o.pr == pr)
+        else {
+            return self.finish_boundary(pr, cleanup);
+        };
+        let listing = outcomes.into_iter().find_map(|o| match o.result {
+            Ok(crate::cascade::EffectResponse::GitHub(GitHubResponse::Comments(comments))) => {
+                Some(comments)
+            }
+            _ => None,
+        });
+        let Some(comments) = listing else {
+            warn!(%pr, "stack-ledger probe failed; retrying at the stall cadence");
+            self.retry_requested = true;
+            return self.finish_boundary(pr, cleanup);
+        };
+        let Some(desired) = self.desired_ledger(pr) else {
+            // The PR left the cache (closed long enough to be pruned):
+            // there is no declaration left to record.
+            info!(%pr, "no cached PR for an owed stack ledger; dropping the obligation");
+            self.store.clear_owed_stack_ledger(pr, owed.generation)?;
+            return self.finish_boundary(pr, cleanup);
+        };
+        let body = crate::status::format_stack_ledger(&desired);
+        // Any ledger of ours on this PR; the highest `seq` among several
+        // is the newest.
+        let found = comments
+            .iter()
+            .filter(|c| c.author_id == self.deps.bot_user_id)
+            .filter_map(|c| {
+                crate::status::parse_stack_ledger(&c.body)
+                    .filter(|l| l.pr == pr)
+                    .map(|l| (c.id, l))
+            })
+            .max_by_key(|(id, l)| (l.seq, *id))
+            .map(|(id, _)| id);
+        let write = match found {
+            Some(comment_id) => {
+                // Record where it lives BEFORE writing to it, or the next
+                // crash leaves a second.
+                info!(%pr, %comment_id, "adopting an unrecorded stack ledger comment");
+                self.store.append_batch(
+                    &[StateEventPayload::StackLedgerPosted { pr, comment_id }],
+                    Utc::now(),
+                )?;
+                Effect::GitHub(GitHubEffect::UpdateComment { comment_id, body })
+            }
+            None => Effect::GitHub(GitHubEffect::PostComment { pr, body }),
+        };
+        Ok(Some(self.ledger_write_batch(
+            pr,
+            owed.generation,
+            write,
+            cleanup,
+        )))
+    }
+
     /// Leaves an observation boundary: runs whatever the stops and aborts
     /// applied there left behind, or moves on to the next work. Unlike
     /// `finish_or_pump` this does NOT re-queue the owed syncs — the
@@ -1468,6 +1776,9 @@ impl Processor {
     /// restart would pick it up (Codex terminal-sync review round 5, P1).
     /// Idempotent: `queue` coalesces status syncs.
     fn queue_owed_status_syncs(&mut self) -> Result<(), StoreError> {
+        for owed in self.store.owed_stack_ledgers()? {
+            self.queue(PendingWork::LedgerSync { pr: owed.pr });
+        }
         for sync in self.store.owed_status_syncs()? {
             self.queue(PendingWork::StatusSync {
                 root: sync.root,
@@ -1703,6 +2014,54 @@ impl Processor {
                 PendingWork::Trigger(Trigger::LateAddition { .. }) => {
                     unreachable!("LateAddition is answered in the pipeline, never queued")
                 }
+                PendingWork::LedgerSync { pr } => {
+                    let Some(owed) = self
+                        .store
+                        .owed_stack_ledgers()?
+                        .into_iter()
+                        .find(|o| o.pr == pr)
+                    else {
+                        continue; // written meanwhile
+                    };
+                    let recorded = self
+                        .store
+                        .state()
+                        .prs
+                        .get(&pr)
+                        .and_then(|cached| cached.ledger_comment_id);
+                    if let Some(comment_id) = recorded {
+                        // The store knows the comment: write to it. No
+                        // listing is consulted — the recorded id is the
+                        // truth about where the ledger lives until a
+                        // deletion webhook or a 404 retires it.
+                        let Some(desired) = self.desired_ledger(pr) else {
+                            info!(%pr, "no cached PR for an owed stack ledger; dropping the obligation");
+                            self.store.clear_owed_stack_ledger(pr, owed.generation)?;
+                            continue;
+                        };
+                        let write = Effect::GitHub(GitHubEffect::UpdateComment {
+                            comment_id,
+                            body: crate::status::format_stack_ledger(&desired),
+                        });
+                        return Ok(Some(self.ledger_write_batch(
+                            pr,
+                            owed.generation,
+                            write,
+                            Vec::new(),
+                        )));
+                    }
+                    // No id on record: the probe finds a ledger a crash
+                    // left unrecorded, or confirms there is none to find.
+                    self.ledger_probes.insert(pr);
+                    self.in_flight = Some(pr);
+                    return Ok(Some(SagaBatch {
+                        root: pr,
+                        effects: vec![Effect::GitHub(GitHubEffect::ListComments { pr })],
+                        best_effort: Vec::new(),
+                        feedback: false,
+                        restart_cleanup: false,
+                    }));
+                }
                 PendingWork::StatusSync { root, started_at } => {
                     if !self
                         .store
@@ -1786,6 +2145,9 @@ impl Processor {
 
         if let Some(started_at) = self.sync_probes.remove(&root) {
             return self.on_sync_probe(root, started_at, outcomes);
+        }
+        if self.ledger_probes.remove(&root) {
+            return self.on_ledger_probe(root, outcomes);
         }
         if !feedback {
             // A completed best-effort batch is an observation boundary

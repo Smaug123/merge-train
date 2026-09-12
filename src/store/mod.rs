@@ -33,6 +33,15 @@ use crate::persistence::snapshot::{PersistedRepoSnapshot, SCHEMA_VERSION};
 use crate::state::RepoState;
 use crate::types::{CommentId, PrNumber, TrainRecord};
 
+/// A PR whose stack-ledger comment no longer matches what the store holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwedLedger {
+    pub pr: PrNumber,
+    /// The generation this obligation was raised at. A write clears the
+    /// generation it read, and no other.
+    pub generation: u64,
+}
+
 /// A terminal status-comment update still owed, keyed by the train
 /// INCARNATION (root + `started_at`): a root can retire twice under two
 /// different comments, and each owes its own final word. `comment_id` is
@@ -64,7 +73,7 @@ use crate::webhooks::dedupe::DedupeKey;
 /// at a different version is rejected loudly rather than mis-read.
 ///
 /// v2 added the `deliveries` and `dedupe_keys` tables (the webhook queue).
-const STORE_SCHEMA_VERSION: i64 = 5;
+const STORE_SCHEMA_VERSION: i64 = 6;
 
 /// Errors from the store.
 #[derive(Debug, Error)]
@@ -637,6 +646,80 @@ impl Store {
         Ok(count as u32 + 1)
     }
 
+    /// The PRs whose stack ledger is out of date, oldest change first.
+    pub fn owed_stack_ledgers(&self) -> Result<Vec<OwedLedger>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT pr, generation FROM owed_stack_ledgers ORDER BY generation, pr")?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
+        let mut owed = Vec::new();
+        for row in rows {
+            let (pr, generation) = row?;
+            owed.push(OwedLedger {
+                pr: PrNumber(pr as u64),
+                generation: generation as u64,
+            });
+        }
+        Ok(owed)
+    }
+
+    /// Marks a PR's stack ledger out of date at a fresh generation. Used
+    /// where the ledger comment itself changed — somebody edited or deleted
+    /// it — since the topology events that normally dirty it did not
+    /// happen.
+    pub fn mark_ledger_owed(&mut self, pr: PrNumber) -> Result<(), StoreError> {
+        let tx = self.conn.transaction()?;
+        mark_ledger_owed_in(&tx, pr)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The recorded ledger comment is gone: forgets its id and owes the
+    /// ledger again, in ONE transaction. Split in two, a crash between
+    /// them left the id forgotten and nothing owed — the redelivered
+    /// deletion webhook then no longer matched a recorded comment, and
+    /// the ledger stayed missing until the next declaration.
+    pub fn retire_stack_ledger(
+        &mut self,
+        pr: PrNumber,
+        comment_id: CommentId,
+        ts: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        let mut next_state = self.state.clone();
+        let mut seq = self.next_seq;
+        let tx = self.conn.transaction()?;
+        let event = StateEvent {
+            seq,
+            ts,
+            payload: StateEventPayload::StackLedgerRetired { pr, comment_id },
+        };
+        insert_and_apply(&tx, &mut next_state, &event)?;
+        seq += 1;
+        upsert_cache(&tx, &next_state, seq, ts)?;
+        mark_ledger_owed_in(&tx, pr)?;
+        tx.commit()?;
+        self.state = next_state;
+        self.next_seq = seq;
+        Ok(())
+    }
+
+    /// Clears the obligation a write was made FOR — identified by the
+    /// generation it read. Anything that dirtied the ledger since (a
+    /// declaration, a retraction, a maintainer editing the comment) holds
+    /// a newer generation and survives it (Codex ledger review round 13,
+    /// P1).
+    pub fn clear_owed_stack_ledger(
+        &mut self,
+        pr: PrNumber,
+        generation: u64,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM owed_stack_ledgers WHERE pr = ?1 AND generation = ?2",
+            rusqlite::params![pr.0 as i64, generation as i64],
+        )?;
+        Ok(())
+    }
+
     /// Clears the owed sync for one train incarnation (idempotent).
     pub fn delete_owed_status_sync(
         &mut self,
@@ -792,6 +875,44 @@ impl Drop for Store {
     }
 }
 
+/// Dirties a PR's ledger at a FRESH generation, inside `tx`.
+fn mark_ledger_owed_in(tx: &rusqlite::Transaction<'_>, pr: PrNumber) -> Result<(), StoreError> {
+    tx.execute(
+        "UPDATE counters SET value = value + 1 WHERE name = 'ledger_gen'",
+        [],
+    )?;
+    let generation: i64 = tx.query_row(
+        "SELECT value FROM counters WHERE name = 'ledger_gen'",
+        [],
+        |row| row.get(0),
+    )?;
+    tx.execute(
+        "INSERT INTO owed_stack_ledgers (pr, generation) VALUES (?1, ?2) \
+         ON CONFLICT(pr) DO UPDATE SET generation = ?2",
+        rusqlite::params![pr.0 as i64, generation],
+    )?;
+    Ok(())
+}
+
+/// What a PR's ledger states: the declaration in force, if any.
+fn declaration_of(state: &RepoState, pr: PrNumber) -> Option<(PrNumber, CommentId)> {
+    state
+        .prs
+        .get(&pr)
+        .and_then(|p| p.predecessor.zip(p.predecessor_comment_id))
+}
+
+/// The PR whose declaration an event may change: the two events that carry
+/// one, and nothing else. `StackLedgerPosted` records where the ledger
+/// lives rather than what it says, so it does not dirty it.
+fn ledger_declaration_events(payload: &StateEventPayload) -> Option<PrNumber> {
+    match payload {
+        StateEventPayload::PredecessorDeclared { pr, .. }
+        | StateEventPayload::PredecessorRemoved { pr, .. } => Some(*pr),
+        _ => None,
+    }
+}
+
 /// Inserts `event` into the log and applies it to `state`, within `tx`.
 fn insert_and_apply(
     tx: &rusqlite::Transaction,
@@ -830,7 +951,21 @@ fn insert_and_apply(
             ],
         )?;
     }
+    // A topology change owes its PR's ledger comment a rewrite — in this
+    // transaction, so a crash between the commit and the write cannot lose
+    // it. The obligation names only the PR: what to write is read from the
+    // state at write time, which is what makes repeated changes coalesce
+    // into one correct write (`status::ledger`). Only a change that the
+    // state actually took counts: a removal naming a comment that no
+    // longer owns the declaration changes nothing, and owes nothing.
+    let ledger_pr = ledger_declaration_events(&event.payload);
+    let declaration_before = ledger_pr.map(|pr| declaration_of(state, pr));
     state.apply_event(event);
+    if let Some(pr) = ledger_pr
+        && declaration_before != Some(declaration_of(state, pr))
+    {
+        mark_ledger_owed_in(tx, pr)?;
+    }
     tx.execute(
         "INSERT INTO events (seq, ts, payload) VALUES (?1, ?2, ?3)",
         rusqlite::params![
@@ -933,7 +1068,26 @@ fn init_schema(conn: &Connection) -> Result<(), StoreError> {
             absent_probes INTEGER NOT NULL DEFAULT 0,
             absent_at     TEXT,
             PRIMARY KEY (root, started_at)
-        );",
+        );
+
+        -- PRs whose stack-ledger comment no longer matches what the store
+        -- holds. A dirty set, not a queue of payloads: the write states the
+        -- CURRENT declaration, so several changes in a row need one write
+        -- and it always converges on the truth. `generation` is strictly
+        -- increasing across the store's whole life: a write clears the
+        -- obligation it READ, so anything that dirties the ledger while
+        -- that write is in flight holds a newer generation and survives.
+        CREATE TABLE owed_stack_ledgers (
+            pr         INTEGER PRIMARY KEY,
+            generation INTEGER NOT NULL
+        );
+
+        -- Monotone counters that are not event sequence numbers.
+        CREATE TABLE counters (
+            name  TEXT PRIMARY KEY,
+            value INTEGER NOT NULL
+        );
+        INSERT INTO counters (name, value) VALUES ('ledger_gen', 0);",
     )?;
     // `user_version` is a transactional header write, so the DDL above and this
     // bump commit together — a crash can't leave a partial schema at version 0.
@@ -1332,6 +1486,136 @@ mod tests {
             .map(|o| o.root.0)
             .collect();
         assert_eq!(roots, vec![1, 3, 4], "owed syncs survive a reopen");
+    }
+
+    /// A topology change owes its PR's ledger in the event's own
+    /// transaction, at a fresh generation; a change the state did not
+    /// take owes nothing; and a write clears only the generation it read.
+    #[test]
+    fn topology_events_owe_the_ledger_at_fresh_generations() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let ts = test_timestamp();
+        let generation_of = |store: &Store, pr: u64| {
+            store
+                .owed_stack_ledgers()
+                .unwrap()
+                .into_iter()
+                .find(|o| o.pr == PrNumber(pr))
+                .map(|o| o.generation)
+        };
+        let g2 = {
+            let mut store = Store::open(&path).unwrap();
+            for pr in [1u64, 2] {
+                store
+                    .append(
+                        StateEventPayload::PrOpened {
+                            pr: PrNumber(pr),
+                            head_sha: crate::types::Sha::parse("a".repeat(40)).unwrap(),
+                            head_ref: format!("pr-{pr}"),
+                            base_ref: "main".to_string(),
+                            is_draft: false,
+                        },
+                        ts,
+                    )
+                    .unwrap();
+            }
+            assert!(
+                store.owed_stack_ledgers().unwrap().is_empty(),
+                "opening PRs declares nothing"
+            );
+            store
+                .append(
+                    StateEventPayload::PredecessorDeclared {
+                        pr: PrNumber(2),
+                        predecessor: PrNumber(1),
+                        comment_id: CommentId(5),
+                    },
+                    ts,
+                )
+                .unwrap();
+            let g1 = generation_of(&store, 2).expect("the declaration owes PR 2's ledger");
+            assert_eq!(generation_of(&store, 1), None, "PR 1's ledger is untouched");
+            // A removal naming a comment that does not own the declaration
+            // changes nothing, and owes nothing new.
+            store
+                .append(
+                    StateEventPayload::PredecessorRemoved {
+                        pr: PrNumber(2),
+                        comment_id: CommentId(99),
+                    },
+                    ts,
+                )
+                .unwrap();
+            assert_eq!(
+                generation_of(&store, 2),
+                Some(g1),
+                "a no-op removal owes nothing"
+            );
+            store
+                .append(
+                    StateEventPayload::PredecessorRemoved {
+                        pr: PrNumber(2),
+                        comment_id: CommentId(5),
+                    },
+                    ts,
+                )
+                .unwrap();
+            let g2 = generation_of(&store, 2).expect("still owed");
+            assert!(g2 > g1, "a real change raises the generation");
+            // A write made for the OLD generation clears nothing: the
+            // change that landed while it was out survives it.
+            store.clear_owed_stack_ledger(PrNumber(2), g1).unwrap();
+            assert_eq!(generation_of(&store, 2), Some(g2));
+            g2
+        };
+        let mut store = Store::open(&path).unwrap();
+        assert_eq!(
+            generation_of(&store, 2),
+            Some(g2),
+            "the obligation survives a reopen"
+        );
+        store.clear_owed_stack_ledger(PrNumber(2), g2).unwrap();
+        assert_eq!(
+            generation_of(&store, 2),
+            None,
+            "the write it was made for clears it"
+        );
+        store.mark_ledger_owed(PrNumber(2)).unwrap();
+        let g3 = generation_of(&store, 2).expect("a comment change owes it again");
+        assert!(g3 > g2, "at a generation fresh across the store's life");
+        store.clear_owed_stack_ledger(PrNumber(2), g3).unwrap();
+
+        // Retiring the recorded comment forgets its id AND owes the ledger,
+        // together: neither half is observable without the other.
+        store
+            .append(
+                StateEventPayload::StackLedgerPosted {
+                    pr: PrNumber(2),
+                    comment_id: CommentId(77),
+                },
+                ts,
+            )
+            .unwrap();
+        assert_eq!(
+            generation_of(&store, 2),
+            None,
+            "recording an id owes nothing"
+        );
+        store
+            .retire_stack_ledger(PrNumber(2), CommentId(77), ts)
+            .unwrap();
+        assert_eq!(store.state().prs[&PrNumber(2)].ledger_comment_id, None);
+        let g4 = generation_of(&store, 2).expect("the retirement owes the ledger");
+        assert!(g4 > g3);
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.state().prs[&PrNumber(2)].ledger_comment_id, None);
+        assert_eq!(
+            generation_of(&store, 2),
+            Some(g4),
+            "both halves survive a reopen"
+        );
     }
 
     /// A root that retires TWICE under two different status comments owes

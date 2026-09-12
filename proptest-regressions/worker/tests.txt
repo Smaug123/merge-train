@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc b5f3ec235af5d14cce5f28fb567758dc37d6665ffc44200560b42944343dac0c # shrinks to steps = [(Declare { pr: 2, target: 1 }, None), (DeleteLedger { pr: 2, webhook: true }, DeleteBeforeAck)]
