@@ -95,6 +95,11 @@ pub struct FakeGitHub {
     /// `UpdateComment` calls that reached a live comment, so a test can
     /// assert that a satisfied obligation writes nothing further.
     pub comment_updates: u32,
+    /// Bodies `ListComments` serves INSTEAD of the stored ones, per
+    /// comment id: GitHub's listing cache can lag an edit, returning a
+    /// pre-edit body for a comment whose true content has moved on.
+    /// `UpdateComment` and direct reads see the real comment.
+    pub stale_listing_bodies: std::collections::BTreeMap<CommentId, String>,
     /// While set, `PostComment` CREATES the comment but reports a
     /// transient failure — the response is lost on the wire. The comment
     /// exists; nothing acknowledged it.
@@ -122,6 +127,7 @@ impl FakeGitHub {
             blocked: std::collections::HashSet::new(),
             hidden_from_listings: std::collections::HashSet::new(),
             comment_updates: 0,
+            stale_listing_bodies: std::collections::BTreeMap::new(),
             post_comment_response_lost: false,
             update_comment_broken: false,
         }
@@ -338,7 +344,7 @@ impl FakeGitHub {
                     }
                     // A deleted comment 404s, exactly like GitHub.
                     None => Err(EffectError::Permanent {
-                        kind: TrainErrorKind::ApiError,
+                        kind: TrainErrorKind::NotFound,
                         detail: format!("no such comment {comment_id} (fake 404)"),
                     }),
                 }
@@ -375,7 +381,11 @@ impl FakeGitHub {
                     .map(|(id, c)| crate::effects::github::CommentData {
                         id: *id,
                         author_id: c.author_id,
-                        body: c.body.clone(),
+                        body: self
+                            .stale_listing_bodies
+                            .get(id)
+                            .cloned()
+                            .unwrap_or_else(|| c.body.clone()),
                         edited: c.edited,
                     })
                     .collect(),

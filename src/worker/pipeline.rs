@@ -158,6 +158,11 @@ enum PendingWork {
     /// [`PendingWork::StatusSync`] this is the retry: a probe of the PR's
     /// comments, then the write.
     LedgerSync { pr: PrNumber },
+    /// Fixes named or discovered ledger comments on a PR by id —
+    /// rewriting the recorded one to the store's truth, neutralizing
+    /// pretenders — independent of listings, which can lag the edits
+    /// that made the work (Codex ledger review round 21, P2).
+    LedgerRepair { pr: PrNumber },
     StatusSync {
         root: PrNumber,
         /// The train INCARNATION whose comment is owed the final word: the
@@ -236,17 +241,21 @@ pub(crate) struct Processor {
     /// for. The write clears THAT generation and no other, so anything
     /// that dirtied the ledger while it was out survives it.
     ledger_write_gen: HashMap<PrNumber, u64>,
-    /// PRs whose replacement POST failed AMBIGUOUSLY — the response was
-    /// lost, so the comment may exist unrecorded. Independent of the
-    /// in-flight binding, which a failure removes: a delayed deletion
-    /// webhook for the still-recorded predecessor must not drop the
-    /// repost guard while a replacement may already stand (Codex ledger
-    /// review round 19, P2). Resolved by a probe that SEES a ledger, or
-    /// by a later post's acknowledged outcome. Seeded at startup with
-    /// every PR whose obligation is owed: the dead process may have
-    /// posted without an acknowledgement, and the caution must outlive
-    /// it (round 20, P2).
+    /// PRs with a ledger POST dispatched and not yet acknowledged —
+    /// from the moment the effect exists (round 21, P2: a POST can fly
+    /// unbound and unfailed) through a lost response (round 19, P2).
+    /// Independent of the discharge binding: a delayed deletion webhook
+    /// for the still-recorded predecessor must not drop the repost
+    /// guard while a replacement may already stand. Resolved by a probe
+    /// that SEES a ledger, or by a post's acknowledged outcome. Seeded
+    /// at startup with every PR whose obligation is owed: a dead
+    /// process may have posted without an acknowledgement, and the
+    /// caution must outlive it (round 20, P2).
     unacked_ledger_posts: HashSet<PrNumber>,
+    /// The (pr, generation) each in-flight per-comment repair write was
+    /// dispatched for, by comment id. Its acknowledgement clears exactly
+    /// that repair; a 404 drops it — the comment is gone for ever.
+    repair_write_gen: HashMap<crate::types::CommentId, (PrNumber, u64)>,
     /// PRs a ledger POST has been dispatched for, or may have been by a
     /// process that died holding the obligation. Absence in a listing is
     /// only evidence for these; for anything else there is nothing to
@@ -344,6 +353,13 @@ impl Processor {
                 .into_iter()
                 .map(|owed| PendingWork::LedgerSync { pr: owed.pr }),
         );
+        // Per-comment ledger repairs a previous process never landed.
+        pending.extend(
+            store
+                .ledger_repair_prs()?
+                .into_iter()
+                .map(|pr| PendingWork::LedgerRepair { pr }),
+        );
         // Startup *evaluations* of active trains (so an acknowledged CI
         // success whose trigger died with the process still resumes a
         // parked train) are computed here but queue only once the durable
@@ -402,6 +418,7 @@ impl Processor {
             // probe sees a ledger or a post acknowledges (Codex ledger
             // review round 20, P2).
             unacked_ledger_posts: owed_ledger_prs,
+            repair_write_gen: HashMap::new(),
             ledger_posts_attempted,
             startup_evaluates: Some(startup_evaluates),
             active_start: None,
@@ -611,17 +628,22 @@ impl Processor {
                 self.queue(PendingWork::LedgerSync { pr });
                 if positively_ours {
                     match comment.action {
-                        // The webhook NAMES the comment: remember it, so
-                        // an eventually-consistent listing that omits it
-                        // cannot discharge the obligation past a known
-                        // forgery (Codex ledger review round 19, P2).
+                        // The webhook NAMES the comment and what it now
+                        // holds: repair it directly, by id — a listing
+                        // is never consulted, because listings can serve
+                        // pre-edit bodies long after the edit (Codex
+                        // ledger review rounds 19 and 21, P2). The
+                        // repair is owed until its write acknowledges.
                         crate::webhooks::events::CommentAction::Edited => {
-                            self.store.add_ledger_suspect(pr, comment.comment_id)?;
+                            let rewrite = recorded == Some(comment.comment_id);
+                            self.store
+                                .add_ledger_repair(pr, comment.comment_id, rewrite)?;
+                            self.queue(PendingWork::LedgerRepair { pr });
                         }
-                        // A deletion proves the comment gone: there is
-                        // nothing left to verify about it.
+                        // A deletion proves the comment gone for ever:
+                        // nothing is left to repair on it.
                         _ => {
-                            self.store.remove_ledger_suspect(pr, comment.comment_id)?;
+                            self.store.drop_ledger_repair(pr, comment.comment_id)?;
                         }
                     }
                 }
@@ -1097,6 +1119,7 @@ impl Processor {
                 | PendingWork::DeferredAbort { .. }
                 | PendingWork::StatusSync { .. }
                 | PendingWork::LedgerSync { .. }
+                | PendingWork::LedgerRepair { .. }
         );
         if idempotent && self.pending.contains(&work) {
             return;
@@ -1419,6 +1442,38 @@ impl Processor {
         &mut self,
         outcomes: &[crate::cascade::EffectOutcome],
     ) -> Result<(), StoreError> {
+        // Per-comment repair acknowledgements first: these writes are
+        // matched by COMMENT ID, not by body — a neutralized body
+        // deliberately parses as nothing. Success clears the repair the
+        // write was dispatched for; a 404 drops it (comment ids never
+        // come back); anything else keeps it owed at the stall cadence.
+        for outcome in outcomes {
+            let Effect::GitHub(GitHubEffect::UpdateComment { comment_id, .. }) = &outcome.effect
+            else {
+                continue;
+            };
+            let Some((pr, generation)) = self.repair_write_gen.remove(comment_id) else {
+                continue;
+            };
+            match &outcome.result {
+                Ok(_) => self
+                    .store
+                    .clear_ledger_repair(pr, *comment_id, generation)?,
+                Err(crate::cascade::EffectError::Permanent {
+                    kind: crate::types::TrainErrorKind::NotFound,
+                    ..
+                }) => {
+                    self.store.drop_ledger_repair(pr, *comment_id)?;
+                }
+                Err(e) => {
+                    warn!(
+                        %pr, comment = %comment_id, error = ?e,
+                        "ledger repair failed; still owed"
+                    );
+                    self.retry_requested = true;
+                }
+            }
+        }
         for outcome in outcomes {
             let (posted_to, body) = match &outcome.effect {
                 Effect::GitHub(GitHubEffect::UpdateComment { body, .. }) => (None, body),
@@ -1462,12 +1517,6 @@ impl Processor {
                     // duplicate the cleanup had not yet seen (Codex
                     // ledger review round 17, P2).
                     self.ledger_write_gen.remove(&ledger.pr);
-                    // A failed POST is ambiguous — the comment may exist
-                    // with its response lost — and the deletion fast
-                    // path must know (round 19, P2).
-                    if posted_to.is_some() {
-                        self.unacked_ledger_posts.insert(ledger.pr);
-                    }
                     self.retry_requested = true;
                 }
             }
@@ -1635,6 +1684,21 @@ impl Processor {
         Ok(cleanup)
     }
 
+    /// What `pr`'s ledger comment should say right now, or `None` when
+    /// the PR left the cache and there is nothing to state.
+    fn desired_ledger(&self, pr: PrNumber) -> Option<crate::status::StackLedger> {
+        let cached = self.store.state().prs.get(&pr)?;
+        Some(crate::status::StackLedger {
+            pr,
+            declared: cached
+                .predecessor
+                .zip(cached.predecessor_comment_id)
+                .map(|(predecessor, owner)| crate::status::Declaration { predecessor, owner }),
+            seq: self.store.next_seq().saturating_sub(1),
+            settled_through: cached.declarations_settled_through,
+        })
+    }
+
     /// How far apart two listings must be for their agreement on an
     /// absence to count as evidence rather than one stale read twice.
     fn absence_cooldown(&self) -> chrono::Duration {
@@ -1683,46 +1747,6 @@ impl Processor {
             self.retry_requested = true;
             return self.finish_boundary(pr, cleanup);
         };
-        // NAMED evidence first: comments a webhook reported edited into
-        // ledgers. A fresh listing that SHOWS one hands it to the
-        // machinery below (as the live ledger or a forged sibling); one
-        // that OMITS it proves nothing — listings are eventually
-        // consistent and can lag the webhook — so the obligation cannot
-        // be discharged until every suspect is seen or stably absent
-        // (Codex ledger review round 19, P2). A stale listing (the
-        // generation moved mid-probe) neither resolves nor strikes.
-        let mut suspects_unseen = 0u32;
-        if owed.generation == probe_generation {
-            for suspect in self.store.ledger_suspects(pr)? {
-                if let Some(comment) = comments.iter().find(|c| c.id == suspect) {
-                    // Seen — but seeing is not repairing (round 20, P2).
-                    // Inert now: resolved. Still ledger-shaped: it is
-                    // the primary or a forged sibling below, both of
-                    // which block discharge until repaired — keep it on
-                    // the books (a discharge purges the leftovers), and
-                    // restart its absence evidence: it is demonstrably
-                    // alive.
-                    let still_forged = crate::status::parse_stack_ledger(&comment.body)
-                        .is_some_and(|l| l.pr == pr);
-                    if still_forged {
-                        self.store.add_ledger_suspect(pr, suspect)?;
-                    } else {
-                        self.store.remove_ledger_suspect(pr, suspect)?;
-                    }
-                } else if self.store.note_absent_ledger_suspect(
-                    pr,
-                    suspect,
-                    Utc::now(),
-                    self.absence_cooldown(),
-                )? >= ABSENT_PROBES_BEFORE_BELIEVED
-                {
-                    // Two spaced listings never showed it: believed gone.
-                    self.store.remove_ledger_suspect(pr, suspect)?;
-                } else {
-                    suspects_unseen += 1;
-                }
-            }
-        }
         // The state this write states, and the watermark that says so: an
         // event appended while the write is in flight carries a higher
         // sequence number, so it survives this write's acknowledgement.
@@ -1735,16 +1759,21 @@ impl Processor {
             // a ledger for this PR is still a forgery a crawl would
             // believe, and dropping the obligation with one standing
             // leaves it for ever (Codex ledger review round 17, P2).
-            // Neutralize what the listing shows; only a listing with
-            // nothing ledger-shaped left clears the obligation.
+            // Anything ledger-shaped becomes a durable repair BEFORE its
+            // cleanup is dispatched (round 21, P2); the obligation drops
+            // only when no repair remains and the listing was fresh.
             let forged: Vec<crate::types::CommentId> = comments
                 .iter()
                 .filter(|c| c.author_id == self.deps.bot_user_id)
                 .filter(|c| crate::status::parse_stack_ledger(&c.body).is_some_and(|l| l.pr == pr))
                 .map(|c| c.id)
                 .collect();
-            if forged.is_empty() {
-                if owed.generation == probe_generation && suspects_unseen == 0 {
+            for &f in &forged {
+                self.store.add_ledger_repair(pr, f, false)?;
+            }
+            let repairs = self.store.ledger_repairs(pr)?;
+            if repairs.is_empty() {
+                if owed.generation == probe_generation {
                     info!(%pr, "no cached PR for an owed stack ledger; dropping the obligation");
                     self.store.clear_owed_stack_ledger(pr, probe_generation)?;
                 } else {
@@ -1758,21 +1787,23 @@ impl Processor {
                 return self.finish_boundary(pr, cleanup);
             }
             info!(
-                %pr, count = forged.len(),
-                "neutralizing forged ledgers on an uncached PR"
+                %pr, count = repairs.len(),
+                "repairing ledger-shaped comments on an uncached PR"
             );
             self.ledger_write_gen.remove(&pr);
             self.retry_requested = true;
             self.in_flight = Some(pr);
-            let mut best_effort: Vec<Effect> = forged
-                .into_iter()
-                .map(|comment_id| {
-                    Effect::GitHub(GitHubEffect::UpdateComment {
-                        comment_id,
-                        body: NEUTRALIZED_LEDGER_BODY.to_owned(),
-                    })
-                })
-                .collect();
+            // With no cached PR there is no truth to rewrite: every
+            // repair here neutralizes, rewrite-flagged or not.
+            let mut best_effort: Vec<Effect> = Vec::new();
+            for repair in repairs {
+                self.repair_write_gen
+                    .insert(repair.comment_id, (pr, repair.generation));
+                best_effort.push(Effect::GitHub(GitHubEffect::UpdateComment {
+                    comment_id: repair.comment_id,
+                    body: NEUTRALIZED_LEDGER_BODY.to_owned(),
+                }));
+            }
             best_effort.append(&mut cleanup);
             return Ok(Some(SagaBatch {
                 root: pr,
@@ -1829,6 +1860,15 @@ impl Processor {
             .filter(|c| crate::status::parse_stack_ledger(&c.body).is_some_and(|l| l.pr == pr))
             .map(|c| c.id)
             .collect();
+        // Discovered duplicates become durable repairs BEFORE their
+        // cleanup is dispatched: a failed write must leave them owed,
+        // not forgotten with the batch (Codex ledger review round 21,
+        // P2). The webhook-named repairs are already on the books.
+        for &extra in &extras {
+            self.store.add_ledger_repair(pr, extra, false)?;
+        }
+        let repairs = self.store.ledger_repairs(pr)?;
+        let repairs_open = !repairs.is_empty();
         let body = crate::status::format_stack_ledger(&desired);
         let write: Option<Effect> = match live {
             Some((comment_id, parsed)) => {
@@ -1886,24 +1926,24 @@ impl Processor {
                             && l.settled_through == desired.settled_through
                             && l.seq <= desired.seq
                     });
-                if satisfied && extras.is_empty() && suspects_unseen == 0 {
-                    // It already says what the store holds. Rewriting it
-                    // would be a write that can only fail.
+                if satisfied && !repairs_open {
+                    // It already says what the store holds, and no
+                    // repair is outstanding. Rewriting it would be a
+                    // write that can only fail.
                     self.store.clear_owed_stack_ledger(pr, owed.generation)?;
                     return self.finish_boundary(pr, cleanup);
                 }
-                if satisfied && extras.is_empty() {
-                    // Nothing visible needs a write, but a NAMED suspect
-                    // is still unseen: the obligation waits for it or
-                    // for its confirmed absence (round 19, P2).
-                    self.retry_requested = true;
-                    return self.finish_boundary(pr, cleanup);
-                }
                 if satisfied {
-                    // The live ledger is already right; only the forged
-                    // siblings need writes.
+                    // The live ledger is already right; the open repairs
+                    // carry their own writes and acknowledgements.
                     None
                 } else {
+                    // The rewrite also acknowledges a repair recorded
+                    // for this very comment, if one is on the books.
+                    if let Some(repair) = repairs.iter().find(|r| r.comment_id == comment_id) {
+                        self.repair_write_gen
+                            .insert(comment_id, (pr, repair.generation));
+                    }
                     Some(Effect::GitHub(GitHubEffect::UpdateComment {
                         comment_id,
                         body,
@@ -1939,31 +1979,42 @@ impl Processor {
                 // if its response is lost, one stale listing must not
                 // immediately produce a second comment.
                 self.store.reset_absent_ledger(pr)?;
+                // Tracked from the moment it exists: a POST can be in
+                // flight UNBOUND (repairs open, or the obligation moved),
+                // and waiting for a failure to record it left a window
+                // where a delayed deletion webhook dropped the repost
+                // guard mid-flight (Codex ledger review round 21, P2).
+                self.unacked_ledger_posts.insert(pr);
                 Some(Effect::GitHub(GitHubEffect::PostComment { pr, body }))
             }
         };
         self.in_flight = Some(pr);
-        if extras.is_empty() && owed.generation == probe_generation && suspects_unseen == 0 {
+        if owed.generation == probe_generation && !repairs_open {
             self.ledger_write_gen.insert(pr, probe_generation);
         } else {
-            // With forged siblings in play — or an obligation that moved
-            // while the listing was in flight, or a NAMED suspect this
-            // listing has not yet shown, so a forgery may exist it never
-            // saw (Codex ledger review rounds 18 and 19, P2) — no write here discharges the obligation: it stays open
-            // until a fresh listing (at the stall cadence, or via the
-            // sync the advancing webhook queued) confirms the set is
-            // clean. A binding left over from an earlier failed attempt
-            // is dead for the same reason (round 17, P2).
+            // With repairs open — named tampering or discovered
+            // duplicates whose fixes have not acknowledged — or an
+            // obligation that moved while the listing was in flight
+            // (Codex ledger review rounds 18, 19 and 21, P2), no write
+            // here discharges the obligation: it stays open until every
+            // repair has acknowledged and a fresh listing agrees. A
+            // binding left over from an earlier failed attempt is dead
+            // for the same reason (round 17, P2).
             self.ledger_write_gen.remove(&pr);
             self.retry_requested = true;
         }
         let mut best_effort: Vec<Effect> = write.into_iter().collect();
-        best_effort.extend(extras.into_iter().map(|comment_id| {
-            Effect::GitHub(GitHubEffect::UpdateComment {
-                comment_id,
+        for &extra in &extras {
+            // The inline cleanup binds each discovered repair, so its
+            // outcome acknowledges (or retains) the durable record.
+            if let Some(repair) = repairs.iter().find(|r| r.comment_id == extra) {
+                self.repair_write_gen.insert(extra, (pr, repair.generation));
+            }
+            best_effort.push(Effect::GitHub(GitHubEffect::UpdateComment {
+                comment_id: extra,
                 body: NEUTRALIZED_LEDGER_BODY.to_owned(),
-            })
-        }));
+            }));
+        }
         best_effort.append(&mut cleanup);
         Ok(Some(SagaBatch {
             root: pr,
@@ -2018,6 +2069,9 @@ impl Processor {
     fn queue_owed_status_syncs(&mut self) -> Result<(), StoreError> {
         for owed in self.store.owed_stack_ledgers()? {
             self.queue(PendingWork::LedgerSync { pr: owed.pr });
+        }
+        for pr in self.store.ledger_repair_prs()? {
+            self.queue(PendingWork::LedgerRepair { pr });
         }
         for sync in self.store.owed_status_syncs()? {
             self.queue(PendingWork::StatusSync {
@@ -2253,6 +2307,42 @@ impl Processor {
                 }
                 PendingWork::Trigger(Trigger::LateAddition { .. }) => {
                     unreachable!("LateAddition is answered in the pipeline, never queued")
+                }
+                PendingWork::LedgerRepair { pr } => {
+                    let repairs = self.store.ledger_repairs(pr)?;
+                    if repairs.is_empty() {
+                        continue; // repaired meanwhile
+                    }
+                    // Direct, id-addressed repairs: no listing is needed
+                    // — the ids and their fixes were recorded when the
+                    // tampering was named or the duplicate discovered.
+                    // Each write is owed until it acknowledges or 404s.
+                    // A rewrite with nothing to state (the PR left the
+                    // cache) neutralizes instead.
+                    let desired_body = self
+                        .desired_ledger(pr)
+                        .map(|l| crate::status::format_stack_ledger(&l));
+                    let mut best_effort = Vec::new();
+                    for repair in repairs {
+                        let body = match (&desired_body, repair.rewrite) {
+                            (Some(body), true) => body.clone(),
+                            _ => NEUTRALIZED_LEDGER_BODY.to_owned(),
+                        };
+                        self.repair_write_gen
+                            .insert(repair.comment_id, (pr, repair.generation));
+                        best_effort.push(Effect::GitHub(GitHubEffect::UpdateComment {
+                            comment_id: repair.comment_id,
+                            body,
+                        }));
+                    }
+                    self.in_flight = Some(pr);
+                    return Ok(Some(SagaBatch {
+                        root: pr,
+                        effects: Vec::new(),
+                        best_effort,
+                        feedback: false,
+                        restart_cleanup: false,
+                    }));
                 }
                 PendingWork::LedgerSync { pr } => {
                     let Some(owed) = self

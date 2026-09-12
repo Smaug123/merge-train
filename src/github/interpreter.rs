@@ -1028,6 +1028,13 @@ pub fn classify_github_error(error: &GitHubApiError) -> EffectError {
         GitHubErrorKind::Permanent if error.status_code == Some(405) => EffectError::Transient {
             detail: error.to_string(),
         },
+        // 404: the target is gone, and a target never comes back under
+        // the same id. Callers holding per-target obligations resolve
+        // them on this instead of retrying for ever.
+        GitHubErrorKind::Permanent if error.status_code == Some(404) => EffectError::Permanent {
+            kind: TrainErrorKind::NotFound,
+            detail: error.to_string(),
+        },
         GitHubErrorKind::Permanent => EffectError::Permanent {
             kind: TrainErrorKind::ApiError,
             detail: error.to_string(),

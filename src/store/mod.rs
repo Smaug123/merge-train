@@ -33,6 +33,16 @@ use crate::persistence::snapshot::{PersistedRepoSnapshot, SCHEMA_VERSION};
 use crate::state::RepoState;
 use crate::types::{CommentId, PrNumber, TrainRecord};
 
+/// A ledger repair owed on one comment: fix it by id, no listing needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LedgerRepair {
+    pub comment_id: CommentId,
+    /// Rewrite the recorded ledger to the store's truth; otherwise make
+    /// the pretender inert.
+    pub rewrite: bool,
+    pub generation: u64,
+}
+
 /// A PR whose stack-ledger comment no longer matches what the store holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OwedLedger {
@@ -739,102 +749,116 @@ impl Store {
         pr: PrNumber,
         generation: u64,
     ) -> Result<(), StoreError> {
-        let tx = self.conn.transaction()?;
-        let cleared = tx.execute(
+        self.conn.execute(
             "DELETE FROM owed_stack_ledgers WHERE pr = ?1 AND generation = ?2",
             rusqlite::params![pr.0 as i64, generation as i64],
         )?;
-        if cleared > 0 {
-            // Discharge forgets the PR's suspects too: every discharge
-            // path first proves each suspect seen in a good state or
-            // stably absent, and a suspect row must not outlive the
-            // obligation it gates (Codex ledger review round 20, P2).
-            tx.execute(
-                "DELETE FROM owed_ledger_suspects WHERE pr = ?1",
-                rusqlite::params![pr.0 as i64],
-            )?;
-        }
+        Ok(())
+    }
+
+    /// Records that `comment_id` on `pr` needs a ledger repair:
+    /// `rewrite` writes the store's truth over the recorded ledger,
+    /// `!rewrite` makes a pretender inert. Named by a webhook or
+    /// discovered in a listing, the repair is owed until an
+    /// acknowledgement — it never depends on a later listing showing
+    /// the comment again (Codex ledger review round 21, P2). Re-adding
+    /// bumps the generation: fresh tampering voids an in-flight
+    /// acknowledgement.
+    pub fn add_ledger_repair(
+        &mut self,
+        pr: PrNumber,
+        comment_id: CommentId,
+        rewrite: bool,
+    ) -> Result<(), StoreError> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE counters SET value = value + 1 WHERE name = 'ledger_gen'",
+            [],
+        )?;
+        let generation: i64 = tx.query_row(
+            "SELECT value FROM counters WHERE name = 'ledger_gen'",
+            [],
+            |row| row.get(0),
+        )?;
+        tx.execute(
+            "INSERT INTO owed_ledger_repairs (pr, comment_id, rewrite, generation) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(pr, comment_id) DO UPDATE SET rewrite = ?3, generation = ?4",
+            rusqlite::params![pr.0 as i64, comment_id.0 as i64, rewrite as i64, generation],
+        )?;
         tx.commit()?;
         Ok(())
     }
 
-    /// Records a NAMED ledger suspect: a bot comment a webhook reported
-    /// edited while it was (or became) ledger-shaped for `pr`. The
-    /// listing-driven repair must see it, or confirm its absence across
-    /// spaced listings, before the PR's obligation is discharged (Codex
-    /// ledger review round 19, P2). Re-suspecting restarts the absence
-    /// count: a fresh edit voids what earlier listings proved.
-    pub fn add_ledger_suspect(
+    /// Clears the repair an acknowledged write was dispatched FOR —
+    /// identified by the generation it read. Tampering recorded since
+    /// holds a newer generation and survives it.
+    pub fn clear_ledger_repair(
+        &mut self,
+        pr: PrNumber,
+        comment_id: CommentId,
+        generation: u64,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM owed_ledger_repairs \
+             WHERE pr = ?1 AND comment_id = ?2 AND generation = ?3",
+            rusqlite::params![pr.0 as i64, comment_id.0 as i64, generation as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Drops a repair unconditionally: the comment is PROVEN gone (its
+    /// deletion webhook arrived, or a write to it answered 404), and a
+    /// comment id never comes back.
+    pub fn drop_ledger_repair(
         &mut self,
         pr: PrNumber,
         comment_id: CommentId,
     ) -> Result<(), StoreError> {
         self.conn.execute(
-            "INSERT INTO owed_ledger_suspects (pr, comment_id, absent_probes, absent_at) \
-             VALUES (?1, ?2, 0, NULL) \
-             ON CONFLICT(pr, comment_id) DO UPDATE SET absent_probes = 0, absent_at = NULL",
+            "DELETE FROM owed_ledger_repairs WHERE pr = ?1 AND comment_id = ?2",
             rusqlite::params![pr.0 as i64, comment_id.0 as i64],
         )?;
         Ok(())
     }
 
-    /// Forgets a ledger suspect: it was seen by a fresh listing (the
-    /// normal machinery has it now), its absence became stable, or its
-    /// deletion webhook proved it gone.
-    pub fn remove_ledger_suspect(
-        &mut self,
-        pr: PrNumber,
-        comment_id: CommentId,
-    ) -> Result<(), StoreError> {
-        self.conn.execute(
-            "DELETE FROM owed_ledger_suspects WHERE pr = ?1 AND comment_id = ?2",
-            rusqlite::params![pr.0 as i64, comment_id.0 as i64],
-        )?;
-        Ok(())
-    }
-
-    /// The ledger suspects recorded for `pr`.
-    pub fn ledger_suspects(&self, pr: PrNumber) -> Result<Vec<CommentId>, StoreError> {
+    /// The repairs owed on `pr`.
+    pub fn ledger_repairs(&self, pr: PrNumber) -> Result<Vec<LedgerRepair>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT comment_id FROM owed_ledger_suspects WHERE pr = ?1 ORDER BY comment_id",
+            "SELECT comment_id, rewrite, generation FROM owed_ledger_repairs \
+             WHERE pr = ?1 ORDER BY comment_id",
         )?;
-        let rows = stmt.query_map(rusqlite::params![pr.0 as i64], |row| row.get::<_, i64>(0))?;
-        let mut suspects = Vec::new();
+        let rows = stmt.query_map(rusqlite::params![pr.0 as i64], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut repairs = Vec::new();
         for row in rows {
-            suspects.push(CommentId(row? as u64));
+            let (comment_id, rewrite, generation) = row?;
+            repairs.push(LedgerRepair {
+                comment_id: CommentId(comment_id as u64),
+                rewrite: rewrite != 0,
+                generation: generation as u64,
+            });
         }
-        Ok(suspects)
+        Ok(repairs)
     }
 
-    /// Records that a fresh listing omitted a suspect, and answers how
-    /// many listings at least `cooldown` apart have now done so — the
-    /// same stable-absence contract as `note_absent_ledger`.
-    pub fn note_absent_ledger_suspect(
-        &mut self,
-        pr: PrNumber,
-        comment_id: CommentId,
-        now: DateTime<Utc>,
-        cooldown: chrono::Duration,
-    ) -> Result<u32, StoreError> {
-        let (count, last): (i64, Option<String>) = self.conn.query_row(
-            "SELECT absent_probes, absent_at FROM owed_ledger_suspects \
-             WHERE pr = ?1 AND comment_id = ?2",
-            rusqlite::params![pr.0 as i64, comment_id.0 as i64],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        let too_soon = last
-            .as_deref()
-            .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
-            .is_some_and(|at| now - at.with_timezone(&Utc) < cooldown);
-        if too_soon {
-            return Ok(count as u32);
+    /// Every PR with a repair owed, for requeueing after a restart or a
+    /// stall retry.
+    pub fn ledger_repair_prs(&self) -> Result<Vec<PrNumber>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT pr FROM owed_ledger_repairs ORDER BY pr")?;
+        let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+        let mut prs = Vec::new();
+        for row in rows {
+            prs.push(PrNumber(row? as u64));
         }
-        self.conn.execute(
-            "UPDATE owed_ledger_suspects SET absent_probes = absent_probes + 1, absent_at = ?3 \
-             WHERE pr = ?1 AND comment_id = ?2",
-            rusqlite::params![pr.0 as i64, comment_id.0 as i64, now.to_rfc3339()],
-        )?;
-        Ok(count as u32 + 1)
+        Ok(prs)
     }
 
     /// Clears the owed sync for one train incarnation (idempotent).
@@ -1204,17 +1228,20 @@ fn init_schema(conn: &Connection) -> Result<(), StoreError> {
             absent_at     TEXT
         );
 
-        -- Bot comments a webhook reported edited while ledger-shaped:
-        -- NAMED evidence the listing-driven repair must account for —
-        -- see the comment (and repair or neutralize it), or confirm its
-        -- absence across spaced listings — before the PR's obligation
-        -- may be discharged. An eventually-consistent listing can omit
-        -- a comment the webhook has already named.
-        CREATE TABLE owed_ledger_suspects (
+        -- Per-comment ledger repairs: a bot comment KNOWN to need fixing
+        -- — a webhook reported it edited into (or as) a ledger, or a
+        -- probe's listing discovered it as a duplicate. The repair
+        -- targets the comment id directly (no listing needed), and is
+        -- owed until an UpdateComment to it is acknowledged, a 404 says
+        -- it is gone, or its deletion webhook arrives. `rewrite` = 1
+        -- rewrites the recorded ledger to the store's truth; 0 makes a
+        -- pretender inert. `generation` follows the obligation counter:
+        -- an acknowledgement clears only the tampering it saw.
+        CREATE TABLE owed_ledger_repairs (
             pr            INTEGER NOT NULL,
             comment_id    INTEGER NOT NULL,
-            absent_probes INTEGER NOT NULL DEFAULT 0,
-            absent_at     TEXT,
+            rewrite       INTEGER NOT NULL,
+            generation    INTEGER NOT NULL,
             PRIMARY KEY (pr, comment_id)
         );
 

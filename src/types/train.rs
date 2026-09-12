@@ -500,6 +500,11 @@ pub enum TrainErrorKind {
     ReviewDismissed,
     ApprovalWithdrawn,
     ApiError,
+    /// The target of the request no longer exists (HTTP 404): a deleted
+    /// comment, PR, or branch. Distinguished from `ApiError` so callers
+    /// that own retryable per-target obligations (e.g. ledger repairs)
+    /// can resolve "gone for ever" instead of retrying for ever.
+    NotFound,
     BranchDeleted,
     NonSquashMerge,
     StatusCommentTooLarge,
