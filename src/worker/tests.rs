@@ -1257,6 +1257,12 @@ fn owed_ledgers_are_seeded_when_the_processor_starts() {
         Some(PrNumber(1)),
         "and then wrote it"
     );
+    // The obligation outlived a dead process whose own post may still be
+    // out there unobserved, so the replacement went out unbound: a fresh
+    // listing must account for any orphan before discharge (Codex ledger
+    // review round 23, P2).
+    processor.requeue_marked_recoveries().unwrap();
+    run_sagas(&mut processor);
     assert!(
         processor
             .store_mut()
@@ -3317,6 +3323,259 @@ fn a_displaced_ledger_is_owed_cleanup_not_forgotten() {
     );
 }
 
+/// Retract, let the "not stacked" write land, restore the declaration
+/// in the same comment: two distinct ledger bodies both match the
+/// restored declaration, and only the sequence number tells them apart.
+/// A stale listing serving the ORIGINAL stacked body used to satisfy the
+/// obligation — its seq was older but under the tamper cap — while the
+/// real comment still said "not stacked" (Codex ledger review round 23,
+/// P2). A body older than the last acknowledged write is never accepted.
+#[test]
+fn a_body_older_than_the_last_acknowledged_write_is_not_believed() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    drain(&mut processor);
+    let ledger = ledgers_on(&world, 2)[0].0;
+    let stacked_body = world.github.lock().unwrap().comments[&ledger].body.clone();
+
+    // The author retracts by editing the declaration away; the
+    // "not stacked" rewrite lands.
+    let config = world.config.clone();
+    let edited_declaration = move |text: &str| {
+        format!(
+            r#"{{
+                "action": "edited",
+                "comment": {{
+                    "id": 20,
+                    "body": "{text}",
+                    "user": {{ "id": {AUTHOR}, "login": "author" }},
+                    "updated_at": "2026-07-01T12:00:00Z"
+                }},
+                "issue": {{
+                    "number": 2,
+                    "pull_request": {{ "url": "..." }},
+                    "user": {{ "id": {AUTHOR}, "login": "author" }}
+                }},
+                "repository": {repo},
+                "sender": {{ "id": {AUTHOR}, "login": "author" }}
+            }}"#,
+            repo = repo_json(&config),
+        )
+        .into_bytes()
+    };
+    world.enqueue(
+        &mut processor,
+        "issue_comment",
+        edited_declaration("never mind"),
+    );
+    drain(&mut processor);
+
+    // ...and restores the declaration in the same comment, while the
+    // listing cache still serves the ORIGINAL stacked body.
+    world
+        .github
+        .lock()
+        .unwrap()
+        .stale_listing_bodies
+        .insert(ledger, stacked_body);
+    world.enqueue(
+        &mut processor,
+        "issue_comment",
+        edited_declaration("@merge-train predecessor #1"),
+    );
+    drain(&mut processor);
+
+    // Whatever the stale listing said, the real comment must state the
+    // restored declaration once the cache heals.
+    world.github.lock().unwrap().stale_listing_bodies.clear();
+    processor.requeue_marked_recoveries().unwrap();
+    run_sagas(&mut processor);
+    processor.requeue_marked_recoveries().unwrap();
+    run_sagas(&mut processor);
+    assert_ledgers_match_store(&world, &processor);
+    assert!(
+        processor
+            .store_mut()
+            .owed_stack_ledgers()
+            .unwrap()
+            .is_empty(),
+        "nothing owed once the rewrite lands"
+    );
+}
+
+/// GitHub answers 404 for comments that EXIST when repository access is
+/// temporarily revoked. Treating that as proven deletion marked a forged
+/// sibling dead and dropped its repair; after access was restored, the
+/// dead-filter hid the forgery from every listing and the obligation
+/// cleared over it (Codex ledger review round 23, P2). A write 404 alone
+/// now only flags the repair; death needs a successful listing that
+/// omits the comment too.
+#[test]
+fn an_auth_glitch_404_does_not_bury_a_forged_sibling() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    drain(&mut processor);
+    let real = ledgers_on(&world, 2)[0].0;
+
+    // A forged sibling is named while comment writes 404 spuriously.
+    let forged = crate::status::format_stack_ledger(&crate::status::StackLedger {
+        pr: PrNumber(2),
+        declared: None,
+        seq: u64::MAX,
+        settled_through: None,
+    });
+    {
+        let mut github = world.github.lock().unwrap();
+        github.comments.insert(
+            crate::types::CommentId(4242),
+            FakeComment {
+                pr: PrNumber(2),
+                author_id: TEST_BOT_ID,
+                body: forged.clone(),
+                edited: true,
+            },
+        );
+        github.update_comment_notfound = true;
+    }
+    let edit = format!(
+        r#"{{
+            "action": "edited",
+            "comment": {{
+                "id": 4242,
+                "body": "{body}",
+                "user": {{ "id": {TEST_BOT_ID}, "login": "merge-train" }},
+                "updated_at": "2026-07-01T12:00:00Z"
+            }},
+            "issue": {{
+                "number": 2,
+                "pull_request": {{ "url": "..." }},
+                "user": {{ "id": {AUTHOR}, "login": "author" }}
+            }},
+            "repository": {repo},
+            "sender": {{ "id": {AUTHOR}, "login": "author" }}
+        }}"#,
+        body = json_escaped(&forged),
+        repo = repo_json(&world.config),
+    );
+    world.enqueue(&mut processor, "issue_comment", edit.into_bytes());
+    drain(&mut processor);
+
+    // Access is restored: the forgery is still there, still listed, and
+    // must still be repaired.
+    world.github.lock().unwrap().update_comment_notfound = false;
+    processor.requeue_marked_recoveries().unwrap();
+    run_sagas(&mut processor);
+    processor.requeue_marked_recoveries().unwrap();
+    run_sagas(&mut processor);
+    let after = ledgers_on(&world, 2);
+    assert_eq!(
+        after.len(),
+        1,
+        "a spurious 404 must not bury the forgery for ever"
+    );
+    assert_eq!(after[0].0, real);
+    assert_ledgers_match_store(&world, &processor);
+    assert!(
+        processor
+            .store_mut()
+            .owed_stack_ledgers()
+            .unwrap()
+            .is_empty(),
+        "nothing owed once the repair lands"
+    );
+}
+
+/// The first ledger POST lands with its response lost, so no id is
+/// recorded. Two spaced listings omit the orphan and a replacement is
+/// posted — displacing NOTHING on record, so no cleanup was owed, and
+/// both ledgers stood for ever with empty obligation and repair tables
+/// (Codex ledger review round 23, P2). A replacement over an earlier
+/// unacknowledged post goes out unbound: only a fresh listing that
+/// accounts for the orphan may discharge.
+#[test]
+fn a_replacement_over_an_unacknowledged_orphan_keeps_reconciling() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.github.lock().unwrap().post_comment_response_lost = true;
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    drain(&mut processor);
+    world.github.lock().unwrap().post_comment_response_lost = false;
+    let orphan = ledgers_on(&world, 2)[0].0;
+
+    // Two spaced listings omit the orphan; the replacement lands.
+    world
+        .github
+        .lock()
+        .unwrap()
+        .hidden_from_listings
+        .insert(orphan);
+    let remark = comment_body(&world.config, 2, "a remark", AUTHOR, "author", 9001);
+    world.enqueue(&mut processor, "issue_comment", remark);
+    drain(&mut processor);
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    let remark = comment_body(&world.config, 2, "another remark", AUTHOR, "author", 9002);
+    world.enqueue(&mut processor, "issue_comment", remark);
+    drain(&mut processor);
+
+    // The listings recover: the orphan must be reconciled away, not
+    // stand for ever beside the replacement with nothing owed.
+    world.github.lock().unwrap().hidden_from_listings.clear();
+    processor.requeue_marked_recoveries().unwrap();
+    run_sagas(&mut processor);
+    processor.requeue_marked_recoveries().unwrap();
+    run_sagas(&mut processor);
+    let after = ledgers_on(&world, 2);
+    assert_eq!(
+        after.len(),
+        1,
+        "a replacement over an unacknowledged orphan owes reconciliation"
+    );
+    assert_ne!(after[0].0, orphan, "the replacement is the one that stands");
+    assert_ledgers_match_store(&world, &processor);
+    assert!(
+        processor
+            .store_mut()
+            .owed_stack_ledgers()
+            .unwrap()
+            .is_empty(),
+        "nothing owed once the orphan is reconciled"
+    );
+}
+
+/// The id transition and the displaced comment's cleanup are one store
+/// transaction: whichever moment a crash picks, either both survive or
+/// neither does (Codex ledger review round 23, P2). Functionally: one
+/// call records the new id AND owes the old comment its repair.
+#[test]
+fn recording_a_replacement_owes_the_displaced_cleanup_atomically() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    drain(&mut processor);
+    let old = ledgers_on(&world, 2)[0].0;
+
+    let store = processor.store_mut();
+    store
+        .record_stack_ledger_posted(
+            PrNumber(2),
+            crate::types::CommentId(9999),
+            Some(old),
+            chrono::Utc::now(),
+        )
+        .unwrap();
+    assert_eq!(
+        store.state().prs[&PrNumber(2)].ledger_comment_id,
+        Some(crate::types::CommentId(9999)),
+        "the id transition landed"
+    );
+    let repairs = store.ledger_repairs(PrNumber(2)).unwrap();
+    assert_eq!(repairs.len(), 1, "the displaced comment is owed cleanup");
+    assert_eq!(repairs[0].comment_id, old);
+    assert!(!repairs[0].rewrite, "cleanup neutralizes, not rewrites");
+}
+
 /// A doctored ledger that also LOOKS like a command must still be
 /// repaired. Command authorization rejects the apparent command and
 /// returns early, so the repair has to happen before it (Codex ledger
@@ -3650,6 +3909,11 @@ mod ledger_property {
         HealUpdates,
         /// Posts land, but their responses are lost on the wire.
         LosePostResponses,
+        /// Repository access flickers: comment writes 404 although the
+        /// comments exist...
+        AuthGlitch404,
+        /// ...and access returns.
+        HealAuth,
         /// The worker dies; a fresh one takes over the same store.
         Restart,
         /// Time passes mid-adversity: the stall timer fires and the
@@ -3677,6 +3941,8 @@ mod ledger_property {
             1 => Just(AdversarialAction::BreakUpdates),
             1 => Just(AdversarialAction::HealUpdates),
             1 => Just(AdversarialAction::LosePostResponses),
+            1 => Just(AdversarialAction::AuthGlitch404),
+            1 => Just(AdversarialAction::HealAuth),
             1 => Just(AdversarialAction::Restart),
             2 => Just(AdversarialAction::Tick),
         ]
@@ -3886,6 +4152,12 @@ mod ledger_property {
                 AdversarialAction::LosePostResponses => {
                     world.github.lock().unwrap().post_comment_response_lost = true;
                 }
+                AdversarialAction::AuthGlitch404 => {
+                    world.github.lock().unwrap().update_comment_notfound = true;
+                }
+                AdversarialAction::HealAuth => {
+                    world.github.lock().unwrap().update_comment_notfound = false;
+                }
                 AdversarialAction::Restart => {
                     drop(processor);
                     processor = world.processor();
@@ -3907,6 +4179,7 @@ mod ledger_property {
             github.stale_listing_bodies.clear();
             github.stale_listing_ghosts.clear();
             github.update_comment_broken = false;
+            github.update_comment_notfound = false;
             github.post_comment_response_lost = false;
         }
         for hook in delayed {
@@ -4029,6 +4302,26 @@ mod ledger_property {
             AdversarialAction::Declare { pr: 2 },
             AdversarialAction::HideListings { pr: 2 },
             AdversarialAction::Tick,
+            AdversarialAction::Tick,
+            AdversarialAction::Tick,
+            AdversarialAction::UnhideAll,
+            AdversarialAction::Tick,
+        ]);
+        // The round-23 shapes: a forgery behind an auth-glitch 404, and
+        // a replacement posted over an orphan whose response was lost.
+        adversarial_case(&[
+            AdversarialAction::Declare { pr: 2 },
+            AdversarialAction::AuthGlitch404,
+            AdversarialAction::ForgeSibling { pr: 2 },
+            AdversarialAction::Tick,
+            AdversarialAction::HealAuth,
+            AdversarialAction::Tick,
+        ]);
+        adversarial_case(&[
+            AdversarialAction::LosePostResponses,
+            AdversarialAction::Declare { pr: 2 },
+            AdversarialAction::HealUpdates,
+            AdversarialAction::HideListings { pr: 2 },
             AdversarialAction::Tick,
             AdversarialAction::Tick,
             AdversarialAction::UnhideAll,

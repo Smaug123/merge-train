@@ -41,6 +41,10 @@ pub struct LedgerRepair {
     /// the pretender inert.
     pub rewrite: bool,
     pub generation: u64,
+    /// A write to this comment answered 404 — suggestive, not proof
+    /// (auth loss 404s existing comments). A successful listing decides:
+    /// showing it clears the flag, omitting it concludes death.
+    pub saw_404: bool,
 }
 
 /// A PR whose stack-ledger comment no longer matches what the store holds.
@@ -783,7 +787,7 @@ impl Store {
         tx.execute(
             "INSERT INTO owed_ledger_repairs (pr, comment_id, rewrite, generation) \
              VALUES (?1, ?2, ?3, ?4) \
-             ON CONFLICT(pr, comment_id) DO UPDATE SET rewrite = ?3, generation = ?4",
+             ON CONFLICT(pr, comment_id) DO UPDATE SET rewrite = ?3, generation = ?4, saw_404 = 0",
             rusqlite::params![pr.0 as i64, comment_id.0 as i64, rewrite as i64, generation],
         )?;
         tx.commit()?;
@@ -825,7 +829,7 @@ impl Store {
     /// The repairs owed on `pr`.
     pub fn ledger_repairs(&self, pr: PrNumber) -> Result<Vec<LedgerRepair>, StoreError> {
         let mut stmt = self.conn.prepare(
-            "SELECT comment_id, rewrite, generation FROM owed_ledger_repairs \
+            "SELECT comment_id, rewrite, generation, saw_404 FROM owed_ledger_repairs \
              WHERE pr = ?1 ORDER BY comment_id",
         )?;
         let rows = stmt.query_map(rusqlite::params![pr.0 as i64], |row| {
@@ -833,18 +837,120 @@ impl Store {
                 row.get::<_, i64>(0)?,
                 row.get::<_, i64>(1)?,
                 row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
             ))
         })?;
         let mut repairs = Vec::new();
         for row in rows {
-            let (comment_id, rewrite, generation) = row?;
+            let (comment_id, rewrite, generation, saw_404) = row?;
             repairs.push(LedgerRepair {
                 comment_id: CommentId(comment_id as u64),
                 rewrite: rewrite != 0,
                 generation: generation as u64,
+                saw_404: saw_404 != 0,
             });
         }
         Ok(repairs)
+    }
+
+    /// Notes that a write to this repair's comment answered 404 — not
+    /// proof of deletion by itself, since losing repository access 404s
+    /// comments that exist (Codex ledger review round 23, P2). Death is
+    /// concluded only together with a successful listing omitting it.
+    pub fn flag_ledger_repair_404(
+        &mut self,
+        pr: PrNumber,
+        comment_id: CommentId,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE owed_ledger_repairs SET saw_404 = 1 WHERE pr = ?1 AND comment_id = ?2",
+            rusqlite::params![pr.0 as i64, comment_id.0 as i64],
+        )?;
+        Ok(())
+    }
+
+    /// A listing SHOWED the comment: the 404 was a glitch, not a grave.
+    pub fn unflag_ledger_repair_404(
+        &mut self,
+        pr: PrNumber,
+        comment_id: CommentId,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE owed_ledger_repairs SET saw_404 = 0 WHERE pr = ?1 AND comment_id = ?2",
+            rusqlite::params![pr.0 as i64, comment_id.0 as i64],
+        )?;
+        Ok(())
+    }
+
+    /// The sequence number of the last acknowledged ledger write for
+    /// `pr` (0 when none is known — a fresh store accepts any listed
+    /// body no newer than its own state).
+    pub fn ledger_written_seq(&self, pr: PrNumber) -> Result<u64, StoreError> {
+        let seq: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT seq FROM ledger_written_seq WHERE pr = ?1",
+                rusqlite::params![pr.0 as i64],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(seq.unwrap_or(0) as u64)
+    }
+
+    /// Raises the acknowledged-write floor for `pr` (never lowers it).
+    pub fn note_ledger_written_seq(&mut self, pr: PrNumber, seq: u64) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO ledger_written_seq (pr, seq) VALUES (?1, ?2) \
+             ON CONFLICT(pr) DO UPDATE SET seq = MAX(seq, excluded.seq)",
+            rusqlite::params![pr.0 as i64, seq as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Records where a PR's ledger now lives and, in the SAME
+    /// transaction, the cleanup owed to the comment it displaced: a
+    /// crash between the two would otherwise strand the old comment as
+    /// a permanent duplicate once listings recover (Codex ledger review
+    /// round 23, P2).
+    pub fn record_stack_ledger_posted(
+        &mut self,
+        pr: PrNumber,
+        comment_id: CommentId,
+        displaced: Option<CommentId>,
+        ts: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        let mut next_state = self.state.clone();
+        let mut seq = self.next_seq;
+        let tx = self.conn.transaction()?;
+        let event = StateEvent {
+            seq,
+            ts,
+            payload: StateEventPayload::StackLedgerPosted { pr, comment_id },
+        };
+        insert_and_apply(&tx, &mut next_state, &event)?;
+        seq += 1;
+        upsert_cache(&tx, &next_state, seq, ts)?;
+        if let Some(old) = displaced {
+            tx.execute(
+                "UPDATE counters SET value = value + 1 WHERE name = 'ledger_gen'",
+                [],
+            )?;
+            let generation: i64 = tx.query_row(
+                "SELECT value FROM counters WHERE name = 'ledger_gen'",
+                [],
+                |row| row.get(0),
+            )?;
+            tx.execute(
+                "INSERT INTO owed_ledger_repairs (pr, comment_id, rewrite, generation) \
+                 VALUES (?1, ?2, 0, ?3) \
+                 ON CONFLICT(pr, comment_id) DO UPDATE SET rewrite = 0, generation = ?3, saw_404 = 0",
+                rusqlite::params![pr.0 as i64, old.0 as i64, generation],
+            )?;
+        }
+        tx.commit()?;
+        self.state = next_state;
+        self.next_seq = seq;
+        Ok(())
     }
 
     /// Distrusts a comment id: `dead` when its deletion is proven (a
@@ -1288,7 +1394,20 @@ fn init_schema(conn: &Connection) -> Result<(), StoreError> {
             comment_id    INTEGER NOT NULL,
             rewrite       INTEGER NOT NULL,
             generation    INTEGER NOT NULL,
+            -- A write to this comment answered 404. Not proof of
+            -- deletion by itself (auth loss 404s existing comments):
+            -- death needs a successful listing that omits it too.
+            saw_404       INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (pr, comment_id)
+        );
+
+        -- The sequence number of the last ACKNOWLEDGED ledger write per
+        -- PR. A listed body older than this is stale listing content,
+        -- however well it matches: content can march A -> B -> A, and
+        -- only the sequence number tells the two A-bodies apart.
+        CREATE TABLE ledger_written_seq (
+            pr  INTEGER PRIMARY KEY,
+            seq INTEGER NOT NULL
         );
 
         -- Comment ids the ledger machinery must not trust from a

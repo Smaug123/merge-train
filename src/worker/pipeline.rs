@@ -1479,10 +1479,19 @@ impl Processor {
                     kind: crate::types::TrainErrorKind::NotFound,
                     ..
                 }) => {
-                    // Proven gone — remember it, so a ghost in a stale
-                    // listing is never believed (round 22, P2).
-                    self.store.distrust_ledger_comment(pr, *comment_id, true)?;
-                    self.store.drop_ledger_repair(pr, *comment_id)?;
+                    // Suggestive, not proof: losing repository access
+                    // 404s comments that exist, and concluding death
+                    // here buried live forgeries for ever (Codex ledger
+                    // review round 23, P2). The flag asks the next
+                    // successful listing to decide — and listings come
+                    // from the obligation machinery, so if nothing is
+                    // owed, owe one look.
+                    self.store.flag_ledger_repair_404(pr, *comment_id)?;
+                    if !self.store.owed_stack_ledgers()?.iter().any(|o| o.pr == pr) {
+                        self.store.mark_ledger_owed(pr)?;
+                        self.queue(PendingWork::LedgerSync { pr });
+                    }
+                    self.retry_requested = true;
                 }
                 Err(e) => {
                     warn!(
@@ -1515,41 +1524,40 @@ impl Processor {
                         .state()
                         .prs
                         .get(&ledger.pr)
-                        .and_then(|cached| cached.ledger_comment_id);
+                        .and_then(|cached| cached.ledger_comment_id)
+                        .filter(|old| old != id);
                     // Record where the ledger lives BEFORE clearing the
                     // obligation: a crash in between re-writes the ledger,
                     // which is idempotent, while the reverse order could
-                    // post a second one.
-                    self.store.append_batch(
-                        &[StateEventPayload::StackLedgerPosted {
-                            pr: ledger.pr,
-                            comment_id: *id,
-                        }],
-                        Utc::now(),
-                    )?;
-                    // The replacement displaced a recorded comment on
-                    // absence EVIDENCE, not proof: if the old one still
-                    // exists (the listings lied), it must be cleaned up
-                    // — and if it is truly gone, the write 404s and
-                    // resolves (Codex ledger review round 22, P2).
-                    if let Some(old) = displaced
-                        && old != *id
-                    {
-                        self.store.add_ledger_repair(ledger.pr, old, false)?;
+                    // post a second one. The cleanup owed to a DISPLACED
+                    // comment commits in the same transaction — a crash
+                    // between the two stranded it as a permanent
+                    // duplicate (Codex ledger review rounds 22 and 23,
+                    // P2): if it still exists it is neutralized, and if
+                    // it is truly gone the write 404s and resolves.
+                    self.store
+                        .record_stack_ledger_posted(ledger.pr, *id, displaced, Utc::now())?;
+                    if displaced.is_some() {
                         self.queue(PendingWork::LedgerRepair { pr: ledger.pr });
                     }
+                    self.store.note_ledger_written_seq(ledger.pr, ledger.seq)?;
                     self.clear_written_ledger(ledger.pr)?;
                 }
-                Ok(_) => self.clear_written_ledger(ledger.pr)?,
+                Ok(_) => {
+                    self.store.note_ledger_written_seq(ledger.pr, ledger.seq)?;
+                    self.clear_written_ledger(ledger.pr)?;
+                }
                 Err(e) => {
                     warn!(
                         pr = %ledger.pr, error = ?e,
                         "stack ledger write failed; the ledger is still owed"
                     );
-                    // A 404 on the rewrite is the same proof a deletion
-                    // webhook gives: the comment is gone for ever, and a
-                    // ghost of it in a stale listing must not be
-                    // believed (Codex ledger review round 22, P2).
+                    // A 404 on the rewrite is EVIDENCE the comment is
+                    // gone (round 22, P2) — but only evidence: auth loss
+                    // 404s comments that exist (round 23, P2). It
+                    // becomes a flagged repair, and the next successful
+                    // listing decides: shown, the rewrite is retried;
+                    // omitted, the comment is concluded dead.
                     if let (
                         Effect::GitHub(GitHubEffect::UpdateComment { comment_id, .. }),
                         crate::cascade::EffectError::Permanent {
@@ -1558,8 +1566,17 @@ impl Processor {
                         },
                     ) = (&outcome.effect, e)
                     {
-                        self.store
-                            .distrust_ledger_comment(ledger.pr, *comment_id, true)?;
+                        self.store.add_ledger_repair(ledger.pr, *comment_id, true)?;
+                        self.store.flag_ledger_repair_404(ledger.pr, *comment_id)?;
+                        if !self
+                            .store
+                            .owed_stack_ledgers()?
+                            .iter()
+                            .any(|o| o.pr == ledger.pr)
+                        {
+                            self.store.mark_ledger_owed(ledger.pr)?;
+                            self.queue(PendingWork::LedgerSync { pr: ledger.pr });
+                        }
                     }
                     // The binding dies with the attempt: left in place, a
                     // LATER write landing amid duplicate cleanup — which
@@ -1818,6 +1835,24 @@ impl Processor {
                 .filter(|c| !dead.contains(&c.id))
                 .collect()
         };
+        // 404-flagged repairs meet the successful listing that decides
+        // them (Codex ledger review round 23, P2): shown, the 404 was an
+        // auth glitch and the repair retries; omitted (and the listing
+        // fresh), the two independent signals conclude death.
+        if owed.generation == probe_generation {
+            for repair in self.store.ledger_repairs(pr)? {
+                if !repair.saw_404 {
+                    continue;
+                }
+                if comments.iter().any(|c| c.id == repair.comment_id) {
+                    self.store.unflag_ledger_repair_404(pr, repair.comment_id)?;
+                } else {
+                    self.store
+                        .distrust_ledger_comment(pr, repair.comment_id, true)?;
+                    self.store.drop_ledger_repair(pr, repair.comment_id)?;
+                }
+            }
+        }
         // The state this write states, and the watermark that says so: an
         // event appended while the write is in flight carries a higher
         // sequence number, so it survives this write's acknowledgement.
@@ -1940,6 +1975,7 @@ impl Processor {
         }
         let repairs = self.store.ledger_repairs(pr)?;
         let repairs_open = !repairs.is_empty();
+        let mut replacement_over_unacked = false;
         let body = crate::status::format_stack_ledger(&desired);
         let write: Option<Effect> = match live {
             Some((comment_id, parsed)) => {
@@ -1964,19 +2000,16 @@ impl Processor {
                 if cached.ledger_comment_id != Some(comment_id) {
                     // Found one the store did not know about: record where
                     // it lives before writing to it, or the next crash
-                    // leaves a second.
+                    // leaves a second. Adoption can DISPLACE a recorded
+                    // comment the listing happens not to show — it may
+                    // still exist, so its cleanup commits in the SAME
+                    // transaction as the id transition (rounds 22 and
+                    // 23, P2): a crash between the two stranded it.
                     info!(%pr, %comment_id, "adopting an unrecorded stack ledger comment");
-                    self.store.append_batch(
-                        &[StateEventPayload::StackLedgerPosted { pr, comment_id }],
-                        Utc::now(),
-                    )?;
-                    // Adoption can DISPLACE a recorded comment the
-                    // listing happens not to show: it may still exist,
-                    // so it is owed cleanup — or a 404 (round 22, P2).
-                    if let Some(old) = cached.ledger_comment_id
-                        && old != comment_id
-                    {
-                        self.store.add_ledger_repair(pr, old, false)?;
+                    let displaced = cached.ledger_comment_id.filter(|old| *old != comment_id);
+                    self.store
+                        .record_stack_ledger_posted(pr, comment_id, displaced, Utc::now())?;
+                    if displaced.is_some() {
                         self.queue(PendingWork::LedgerRepair { pr });
                     }
                 }
@@ -1999,6 +2032,12 @@ impl Processor {
                 // unrepaired for ever (Codex ledger review round 14, P1).
                 // On a mismatch, fall through to the write: it repairs
                 // the comment and is generation-bound itself.
+                // ...and no older than the last write we KNOW landed:
+                // content can march A -> B -> A, and a stale listing
+                // serving the first A-body matches the restored state on
+                // everything but its sequence number (Codex ledger
+                // review round 23, P2).
+                let written_floor = self.store.ledger_written_seq(pr)?;
                 let satisfied = owed.generation == probe_generation
                     && !tainted.contains(&comment_id)
                     && parsed.is_some_and(|l| {
@@ -2006,6 +2045,7 @@ impl Processor {
                             && l.declared == desired.declared
                             && l.settled_through == desired.settled_through
                             && l.seq <= desired.seq
+                            && l.seq >= written_floor
                     });
                 if satisfied && !repairs_open {
                     // It already says what the store holds, and no
@@ -2060,6 +2100,13 @@ impl Processor {
                 // if its response is lost, one stale listing must not
                 // immediately produce a second comment.
                 self.store.reset_absent_ledger(pr)?;
+                // A replacement over an EARLIER unacknowledged post may
+                // be joining an orphan whose id nobody knows: its
+                // acknowledgement must not discharge the obligation, or
+                // both stand for ever with nothing owed (Codex ledger
+                // review round 23, P2). Unbound, the obligation waits
+                // for a fresh listing that accounts for the orphan.
+                replacement_over_unacked = self.unacked_ledger_posts.contains(&pr);
                 // Tracked from the moment it exists: a POST can be in
                 // flight UNBOUND (repairs open, or the obligation moved),
                 // and waiting for a failure to record it left a window
@@ -2070,7 +2117,7 @@ impl Processor {
             }
         };
         self.in_flight = Some(pr);
-        if owed.generation == probe_generation && !repairs_open {
+        if owed.generation == probe_generation && !repairs_open && !replacement_over_unacked {
             self.ledger_write_gen.insert(pr, probe_generation);
         } else {
             // With repairs open — named tampering or discovered

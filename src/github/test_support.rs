@@ -108,6 +108,10 @@ pub struct FakeGitHub {
     /// transient failure — the response is lost on the wire. The comment
     /// exists; nothing acknowledged it.
     pub post_comment_response_lost: bool,
+    /// While set, `UpdateComment` answers 404 for comments that EXIST:
+    /// GitHub does this when repository access is temporarily revoked,
+    /// so a 404 is not proof of deletion.
+    pub update_comment_notfound: bool,
     /// While set, `UpdateComment` fails `Permanent` while everything else
     /// keeps working: the token can still READ comments but has lost the
     /// right to edit them, so an owed rewrite can never land.
@@ -134,6 +138,7 @@ impl FakeGitHub {
             stale_listing_ghosts: std::collections::BTreeMap::new(),
             stale_listing_bodies: std::collections::BTreeMap::new(),
             post_comment_response_lost: false,
+            update_comment_notfound: false,
             update_comment_broken: false,
         }
     }
@@ -333,6 +338,12 @@ impl FakeGitHub {
                 Ok(GitHubResponse::CommentPosted { id })
             }
             GitHubEffect::UpdateComment { comment_id, body } => {
+                if self.update_comment_notfound {
+                    return Err(EffectError::Permanent {
+                        kind: TrainErrorKind::NotFound,
+                        detail: format!("comment {comment_id} 404s (auth glitch, test-injected)"),
+                    });
+                }
                 if self.update_comment_broken {
                     return Err(EffectError::Permanent {
                         kind: TrainErrorKind::ApiError,
