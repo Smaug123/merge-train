@@ -329,7 +329,7 @@ fn handle_predecessor_command(
     if let Err(e) = validation {
         return HandlerOutput {
             events: vec![],
-            effects: vec![reject(pr, comment_id, &predecessor_rejection_message(&e))],
+            effects: vec![reject(pr, &predecessor_rejection_message(&e))],
             triggers: vec![],
         };
     }
@@ -650,10 +650,10 @@ fn ack(comment_id: CommentId) -> Effect {
 /// a rejection RECEIPT naming the comment, so a lost-DB crawl — which can
 /// only see that the comment survives — knows live refused it and does not
 /// re-validate it against a present in which it might pass.
-fn reject(pr: PrNumber, comment_id: CommentId, body: &str) -> Effect {
+fn reject(pr: PrNumber, body: &str) -> Effect {
     Effect::GitHub(GitHubEffect::PostComment {
         pr,
-        body: crate::status::format_rejection_receipt(pr, comment_id, body),
+        body: body.to_owned(),
     })
 }
 
@@ -1011,15 +1011,9 @@ mod tests {
             panic!("expected one rejection comment, got {:?}", out.effects);
         };
         assert!(body.starts_with("Cannot declare predecessor"), "{body}");
-        // The rejection is durable evidence: a lost-DB crawl must not
-        // re-validate this comment against the present and accept it.
-        assert_eq!(
-            crate::status::parse_receipt(body),
-            Some(crate::status::Receipt::Rejection {
-                pr: PrNumber(2),
-                rejected: CommentId(7),
-            })
-        );
+        // A refusal records nothing, and needs to record nothing: with no
+        // stack ledger behind it, a crawl will never turn this comment
+        // into an edge.
     }
 
     #[test]

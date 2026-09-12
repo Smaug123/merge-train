@@ -33,6 +33,7 @@
 //! work they trigger queues for the saga slot.
 
 pub mod authz;
+mod bootstrap;
 pub mod executor;
 mod pipeline;
 pub mod recovery;
