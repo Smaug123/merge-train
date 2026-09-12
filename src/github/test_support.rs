@@ -95,6 +95,10 @@ pub struct FakeGitHub {
     /// `UpdateComment` calls that reached a live comment, so a test can
     /// assert that a satisfied obligation writes nothing further.
     pub comment_updates: u32,
+    /// Comments `ListComments` still serves although they no longer
+    /// exist: GitHub's listing cache can keep returning a deleted
+    /// comment for a while. Writes to them 404, exactly like GitHub.
+    pub stale_listing_ghosts: std::collections::BTreeMap<CommentId, FakeComment>,
     /// Bodies `ListComments` serves INSTEAD of the stored ones, per
     /// comment id: GitHub's listing cache can lag an edit, returning a
     /// pre-edit body for a comment whose true content has moved on.
@@ -127,6 +131,7 @@ impl FakeGitHub {
             blocked: std::collections::HashSet::new(),
             hidden_from_listings: std::collections::HashSet::new(),
             comment_updates: 0,
+            stale_listing_ghosts: std::collections::BTreeMap::new(),
             stale_listing_bodies: std::collections::BTreeMap::new(),
             post_comment_response_lost: false,
             update_comment_broken: false,
@@ -388,6 +393,17 @@ impl FakeGitHub {
                             .unwrap_or_else(|| c.body.clone()),
                         edited: c.edited,
                     })
+                    .chain(
+                        self.stale_listing_ghosts
+                            .iter()
+                            .filter(|(_, c)| c.pr == *pr)
+                            .map(|(id, c)| crate::effects::github::CommentData {
+                                id: *id,
+                                author_id: c.author_id,
+                                body: c.body.clone(),
+                                edited: c.edited,
+                            }),
+                    )
                     .collect(),
             )),
             GitHubEffect::AddReaction { .. } => Ok(GitHubResponse::ReactionAdded),

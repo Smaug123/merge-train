@@ -3128,6 +3128,195 @@ fn a_post_in_flight_unbound_still_blocks_the_deletion_fast_path() {
     );
 }
 
+/// A deletion webhook is PROOF the recorded ledger is gone — but a
+/// stale listing can keep serving the dead comment's old body, and the
+/// probe used to accept that ghost as a satisfied ledger and discharge
+/// without ever posting a replacement, leaving the declaration with no
+/// backup (Codex ledger review round 22, P2). A confirmed deletion is
+/// remembered, and the ghost is never selected again.
+#[test]
+fn a_ghost_of_a_confirmed_deleted_ledger_is_never_believed() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    drain(&mut processor);
+    let old = ledgers_on(&world, 2)[0].0;
+
+    // The maintainer deletes the ledger; the listing cache keeps
+    // serving it.
+    {
+        let mut github = world.github.lock().unwrap();
+        let ghost = github.comments.remove(&old).unwrap();
+        github.stale_listing_ghosts.insert(old, ghost);
+    }
+    let deletion = format!(
+        r#"{{
+            "action": "deleted",
+            "comment": {{
+                "id": {old},
+                "body": "gone",
+                "user": {{ "id": {TEST_BOT_ID}, "login": "merge-train" }},
+                "updated_at": "2026-07-01T12:00:00Z"
+            }},
+            "issue": {{
+                "number": 2,
+                "pull_request": {{ "url": "..." }},
+                "user": {{ "id": {AUTHOR}, "login": "author" }}
+            }},
+            "repository": {repo},
+            "sender": {{ "id": {AUTHOR}, "login": "author" }}
+        }}"#,
+        repo = repo_json(&world.config),
+    );
+    world.enqueue(&mut processor, "issue_comment", deletion.into_bytes());
+    drain(&mut processor);
+
+    // The webhook proved the deletion: the ghost in the listing must not
+    // satisfy anything, and the replacement must actually exist.
+    assert_eq!(
+        ledgers_on(&world, 2).len(),
+        1,
+        "a replacement is posted even while the listing serves the ghost"
+    );
+    world.github.lock().unwrap().stale_listing_ghosts.clear();
+    processor.requeue_marked_recoveries().unwrap();
+    run_sagas(&mut processor);
+    assert_ledgers_match_store(&world, &processor);
+    assert!(
+        processor
+            .store_mut()
+            .owed_stack_ledgers()
+            .unwrap()
+            .is_empty(),
+        "nothing owed once the replacement stands"
+    );
+}
+
+/// A ledger POST lands with its response lost, so its id is unrecorded —
+/// and a maintainer then edits the marker away. The webhook matches only
+/// the catch-all, which used to record nothing; a stale listing serving
+/// the PRE-EDIT body then adopted the comment and discharged, leaving
+/// the real comment vandalized with no retry owed (Codex ledger review
+/// round 22, P2). The named-but-unidentified edit now taints the id: a
+/// selection of it must rewrite, never accept a cached body.
+#[test]
+fn an_unidentified_edit_taints_a_cached_body_until_rewritten() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    // The declaration's ledger POST lands, but its response is lost.
+    world.github.lock().unwrap().post_comment_response_lost = true;
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    drain(&mut processor);
+    world.github.lock().unwrap().post_comment_response_lost = false;
+    let unrecorded = ledgers_on(&world, 2)[0].0;
+    let pre_edit = world.github.lock().unwrap().comments[&unrecorded]
+        .body
+        .clone();
+
+    // The maintainer edits the marker away; the listing cache still
+    // serves the pre-edit ledger body.
+    {
+        let mut github = world.github.lock().unwrap();
+        github.comments.get_mut(&unrecorded).unwrap().body = "vandalized".to_string();
+        github.stale_listing_bodies.insert(unrecorded, pre_edit);
+    }
+    let edit = format!(
+        r#"{{
+            "action": "edited",
+            "comment": {{
+                "id": {unrecorded},
+                "body": "vandalized",
+                "user": {{ "id": {TEST_BOT_ID}, "login": "merge-train" }},
+                "updated_at": "2026-07-01T12:00:00Z"
+            }},
+            "issue": {{
+                "number": 2,
+                "pull_request": {{ "url": "..." }},
+                "user": {{ "id": {AUTHOR}, "login": "author" }}
+            }},
+            "repository": {repo},
+            "sender": {{ "id": {AUTHOR}, "login": "author" }}
+        }}"#,
+        repo = repo_json(&world.config),
+    );
+    world.enqueue(&mut processor, "issue_comment", edit.into_bytes());
+    drain(&mut processor);
+
+    // Whatever the stale listing said, the REAL comment must carry the
+    // ledger again (the taint forces an acknowledged rewrite by id).
+    assert_eq!(
+        ledgers_on(&world, 2).len(),
+        1,
+        "the vandalized ledger is rewritten, not trusted from a cached body"
+    );
+    world.github.lock().unwrap().stale_listing_bodies.clear();
+    processor.requeue_marked_recoveries().unwrap();
+    run_sagas(&mut processor);
+    assert_ledgers_match_store(&world, &processor);
+    assert!(
+        processor
+            .store_mut()
+            .owed_stack_ledgers()
+            .unwrap()
+            .is_empty(),
+        "nothing owed once the rewrite lands"
+    );
+}
+
+/// Two spaced listings omit a ledger that still EXISTS, so stable
+/// absence posts a replacement — displacing the recorded id on evidence,
+/// not proof. Once listings recover, both comments used to stand for
+/// ever with nothing owed (Codex ledger review round 22, P2). Displacing
+/// a recorded ledger now leaves a cleanup obligation behind: neutralize
+/// it, or learn from the 404 that it really was gone.
+#[test]
+fn a_displaced_ledger_is_owed_cleanup_not_forgotten() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    drain(&mut processor);
+    let old = ledgers_on(&world, 2)[0].0;
+
+    // The listings go blind to the (existing!) ledger long enough for
+    // absence to become stable.
+    world
+        .github
+        .lock()
+        .unwrap()
+        .hidden_from_listings
+        .insert(old);
+    processor.store_mut().mark_ledger_owed(PrNumber(2)).unwrap();
+    let remark = comment_body(&world.config, 2, "a remark", AUTHOR, "author", 9001);
+    world.enqueue(&mut processor, "issue_comment", remark);
+    drain(&mut processor);
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    let remark = comment_body(&world.config, 2, "another remark", AUTHOR, "author", 9002);
+    world.enqueue(&mut processor, "issue_comment", remark);
+    drain(&mut processor);
+
+    // The replacement stands; the displaced original still exists. Once
+    // the listings recover, exactly one ledger may remain.
+    world.github.lock().unwrap().hidden_from_listings.clear();
+    processor.requeue_marked_recoveries().unwrap();
+    run_sagas(&mut processor);
+    let after = ledgers_on(&world, 2);
+    assert_eq!(
+        after.len(),
+        1,
+        "displacing a recorded ledger owes its cleanup; two must not stand"
+    );
+    assert_ne!(after[0].0, old, "the replacement is the one that stands");
+    assert_ledgers_match_store(&world, &processor);
+    assert!(
+        processor
+            .store_mut()
+            .owed_stack_ledgers()
+            .unwrap()
+            .is_empty(),
+        "nothing owed once the displaced ledger is cleaned up"
+    );
+}
+
 /// A doctored ledger that also LOOKS like a command must still be
 /// repaired. Command authorization rejects the apparent command and
 /// returns early, so the repair has to happen before it (Codex ledger
@@ -3432,14 +3621,24 @@ mod ledger_property {
         /// A user (re)declares `pr`'s predecessor in a fresh comment.
         Declare { pr: u64 },
         /// A maintainer edits `pr`'s highest-ranked ledger comment into
-        /// a forgery with an unbeatable sequence number.
-        TamperLedger { pr: u64 },
+        /// a forgery with an unbeatable sequence number. When `stale`,
+        /// the listing cache keeps serving the pre-edit body.
+        TamperLedger { pr: u64, stale: bool },
+        /// A maintainer edits the marker out of `pr`'s ledger comment,
+        /// leaving plain text. When `stale`, the listing cache keeps
+        /// serving the pre-edit body.
+        EditAwayLedger { pr: u64, stale: bool },
         /// A maintainer edits some other bot reply on `pr` into a
         /// forged ledger.
         ForgeSibling { pr: u64 },
         /// A maintainer deletes `pr`'s ledger comment; the webhook may
-        /// arrive only after everything else.
-        DeleteLedger { pr: u64, delayed_webhook: bool },
+        /// arrive only after everything else, and the listing cache may
+        /// keep serving the dead comment as a ghost.
+        DeleteLedger {
+            pr: u64,
+            delayed_webhook: bool,
+            ghost: bool,
+        },
         /// GitHub's listings transiently omit every comment currently
         /// on `pr` (they still exist; writes by id still reach them).
         HideListings { pr: u64 },
@@ -3453,25 +3652,33 @@ mod ledger_property {
         LosePostResponses,
         /// The worker dies; a fresh one takes over the same store.
         Restart,
+        /// Time passes mid-adversity: the stall timer fires and the
+        /// machinery retries WHILE the world is still lying to it.
+        Tick,
     }
 
     fn arb_adversarial_action() -> impl Strategy<Value = AdversarialAction> {
         prop_oneof![
             3 => (2u64..=3).prop_map(|pr| AdversarialAction::Declare { pr }),
-            2 => (2u64..=3).prop_map(|pr| AdversarialAction::TamperLedger { pr }),
+            2 => ((2u64..=3), proptest::bool::ANY)
+                .prop_map(|(pr, stale)| AdversarialAction::TamperLedger { pr, stale }),
+            2 => ((2u64..=3), proptest::bool::ANY)
+                .prop_map(|(pr, stale)| AdversarialAction::EditAwayLedger { pr, stale }),
             2 => (2u64..=3).prop_map(|pr| AdversarialAction::ForgeSibling { pr }),
-            2 => ((2u64..=3), proptest::bool::ANY).prop_map(|(pr, delayed_webhook)| {
-                AdversarialAction::DeleteLedger {
+            2 => ((2u64..=3), proptest::bool::ANY, proptest::bool::ANY).prop_map(
+                |(pr, delayed_webhook, ghost)| AdversarialAction::DeleteLedger {
                     pr,
                     delayed_webhook,
-                }
-            }),
+                    ghost,
+                },
+            ),
             1 => (2u64..=3).prop_map(|pr| AdversarialAction::HideListings { pr }),
             1 => Just(AdversarialAction::UnhideAll),
             1 => Just(AdversarialAction::BreakUpdates),
             1 => Just(AdversarialAction::HealUpdates),
             1 => Just(AdversarialAction::LosePostResponses),
             1 => Just(AdversarialAction::Restart),
+            2 => Just(AdversarialAction::Tick),
         ]
     }
 
@@ -3576,20 +3783,36 @@ mod ledger_property {
                     );
                     world.enqueue(&mut processor, "issue_comment", body);
                 }
-                AdversarialAction::TamperLedger { pr } => {
+                AdversarialAction::TamperLedger { pr, stale } => {
                     let Some((id, _)) = ledgers_on(&world, pr).into_iter().next() else {
                         continue;
                     };
                     let forged = forged_body(pr);
-                    world
-                        .github
-                        .lock()
-                        .unwrap()
-                        .comments
-                        .get_mut(&id)
-                        .unwrap()
-                        .body = forged.clone();
+                    {
+                        let mut github = world.github.lock().unwrap();
+                        let comment = github.comments.get_mut(&id).unwrap();
+                        let pre_edit = std::mem::replace(&mut comment.body, forged.clone());
+                        if stale {
+                            github.stale_listing_bodies.insert(id, pre_edit);
+                        }
+                    }
                     let hook = edited_comment_webhook(&world.config, pr, id.0, &forged);
+                    world.enqueue(&mut processor, "issue_comment", hook);
+                }
+                AdversarialAction::EditAwayLedger { pr, stale } => {
+                    let Some((id, _)) = ledgers_on(&world, pr).into_iter().next() else {
+                        continue;
+                    };
+                    {
+                        let mut github = world.github.lock().unwrap();
+                        let comment = github.comments.get_mut(&id).unwrap();
+                        let pre_edit =
+                            std::mem::replace(&mut comment.body, "vandalized".to_string());
+                        if stale {
+                            github.stale_listing_bodies.insert(id, pre_edit);
+                        }
+                    }
+                    let hook = edited_comment_webhook(&world.config, pr, id.0, "vandalized");
                     world.enqueue(&mut processor, "issue_comment", hook);
                 }
                 AdversarialAction::ForgeSibling { pr } => {
@@ -3620,11 +3843,18 @@ mod ledger_property {
                 AdversarialAction::DeleteLedger {
                     pr,
                     delayed_webhook,
+                    ghost,
                 } => {
                     let Some((id, _)) = ledgers_on(&world, pr).into_iter().next() else {
                         continue;
                     };
-                    world.github.lock().unwrap().comments.remove(&id);
+                    {
+                        let mut github = world.github.lock().unwrap();
+                        let removed = github.comments.remove(&id).unwrap();
+                        if ghost {
+                            github.stale_listing_ghosts.insert(id, removed);
+                        }
+                    }
                     let hook = deleted_comment_webhook(&world.config, pr, id.0);
                     if delayed_webhook {
                         delayed.push(hook);
@@ -3660,6 +3890,11 @@ mod ledger_property {
                     drop(processor);
                     processor = world.processor();
                 }
+                AdversarialAction::Tick => {
+                    std::thread::sleep(std::time::Duration::from_millis(30));
+                    processor.requeue_marked_recoveries().unwrap();
+                    run_sagas(&mut processor);
+                }
             }
             drain(&mut processor);
         }
@@ -3669,6 +3904,8 @@ mod ledger_property {
         {
             let mut github = world.github.lock().unwrap();
             github.hidden_from_listings.clear();
+            github.stale_listing_bodies.clear();
+            github.stale_listing_ghosts.clear();
             github.update_comment_broken = false;
             github.post_comment_response_lost = false;
         }
@@ -3748,7 +3985,7 @@ mod ledger_property {
     fn adversarial_fixed_cases() {
         adversarial_case(&[
             AdversarialAction::Declare { pr: 2 },
-            AdversarialAction::TamperLedger { pr: 2 },
+            AdversarialAction::TamperLedger { pr: 2, stale: true },
             AdversarialAction::HideListings { pr: 2 },
         ]);
         adversarial_case(&[
@@ -3763,9 +4000,39 @@ mod ledger_property {
             AdversarialAction::DeleteLedger {
                 pr: 2,
                 delayed_webhook: true,
+                ghost: false,
             },
             AdversarialAction::LosePostResponses,
             AdversarialAction::Restart,
+        ]);
+        // The round-22 shapes: a ghost of a confirmed deletion, an
+        // unidentified edit-away behind a stale body after a lost post
+        // response, and a displacement by listing blindness with time
+        // passing mid-adversity.
+        adversarial_case(&[
+            AdversarialAction::Declare { pr: 2 },
+            AdversarialAction::DeleteLedger {
+                pr: 2,
+                delayed_webhook: false,
+                ghost: true,
+            },
+            AdversarialAction::Tick,
+        ]);
+        adversarial_case(&[
+            AdversarialAction::LosePostResponses,
+            AdversarialAction::Declare { pr: 2 },
+            AdversarialAction::HealUpdates,
+            AdversarialAction::EditAwayLedger { pr: 2, stale: true },
+            AdversarialAction::Tick,
+        ]);
+        adversarial_case(&[
+            AdversarialAction::Declare { pr: 2 },
+            AdversarialAction::HideListings { pr: 2 },
+            AdversarialAction::Tick,
+            AdversarialAction::Tick,
+            AdversarialAction::Tick,
+            AdversarialAction::UnhideAll,
+            AdversarialAction::Tick,
         ]);
     }
 }

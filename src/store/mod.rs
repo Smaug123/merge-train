@@ -847,6 +847,52 @@ impl Store {
         Ok(repairs)
     }
 
+    /// Distrusts a comment id: `dead` when its deletion is proven (a
+    /// webhook, or a write answered 404) — never select it from a
+    /// listing again; live-but-tainted when it was edited under us
+    /// without identification — a selection must rewrite, never accept
+    /// a cached body (Codex ledger review round 22, P2). Death is
+    /// permanent: a taint never downgrades it.
+    pub fn distrust_ledger_comment(
+        &mut self,
+        pr: PrNumber,
+        comment_id: CommentId,
+        dead: bool,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO ledger_comment_distrust (comment_id, pr, dead) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(comment_id) DO UPDATE SET dead = MAX(dead, excluded.dead)",
+            rusqlite::params![comment_id.0 as i64, pr.0 as i64, dead as i64],
+        )?;
+        Ok(())
+    }
+
+    /// The distrusted comment ids on `pr`, each with whether it is dead.
+    pub fn ledger_distrust(&self, pr: PrNumber) -> Result<Vec<(CommentId, bool)>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT comment_id, dead FROM ledger_comment_distrust WHERE pr = ?1 ORDER BY comment_id",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![pr.0 as i64], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut distrust = Vec::new();
+        for row in rows {
+            let (comment_id, dead) = row?;
+            distrust.push((CommentId(comment_id as u64), dead != 0));
+        }
+        Ok(distrust)
+    }
+
+    /// An acknowledged write to a comment re-earns its trust: we know
+    /// what it says now. Death is not a taint and stays.
+    pub fn clear_ledger_taint(&mut self, comment_id: CommentId) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM ledger_comment_distrust WHERE comment_id = ?1 AND dead = 0",
+            rusqlite::params![comment_id.0 as i64],
+        )?;
+        Ok(())
+    }
+
     /// Every PR with a repair owed, for requeueing after a restart or a
     /// stall retry.
     pub fn ledger_repair_prs(&self) -> Result<Vec<PrNumber>, StoreError> {
@@ -1243,6 +1289,20 @@ fn init_schema(conn: &Connection) -> Result<(), StoreError> {
             rewrite       INTEGER NOT NULL,
             generation    INTEGER NOT NULL,
             PRIMARY KEY (pr, comment_id)
+        );
+
+        -- Comment ids the ledger machinery must not trust from a
+        -- listing. DEAD ones are proven gone (a deletion webhook, or a
+        -- write answered 404): a listing still showing one serves a
+        -- ghost, and selecting it discharges obligations against a
+        -- comment that does not exist. TAINTED ones were edited under
+        -- us without identification (only the repost guard matched):
+        -- a listed body may predate the edit, so a selection must
+        -- REWRITE — only an acknowledged write re-earns trust.
+        CREATE TABLE ledger_comment_distrust (
+            comment_id INTEGER PRIMARY KEY,
+            pr         INTEGER NOT NULL,
+            dead       INTEGER NOT NULL
         );
 
         -- Monotone counters that are not event sequence numbers.
