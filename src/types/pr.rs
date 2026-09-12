@@ -138,6 +138,19 @@ pub struct CachedPr {
     /// Used to identify when the declaration is deleted or edited.
     pub predecessor_comment_id: Option<CommentId>,
 
+    /// The highest declaration-comment id the bot has ACTED on for this
+    /// PR — recorded or retracted. Everything at or below it is a comment
+    /// whose fate the bot has already settled, which is what lets a crawl
+    /// tell an old superseded declaration (explained) from one that
+    /// appeared while the bot was away (evidence the topology moved).
+    pub declarations_settled_through: Option<CommentId>,
+
+    /// The bot's own stack-ledger comment on this PR, once it knows the id:
+    /// the durable record of the two fields above, which a store rebuilt
+    /// from GitHub alone reads back instead of re-deriving the topology
+    /// from the users' comments (`status::ledger`).
+    pub ledger_comment_id: Option<CommentId>,
+
     /// The current state of the PR.
     pub state: PrState,
 
@@ -188,6 +201,8 @@ impl CachedPr {
             base_ref,
             predecessor,
             predecessor_comment_id: None,
+            declarations_settled_through: None,
+            ledger_comment_id: None,
             state,
             merge_state_status,
             is_draft,

@@ -328,7 +328,7 @@ impl FakeGitHub {
                     }
                     // A deleted comment 404s, exactly like GitHub.
                     None => Err(EffectError::Permanent {
-                        kind: TrainErrorKind::ApiError,
+                        kind: TrainErrorKind::NotFound,
                         detail: format!("no such comment {comment_id} (fake 404)"),
                     }),
                 }

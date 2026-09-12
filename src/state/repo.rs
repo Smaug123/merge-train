@@ -336,6 +336,26 @@ impl RepoState {
                 }
             }
 
+            // The ledger comment's id, so the next write edits it in place
+            // rather than posting a second record of the same PR.
+            StateEventPayload::StackLedgerPosted { pr, comment_id } => {
+                if let Some(p) = self.prs.get_mut(pr) {
+                    p.ledger_comment_id = Some(*comment_id);
+                    prs_mutated = true;
+                }
+            }
+
+            // Only the comment the event names: a retirement that raced a
+            // later post must not forget the newer comment.
+            StateEventPayload::StackLedgerRetired { pr, comment_id } => {
+                if let Some(p) = self.prs.get_mut(pr)
+                    && p.ledger_comment_id == Some(*comment_id)
+                {
+                    p.ledger_comment_id = None;
+                    prs_mutated = true;
+                }
+            }
+
             StateEventPayload::PredecessorDeclared {
                 pr,
                 predecessor,
@@ -344,6 +364,11 @@ impl RepoState {
                 if let Some(p) = self.prs.get_mut(pr) {
                     p.predecessor = Some(*predecessor);
                     p.predecessor_comment_id = Some(*comment_id);
+                    // Monotone: webhooks can arrive out of order, and a
+                    // settled watermark that moved backwards would make a
+                    // crawl read already-settled comments as new evidence.
+                    p.declarations_settled_through =
+                        p.declarations_settled_through.max(Some(*comment_id));
                     prs_mutated = true;
                 }
             }
@@ -359,6 +384,8 @@ impl RepoState {
                 {
                     p.predecessor = None;
                     p.predecessor_comment_id = None;
+                    p.declarations_settled_through =
+                        p.declarations_settled_through.max(Some(*comment_id));
                     prs_mutated = true;
                 }
             }
@@ -583,6 +610,13 @@ mod tests {
         ]
     }
 
+    /// A comment id from a tiny set, so a removal or retirement names the
+    /// comment currently in force often enough to exercise the guarded
+    /// arms, and misses it often enough to exercise the no-op ones.
+    fn arb_small_comment() -> impl Strategy<Value = CommentId> {
+        (1u64..=3).prop_map(CommentId)
+    }
+
     fn arb_pr_state() -> impl Strategy<Value = PrState> {
         prop_oneof![
             Just(PrState::Open),
@@ -734,12 +768,19 @@ mod tests {
                 .prop_map(|(pr, sha)| StateEventPayload::PrMerged { pr, merge_sha: sha }),
             (arb_small_pr(), arb_pr_state_string())
                 .prop_map(|(pr, state)| StateEventPayload::PrStateChanged { pr, state }),
-            (arb_small_pr(), arb_small_pr()).prop_map(|(pr, pred)| {
+            (arb_small_pr(), arb_small_pr(), arb_small_comment()).prop_map(|(pr, pred, c)| {
                 StateEventPayload::PredecessorDeclared {
                     pr,
                     predecessor: pred,
-                    comment_id: CommentId(1),
+                    comment_id: c,
                 }
+            }),
+            // Stack-ledger bookkeeping: where the ledger comment lives.
+            (arb_small_pr(), arb_small_comment()).prop_map(|(pr, comment_id)| {
+                StateEventPayload::StackLedgerPosted { pr, comment_id }
+            }),
+            (arb_small_pr(), arb_small_comment()).prop_map(|(pr, comment_id)| {
+                StateEventPayload::StackLedgerRetired { pr, comment_id }
             }),
             (
                 arb_small_pr(),
@@ -752,9 +793,8 @@ mod tests {
                     original_root_pr: orig,
                 }),
             // PR-lifecycle arms — exercise the cache/index materialization.
-            arb_small_pr().prop_map(|pr| StateEventPayload::PredecessorRemoved {
-                pr,
-                comment_id: CommentId(1),
+            (arb_small_pr(), arb_small_comment()).prop_map(|(pr, comment_id)| {
+                StateEventPayload::PredecessorRemoved { pr, comment_id }
             }),
             (
                 arb_small_pr(),
@@ -816,6 +856,43 @@ mod tests {
         ]
     }
 
+    /// Only the events the stack-ledger fields answer to, over three PRs:
+    /// dense enough that posts, retirements, declarations and removals
+    /// keep landing on the same PR in every order.
+    fn arb_ledger_event() -> impl Strategy<Value = StateEvent> {
+        let pr = || (1u64..=3).prop_map(PrNumber);
+        let payload = prop_oneof![
+            (pr(), arb_small_comment()).prop_map(|(pr, comment_id)| {
+                StateEventPayload::StackLedgerPosted { pr, comment_id }
+            }),
+            (pr(), arb_small_comment()).prop_map(|(pr, comment_id)| {
+                StateEventPayload::StackLedgerRetired { pr, comment_id }
+            }),
+            (pr(), pr(), arb_small_comment()).prop_map(|(pr, pred, c)| {
+                StateEventPayload::PredecessorDeclared {
+                    pr,
+                    predecessor: pred,
+                    comment_id: c,
+                }
+            }),
+            (pr(), arb_small_comment()).prop_map(|(pr, comment_id)| {
+                StateEventPayload::PredecessorRemoved { pr, comment_id }
+            }),
+            (pr(), arb_sha()).prop_map(|(pr, head_sha)| StateEventPayload::PrOpened {
+                pr,
+                head_sha,
+                head_ref: "a".to_string(),
+                base_ref: "main".to_string(),
+                is_draft: false,
+            }),
+        ];
+        (any::<u64>(), arb_datetime(), payload).prop_map(|(seq, ts, payload)| StateEvent {
+            seq,
+            ts,
+            payload,
+        })
+    }
+
     fn arb_pool_event() -> impl Strategy<Value = StateEvent> {
         (any::<u64>(), arb_datetime(), arb_pool_event_payload())
             .prop_map(|(seq, ts, payload)| StateEvent { seq, ts, payload })
@@ -870,6 +947,88 @@ mod tests {
             }
 
             prop_assert_eq!(full, resumed);
+        }
+
+        /// The stack-ledger fields are pure functions of the event history,
+        /// per PR, against this reference: the ledger's comment id is the
+        /// last one posted unless a later retirement named exactly it; the
+        /// settled watermark is the largest declaration comment the state
+        /// actually took (a removal naming a comment no longer in force
+        /// takes nothing), and never moves backwards.
+        #[test]
+        fn ledger_fields_follow_their_reference(
+            initial in arb_repo_state(),
+            events in prop::collection::vec(arb_ledger_event(), 0..30),
+        ) {
+            #[derive(Default, Clone, Copy)]
+            struct Ref {
+                ledger: Option<CommentId>,
+                owner: Option<CommentId>,
+                settled: Option<CommentId>,
+            }
+            let mut reference: HashMap<PrNumber, Ref> = initial
+                .prs
+                .iter()
+                .map(|(pr, p)| {
+                    (
+                        *pr,
+                        Ref {
+                            ledger: p.ledger_comment_id,
+                            owner: p.predecessor_comment_id,
+                            settled: p.declarations_settled_through,
+                        },
+                    )
+                })
+                .collect();
+            let mut state = initial;
+            for event in &events {
+                match &event.payload {
+                    StateEventPayload::PrOpened { pr, .. } => {
+                        reference.entry(*pr).or_default();
+                    }
+                    StateEventPayload::StackLedgerPosted { pr, comment_id } => {
+                        if let Some(r) = reference.get_mut(pr) {
+                            r.ledger = Some(*comment_id);
+                        }
+                    }
+                    StateEventPayload::StackLedgerRetired { pr, comment_id } => {
+                        if let Some(r) = reference.get_mut(pr)
+                            && r.ledger == Some(*comment_id)
+                        {
+                            r.ledger = None;
+                        }
+                    }
+                    StateEventPayload::PredecessorDeclared { pr, comment_id, .. } => {
+                        if let Some(r) = reference.get_mut(pr) {
+                            r.owner = Some(*comment_id);
+                            r.settled = r.settled.max(Some(*comment_id));
+                        }
+                    }
+                    StateEventPayload::PredecessorRemoved { pr, comment_id } => {
+                        if let Some(r) = reference.get_mut(pr)
+                            && r.owner == Some(*comment_id)
+                        {
+                            r.owner = None;
+                            r.settled = r.settled.max(Some(*comment_id));
+                        }
+                    }
+                    _ => {}
+                }
+                let settled_before: HashMap<PrNumber, Option<CommentId>> = state
+                    .prs
+                    .iter()
+                    .map(|(pr, p)| (*pr, p.declarations_settled_through))
+                    .collect();
+                state.apply_event(event);
+                for (pr, p) in &state.prs {
+                    let r = reference.get(pr).copied().unwrap_or_default();
+                    prop_assert_eq!(p.ledger_comment_id, r.ledger, "ledger id of {} after {:?}", pr, event.payload);
+                    prop_assert_eq!(p.declarations_settled_through, r.settled, "watermark of {} after {:?}", pr, event.payload);
+                    if let Some(before) = settled_before.get(pr) {
+                        prop_assert!(p.declarations_settled_through >= *before, "watermark of {} moved backwards", pr);
+                    }
+                }
+            }
         }
 
     }
