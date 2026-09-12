@@ -236,6 +236,16 @@ pub(crate) struct Processor {
     /// for. The write clears THAT generation and no other, so anything
     /// that dirtied the ledger while it was out survives it.
     ledger_write_gen: HashMap<PrNumber, u64>,
+    /// PRs whose replacement POST failed AMBIGUOUSLY — the response was
+    /// lost, so the comment may exist unrecorded. Independent of the
+    /// in-flight binding, which a failure removes: a delayed deletion
+    /// webhook for the still-recorded predecessor must not drop the
+    /// repost guard while a replacement may already stand (Codex ledger
+    /// review round 19, P2). Resolved by a probe that SEES a ledger, or
+    /// by a later post's acknowledged outcome. In-memory: a restart
+    /// falls back to the conservative owed-plus-recorded seeding of
+    /// `ledger_posts_attempted`.
+    unacked_ledger_posts: HashSet<PrNumber>,
     /// PRs a ledger POST has been dispatched for, or may have been by a
     /// process that died holding the obligation. Absence in a listing is
     /// only evidence for these; for anything else there is nothing to
@@ -380,6 +390,7 @@ impl Processor {
             deferred_for_sync: HashSet::new(),
             ledger_probes: HashMap::new(),
             ledger_write_gen: HashMap::new(),
+            unacked_ledger_posts: HashSet::new(),
             ledger_posts_attempted,
             startup_evaluates: Some(startup_evaluates),
             active_start: None,
@@ -587,6 +598,22 @@ impl Processor {
                 // return early (an apparent command that authorization
                 // refuses), and nothing later would queue it.
                 self.queue(PendingWork::LedgerSync { pr });
+                if positively_ours {
+                    match comment.action {
+                        // The webhook NAMES the comment: remember it, so
+                        // an eventually-consistent listing that omits it
+                        // cannot discharge the obligation past a known
+                        // forgery (Codex ledger review round 19, P2).
+                        crate::webhooks::events::CommentAction::Edited => {
+                            self.store.add_ledger_suspect(pr, comment.comment_id)?;
+                        }
+                        // A deletion proves the comment gone: there is
+                        // nothing left to verify about it.
+                        _ => {
+                            self.store.remove_ledger_suspect(pr, comment.comment_id)?;
+                        }
+                    }
+                }
                 // Whether the deletion took the LIVE ledger with it:
                 // the recorded comment when there is one — a deleted
                 // ledger-shaped body that is NOT the recorded comment
@@ -603,6 +630,7 @@ impl Processor {
                 if comment.action == crate::webhooks::events::CommentAction::Deleted
                     && deleted_the_live_ledger
                     && !self.ledger_write_gen.contains_key(&pr)
+                    && !self.unacked_ledger_posts.contains(&pr)
                 {
                     // The webhook itself proves the old ledger is gone, so
                     // a replacement needs no listing to confirm it. Only
@@ -616,7 +644,9 @@ impl Processor {
                     // webhook describes the PREDECESSOR of the comment
                     // the in-flight write creates, and dropping the guard
                     // here let one short listing post a third (round 16,
-                    // P2).
+                    // P2). An UNACKNOWLEDGED post — dispatched, response
+                    // lost — is the same replacement in a different
+                    // dress, so it blocks the drop too (round 19, P2).
                     self.ledger_posts_attempted.remove(&pr);
                 }
             }
@@ -1394,6 +1424,7 @@ impl Processor {
                 Ok(crate::cascade::EffectResponse::GitHub(GitHubResponse::CommentPosted {
                     id,
                 })) => {
+                    self.unacked_ledger_posts.remove(&ledger.pr);
                     // Record where the ledger lives BEFORE clearing the
                     // obligation: a crash in between re-writes the ledger,
                     // which is idempotent, while the reverse order could
@@ -1420,6 +1451,12 @@ impl Processor {
                     // duplicate the cleanup had not yet seen (Codex
                     // ledger review round 17, P2).
                     self.ledger_write_gen.remove(&ledger.pr);
+                    // A failed POST is ambiguous — the comment may exist
+                    // with its response lost — and the deletion fast
+                    // path must know (round 19, P2).
+                    if posted_to.is_some() {
+                        self.unacked_ledger_posts.insert(ledger.pr);
+                    }
                     self.retry_requested = true;
                 }
             }
@@ -1587,6 +1624,13 @@ impl Processor {
         Ok(cleanup)
     }
 
+    /// How far apart two listings must be for their agreement on an
+    /// absence to count as evidence rather than one stale read twice.
+    fn absence_cooldown(&self) -> chrono::Duration {
+        chrono::Duration::from_std(self.deps.stall_retry_delay)
+            .unwrap_or_else(|_| chrono::Duration::seconds(30))
+    }
+
     /// Clears the obligation the in-flight write for `pr` was made for.
     /// Nothing is cleared when the generation is unknown (a restart lost
     /// it) or has moved on (the ledger was dirtied again while the write
@@ -1628,6 +1672,34 @@ impl Processor {
             self.retry_requested = true;
             return self.finish_boundary(pr, cleanup);
         };
+        // NAMED evidence first: comments a webhook reported edited into
+        // ledgers. A fresh listing that SHOWS one hands it to the
+        // machinery below (as the live ledger or a forged sibling); one
+        // that OMITS it proves nothing — listings are eventually
+        // consistent and can lag the webhook — so the obligation cannot
+        // be discharged until every suspect is seen or stably absent
+        // (Codex ledger review round 19, P2). A stale listing (the
+        // generation moved mid-probe) neither resolves nor strikes.
+        let mut suspects_unseen = 0u32;
+        if owed.generation == probe_generation {
+            let listed: HashSet<crate::types::CommentId> = comments.iter().map(|c| c.id).collect();
+            for suspect in self.store.ledger_suspects(pr)? {
+                if listed.contains(&suspect) {
+                    self.store.remove_ledger_suspect(pr, suspect)?;
+                } else if self.store.note_absent_ledger_suspect(
+                    pr,
+                    suspect,
+                    Utc::now(),
+                    self.absence_cooldown(),
+                )? >= ABSENT_PROBES_BEFORE_BELIEVED
+                {
+                    // Two spaced listings never showed it: believed gone.
+                    self.store.remove_ledger_suspect(pr, suspect)?;
+                } else {
+                    suspects_unseen += 1;
+                }
+            }
+        }
         // The state this write states, and the watermark that says so: an
         // event appended while the write is in flight carries a higher
         // sequence number, so it survives this write's acknowledgement.
@@ -1649,7 +1721,7 @@ impl Processor {
                 .map(|c| c.id)
                 .collect();
             if forged.is_empty() {
-                if owed.generation == probe_generation {
+                if owed.generation == probe_generation && suspects_unseen == 0 {
                     info!(%pr, "no cached PR for an owed stack ledger; dropping the obligation");
                     self.store.clear_owed_stack_ledger(pr, probe_generation)?;
                 } else {
@@ -1750,6 +1822,11 @@ impl Processor {
                 // the PR — and the next transiently-short listing posted
                 // a duplicate (Codex ledger review round 15, P2).
                 self.ledger_posts_attempted.insert(pr);
+                // ...and it resolves a lost-response post: whatever
+                // landed, a ledger stands and is recorded below, so the
+                // deletion fast path no longer needs to fear an unseen
+                // replacement (round 19, P2).
+                self.unacked_ledger_posts.remove(&pr);
                 if cached.ledger_comment_id != Some(comment_id) {
                     // Found one the store did not know about: record where
                     // it lives before writing to it, or the next crash
@@ -1786,10 +1863,17 @@ impl Processor {
                             && l.settled_through == desired.settled_through
                             && l.seq <= desired.seq
                     });
-                if satisfied && extras.is_empty() {
+                if satisfied && extras.is_empty() && suspects_unseen == 0 {
                     // It already says what the store holds. Rewriting it
                     // would be a write that can only fail.
                     self.store.clear_owed_stack_ledger(pr, owed.generation)?;
+                    return self.finish_boundary(pr, cleanup);
+                }
+                if satisfied && extras.is_empty() {
+                    // Nothing visible needs a write, but a NAMED suspect
+                    // is still unseen: the obligation waits for it or
+                    // for its confirmed absence (round 19, P2).
+                    self.retry_requested = true;
                     return self.finish_boundary(pr, cleanup);
                 }
                 if satisfied {
@@ -1814,9 +1898,9 @@ impl Processor {
                 // posted for is simply new, and waiting would delay every
                 // first ledger by a stall cycle for nothing.
                 if self.ledger_posts_attempted.contains(&pr) {
-                    let cooldown = chrono::Duration::from_std(self.deps.stall_retry_delay)
-                        .unwrap_or_else(|_| chrono::Duration::seconds(30));
-                    let absences = self.store.note_absent_ledger(pr, Utc::now(), cooldown)?;
+                    let absences =
+                        self.store
+                            .note_absent_ledger(pr, Utc::now(), self.absence_cooldown())?;
                     if absences < ABSENT_PROBES_BEFORE_BELIEVED {
                         warn!(
                             %pr, absences,
@@ -1836,13 +1920,13 @@ impl Processor {
             }
         };
         self.in_flight = Some(pr);
-        if extras.is_empty() && owed.generation == probe_generation {
+        if extras.is_empty() && owed.generation == probe_generation && suspects_unseen == 0 {
             self.ledger_write_gen.insert(pr, probe_generation);
         } else {
             // With forged siblings in play — or an obligation that moved
-            // while the listing was in flight, so a forgery may exist
-            // this listing never saw (Codex ledger review round 18, P2)
-            // — no write here discharges the obligation: it stays open
+            // while the listing was in flight, or a NAMED suspect this
+            // listing has not yet shown, so a forgery may exist it never
+            // saw (Codex ledger review rounds 18 and 19, P2) — no write here discharges the obligation: it stays open
             // until a fresh listing (at the stall cadence, or via the
             // sync the advancing webhook queued) confirms the set is
             // clean. A binding left over from an earlier failed attempt

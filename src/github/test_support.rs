@@ -95,6 +95,10 @@ pub struct FakeGitHub {
     /// `UpdateComment` calls that reached a live comment, so a test can
     /// assert that a satisfied obligation writes nothing further.
     pub comment_updates: u32,
+    /// While set, `PostComment` CREATES the comment but reports a
+    /// transient failure — the response is lost on the wire. The comment
+    /// exists; nothing acknowledged it.
+    pub post_comment_response_lost: bool,
     /// While set, `UpdateComment` fails `Permanent` while everything else
     /// keeps working: the token can still READ comments but has lost the
     /// right to edit them, so an owed rewrite can never land.
@@ -118,6 +122,7 @@ impl FakeGitHub {
             blocked: std::collections::HashSet::new(),
             hidden_from_listings: std::collections::HashSet::new(),
             comment_updates: 0,
+            post_comment_response_lost: false,
             update_comment_broken: false,
         }
     }
@@ -309,6 +314,11 @@ impl FakeGitHub {
                         edited: false,
                     },
                 );
+                if self.post_comment_response_lost {
+                    return Err(EffectError::Transient {
+                        detail: "post landed but the response was lost (test-injected)".to_owned(),
+                    });
+                }
                 Ok(GitHubResponse::CommentPosted { id })
             }
             GitHubEffect::UpdateComment { comment_id, body } => {

@@ -746,6 +746,85 @@ impl Store {
         Ok(())
     }
 
+    /// Records a NAMED ledger suspect: a bot comment a webhook reported
+    /// edited while it was (or became) ledger-shaped for `pr`. The
+    /// listing-driven repair must see it, or confirm its absence across
+    /// spaced listings, before the PR's obligation is discharged (Codex
+    /// ledger review round 19, P2). Re-suspecting restarts the absence
+    /// count: a fresh edit voids what earlier listings proved.
+    pub fn add_ledger_suspect(
+        &mut self,
+        pr: PrNumber,
+        comment_id: CommentId,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO owed_ledger_suspects (pr, comment_id, absent_probes, absent_at) \
+             VALUES (?1, ?2, 0, NULL) \
+             ON CONFLICT(pr, comment_id) DO UPDATE SET absent_probes = 0, absent_at = NULL",
+            rusqlite::params![pr.0 as i64, comment_id.0 as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Forgets a ledger suspect: it was seen by a fresh listing (the
+    /// normal machinery has it now), its absence became stable, or its
+    /// deletion webhook proved it gone.
+    pub fn remove_ledger_suspect(
+        &mut self,
+        pr: PrNumber,
+        comment_id: CommentId,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM owed_ledger_suspects WHERE pr = ?1 AND comment_id = ?2",
+            rusqlite::params![pr.0 as i64, comment_id.0 as i64],
+        )?;
+        Ok(())
+    }
+
+    /// The ledger suspects recorded for `pr`.
+    pub fn ledger_suspects(&self, pr: PrNumber) -> Result<Vec<CommentId>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT comment_id FROM owed_ledger_suspects WHERE pr = ?1 ORDER BY comment_id",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![pr.0 as i64], |row| row.get::<_, i64>(0))?;
+        let mut suspects = Vec::new();
+        for row in rows {
+            suspects.push(CommentId(row? as u64));
+        }
+        Ok(suspects)
+    }
+
+    /// Records that a fresh listing omitted a suspect, and answers how
+    /// many listings at least `cooldown` apart have now done so — the
+    /// same stable-absence contract as `note_absent_ledger`.
+    pub fn note_absent_ledger_suspect(
+        &mut self,
+        pr: PrNumber,
+        comment_id: CommentId,
+        now: DateTime<Utc>,
+        cooldown: chrono::Duration,
+    ) -> Result<u32, StoreError> {
+        let (count, last): (i64, Option<String>) = self.conn.query_row(
+            "SELECT absent_probes, absent_at FROM owed_ledger_suspects \
+             WHERE pr = ?1 AND comment_id = ?2",
+            rusqlite::params![pr.0 as i64, comment_id.0 as i64],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let too_soon = last
+            .as_deref()
+            .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+            .is_some_and(|at| now - at.with_timezone(&Utc) < cooldown);
+        if too_soon {
+            return Ok(count as u32);
+        }
+        self.conn.execute(
+            "UPDATE owed_ledger_suspects SET absent_probes = absent_probes + 1, absent_at = ?3 \
+             WHERE pr = ?1 AND comment_id = ?2",
+            rusqlite::params![pr.0 as i64, comment_id.0 as i64, now.to_rfc3339()],
+        )?;
+        Ok(count as u32 + 1)
+    }
+
     /// Clears the owed sync for one train incarnation (idempotent).
     pub fn delete_owed_status_sync(
         &mut self,
@@ -1111,6 +1190,20 @@ fn init_schema(conn: &Connection) -> Result<(), StoreError> {
             generation           INTEGER NOT NULL,
             absent_probes INTEGER NOT NULL DEFAULT 0,
             absent_at     TEXT
+        );
+
+        -- Bot comments a webhook reported edited while ledger-shaped:
+        -- NAMED evidence the listing-driven repair must account for —
+        -- see the comment (and repair or neutralize it), or confirm its
+        -- absence across spaced listings — before the PR's obligation
+        -- may be discharged. An eventually-consistent listing can omit
+        -- a comment the webhook has already named.
+        CREATE TABLE owed_ledger_suspects (
+            pr            INTEGER NOT NULL,
+            comment_id    INTEGER NOT NULL,
+            absent_probes INTEGER NOT NULL DEFAULT 0,
+            absent_at     TEXT,
+            PRIMARY KEY (pr, comment_id)
         );
 
         -- Monotone counters that are not event sequence numbers.
