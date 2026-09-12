@@ -2619,6 +2619,215 @@ fn an_unacknowledged_replacement_still_guards_after_a_late_deletion() {
     );
 }
 
+/// Seeing a suspect is not the same as repairing it: the reconciliation
+/// used to forget a suspect the moment a listing showed it, so a FAILED
+/// neutralization followed by one short listing let the satisfied
+/// primary discharge the obligation with the known forgery standing
+/// (Codex ledger review round 20, P2). A suspect leaves the books only
+/// seen in a good state — inert, or as the satisfied ledger itself — or
+/// stably absent.
+#[test]
+fn a_suspect_outlives_a_failed_neutralization() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    drain(&mut processor);
+    let real = ledgers_on(&world, 2)[0].0;
+
+    // A bot reply becomes a forged ledger; the webhook names it.
+    let forged = crate::status::format_stack_ledger(&crate::status::StackLedger {
+        pr: PrNumber(2),
+        declared: None,
+        seq: u64::MAX,
+        settled_through: None,
+    });
+    {
+        let mut github = world.github.lock().unwrap();
+        github.comments.insert(
+            crate::types::CommentId(4242),
+            FakeComment {
+                pr: PrNumber(2),
+                author_id: TEST_BOT_ID,
+                body: forged.clone(),
+                edited: true,
+            },
+        );
+        // The first repair attempt will fail.
+        github.update_comment_broken = true;
+    }
+    let edit = format!(
+        r#"{{
+            "action": "edited",
+            "comment": {{
+                "id": 4242,
+                "body": "{body}",
+                "user": {{ "id": {TEST_BOT_ID}, "login": "merge-train" }},
+                "updated_at": "2026-07-01T12:00:00Z"
+            }},
+            "issue": {{
+                "number": 2,
+                "pull_request": {{ "url": "..." }},
+                "user": {{ "id": {AUTHOR}, "login": "author" }}
+            }},
+            "repository": {repo},
+            "sender": {{ "id": {AUTHOR}, "login": "author" }}
+        }}"#,
+        body = json_escaped(&forged),
+        repo = repo_json(&world.config),
+    );
+    world.enqueue(&mut processor, "issue_comment", edit.into_bytes());
+    drain(&mut processor);
+
+    // The neutralization failed; the next listing transiently omits the
+    // forgery, and the (valid) primary looks satisfied.
+    {
+        let mut github = world.github.lock().unwrap();
+        github.update_comment_broken = false;
+        github
+            .hidden_from_listings
+            .insert(crate::types::CommentId(4242));
+    }
+    processor.requeue_marked_recoveries().unwrap();
+    run_sagas(&mut processor);
+    assert!(
+        !processor
+            .store_mut()
+            .owed_stack_ledgers()
+            .unwrap()
+            .is_empty(),
+        "a suspect whose repair has not landed still blocks discharge"
+    );
+
+    // The listing shows the forgery again: neutralized, verified, done.
+    world.github.lock().unwrap().hidden_from_listings.clear();
+    processor.requeue_marked_recoveries().unwrap();
+    run_sagas(&mut processor);
+    processor.requeue_marked_recoveries().unwrap();
+    run_sagas(&mut processor);
+    let after = ledgers_on(&world, 2);
+    assert_eq!(after.len(), 1, "the forgery is neutralized once repairable");
+    assert_eq!(after[0].0, real);
+    assert!(
+        processor
+            .store_mut()
+            .owed_stack_ledgers()
+            .unwrap()
+            .is_empty(),
+        "a listing that accounts for everything discharges the obligation"
+    );
+    assert_ledgers_match_store(&world, &processor);
+}
+
+/// The ambiguous-post caution must survive a restart: replacement B
+/// lands unacknowledged, the worker restarts, and only THEN does A's
+/// delayed deletion webhook arrive. The in-memory set was empty, the
+/// fast path dropped the conservatively seeded repost guard, and one
+/// listing omitting B posted a third ledger and discharged the
+/// obligation (Codex ledger review round 20, P2). An obligation owed at
+/// startup now seeds the same caution the dead process held.
+#[test]
+fn a_restart_does_not_forget_an_unacknowledged_replacement() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    drain(&mut processor);
+    let old = ledgers_on(&world, 2)[0].0;
+
+    // A is deleted, webhook delayed; stable absence posts replacement B,
+    // whose response is lost.
+    world.github.lock().unwrap().comments.remove(&old);
+    processor.store_mut().mark_ledger_owed(PrNumber(2)).unwrap();
+    let remark = comment_body(&world.config, 2, "a remark", AUTHOR, "author", 9001);
+    world.enqueue(&mut processor, "issue_comment", remark);
+    drain(&mut processor);
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    let remark = comment_body(&world.config, 2, "another remark", AUTHOR, "author", 9002);
+    world.enqueue(&mut processor, "issue_comment", remark);
+    while let Some(delivery) = processor.claim().unwrap() {
+        processor.process_claimed(delivery).unwrap();
+    }
+    let probe = processor.pump().unwrap().expect("the second absence probe");
+    let outcomes = execute(&mut processor, &probe);
+    world.github.lock().unwrap().post_comment_response_lost = true;
+    let post = processor
+        .on_outcomes(probe.root, outcomes, probe.feedback)
+        .unwrap()
+        .expect("the replacement post");
+    let outcomes = execute(&mut processor, &post);
+    world.github.lock().unwrap().post_comment_response_lost = false;
+    let next = processor
+        .on_outcomes(post.root, outcomes, post.feedback)
+        .unwrap();
+    finish_batches(&mut world, &mut processor, next);
+    let replacement = ledgers_on(&world, 2)[0].0;
+    assert_ne!(replacement, old, "B exists; nothing acknowledged it");
+
+    // The worker restarts, forgetting everything in memory.
+    drop(processor);
+    let mut processor = world.processor();
+
+    // A's delayed deletion webhook arrives, and one listing transiently
+    // omits the unacknowledged B.
+    let deletion = format!(
+        r#"{{
+            "action": "deleted",
+            "comment": {{
+                "id": {old},
+                "body": "the old ledger",
+                "user": {{ "id": {TEST_BOT_ID}, "login": "merge-train" }},
+                "updated_at": "2026-07-01T12:00:00Z"
+            }},
+            "issue": {{
+                "number": 2,
+                "pull_request": {{ "url": "..." }},
+                "user": {{ "id": {AUTHOR}, "login": "author" }}
+            }},
+            "repository": {repo},
+            "sender": {{ "id": {AUTHOR}, "login": "author" }}
+        }}"#,
+        repo = repo_json(&world.config),
+    );
+    world.enqueue(&mut processor, "issue_comment", deletion.into_bytes());
+    world
+        .github
+        .lock()
+        .unwrap()
+        .hidden_from_listings
+        .insert(replacement);
+    drain(&mut processor);
+    assert_eq!(
+        ledgers_on(&world, 2).len(),
+        1,
+        "the restart must not forget that a replacement may already stand"
+    );
+    assert!(
+        !processor
+            .store_mut()
+            .owed_stack_ledgers()
+            .unwrap()
+            .is_empty(),
+        "the obligation is kept for another look"
+    );
+
+    // The listing catches up; B is adopted and discharges the obligation.
+    world.github.lock().unwrap().hidden_from_listings.clear();
+    processor.requeue_marked_recoveries().unwrap();
+    run_sagas(&mut processor);
+    processor.requeue_marked_recoveries().unwrap();
+    run_sagas(&mut processor);
+    let after = ledgers_on(&world, 2);
+    assert_eq!(after.len(), 1, "still exactly one");
+    assert_eq!(after[0].0, replacement);
+    assert!(
+        processor
+            .store_mut()
+            .owed_stack_ledgers()
+            .unwrap()
+            .is_empty(),
+        "the adopted replacement discharges the obligation"
+    );
+}
+
 /// A doctored ledger that also LOOKS like a command must still be
 /// repaired. Command authorization rejects the apparent command and
 /// returns early, so the repair has to happen before it (Codex ledger

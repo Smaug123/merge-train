@@ -242,9 +242,10 @@ pub(crate) struct Processor {
     /// webhook for the still-recorded predecessor must not drop the
     /// repost guard while a replacement may already stand (Codex ledger
     /// review round 19, P2). Resolved by a probe that SEES a ledger, or
-    /// by a later post's acknowledged outcome. In-memory: a restart
-    /// falls back to the conservative owed-plus-recorded seeding of
-    /// `ledger_posts_attempted`.
+    /// by a later post's acknowledged outcome. Seeded at startup with
+    /// every PR whose obligation is owed: the dead process may have
+    /// posted without an acknowledgement, and the caution must outlive
+    /// it (round 20, P2).
     unacked_ledger_posts: HashSet<PrNumber>,
     /// PRs a ledger POST has been dispatched for, or may have been by a
     /// process that died holding the obligation. Absence in a listing is
@@ -356,10 +357,14 @@ impl Processor {
         // post, and one transiently-short listing after the next topology
         // change posts a second ledger next to the recorded one (Codex
         // ledger review round 14, P2).
-        let ledger_posts_attempted: HashSet<PrNumber> = store
+        let owed_ledger_prs: HashSet<PrNumber> = store
             .owed_stack_ledgers()?
             .into_iter()
             .map(|owed| owed.pr)
+            .collect();
+        let ledger_posts_attempted: HashSet<PrNumber> = owed_ledger_prs
+            .iter()
+            .copied()
             .chain(
                 store
                     .state()
@@ -390,7 +395,13 @@ impl Processor {
             deferred_for_sync: HashSet::new(),
             ledger_probes: HashMap::new(),
             ledger_write_gen: HashMap::new(),
-            unacked_ledger_posts: HashSet::new(),
+            // An obligation that outlived a process carries that
+            // process's uncertainty with it: it may have posted a
+            // replacement whose acknowledgement died with it, so the
+            // deletion fast path stays blocked for these PRs until a
+            // probe sees a ledger or a post acknowledges (Codex ledger
+            // review round 20, P2).
+            unacked_ledger_posts: owed_ledger_prs,
             ledger_posts_attempted,
             startup_evaluates: Some(startup_evaluates),
             active_start: None,
@@ -1682,10 +1693,22 @@ impl Processor {
         // generation moved mid-probe) neither resolves nor strikes.
         let mut suspects_unseen = 0u32;
         if owed.generation == probe_generation {
-            let listed: HashSet<crate::types::CommentId> = comments.iter().map(|c| c.id).collect();
             for suspect in self.store.ledger_suspects(pr)? {
-                if listed.contains(&suspect) {
-                    self.store.remove_ledger_suspect(pr, suspect)?;
+                if let Some(comment) = comments.iter().find(|c| c.id == suspect) {
+                    // Seen — but seeing is not repairing (round 20, P2).
+                    // Inert now: resolved. Still ledger-shaped: it is
+                    // the primary or a forged sibling below, both of
+                    // which block discharge until repaired — keep it on
+                    // the books (a discharge purges the leftovers), and
+                    // restart its absence evidence: it is demonstrably
+                    // alive.
+                    let still_forged = crate::status::parse_stack_ledger(&comment.body)
+                        .is_some_and(|l| l.pr == pr);
+                    if still_forged {
+                        self.store.add_ledger_suspect(pr, suspect)?;
+                    } else {
+                        self.store.remove_ledger_suspect(pr, suspect)?;
+                    }
                 } else if self.store.note_absent_ledger_suspect(
                     pr,
                     suspect,

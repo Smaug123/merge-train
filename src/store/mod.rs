@@ -739,10 +739,22 @@ impl Store {
         pr: PrNumber,
         generation: u64,
     ) -> Result<(), StoreError> {
-        self.conn.execute(
+        let tx = self.conn.transaction()?;
+        let cleared = tx.execute(
             "DELETE FROM owed_stack_ledgers WHERE pr = ?1 AND generation = ?2",
             rusqlite::params![pr.0 as i64, generation as i64],
         )?;
+        if cleared > 0 {
+            // Discharge forgets the PR's suspects too: every discharge
+            // path first proves each suspect seen in a good state or
+            // stably absent, and a suspect row must not outlive the
+            // obligation it gates (Codex ledger review round 20, P2).
+            tx.execute(
+                "DELETE FROM owed_ledger_suspects WHERE pr = ?1",
+                rusqlite::params![pr.0 as i64],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
