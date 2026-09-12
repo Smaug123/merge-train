@@ -4,4 +4,14 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
 cc b5f3ec235af5d14cce5f28fb567758dc37d6665ffc44200560b42944343dac0c # shrinks to steps = [(Declare { pr: 2, target: 1 }, None), (DeleteLedger { pr: 2, webhook: true }, DeleteBeforeAck)]
+cc ef6fc76b0adb31ab920d5e2e6cbae80f2873608fa321971e167a676618634a9e # shrinks to actions = [Declare { pr: 2, crash: false }, EditAwayLedger { pr: 2, stale: false }, EditAwayLedger { pr: 2, stale: false }]
+cc 50dc657b1f500f37744ce097088d1c6dac99d49459dff1f819002156904fd40b # shrinks to actions = [AuthGlitch404, ForgeSibling { pr: 2 }]
+cc b9aa3980c42b15655a3c393d5e5aa6b3e75d564984caf74a356de38f80cb7c84 # shrinks to actions = [DeclareThenInterfere { pr: 2, interference: Delete }, HealAuth, DeclareThenInterfere { pr: 3, interference: Tamper }, HideListings { pr: 3 }, AuthGlitch404, DeclareThenInterfere { pr: 3, interference: Tamper }]
+cc f0d0713f8ea46d2d30af778fd745903af5670b9957e21fc053dce8aa58b5be88 # shrinks to actions = [AuthGlitch404, Declare { pr: 2, crash: false }, EditAwayLedger { pr: 2, stale: false }]

@@ -42,6 +42,42 @@ pub struct OwedLedger {
     pub generation: u64,
 }
 
+/// A bot comment on a PR that is NOT its ledger but reads as one — a
+/// reply a maintainer edited into a forgery, or a stale duplicate of the
+/// bot's own making — owed a rewrite into inert text until that write
+/// acknowledges. Addressed by id: no listing is needed to act on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LedgerRepair {
+    pub comment_id: CommentId,
+    /// The generation this repair was (last) raised at. An acknowledged
+    /// neutralization clears the generation it was dispatched for, and no
+    /// other: an edit reported after the dispatch may have re-forged it.
+    pub generation: u64,
+}
+
+/// A comment that MAY exist on a PR without being its recorded ledger: a
+/// post whose response never came back (the id is unknown; the body's
+/// sequence number identifies it), a recorded comment a rewrite found
+/// nothing at, or a forgery a neutralization found nothing at (the id is
+/// known; the 404 may have been a passing mood). Posting another ledger
+/// while one of these is unresolved risks a duplicate, so a post waits
+/// for the question to be settled: by a listing that shows the comment,
+/// or by absence stable across spaced listings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnresolvedLedger {
+    /// The row's own identity, for resolving it.
+    pub row: i64,
+    pub comment_id: Option<CommentId>,
+    /// The sequence number the comment's body carried when it was written.
+    pub seq: u64,
+    /// Whether the store WROTE this comment as `pr`'s ledger — its own post
+    /// or its own recorded comment — which is what makes it adoptable when
+    /// a listing shows it. A forgery's row is not.
+    pub ours: bool,
+    /// Listings at least a cooldown apart that showed no sign of it.
+    pub absent_probes: u32,
+}
+
 /// A terminal status-comment update still owed, keyed by the train
 /// INCARNATION (root + `started_at`): a root can retire twice under two
 /// different comments, and each owes its own final word. `comment_id` is
@@ -73,7 +109,10 @@ use crate::webhooks::dedupe::DedupeKey;
 /// at a different version is rejected loudly rather than mis-read.
 ///
 /// v2 added the `deliveries` and `dedupe_keys` tables (the webhook queue).
-const STORE_SCHEMA_VERSION: i64 = 6;
+///
+/// v6 added the stack-ledger obligations; v7 the repairs, unresolved
+/// comments and settled verdicts the ledger's hardening keeps.
+const STORE_SCHEMA_VERSION: i64 = 7;
 
 /// Errors from the store.
 #[derive(Debug, Error)]
@@ -599,11 +638,17 @@ impl Store {
         started_at: DateTime<Utc>,
         comment_id: CommentId,
     ) -> Result<(), StoreError> {
-        self.conn.execute(
+        let tx = self.conn.transaction()?;
+        tx.execute(
             "UPDATE owed_status_syncs SET comment_id = ?3, absent_probes = 0, \
              absent_at = NULL WHERE root = ?1 AND started_at = ?2",
             rusqlite::params![root.0 as i64, started_at.to_rfc3339(), comment_id.0 as i64],
         )?;
+        // A comment resolved by listing was posted with its
+        // acknowledgement lost: this is where the store learns it is a
+        // status comment.
+        register_status_comment_in(&tx, comment_id, root)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -703,6 +748,43 @@ impl Store {
         Ok(())
     }
 
+    /// [`Store::retire_stack_ledger`], and in the SAME transaction the
+    /// retired comment becomes an unresolved comment of the store's own:
+    /// a rewrite answered 404, which may have been a passing mood, so the
+    /// comment may still exist — and only this row lets a listing that
+    /// shows it hand it back to be adopted rather than neutralized as a
+    /// forgery. Split in two, a crash between them lost that proof of
+    /// authorship.
+    pub fn retire_stack_ledger_watching(
+        &mut self,
+        pr: PrNumber,
+        comment_id: CommentId,
+        seq: u64,
+        ts: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        let mut next_state = self.state.clone();
+        let mut next_seq = self.next_seq;
+        let tx = self.conn.transaction()?;
+        let event = StateEvent {
+            seq: next_seq,
+            ts,
+            payload: StateEventPayload::StackLedgerRetired { pr, comment_id },
+        };
+        insert_and_apply(&tx, &mut next_state, &event)?;
+        next_seq += 1;
+        upsert_cache(&tx, &next_state, next_seq, ts)?;
+        mark_ledger_owed_in(&tx, pr)?;
+        tx.execute(
+            "INSERT INTO unresolved_ledger_comments (pr, comment_id, seq, ours) \
+             VALUES (?1, ?2, ?3, 1)",
+            rusqlite::params![pr.0 as i64, comment_id.0 as i64, seq as i64],
+        )?;
+        tx.commit()?;
+        self.state = next_state;
+        self.next_seq = next_seq;
+        Ok(())
+    }
+
     /// Clears the obligation a write was made FOR — identified by the
     /// generation it read. Anything that dirtied the ledger since (a
     /// declaration, a retraction, a maintainer editing the comment) holds
@@ -718,6 +800,369 @@ impl Store {
             rusqlite::params![pr.0 as i64, generation as i64],
         )?;
         Ok(())
+    }
+
+    /// Owes a neutralization of `comment_id` on `pr`, at a fresh
+    /// generation (idempotent: re-raising an open repair only bumps its
+    /// generation, so an acknowledgement in flight for the older
+    /// dispatch cannot clear the re-raised one).
+    pub fn add_ledger_repair(
+        &mut self,
+        pr: PrNumber,
+        comment_id: CommentId,
+    ) -> Result<(), StoreError> {
+        let tx = self.conn.transaction()?;
+        let generation = next_ledger_generation(&tx)?;
+        tx.execute(
+            "INSERT INTO owed_ledger_repairs (pr, comment_id, generation) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(pr, comment_id) DO UPDATE SET generation = ?3",
+            rusqlite::params![pr.0 as i64, comment_id.0 as i64, generation],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// A neutralization acknowledged: clears the repair it was dispatched
+    /// FOR — identified by the generation it read — and, only if that was
+    /// the repair still open, records the comment as neutralized (a
+    /// verdict a lagging listing cannot overturn). A re-raise since the
+    /// dispatch survives both: the comment may have been re-forged after
+    /// the write landed, and its verdict is the next write's to give.
+    /// Answers whether the repair was cleared. One transaction.
+    pub fn acknowledge_ledger_repair(
+        &mut self,
+        pr: PrNumber,
+        comment_id: CommentId,
+        generation: u64,
+    ) -> Result<bool, StoreError> {
+        let tx = self.conn.transaction()?;
+        let cleared = tx.execute(
+            "DELETE FROM owed_ledger_repairs WHERE pr = ?1 AND comment_id = ?2 AND generation = ?3",
+            rusqlite::params![pr.0 as i64, comment_id.0 as i64, generation as i64],
+        )? > 0;
+        if cleared {
+            tx.execute(
+                "INSERT OR IGNORE INTO settled_ledger_comments (comment_id, pr, dead) VALUES (?1, ?2, 0)",
+                rusqlite::params![comment_id.0 as i64, pr.0 as i64],
+            )?;
+        }
+        tx.commit()?;
+        Ok(cleared)
+    }
+
+    /// A neutralization answered 404: the repair it was dispatched FOR —
+    /// identified by the generation it read — becomes a WATCHED comment,
+    /// an unresolved row not the store's own, in one transaction, so no
+    /// crash can leave the forgery owed nothing. Shown by a later
+    /// listing, the repair is raised again; absent across spaced
+    /// listings, it is concluded gone. A repair re-raised since the
+    /// dispatch (an edit reported meanwhile) is newer evidence than this
+    /// 404 and stands untouched; answers whether the transfer happened.
+    pub fn watch_ledger_comment_after_404(
+        &mut self,
+        pr: PrNumber,
+        comment_id: CommentId,
+        generation: u64,
+    ) -> Result<bool, StoreError> {
+        let tx = self.conn.transaction()?;
+        let demoted = tx.execute(
+            "DELETE FROM owed_ledger_repairs WHERE pr = ?1 AND comment_id = ?2 AND generation = ?3",
+            rusqlite::params![pr.0 as i64, comment_id.0 as i64, generation as i64],
+        )? > 0;
+        if demoted {
+            tx.execute(
+                "INSERT INTO unresolved_ledger_comments (pr, comment_id, seq, ours) \
+                 VALUES (?1, ?2, 0, 0)",
+                rusqlite::params![pr.0 as i64, comment_id.0 as i64],
+            )?;
+        }
+        tx.commit()?;
+        Ok(demoted)
+    }
+
+    /// Whether `comment_id` is a train's status comment — the durable
+    /// record of a train's fate, which the ledger machinery must never
+    /// touch, however a maintainer edits it. Every `StatusCommentPosted`
+    /// is remembered here for good: the train retires and leaves the
+    /// state, the comment stays.
+    pub fn is_status_comment(&self, comment_id: CommentId) -> Result<bool, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM status_comments WHERE comment_id = ?1",
+                rusqlite::params![comment_id.0 as i64],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// An unresolved comment a listing showed, which is not the ledger:
+    /// the row is settled and a repair raised for it, in one transaction.
+    pub fn resolve_unresolved_ledger_as_repair(
+        &mut self,
+        row: i64,
+        pr: PrNumber,
+        comment_id: CommentId,
+    ) -> Result<(), StoreError> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "DELETE FROM unresolved_ledger_comments WHERE row = ?1",
+            rusqlite::params![row],
+        )?;
+        let generation = next_ledger_generation(&tx)?;
+        tx.execute(
+            "INSERT INTO owed_ledger_repairs (pr, comment_id, generation) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(pr, comment_id) DO UPDATE SET generation = ?3",
+            rusqlite::params![pr.0 as i64, comment_id.0 as i64, generation],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The repairs open on `pr`.
+    pub fn ledger_repairs(&self, pr: PrNumber) -> Result<Vec<LedgerRepair>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT comment_id, generation FROM owed_ledger_repairs WHERE pr = ?1 ORDER BY comment_id",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![pr.0 as i64], |row| {
+            Ok(LedgerRepair {
+                comment_id: CommentId(row.get::<_, i64>(0)? as u64),
+                generation: row.get::<_, i64>(1)? as u64,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Records that `comment_id` on `pr` is gone FOR EVER — its deletion
+    /// webhook arrived — so a listing that still serves it is serving a
+    /// ghost. Nothing can be owed to it any more: its repair and its
+    /// unresolved row go with it, in the same transaction.
+    pub fn mark_ledger_comment_dead(
+        &mut self,
+        pr: PrNumber,
+        comment_id: CommentId,
+    ) -> Result<(), StoreError> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO settled_ledger_comments (comment_id, pr, dead) VALUES (?1, ?2, 1) \
+             ON CONFLICT(comment_id) DO UPDATE SET dead = 1",
+            rusqlite::params![comment_id.0 as i64, pr.0 as i64],
+        )?;
+        tx.execute(
+            "DELETE FROM owed_ledger_repairs WHERE pr = ?1 AND comment_id = ?2",
+            rusqlite::params![pr.0 as i64, comment_id.0 as i64],
+        )?;
+        tx.execute(
+            "DELETE FROM unresolved_ledger_comments WHERE pr = ?1 AND comment_id = ?2",
+            rusqlite::params![pr.0 as i64, comment_id.0 as i64],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// An edit was reported on a neutralized comment: its content is in
+    /// question again. Death is permanent and stays.
+    pub fn unsettle_ledger_comment(&mut self, comment_id: CommentId) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM settled_ledger_comments WHERE comment_id = ?1 AND dead = 0",
+            rusqlite::params![comment_id.0 as i64],
+        )?;
+        Ok(())
+    }
+
+    /// The comment ids on `pr` whose content the store has settled, each
+    /// with whether it is proven deleted (else: neutralized).
+    pub fn settled_ledger_comments(
+        &self,
+        pr: PrNumber,
+    ) -> Result<Vec<(CommentId, bool)>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT comment_id, dead FROM settled_ledger_comments WHERE pr = ?1")?;
+        let rows = stmt.query_map(rusqlite::params![pr.0 as i64], |row| {
+            Ok((
+                CommentId(row.get::<_, i64>(0)? as u64),
+                row.get::<_, i64>(1)? != 0,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Records a comment that may exist on `pr` unrecorded: BEFORE a post
+    /// is dispatched (`comment_id` unknown, `seq` from the body), or when
+    /// a write to a known comment answered 404 (`comment_id` known; `seq`
+    /// is then not consulted). `ours` says whether the store wrote it as
+    /// the PR's ledger (see [`UnresolvedLedger::ours`]).
+    pub fn add_unresolved_ledger(
+        &mut self,
+        pr: PrNumber,
+        comment_id: Option<CommentId>,
+        seq: u64,
+        ours: bool,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO unresolved_ledger_comments (pr, comment_id, seq, ours) \
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                pr.0 as i64,
+                comment_id.map(|c| c.0 as i64),
+                seq as i64,
+                ours as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The comments that may exist on `pr` unrecorded, oldest first.
+    pub fn unresolved_ledgers(&self, pr: PrNumber) -> Result<Vec<UnresolvedLedger>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT row, comment_id, seq, ours, absent_probes FROM unresolved_ledger_comments \
+             WHERE pr = ?1 ORDER BY row",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![pr.0 as i64], |r| {
+            Ok(UnresolvedLedger {
+                row: r.get(0)?,
+                comment_id: r.get::<_, Option<i64>>(1)?.map(|c| CommentId(c as u64)),
+                seq: r.get::<_, i64>(2)? as u64,
+                ours: r.get::<_, i64>(3)? != 0,
+                absent_probes: r.get::<_, i64>(4)? as u32,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// The question is settled: a listing showed the comment (it is now a
+    /// duplicate to neutralize, or the ledger to adopt), or its absence
+    /// was stable, or its deletion was reported.
+    pub fn resolve_unresolved_ledger(&mut self, row: i64) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM unresolved_ledger_comments WHERE row = ?1",
+            rusqlite::params![row],
+        )?;
+        Ok(())
+    }
+
+    /// Records that a listing showed no sign of an unresolved comment, and
+    /// answers how many independent listings have now missed it. Two
+    /// listings taken within one consistency window are one piece of
+    /// evidence, not two: a listing counts only if it was DISPATCHED
+    /// (`listed_at`) at least `cooldown` after the previous counted
+    /// listing was PROCESSED (`processed_at`) — the earlier one may have
+    /// been delayed on the wire, and a listing taken while it was in
+    /// flight is no more independent of it than one taken beforehand.
+    pub fn note_absent_unresolved_ledger(
+        &mut self,
+        row: i64,
+        listed_at: DateTime<Utc>,
+        processed_at: DateTime<Utc>,
+        cooldown: chrono::Duration,
+    ) -> Result<u32, StoreError> {
+        let (count, last): (i64, Option<String>) = self.conn.query_row(
+            "SELECT absent_probes, absent_at FROM unresolved_ledger_comments WHERE row = ?1",
+            rusqlite::params![row],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let too_soon = last
+            .as_deref()
+            .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+            .is_some_and(|at| listed_at - at.with_timezone(&Utc) < cooldown);
+        if too_soon {
+            return Ok(count as u32);
+        }
+        self.conn.execute(
+            "UPDATE unresolved_ledger_comments SET absent_probes = absent_probes + 1, absent_at = ?2 \
+             WHERE row = ?1",
+            rusqlite::params![row, processed_at.to_rfc3339()],
+        )?;
+        Ok(count as u32 + 1)
+    }
+
+    /// Records where `pr`'s ledger lives — a post acknowledged, or an
+    /// unrecorded comment adopted from a listing — and, in the same
+    /// transaction, settles the unresolved rows this comment answers (the
+    /// one naming its id, and any post whose body carried `seq`) and
+    /// drops any repair naming it: the recorded ledger is rewritten, never
+    /// neutralized, whatever it was called before it was recorded.
+    pub fn record_stack_ledger_posted(
+        &mut self,
+        pr: PrNumber,
+        comment_id: CommentId,
+        seq: u64,
+        ts: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        let mut next_state = self.state.clone();
+        let mut next_seq = self.next_seq;
+        let tx = self.conn.transaction()?;
+        let event = StateEvent {
+            seq: next_seq,
+            ts,
+            payload: StateEventPayload::StackLedgerPosted { pr, comment_id },
+        };
+        insert_and_apply(&tx, &mut next_state, &event)?;
+        next_seq += 1;
+        upsert_cache(&tx, &next_state, next_seq, ts)?;
+        tx.execute(
+            "DELETE FROM unresolved_ledger_comments WHERE pr = ?1 \
+             AND (comment_id = ?2 OR (comment_id IS NULL AND seq = ?3))",
+            rusqlite::params![pr.0 as i64, comment_id.0 as i64, seq as i64],
+        )?;
+        tx.execute(
+            "DELETE FROM owed_ledger_repairs WHERE pr = ?1 AND comment_id = ?2",
+            rusqlite::params![pr.0 as i64, comment_id.0 as i64],
+        )?;
+        // ...and any verdict that it reads as nothing: it is the ledger
+        // now, and the rewrite that follows states its content. Left in
+        // place, a later listing would skip the comment for ever.
+        tx.execute(
+            "DELETE FROM settled_ledger_comments WHERE comment_id = ?2 AND dead = 0",
+            rusqlite::params![pr.0 as i64, comment_id.0 as i64],
+        )?;
+        tx.commit()?;
+        self.state = next_state;
+        self.next_seq = next_seq;
+        Ok(())
+    }
+
+    /// A listing of `pr`'s comments is about to be taken: its DISCOVERY —
+    /// the forgeries, duplicates and unresolved comments it will settle —
+    /// is owed until the listing has been processed. Durable, so a crash
+    /// between the listing and its processing (or a listing that fails
+    /// beside writes that land) leaves the look owed rather than lost.
+    pub fn mark_ledger_discovery_owed(&mut self, pr: PrNumber) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO owed_ledger_discoveries (pr) VALUES (?1)",
+            rusqlite::params![pr.0 as i64],
+        )?;
+        Ok(())
+    }
+
+    /// The listing was processed: whatever it showed is on the books.
+    pub fn clear_ledger_discovery(&mut self, pr: PrNumber) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM owed_ledger_discoveries WHERE pr = ?1",
+            rusqlite::params![pr.0 as i64],
+        )?;
+        Ok(())
+    }
+
+    /// The PRs the ledger machinery has anything left to do for: a ledger
+    /// owed, a repair open, a comment unresolved, or a discovery owed.
+    pub fn ledger_pending_prs(&self) -> Result<Vec<PrNumber>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT pr FROM owed_stack_ledgers \
+             UNION SELECT pr FROM owed_ledger_repairs \
+             UNION SELECT pr FROM unresolved_ledger_comments \
+             UNION SELECT pr FROM owed_ledger_discoveries \
+             ORDER BY pr",
+        )?;
+        let rows = stmt.query_map([], |row| Ok(PrNumber(row.get::<_, i64>(0)? as u64)))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Whether `pr` has anything pending (see [`Store::ledger_pending_prs`]).
+    pub fn ledger_pending(&self, pr: PrNumber) -> Result<bool, StoreError> {
+        Ok(self.ledger_pending_prs()?.contains(&pr))
     }
 
     /// Clears the owed sync for one train incarnation (idempotent).
@@ -875,17 +1320,46 @@ impl Drop for Store {
     }
 }
 
-/// Dirties a PR's ledger at a FRESH generation, inside `tx`.
-fn mark_ledger_owed_in(tx: &rusqlite::Transaction<'_>, pr: PrNumber) -> Result<(), StoreError> {
+/// Remembers `comment_id` as a train's status comment, inside `tx`, and
+/// cancels any ledger repair that named it: an edit reported before the
+/// store knew whose comment it was may have queued one.
+fn register_status_comment_in(
+    tx: &rusqlite::Transaction<'_>,
+    comment_id: CommentId,
+    root: PrNumber,
+) -> Result<(), StoreError> {
+    tx.execute(
+        "INSERT OR IGNORE INTO status_comments (comment_id, root) VALUES (?1, ?2)",
+        rusqlite::params![comment_id.0 as i64, root.0 as i64],
+    )?;
+    tx.execute(
+        "DELETE FROM owed_ledger_repairs WHERE comment_id = ?1",
+        rusqlite::params![comment_id.0 as i64],
+    )?;
+    tx.execute(
+        "DELETE FROM unresolved_ledger_comments WHERE comment_id = ?1",
+        rusqlite::params![comment_id.0 as i64],
+    )?;
+    Ok(())
+}
+
+/// The next ledger generation: one counter for obligations and repairs
+/// alike, strictly increasing across the store's whole life.
+fn next_ledger_generation(tx: &rusqlite::Transaction<'_>) -> Result<i64, StoreError> {
     tx.execute(
         "UPDATE counters SET value = value + 1 WHERE name = 'ledger_gen'",
         [],
     )?;
-    let generation: i64 = tx.query_row(
+    Ok(tx.query_row(
         "SELECT value FROM counters WHERE name = 'ledger_gen'",
         [],
         |row| row.get(0),
-    )?;
+    )?)
+}
+
+/// Dirties a PR's ledger at a FRESH generation, inside `tx`.
+fn mark_ledger_owed_in(tx: &rusqlite::Transaction<'_>, pr: PrNumber) -> Result<(), StoreError> {
+    let generation = next_ledger_generation(tx)?;
     tx.execute(
         "INSERT INTO owed_stack_ledgers (pr, generation) VALUES (?1, ?2) \
          ON CONFLICT(pr) DO UPDATE SET generation = ?2",
@@ -950,6 +1424,24 @@ fn insert_and_apply(
                 crate::status::format::terminal_message(&after, fanned_into),
             ],
         )?;
+    }
+    // A train's status comment is remembered for good, from every event
+    // that learns its id: the ledger machinery must never mistake one for
+    // a forgery, however a maintainer edits it, and the train that owns
+    // it leaves the state when it retires.
+    match &event.payload {
+        StateEventPayload::StatusCommentPosted {
+            root_pr,
+            comment_id,
+        } => {
+            register_status_comment_in(tx, *comment_id, *root_pr)?;
+        }
+        StateEventPayload::TrainRecordAdopted { root_pr, record } => {
+            if let Some(comment_id) = record.status_comment_id {
+                register_status_comment_in(tx, comment_id, *root_pr)?;
+            }
+        }
+        _ => {}
     }
     // A topology change owes its PR's ledger comment a rewrite — in this
     // transaction, so a crash between the commit and the write cannot lose
@@ -1080,6 +1572,63 @@ fn init_schema(conn: &Connection) -> Result<(), StoreError> {
         CREATE TABLE owed_stack_ledgers (
             pr         INTEGER PRIMARY KEY,
             generation INTEGER NOT NULL
+        );
+
+        -- Bot comments that read as a PR's ledger but are not it: forged
+        -- by an edit, or a stale duplicate of the bot's own making. Owed a
+        -- rewrite into inert text, addressed by id, until the write
+        -- acknowledges. `generation` follows the ledger counter: an
+        -- acknowledgement clears only the raise it was dispatched for.
+        CREATE TABLE owed_ledger_repairs (
+            pr         INTEGER NOT NULL,
+            comment_id INTEGER NOT NULL,
+            generation INTEGER NOT NULL,
+            PRIMARY KEY (pr, comment_id)
+        );
+
+        -- PRs whose comments are being listed: the discovery that listing
+        -- makes is owed until the listing has been processed.
+        CREATE TABLE owed_ledger_discoveries (
+            pr INTEGER PRIMARY KEY
+        );
+
+        -- Every status comment the bot has posted, for good: a train's
+        -- durable record of its fate, which the ledger machinery must
+        -- never neutralize however a maintainer edits it (the train
+        -- itself leaves the state when it retires).
+        CREATE TABLE status_comments (
+            comment_id INTEGER PRIMARY KEY,
+            root       INTEGER NOT NULL
+        );
+
+        -- Comment ids whose content the store knows better than a listing
+        -- does: `dead` ones had their deletion webhook (a listing still
+        -- serving one serves a ghost; permanent, ids never come back), the
+        -- rest were rewritten into inert text and the write acknowledged
+        -- (a listing serving the old body lags; an edit webhook lifts the
+        -- verdict). Neither is adopted or repaired from a listing.
+        CREATE TABLE settled_ledger_comments (
+            comment_id INTEGER PRIMARY KEY,
+            pr         INTEGER NOT NULL,
+            dead       INTEGER NOT NULL
+        );
+
+        -- Comments that may exist on a PR without being its recorded
+        -- ledger: a post whose response was lost (id NULL; the body's seq
+        -- identifies it in a listing), or a comment a write answered 404
+        -- for (id known). `ours` marks the ones the store wrote as the
+        -- PR's ledger — the only comments a listing may hand back to be
+        -- ADOPTED; a forgery's row is there only to be watched. A further
+        -- post waits until each is settled: shown by a listing, or absent
+        -- from listings spaced at least a cooldown apart.
+        CREATE TABLE unresolved_ledger_comments (
+            row           INTEGER PRIMARY KEY,
+            pr            INTEGER NOT NULL,
+            comment_id    INTEGER,
+            seq           INTEGER NOT NULL,
+            ours          INTEGER NOT NULL,
+            absent_probes INTEGER NOT NULL DEFAULT 0,
+            absent_at     TEXT
         );
 
         -- Monotone counters that are not event sequence numbers.
@@ -1616,6 +2165,185 @@ mod tests {
             Some(g4),
             "both halves survive a reopen"
         );
+    }
+
+    /// The ledger machinery's three questions — a ledger owed, a repair
+    /// open, a comment unresolved — each keep a PR pending; a deletion
+    /// webhook settles what it names; and absence is counted once per
+    /// cooldown.
+    #[test]
+    fn ledger_pending_is_the_union_of_its_three_questions() {
+        let dir = tempdir().unwrap();
+        let mut store = open_temp(&dir);
+        let pending = |store: &Store| store.ledger_pending_prs().unwrap();
+        assert!(pending(&store).is_empty());
+
+        store.add_ledger_repair(PrNumber(2), CommentId(7)).unwrap();
+        let g1 = store.ledger_repairs(PrNumber(2)).unwrap()[0].generation;
+        store.add_ledger_repair(PrNumber(2), CommentId(7)).unwrap();
+        let g2 = store.ledger_repairs(PrNumber(2)).unwrap()[0].generation;
+        assert!(g2 > g1, "re-raising bumps the generation");
+        assert!(
+            !store
+                .acknowledge_ledger_repair(PrNumber(2), CommentId(7), g1)
+                .unwrap(),
+            "the older dispatch clears nothing"
+        );
+        assert_eq!(pending(&store), vec![PrNumber(2)]);
+        assert!(
+            store
+                .settled_ledger_comments(PrNumber(2))
+                .unwrap()
+                .is_empty(),
+            "and settles nothing: the comment may have been re-forged since"
+        );
+        assert!(
+            store
+                .acknowledge_ledger_repair(PrNumber(2), CommentId(7), g2)
+                .unwrap()
+        );
+        assert!(pending(&store).is_empty());
+        assert_eq!(
+            store.settled_ledger_comments(PrNumber(2)).unwrap(),
+            vec![(CommentId(7), false)],
+            "the current dispatch settles it"
+        );
+        // A 404 turns a repair into a watched comment; a sighting turns it
+        // back. Each is one transaction: both halves or neither.
+        store.add_ledger_repair(PrNumber(2), CommentId(8)).unwrap();
+        let g8 = store.ledger_repairs(PrNumber(2)).unwrap()[0].generation;
+        store.add_ledger_repair(PrNumber(2), CommentId(8)).unwrap();
+        assert!(
+            !store
+                .watch_ledger_comment_after_404(PrNumber(2), CommentId(8), g8)
+                .unwrap(),
+            "a 404 for an older dispatch demotes nothing: the re-raise is newer evidence"
+        );
+        assert_eq!(store.ledger_repairs(PrNumber(2)).unwrap().len(), 1);
+        assert!(store.unresolved_ledgers(PrNumber(2)).unwrap().is_empty());
+        let g8 = store.ledger_repairs(PrNumber(2)).unwrap()[0].generation;
+        assert!(
+            store
+                .watch_ledger_comment_after_404(PrNumber(2), CommentId(8), g8)
+                .unwrap()
+        );
+        assert!(store.ledger_repairs(PrNumber(2)).unwrap().is_empty());
+        let watched = store.unresolved_ledgers(PrNumber(2)).unwrap();
+        assert_eq!(watched.len(), 1);
+        assert_eq!(watched[0].comment_id, Some(CommentId(8)));
+        assert!(!watched[0].ours);
+        store
+            .resolve_unresolved_ledger_as_repair(watched[0].row, PrNumber(2), CommentId(8))
+            .unwrap();
+        assert!(store.unresolved_ledgers(PrNumber(2)).unwrap().is_empty());
+        let raised = store.ledger_repairs(PrNumber(2)).unwrap();
+        assert_eq!(raised.len(), 1);
+        assert!(raised[0].generation > g2, "raised afresh");
+        store
+            .acknowledge_ledger_repair(PrNumber(2), CommentId(8), raised[0].generation)
+            .unwrap();
+
+        store
+            .add_unresolved_ledger(PrNumber(3), None, 41, true)
+            .unwrap();
+        store
+            .add_unresolved_ledger(PrNumber(3), Some(CommentId(9)), 0, false)
+            .unwrap();
+        store.mark_ledger_owed(PrNumber(4)).unwrap();
+        assert_eq!(pending(&store), vec![PrNumber(3), PrNumber(4)]);
+
+        let rows = store.unresolved_ledgers(PrNumber(3)).unwrap();
+        assert_eq!(rows.len(), 2);
+        let ts = test_timestamp();
+        let cooldown = chrono::Duration::seconds(30);
+        let at = |seconds: i64| ts + chrono::Duration::seconds(seconds);
+        // The first look was slow: dispatched at 0s, processed at 50s.
+        assert_eq!(
+            store
+                .note_absent_unresolved_ledger(rows[0].row, at(0), at(50), cooldown)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .note_absent_unresolved_ledger(rows[0].row, at(51), at(52), cooldown)
+                .unwrap(),
+            1,
+            "a second look within the cooldown is the same evidence"
+        );
+        // Dispatched 40s after the first — but while the first was still
+        // in flight, so within its window.
+        assert_eq!(
+            store
+                .note_absent_unresolved_ledger(rows[0].row, at(40), at(53), cooldown)
+                .unwrap(),
+            1,
+            "spacing is measured from the previous look's PROCESSING, not its dispatch"
+        );
+        assert_eq!(
+            store
+                .note_absent_unresolved_ledger(rows[0].row, at(90), at(91), cooldown)
+                .unwrap(),
+            2
+        );
+        // The deletion webhook for comment 9 settles its row; the lost
+        // post's row does not answer to it.
+        store
+            .mark_ledger_comment_dead(PrNumber(3), CommentId(9))
+            .unwrap();
+        store.add_ledger_repair(PrNumber(3), CommentId(18)).unwrap();
+        let g = store.ledger_repairs(PrNumber(3)).unwrap()[0].generation;
+        assert!(
+            store
+                .acknowledge_ledger_repair(PrNumber(3), CommentId(18), g)
+                .unwrap()
+        );
+        assert_eq!(
+            store.settled_ledger_comments(PrNumber(3)).unwrap(),
+            vec![(CommentId(9), true), (CommentId(18), false)]
+        );
+        store.unsettle_ledger_comment(CommentId(9)).unwrap();
+        store.unsettle_ledger_comment(CommentId(18)).unwrap();
+        assert_eq!(
+            store.settled_ledger_comments(PrNumber(3)).unwrap(),
+            vec![(CommentId(9), true)],
+            "death is permanent; a neutralization is lifted by an edit"
+        );
+        let rows = store.unresolved_ledgers(PrNumber(3)).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].comment_id, None);
+        assert_eq!(rows[0].absent_probes, 2);
+        store.resolve_unresolved_ledger(rows[0].row).unwrap();
+        assert_eq!(pending(&store), vec![PrNumber(4)]);
+    }
+
+    /// Learning that a comment is a train's status comment cancels
+    /// whatever the ledger machinery had queued against it — a repair, or
+    /// a watch left by a neutralization's 404 — in the same transaction.
+    #[test]
+    fn registering_a_status_comment_cancels_ledger_work_against_it() {
+        let dir = tempdir().unwrap();
+        let mut store = open_temp(&dir);
+        store.add_ledger_repair(PrNumber(1), CommentId(40)).unwrap();
+        store
+            .add_unresolved_ledger(PrNumber(1), Some(CommentId(41)), 0, false)
+            .unwrap();
+        assert!(!store.is_status_comment(CommentId(40)).unwrap());
+        for comment in [40u64, 41] {
+            store
+                .append(
+                    StateEventPayload::StatusCommentPosted {
+                        root_pr: PrNumber(1),
+                        comment_id: CommentId(comment),
+                    },
+                    test_timestamp(),
+                )
+                .unwrap();
+        }
+        assert!(store.is_status_comment(CommentId(40)).unwrap());
+        assert!(store.ledger_repairs(PrNumber(1)).unwrap().is_empty());
+        assert!(store.unresolved_ledgers(PrNumber(1)).unwrap().is_empty());
+        assert!(store.ledger_pending_prs().unwrap().is_empty());
     }
 
     /// A root that retires TWICE under two different status comments owes
