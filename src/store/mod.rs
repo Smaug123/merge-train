@@ -33,6 +33,33 @@ use crate::persistence::snapshot::{PersistedRepoSnapshot, SCHEMA_VERSION};
 use crate::state::RepoState;
 use crate::types::{CommentId, PrNumber, TrainRecord};
 
+/// A ledger repair owed on one comment: fix it by id, no listing needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LedgerRepair {
+    pub comment_id: CommentId,
+    /// Rewrite the recorded ledger to the store's truth; otherwise make
+    /// the pretender inert.
+    pub rewrite: bool,
+    pub generation: u64,
+    /// A write to this comment answered 404 — suggestive, not proof
+    /// (auth loss 404s existing comments). A successful listing decides:
+    /// showing it clears the flag, omitting it concludes death.
+    pub saw_404: bool,
+}
+
+/// A PR whose stack-ledger comment no longer matches what the store holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwedLedger {
+    pub pr: PrNumber,
+    /// The generation this obligation was raised at. A write clears the
+    /// generation it read, and no other.
+    pub generation: u64,
+    /// Probes that found no ledger at all. A replacement is posted only
+    /// once that absence is STABLE: GitHub's listings are eventually
+    /// consistent, and posting on the first miss leaves a duplicate.
+    pub absent_probes: u32,
+}
+
 /// A terminal status-comment update still owed, keyed by the train
 /// INCARNATION (root + `started_at`): a root can retire twice under two
 /// different comments, and each owes its own final word. `comment_id` is
@@ -64,7 +91,7 @@ use crate::webhooks::dedupe::DedupeKey;
 /// at a different version is rejected loudly rather than mis-read.
 ///
 /// v2 added the `deliveries` and `dedupe_keys` tables (the webhook queue).
-const STORE_SCHEMA_VERSION: i64 = 5;
+const STORE_SCHEMA_VERSION: i64 = 6;
 
 /// Errors from the store.
 #[derive(Debug, Error)]
@@ -637,6 +664,355 @@ impl Store {
         Ok(count as u32 + 1)
     }
 
+    /// The PRs whose stack ledger is out of date, oldest change first.
+    pub fn owed_stack_ledgers(&self) -> Result<Vec<OwedLedger>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT pr, generation, absent_probes FROM owed_stack_ledgers ORDER BY generation, pr",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut owed = Vec::new();
+        for row in rows {
+            let (pr, generation, absent_probes) = row?;
+            owed.push(OwedLedger {
+                pr: PrNumber(pr as u64),
+                generation: generation as u64,
+                absent_probes: absent_probes as u32,
+            });
+        }
+        Ok(owed)
+    }
+
+    /// Forgets that any probe has missed this PR's ledger. Called when a
+    /// replacement is POSTED — absence must become stable again relative
+    /// to that attempt, or one stale listing after a post whose response
+    /// was lost would immediately post another (Codex ledger review round
+    /// 13, P2) — and when a probe FINDS the ledger, since a streak broken
+    /// by a positive observation starts over (round 14, P2).
+    pub fn reset_absent_ledger(&mut self, pr: PrNumber) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE owed_stack_ledgers SET absent_probes = 0, absent_at = NULL WHERE pr = ?1",
+            rusqlite::params![pr.0 as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Records that a probe found no ledger on `pr`, and answers how many
+    /// probes at least `cooldown` apart have now missed it. GitHub's
+    /// listings are eventually consistent, so a ledger posted moments ago
+    /// can be absent from one and present in the next — and posting a
+    /// replacement on the first miss leaves a permanent duplicate.
+    pub fn note_absent_ledger(
+        &mut self,
+        pr: PrNumber,
+        now: DateTime<Utc>,
+        cooldown: chrono::Duration,
+    ) -> Result<u32, StoreError> {
+        let (count, last): (i64, Option<String>) = self.conn.query_row(
+            "SELECT absent_probes, absent_at FROM owed_stack_ledgers WHERE pr = ?1",
+            rusqlite::params![pr.0 as i64],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let too_soon = last
+            .as_deref()
+            .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+            .is_some_and(|at| now - at.with_timezone(&Utc) < cooldown);
+        if too_soon {
+            return Ok(count as u32);
+        }
+        self.conn.execute(
+            "UPDATE owed_stack_ledgers SET absent_probes = absent_probes + 1, absent_at = ?2 \
+             WHERE pr = ?1",
+            rusqlite::params![pr.0 as i64, now.to_rfc3339()],
+        )?;
+        Ok(count as u32 + 1)
+    }
+
+    /// Marks a PR's stack ledger out of date. Used where the ledger is
+    /// lost rather than changed — somebody deleted the comment — since the
+    /// topology events that normally dirty it did not happen.
+    pub fn mark_ledger_owed(&mut self, pr: PrNumber) -> Result<(), StoreError> {
+        let tx = self.conn.transaction()?;
+        mark_ledger_owed_in(&tx, pr)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Clears the obligation a write was made FOR — identified by the
+    /// generation it read. Anything that dirtied the ledger since (a
+    /// declaration, a retraction, a maintainer editing the comment) holds
+    /// a newer generation and survives it (Codex ledger review round 13,
+    /// P1).
+    pub fn clear_owed_stack_ledger(
+        &mut self,
+        pr: PrNumber,
+        generation: u64,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM owed_stack_ledgers WHERE pr = ?1 AND generation = ?2",
+            rusqlite::params![pr.0 as i64, generation as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Records that `comment_id` on `pr` needs a ledger repair:
+    /// `rewrite` writes the store's truth over the recorded ledger,
+    /// `!rewrite` makes a pretender inert. Named by a webhook or
+    /// discovered in a listing, the repair is owed until an
+    /// acknowledgement — it never depends on a later listing showing
+    /// the comment again (Codex ledger review round 21, P2). Re-adding
+    /// bumps the generation: fresh tampering voids an in-flight
+    /// acknowledgement.
+    pub fn add_ledger_repair(
+        &mut self,
+        pr: PrNumber,
+        comment_id: CommentId,
+        rewrite: bool,
+    ) -> Result<(), StoreError> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE counters SET value = value + 1 WHERE name = 'ledger_gen'",
+            [],
+        )?;
+        let generation: i64 = tx.query_row(
+            "SELECT value FROM counters WHERE name = 'ledger_gen'",
+            [],
+            |row| row.get(0),
+        )?;
+        tx.execute(
+            "INSERT INTO owed_ledger_repairs (pr, comment_id, rewrite, generation) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(pr, comment_id) DO UPDATE SET rewrite = ?3, generation = ?4, saw_404 = 0",
+            rusqlite::params![pr.0 as i64, comment_id.0 as i64, rewrite as i64, generation],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Clears the repair an acknowledged write was dispatched FOR —
+    /// identified by the generation it read. Tampering recorded since
+    /// holds a newer generation and survives it.
+    pub fn clear_ledger_repair(
+        &mut self,
+        pr: PrNumber,
+        comment_id: CommentId,
+        generation: u64,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM owed_ledger_repairs \
+             WHERE pr = ?1 AND comment_id = ?2 AND generation = ?3",
+            rusqlite::params![pr.0 as i64, comment_id.0 as i64, generation as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Drops a repair unconditionally: the comment is PROVEN gone (its
+    /// deletion webhook arrived, or a write to it answered 404), and a
+    /// comment id never comes back.
+    pub fn drop_ledger_repair(
+        &mut self,
+        pr: PrNumber,
+        comment_id: CommentId,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM owed_ledger_repairs WHERE pr = ?1 AND comment_id = ?2",
+            rusqlite::params![pr.0 as i64, comment_id.0 as i64],
+        )?;
+        Ok(())
+    }
+
+    /// The repairs owed on `pr`.
+    pub fn ledger_repairs(&self, pr: PrNumber) -> Result<Vec<LedgerRepair>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT comment_id, rewrite, generation, saw_404 FROM owed_ledger_repairs \
+             WHERE pr = ?1 ORDER BY comment_id",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![pr.0 as i64], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        let mut repairs = Vec::new();
+        for row in rows {
+            let (comment_id, rewrite, generation, saw_404) = row?;
+            repairs.push(LedgerRepair {
+                comment_id: CommentId(comment_id as u64),
+                rewrite: rewrite != 0,
+                generation: generation as u64,
+                saw_404: saw_404 != 0,
+            });
+        }
+        Ok(repairs)
+    }
+
+    /// Notes that a write to this repair's comment answered 404 — not
+    /// proof of deletion by itself, since losing repository access 404s
+    /// comments that exist (Codex ledger review round 23, P2). Death is
+    /// concluded only together with a successful listing omitting it.
+    pub fn flag_ledger_repair_404(
+        &mut self,
+        pr: PrNumber,
+        comment_id: CommentId,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE owed_ledger_repairs SET saw_404 = 1 WHERE pr = ?1 AND comment_id = ?2",
+            rusqlite::params![pr.0 as i64, comment_id.0 as i64],
+        )?;
+        Ok(())
+    }
+
+    /// A listing SHOWED the comment: the 404 was a glitch, not a grave.
+    pub fn unflag_ledger_repair_404(
+        &mut self,
+        pr: PrNumber,
+        comment_id: CommentId,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE owed_ledger_repairs SET saw_404 = 0 WHERE pr = ?1 AND comment_id = ?2",
+            rusqlite::params![pr.0 as i64, comment_id.0 as i64],
+        )?;
+        Ok(())
+    }
+
+    /// The sequence number of the last acknowledged ledger write for
+    /// `pr` (0 when none is known — a fresh store accepts any listed
+    /// body no newer than its own state).
+    pub fn ledger_written_seq(&self, pr: PrNumber) -> Result<u64, StoreError> {
+        let seq: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT seq FROM ledger_written_seq WHERE pr = ?1",
+                rusqlite::params![pr.0 as i64],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(seq.unwrap_or(0) as u64)
+    }
+
+    /// Raises the acknowledged-write floor for `pr` (never lowers it).
+    pub fn note_ledger_written_seq(&mut self, pr: PrNumber, seq: u64) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO ledger_written_seq (pr, seq) VALUES (?1, ?2) \
+             ON CONFLICT(pr) DO UPDATE SET seq = MAX(seq, excluded.seq)",
+            rusqlite::params![pr.0 as i64, seq as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Records where a PR's ledger now lives and, in the SAME
+    /// transaction, the cleanup owed to the comment it displaced: a
+    /// crash between the two would otherwise strand the old comment as
+    /// a permanent duplicate once listings recover (Codex ledger review
+    /// round 23, P2).
+    pub fn record_stack_ledger_posted(
+        &mut self,
+        pr: PrNumber,
+        comment_id: CommentId,
+        displaced: Option<CommentId>,
+        ts: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        let mut next_state = self.state.clone();
+        let mut seq = self.next_seq;
+        let tx = self.conn.transaction()?;
+        let event = StateEvent {
+            seq,
+            ts,
+            payload: StateEventPayload::StackLedgerPosted { pr, comment_id },
+        };
+        insert_and_apply(&tx, &mut next_state, &event)?;
+        seq += 1;
+        upsert_cache(&tx, &next_state, seq, ts)?;
+        if let Some(old) = displaced {
+            tx.execute(
+                "UPDATE counters SET value = value + 1 WHERE name = 'ledger_gen'",
+                [],
+            )?;
+            let generation: i64 = tx.query_row(
+                "SELECT value FROM counters WHERE name = 'ledger_gen'",
+                [],
+                |row| row.get(0),
+            )?;
+            tx.execute(
+                "INSERT INTO owed_ledger_repairs (pr, comment_id, rewrite, generation) \
+                 VALUES (?1, ?2, 0, ?3) \
+                 ON CONFLICT(pr, comment_id) DO UPDATE SET rewrite = 0, generation = ?3, saw_404 = 0",
+                rusqlite::params![pr.0 as i64, old.0 as i64, generation],
+            )?;
+        }
+        tx.commit()?;
+        self.state = next_state;
+        self.next_seq = seq;
+        Ok(())
+    }
+
+    /// Distrusts a comment id: `dead` when its deletion is proven (a
+    /// webhook, or a write answered 404) — never select it from a
+    /// listing again; live-but-tainted when it was edited under us
+    /// without identification — a selection must rewrite, never accept
+    /// a cached body (Codex ledger review round 22, P2). Death is
+    /// permanent: a taint never downgrades it.
+    pub fn distrust_ledger_comment(
+        &mut self,
+        pr: PrNumber,
+        comment_id: CommentId,
+        dead: bool,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO ledger_comment_distrust (comment_id, pr, dead) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(comment_id) DO UPDATE SET dead = MAX(dead, excluded.dead)",
+            rusqlite::params![comment_id.0 as i64, pr.0 as i64, dead as i64],
+        )?;
+        Ok(())
+    }
+
+    /// The distrusted comment ids on `pr`, each with whether it is dead.
+    pub fn ledger_distrust(&self, pr: PrNumber) -> Result<Vec<(CommentId, bool)>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT comment_id, dead FROM ledger_comment_distrust WHERE pr = ?1 ORDER BY comment_id",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![pr.0 as i64], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut distrust = Vec::new();
+        for row in rows {
+            let (comment_id, dead) = row?;
+            distrust.push((CommentId(comment_id as u64), dead != 0));
+        }
+        Ok(distrust)
+    }
+
+    /// An acknowledged write to a comment re-earns its trust: we know
+    /// what it says now. Death is not a taint and stays.
+    pub fn clear_ledger_taint(&mut self, comment_id: CommentId) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM ledger_comment_distrust WHERE comment_id = ?1 AND dead = 0",
+            rusqlite::params![comment_id.0 as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Every PR with a repair owed, for requeueing after a restart or a
+    /// stall retry.
+    pub fn ledger_repair_prs(&self) -> Result<Vec<PrNumber>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT pr FROM owed_ledger_repairs ORDER BY pr")?;
+        let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+        let mut prs = Vec::new();
+        for row in rows {
+            prs.push(PrNumber(row? as u64));
+        }
+        Ok(prs)
+    }
+
     /// Clears the owed sync for one train incarnation (idempotent).
     pub fn delete_owed_status_sync(
         &mut self,
@@ -792,6 +1168,47 @@ impl Drop for Store {
     }
 }
 
+/// Dirties a PR's ledger at a FRESH generation, inside `tx`.
+fn mark_ledger_owed_in(tx: &rusqlite::Transaction<'_>, pr: PrNumber) -> Result<(), StoreError> {
+    tx.execute(
+        "UPDATE counters SET value = value + 1 WHERE name = 'ledger_gen'",
+        [],
+    )?;
+    let generation: i64 = tx.query_row(
+        "SELECT value FROM counters WHERE name = 'ledger_gen'",
+        [],
+        |row| row.get(0),
+    )?;
+    // The absence streak restarts with the obligation: what a probe saw of
+    // the old one says nothing about this.
+    tx.execute(
+        "INSERT INTO owed_stack_ledgers (pr, generation, absent_probes, absent_at) \
+         VALUES (?1, ?2, 0, NULL) \
+         ON CONFLICT(pr) DO UPDATE SET generation = ?2, absent_probes = 0, absent_at = NULL",
+        rusqlite::params![pr.0 as i64, generation],
+    )?;
+    Ok(())
+}
+
+/// What a PR's ledger states: the declaration in force, if any.
+fn declaration_of(state: &RepoState, pr: PrNumber) -> Option<(PrNumber, CommentId)> {
+    state
+        .prs
+        .get(&pr)
+        .and_then(|p| p.predecessor.zip(p.predecessor_comment_id))
+}
+
+/// The PR whose declaration an event may change: the two events that carry
+/// one, and nothing else. `StackLedgerPosted` records where the ledger
+/// lives rather than what it says, so it does not dirty it.
+fn ledger_declaration_events(payload: &StateEventPayload) -> Option<PrNumber> {
+    match payload {
+        StateEventPayload::PredecessorDeclared { pr, .. }
+        | StateEventPayload::PredecessorRemoved { pr, .. } => Some(*pr),
+        _ => None,
+    }
+}
+
 /// Inserts `event` into the log and applies it to `state`, within `tx`.
 fn insert_and_apply(
     tx: &rusqlite::Transaction,
@@ -830,7 +1247,21 @@ fn insert_and_apply(
             ],
         )?;
     }
+    // A topology change owes its PR's ledger comment a rewrite — in this
+    // transaction, so a crash between the commit and the write cannot lose
+    // it. The obligation names only the PR: what to write is read from the
+    // state at write time, which is what makes repeated changes coalesce
+    // into one correct write (`status::ledger`). Only a change that the
+    // state actually took counts: a removal naming a comment that no
+    // longer owns the declaration changes nothing, and owes nothing.
+    let ledger_pr = ledger_declaration_events(&event.payload);
+    let declaration_before = ledger_pr.map(|pr| declaration_of(state, pr));
     state.apply_event(event);
+    if let Some(pr) = ledger_pr
+        && declaration_before != Some(declaration_of(state, pr))
+    {
+        mark_ledger_owed_in(tx, pr)?;
+    }
     tx.execute(
         "INSERT INTO events (seq, ts, payload) VALUES (?1, ?2, ?3)",
         rusqlite::params![
@@ -933,7 +1364,72 @@ fn init_schema(conn: &Connection) -> Result<(), StoreError> {
             absent_probes INTEGER NOT NULL DEFAULT 0,
             absent_at     TEXT,
             PRIMARY KEY (root, started_at)
-        );",
+        );
+
+        -- PRs whose stack-ledger comment no longer matches what the store
+        -- holds. A dirty set, not a queue of payloads: the write states the
+        -- CURRENT declaration, so several changes in a row need one write
+        -- and it always converges on the truth. `generation` is strictly
+        -- increasing across the store's whole life: a write clears the
+        -- obligation it READ, so anything that dirties the ledger while
+        -- that write is in flight holds a newer generation and survives.
+        CREATE TABLE owed_stack_ledgers (
+            pr            INTEGER PRIMARY KEY,
+            generation           INTEGER NOT NULL,
+            absent_probes INTEGER NOT NULL DEFAULT 0,
+            absent_at     TEXT
+        );
+
+        -- Per-comment ledger repairs: a bot comment KNOWN to need fixing
+        -- — a webhook reported it edited into (or as) a ledger, or a
+        -- probe's listing discovered it as a duplicate. The repair
+        -- targets the comment id directly (no listing needed), and is
+        -- owed until an UpdateComment to it is acknowledged, a 404 says
+        -- it is gone, or its deletion webhook arrives. `rewrite` = 1
+        -- rewrites the recorded ledger to the store's truth; 0 makes a
+        -- pretender inert. `generation` follows the obligation counter:
+        -- an acknowledgement clears only the tampering it saw.
+        CREATE TABLE owed_ledger_repairs (
+            pr            INTEGER NOT NULL,
+            comment_id    INTEGER NOT NULL,
+            rewrite       INTEGER NOT NULL,
+            generation    INTEGER NOT NULL,
+            -- A write to this comment answered 404. Not proof of
+            -- deletion by itself (auth loss 404s existing comments):
+            -- death needs a successful listing that omits it too.
+            saw_404       INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (pr, comment_id)
+        );
+
+        -- The sequence number of the last ACKNOWLEDGED ledger write per
+        -- PR. A listed body older than this is stale listing content,
+        -- however well it matches: content can march A -> B -> A, and
+        -- only the sequence number tells the two A-bodies apart.
+        CREATE TABLE ledger_written_seq (
+            pr  INTEGER PRIMARY KEY,
+            seq INTEGER NOT NULL
+        );
+
+        -- Comment ids the ledger machinery must not trust from a
+        -- listing. DEAD ones are proven gone (a deletion webhook, or a
+        -- write answered 404): a listing still showing one serves a
+        -- ghost, and selecting it discharges obligations against a
+        -- comment that does not exist. TAINTED ones were edited under
+        -- us without identification (only the repost guard matched):
+        -- a listed body may predate the edit, so a selection must
+        -- REWRITE — only an acknowledged write re-earns trust.
+        CREATE TABLE ledger_comment_distrust (
+            comment_id INTEGER PRIMARY KEY,
+            pr         INTEGER NOT NULL,
+            dead       INTEGER NOT NULL
+        );
+
+        -- Monotone counters that are not event sequence numbers.
+        CREATE TABLE counters (
+            name  TEXT PRIMARY KEY,
+            value INTEGER NOT NULL
+        );
+        INSERT INTO counters (name, value) VALUES ('ledger_gen', 0);",
     )?;
     // `user_version` is a transactional header write, so the DDL above and this
     // bump commit together — a crash can't leave a partial schema at version 0.
