@@ -180,6 +180,10 @@ fn check_suite_green_body(config: &GitConfig, head: &Sha, prs: &[u64], suite_id:
 
 // ─── The world: a real stack on a real remote + a fake GitHub ───
 
+/// The harness's stall cadence — production's, since the clock the
+/// processor measures it against is the harness's own and never waited on.
+const STALL_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+
 struct World {
     _temp: TempDir,
     state_dir: TempDir,
@@ -187,6 +191,9 @@ struct World {
     github: Arc<Mutex<FakeGitHub>>,
     /// Monotonic delivery-id source.
     next_delivery: u64,
+    /// The processor's clock. Tests ADVANCE it to state that a cooldown has
+    /// passed; nothing here sleeps.
+    clock: Arc<Mutex<chrono::DateTime<chrono::Utc>>>,
 }
 
 impl World {
@@ -238,8 +245,19 @@ impl World {
             config,
             github,
             next_delivery: 0,
+            clock: Arc::new(Mutex::new(crate::test_utils::test_timestamp())),
         };
         (world, heads)
+    }
+
+    /// Time passes: the next cooldown comparison sees `by` more of it.
+    fn advance(&self, by: chrono::Duration) {
+        *self.clock.lock().unwrap() += by;
+    }
+
+    /// Time passes beyond any cooldown the processor measures.
+    fn advance_past_cooldown(&self) {
+        self.advance(chrono::Duration::from_std(STALL_RETRY_DELAY).unwrap() * 2);
     }
 
     fn db_path(&self) -> PathBuf {
@@ -259,8 +277,9 @@ impl World {
             },
             bot_user_id: TEST_BOT_ID,
             bot_name: "merge-train".to_owned(),
-            stall_retry_delay: std::time::Duration::from_millis(25),
+            stall_retry_delay: STALL_RETRY_DELAY,
             poll_interval: std::time::Duration::ZERO,
+            clock: super::pipeline::Clock::Manual(self.clock.clone()),
         }
     }
 
@@ -1540,11 +1559,11 @@ fn train_with_orphaned_status_comment() -> (World, Processor, crate::types::Comm
 }
 
 /// Any delivery re-queues the owed syncs, as the worker's stall-retry
-/// timer does: a probe that concluded nothing gets another look. The sleep
-/// clears the absence cooldown — this harness sets the stall delay to
-/// 25ms, and two listings closer together than that count as one.
+/// timer does: a probe that concluded nothing gets another look. Time
+/// passes first, past the absence cooldown: two listings closer together
+/// than that count as one.
 fn nudge(world: &mut World, processor: &mut Processor, comment_id: u64) {
-    std::thread::sleep(std::time::Duration::from_millis(30));
+    world.advance_past_cooldown();
     let body = comment_body(
         &world.config,
         1,

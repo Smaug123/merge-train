@@ -68,6 +68,38 @@ use super::executor::{GitHubExec, SagaBatch};
 use super::recovery::{CommentRecovery, decide_comment_recovery};
 
 /// Per-repo dependencies the processor needs beyond the `Store`.
+/// Where the processor reads the time its cooldowns are measured against
+/// — "two listings at least a stall cadence apart are independent
+/// evidence of an absence". Production reads the system clock. Tests hold
+/// a clock they advance by hand, so "spaced past the cooldown" is a fact
+/// a test states, never a race it wins by sleeping.
+#[derive(Clone)]
+pub enum Clock {
+    System,
+    #[cfg(test)]
+    Manual(std::sync::Arc<std::sync::Mutex<chrono::DateTime<Utc>>>),
+}
+
+impl Clock {
+    pub fn now(&self) -> chrono::DateTime<Utc> {
+        match self {
+            Clock::System => Utc::now(),
+            #[cfg(test)]
+            Clock::Manual(held) => *held.lock().unwrap(),
+        }
+    }
+}
+
+impl std::fmt::Debug for Clock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Clock::System => f.write_str("System"),
+            #[cfg(test)]
+            Clock::Manual(held) => write!(f, "Manual({})", held.lock().unwrap()),
+        }
+    }
+}
+
 pub struct WorkerDeps {
     /// How to reach GitHub.
     pub github: GitHubExec,
@@ -82,6 +114,8 @@ pub struct WorkerDeps {
     /// How often the poll timer re-evaluates active trains (the
     /// missed-webhook fallback). Zero disables polling.
     pub poll_interval: std::time::Duration,
+    /// The clock cooldowns are measured against.
+    pub clock: Clock,
 }
 
 /// The git-side settings a [`GitConfig`] is derived from per saga (the
@@ -339,6 +373,12 @@ impl Processor {
 
     pub fn github(&self) -> &GitHubExec {
         &self.deps.github
+    }
+
+    /// The time, as the deps' clock tells it. Every comparison against a
+    /// cooldown reads THIS, so a test can state the passage of time.
+    fn now(&self) -> chrono::DateTime<Utc> {
+        self.deps.clock.now()
     }
 
     pub fn stall_retry_delay(&self) -> std::time::Duration {
@@ -1290,7 +1330,7 @@ impl Processor {
                 .unwrap_or_else(|_| chrono::Duration::seconds(30));
             let absences = self
                 .store
-                .note_absent_probe(root, started_at, Utc::now(), cooldown)?;
+                .note_absent_probe(root, started_at, self.now(), cooldown)?;
             if absences < ABSENT_PROBES_BEFORE_BELIEVED {
                 warn!(
                     %root, absences,
