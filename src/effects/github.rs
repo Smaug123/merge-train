@@ -187,6 +187,33 @@ pub struct PrData {
     pub author_id: u64,
 }
 
+/// GitHub's own edit history for a comment (GraphQL `lastEditedAt` and
+/// `editor`). Deliberately NOT derived from `updated_at > created_at`:
+/// those are second-resolution timestamps, so an edit within the creation
+/// second would pass as unedited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum Edited {
+    /// Never edited: the body is the author's.
+    #[default]
+    Never,
+    /// Edited: the body is the LAST editor's, not the author's. GitHub
+    /// reports only the original author on the comment itself, so an
+    /// author-gated decision cannot attribute an edited body to
+    /// `author_id`; the editor is named here, or not at all (`None`) when
+    /// GitHub cannot name the account any more.
+    By {
+        /// The last editor's GitHub user id, when GitHub still names one.
+        editor: Option<u64>,
+    },
+}
+
+impl Edited {
+    /// Whether the comment has been edited since creation.
+    pub fn is_edited(self) -> bool {
+        !matches!(self, Edited::Never)
+    }
+}
+
 /// Comment data returned from the GitHub API.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommentData {
@@ -196,16 +223,31 @@ pub struct CommentData {
     pub author_id: u64,
     /// The comment body.
     pub body: String,
-    /// Whether the comment has been edited since creation, per GitHub's
-    /// edit history (GraphQL `lastEditedAt`). Deliberately NOT derived from
-    /// `updated_at > created_at`: those are second-resolution timestamps,
-    /// so an edit within the creation second would pass as unedited.
-    /// GitHub reports only the ORIGINAL author, not the last editor, so an
-    /// edited comment's body cannot be attributed to `author_id` —
-    /// author-gated decisions (the bootstrap crawl's predecessor
-    /// declarations) must fail closed on it.
+    /// GitHub's edit history for the comment: who wrote the CURRENT body
+    /// (see [`Edited`]). Author-gated decisions (the bootstrap crawl's
+    /// predecessor declarations) fail closed on any edit; the bot's own
+    /// records are trusted only through [`CommentData::body_written_by`].
     #[serde(default)]
-    pub edited: bool,
+    pub edited: Edited,
+}
+
+impl CommentData {
+    /// The current body, if `user` is who wrote it: the author of a
+    /// never-edited comment, the LAST editor of an edited one. Nothing
+    /// else about a comment says whose bytes are in it — GitHub names the
+    /// original author however many times someone else has edited the
+    /// comment since, and a signature only proves the bot wrote the bytes
+    /// at SOME time, not that the bot is who put them there now (an old
+    /// signed record pasted back over a newer one verifies just the same).
+    /// `0` is the deny-safe sentinel for an account GitHub omitted on
+    /// either side, and two sentinels do not match.
+    pub fn body_written_by(&self, user: u64) -> Option<&str> {
+        let writer = match self.edited {
+            Edited::Never => self.author_id,
+            Edited::By { editor } => editor.unwrap_or(0),
+        };
+        (user != 0 && writer == user).then_some(self.body.as_str())
+    }
 }
 
 /// Branch protection settings.
@@ -485,7 +527,7 @@ mod tests {
                 id,
                 author_id,
                 body,
-                edited: false,
+                edited: Edited::Never,
             }
         })
     }

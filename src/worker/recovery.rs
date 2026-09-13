@@ -76,7 +76,12 @@ pub fn decide_comment_recovery(
         .iter()
         .filter(|c| c.author_id == bot_user_id)
         .filter_map(|c| {
-            let record = parse_status_comment(&c.body).ok()?;
+            // Only bytes the bot wrote LAST: GitHub reports the bot as the
+            // author of its own comments however a maintainer edits them,
+            // and a record somebody else put there — an edit, or an old
+            // record of the bot's pasted back — adopted here would run a
+            // train nobody started.
+            let record = parse_status_comment(c.body_written_by(bot_user_id)?).ok()?;
             (record.original_root_pr == local.original_root_pr
                 && record.started_at == local.started_at)
                 .then_some((c.id, record))
@@ -100,11 +105,16 @@ pub fn decide_comment_recovery(
                 // anything else — behind after a crash-before-update,
                 // mangled by an edit — must be rewritten before the train
                 // resumes.
-                let fresh = parse_status_comment(&live.body).is_ok_and(|r| {
-                    r.original_root_pr == local.original_root_pr
-                        && r.started_at == local.started_at
-                        && r.recovery_seq == local.recovery_seq
-                });
+                // ...and in bytes the bot wrote last: a matching record
+                // somebody else pasted back is theirs, and no backup.
+                let fresh = live
+                    .body_written_by(bot_user_id)
+                    .and_then(|body| parse_status_comment(body).ok())
+                    .is_some_and(|r| {
+                        r.original_root_pr == local.original_root_pr
+                            && r.started_at == local.started_at
+                            && r.recovery_seq == local.recovery_seq
+                    });
                 if fresh {
                     CommentRecovery::KeepLocal
                 } else {
@@ -139,6 +149,7 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+    use crate::effects::github::Edited;
     use crate::status::format::format_status_comment;
     use crate::test_utils::arb_train_record;
     use crate::types::PrNumber;
@@ -151,8 +162,45 @@ mod tests {
             id: CommentId(id),
             author_id,
             body: format_status_comment(record, "status").unwrap(),
-            edited: false,
+            edited: Edited::Never,
         }
+    }
+
+    /// GitHub names a comment's original author however many times
+    /// somebody else has edited it since. A bot comment somebody else
+    /// edited LAST is theirs: an ahead record in it is a replay or a
+    /// forgery, not the bot's newer word, and a matching backup pasted
+    /// back is no backup — both are rewritten. The bot's own edit is as
+    /// good as its post.
+    #[test]
+    fn a_record_somebody_else_wrote_last_is_neither_adopted_nor_kept() {
+        const STRANGER: u64 = 200;
+        let ts = crate::test_utils::test_timestamp();
+        let mut local = TrainRecord::new(PrNumber(1), ts);
+        local.status_comment_id = Some(CommentId(5));
+        let written_by = |record: &TrainRecord, editor: u64| {
+            let mut c = comment(5, BOT, record);
+            c.edited = Edited::By {
+                editor: Some(editor),
+            };
+            c
+        };
+        assert!(matches!(
+            decide_comment_recovery(&local, &[written_by(&ahead_of(&local, 1), STRANGER)], BOT),
+            CommentRecovery::RefreshComment(CommentId(5))
+        ));
+        assert!(matches!(
+            decide_comment_recovery(&local, &[written_by(&local, STRANGER)], BOT),
+            CommentRecovery::RefreshComment(CommentId(5))
+        ));
+        assert!(matches!(
+            decide_comment_recovery(&local, &[written_by(&ahead_of(&local, 1), BOT)], BOT),
+            CommentRecovery::Adopt(_)
+        ));
+        assert!(matches!(
+            decide_comment_recovery(&local, &[written_by(&local, BOT)], BOT),
+            CommentRecovery::KeepLocal
+        ));
     }
 
     /// A record that is `local` but `bump` recovery_seq bumps ahead.
@@ -276,7 +324,7 @@ mod tests {
             id: CommentId(3),
             author_id: BOT,
             body: "someone edited this".to_owned(),
-            edited: false,
+            edited: Edited::Never,
         }];
         assert_eq!(
             decide_comment_recovery(&local, &comments, BOT),

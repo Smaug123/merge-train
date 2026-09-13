@@ -957,7 +957,9 @@ fn plant_bot_comment(world: &World, pr: u64, body: &str) -> crate::types::Commen
             pr: PrNumber(pr),
             author_id: TEST_BOT_ID,
             body: body.to_owned(),
-            edited: true,
+            edited: crate::effects::github::Edited::By {
+                editor: Some(TEST_BOT_ID),
+            },
         },
     );
     id
