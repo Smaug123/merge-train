@@ -1288,11 +1288,12 @@ re-dirties itself from the webhook.
    records corroborating, with every disagreement resolving towards fewer
    edges: the stop-shaped direction, and the cover for the one residual the
    ledger alone leaves (a retraction whose write was lost).
-3. *A declaration no ledger accounts for creates nothing.* It is followed
-   for discovery (the PR it names is fetched) and for nothing else. What it
-   means for a running train — evidence the topology moved in a way the
-   crawl cannot reconstruct, which aborts the train — is the train
-   adoption's concern, the change after this one.
+3. *A declaration no ledger accounts for can only abort.* It is evidence the
+   topology moved in a way the crawl cannot reconstruct, so it aborts a
+   train whose stack it touches and creates nothing. "Accounts for" reads
+   the settled watermark, and only a comment the live path could have
+   accepted — its author's, or an edited body nobody can be held to — is
+   evidence at all.
 
 **Onboarding (owner's ruling, 2026-09-08)** is the single exception: a
 repository with no trace of the bot — not one comment of the bot's: no

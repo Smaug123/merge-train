@@ -32,6 +32,7 @@
 //! commands and head-moved observations reach the engine), and the engine
 //! work they trigger queues for the saga slot.
 
+mod adoption;
 pub mod authz;
 mod bootstrap;
 pub mod executor;

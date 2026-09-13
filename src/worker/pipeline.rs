@@ -55,7 +55,7 @@ use crate::effects::{Effect, GitHubResponse, PrData};
 use crate::git::{CommitIdentity, GitConfig};
 use crate::persistence::event::StateEventPayload;
 use crate::store::{Delivery, Store, StoreError};
-use crate::types::{MergeStateStatus, PrNumber, PrState};
+use crate::types::{CommentId, MergeStateStatus, PrNumber, PrState, TrainRecord};
 use crate::webhooks::dedupe::DedupeKey;
 use crate::webhooks::events::CommentAction;
 use crate::webhooks::handlers::{HandlerCtx, Trigger, handle_event};
@@ -1410,7 +1410,9 @@ impl Processor {
     /// fetches settings, open + recently merged PRs, and every crawled
     /// PR's comments, then appends [`super::bootstrap::crawl_events`]'s
     /// result as ONE atomic batch — a crash or a released retry re-crawls
-    /// from nothing (idempotent reads, no partial state). Returns `false` when GitHub was
+    /// from nothing (idempotent reads, no partial state). Adopted ACTIVE
+    /// trains are marked for M6 recovery, deferred behind the backlog
+    /// drain like every other recovery. Returns `false` when GitHub was
     /// unavailable (any failure: transient, permanent, or a wrong
     /// variant): the caller releases the delivery and the queue pauses at
     /// the stall cadence — there is no safe degraded answer at bootstrap.
@@ -1492,16 +1494,19 @@ impl Processor {
         let mut crawled: Vec<PrData> = open;
         crawled.extend(merged);
         let mut attempted: HashSet<PrNumber> = crawled.iter().map(|p| p.number).collect();
+        // Referenced PRs that a permanent `GetPr` failure could not fetch
+        // (deleted, or the token lost access). `crawl_events` aborts a train
+        // that references one rather than recover it into an `UnknownPr`
+        // stall (Codex crawl review round 12).
+        // Their comments were never listed because the PR could not be
+        // reached, not because the cap bit: a command on one is answered by
+        // the handler's own refusal rather than closed unheard.
+        let mut unfetchable: HashSet<PrNumber> = HashSet::new();
         let mut comments: Vec<(PrNumber, Vec<CommentData>)> = Vec::new();
         let mut listed: HashSet<PrNumber> = HashSet::new();
-        // Seeds a permanent `GetPr` failure could not fetch: their comments
-        // were never listed because the PR could not be reached, not
-        // because the cap bit, and a command on one is answered by the
-        // handler's own refusal rather than closed unheard.
-        let mut unfetchable: HashSet<PrNumber> = HashSet::new();
         // Set when the cap stops us reading a crawled PR's comments: a
-        // ledger may then be missing from the crawl, and the topology it
-        // rebuilt is incomplete.
+        // ledger, or a whole train member, may then be missing from the
+        // crawl, and no train can be recovered from a partial read.
         let mut comments_truncated = false;
         let mut pending: Vec<PrNumber> = seed_prs
             .iter()
@@ -1521,6 +1526,7 @@ impl Processor {
                         "the bootstrap crawl hit its referenced-PR fetch cap; \
                          treating the rest as unfetchable"
                     );
+                    unfetchable.insert(pr);
                     continue;
                 }
                 fetched += 1;
@@ -1572,6 +1578,7 @@ impl Processor {
                 comments: &comments,
                 bot_name: &self.deps.bot_name,
                 bot_user_id: self.deps.bot_user_id,
+                unfetchable: &unfetchable,
                 comments_truncated,
                 now: Utc::now(),
             });
@@ -1589,6 +1596,7 @@ impl Processor {
         info!(
             default_branch = %settings.default_branch,
             crawled_prs = crawled.len(),
+            recovered_trains = outcome.recovered_roots.len(),
             "bootstrapped the repo from a crawl"
         );
         // Is the triggering delivery CURRENT against the present the crawl
@@ -1712,6 +1720,28 @@ impl Processor {
         self.clear_inherited_markers(&outcome.events);
         // (The ledgers the crawl disbelieved were marked owed in the same
         // transaction as its events; the sync below picks them up.)
+        // A train the crawl aborted (its stack was extended during the gap)
+        // needs the same worker-side cleanup a handler abort gets — stale
+        // worktree removal + a final status comment (the engine's own
+        // aborts carry cleanup in their plans; this one has no plan).
+        // Captured NOW and queued AHEAD, as everywhere: run later, a
+        // reloaded `start` could replace the aborted record first and
+        // leave a recompute nothing to find (Codex terminal-sync review
+        // round 14, P2).
+        for payload in &outcome.events {
+            if let StateEventPayload::TrainAborted { root_pr, .. } = payload {
+                let effects = cascade::handler_abort_cleanup(self.store.state(), *root_pr);
+                if !effects.is_empty() {
+                    self.pending.push_front(PendingWork::CapturedCleanup {
+                        root: *root_pr,
+                        effects,
+                    });
+                }
+            }
+        }
+        for root in outcome.recovered_roots {
+            self.inherited_mid_flight.insert(root);
+        }
         // The recoveries defer behind the backlog drain, exactly like
         // startup evaluations (the round-6/round-20 gating); owed status
         // syncs (a synthesized completion) queue too.
@@ -1741,6 +1771,109 @@ impl Processor {
     /// double-squash this check exists to prevent, and the stall cadence
     /// heals "permanent" auth errors the moment the operator fixes the
     /// token (`stop` remains available throughout).
+    /// Adopts `record` in place of the store's for `root` — a record ahead
+    /// of the store's, or a newer incarnation, that supplementary recovery
+    /// found — judged as the crawl judges. Returns whether the train
+    /// resumes; a terminal verdict retires it here.
+    fn adopt_replacement(
+        &mut self,
+        root: PrNumber,
+        record: TrainRecord,
+        barred: Option<CommentId>,
+    ) -> Result<bool, StoreError> {
+        // Judged as the crawl judges (`adoption::judge_replacement`),
+        // against the store as it stands: the record replacing the
+        // one the crawl read may name a member the author unstacked
+        // during the gap, or one another active train owns, and
+        // resumed unjudged the cascade would merge it (Codex trains
+        // review, P1). The store's picture of every PR the record
+        // names is brought to GitHub's present FIRST: a restored
+        // backup's cache can still list a member the train has since
+        // merged as open, and that would read as an extension (Codex
+        // trains review, P2). A PR that cannot be fetched is unknown
+        // here — the crawl's discovery is over.
+        let footprint = super::adoption::Footprint::of(self.store.state(), &record);
+        // Every PR the judgement looks at: what the record names,
+        // and everything the cache hangs off its root and current
+        // PR — that is where a merged member the backup still lists
+        // as open sits.
+        let mut to_refresh: Vec<PrNumber> = footprint.stack.iter().copied().collect();
+        to_refresh.sort_unstable();
+        let mut unknown: HashSet<PrNumber> = HashSet::new();
+        for pr in to_refresh {
+            match self.deps.github.execute(GitHubEffect::GetPr { pr }) {
+                Ok(GitHubResponse::Pr(present)) => {
+                    let reconcile = reconcile_cache_events(self.store.state(), pr, &present);
+                    self.store.append_batch(&reconcile, Utc::now())?;
+                }
+                Err(e @ EffectError::Transient { .. }) => {
+                    warn!(%root, %pr, error = ?e, "cannot fetch a named PR; recovery parked");
+                    self.retry_requested = true;
+                    return Ok(false);
+                }
+                other => {
+                    warn!(%root, %pr, ?other, "a PR of the train's cannot be fetched");
+                    if footprint.named.contains(&pr) {
+                        unknown.insert(pr);
+                    }
+                }
+            }
+        }
+        let verdict =
+            super::adoption::judge_replacement(self.store.state(), root, &record, &unknown, barred);
+        let mut events = vec![StateEventPayload::TrainRecordAdopted {
+            root_pr: root,
+            record,
+        }];
+        let resumes = match verdict {
+            super::adoption::Verdict::Recover => true,
+            // A retired record (stopped, completed, aborted on GitHub's own
+            // say-so) retires the train here: nothing resumes.
+            super::adoption::Verdict::Retired => false,
+            super::adoption::Verdict::Complete => {
+                events.push(StateEventPayload::TrainCompleted { root_pr: root });
+                false
+            }
+            super::adoption::Verdict::Abort(why) => {
+                warn!(%root, ?why, "the record adopted after the crawl is aborted");
+                let default_branch = self.store.state().default_branch.clone();
+                events.push(StateEventPayload::TrainAborted {
+                    root_pr: root,
+                    error: why.error(root, &default_branch),
+                });
+                false
+            }
+        };
+        self.store.append_batch(&events, Utc::now())?;
+        if !resumes {
+            // A terminal verdict retires the train here: the
+            // inherited marker goes with it (or later ledger repairs
+            // on the root would stay deferred behind it), an abort
+            // gets the worker-side cleanup a handler abort gets,
+            // and the final word the record is now owed is queued —
+            // nothing else would, once completion has removed the
+            // train from what polling looks at (Codex trains
+            // review, P2 twice).
+            self.clear_inherited_markers(&events);
+            // ...for a retired record too, whose batch carries no terminal
+            // event of its own (Codex trains review, P2).
+            self.inherited_mid_flight.remove(&root);
+            if events
+                .iter()
+                .any(|e| matches!(e, StateEventPayload::TrainAborted { .. }))
+            {
+                let effects = cascade::handler_abort_cleanup(self.store.state(), root);
+                if !effects.is_empty() {
+                    self.pending
+                        .push_front(PendingWork::CapturedCleanup { root, effects });
+                }
+            }
+            self.queue_owed_status_syncs()?;
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     fn recover_inherited(&mut self, root: PrNumber) -> Result<bool, StoreError> {
         let local = self
             .store
@@ -1777,6 +1910,110 @@ impl Processor {
                 return Ok(false);
             }
         };
+        // The incarnation chosen AGAIN on this listing, as the crawl chose
+        // it (`adoption::choose`): the crawl's listing can have missed a
+        // newer incarnation's record — a stop and a fresh start it had not
+        // caught up with — and `decide_comment_recovery` would keep the
+        // older running record as this train's own (Codex trains review,
+        // P1). A newer incarnation, or any comment of the bot's on the
+        // root that is not its own bytes (a bar, as for the crawl), is
+        // adopted as a replacement and judged as one.
+        let bot = self.deps.bot_user_id;
+        let trusted: Vec<(CommentId, TrainRecord)> = comments
+            .iter()
+            .filter(|c| c.author_id == bot && c.author_id != 0)
+            .filter_map(|c| {
+                let record = c
+                    .body_written_by(bot)
+                    .and_then(|body| crate::status::parse_status_comment(body).ok())?;
+                (record.original_root_pr == root).then_some((c.id, record))
+            })
+            .collect();
+        let barred = comments
+            .iter()
+            .filter(|c| c.author_id == bot && c.body_written_by(bot).is_none())
+            .map(|c| c.id)
+            .max();
+        // A newer incarnation is one whose record sits ABOVE the local
+        // train's own: a different identity alone is no evidence — an
+        // intact database restarting with its train's comment deleted
+        // and a previous incarnation's stop still on the root must repost
+        // its backup, not adopt the old stop (Codex trains review, P2).
+        // ABOVE is by watermark, the incarnation's FIRST comment id: the
+        // local record can be a backup restored after its own repost,
+        // whose comment id sits above every genuine newcomer's for ever
+        // (Codex trains review, P1).
+        let newer = super::adoption::choose(&trusted).filter(|(comment_id, chosen)| {
+            chosen.started_at != local.started_at
+                && local
+                    .watermark
+                    .or(local.status_comment_id)
+                    .is_some_and(|own| chosen.watermark.unwrap_or(*comment_id) > own)
+        });
+        // The bar holds whether or not a trusted record remains: with the
+        // sole status comment edited by somebody else, nothing is left to
+        // choose, and the stale record must not refresh the comment and
+        // resume (Codex trains review, P1).
+        let replaced = match (newer, barred) {
+            (Some((comment_id, mut chosen)), bar) => {
+                info!(
+                    %root, %comment_id, barred = ?bar,
+                    "a newer incarnation's record is on the root; adopting it as a replacement"
+                );
+                chosen.status_comment_id = Some(comment_id);
+                Some(self.adopt_replacement(root, chosen, bar)?)
+            }
+            (None, Some(bar)) => {
+                info!(%root, %bar, "a comment of the bot's on the root is not its own bytes");
+                // The abort this bar forces must outrank every trusted
+                // duplicate of the incarnation: the local record can be
+                // BEHIND them (a database restored from backup), and an
+                // abort written from it alone would lose the next loss's
+                // `choose` to a surviving duplicate — resuming the train
+                // the bar stopped (Codex trains review, P1).
+                let mut record = local.clone();
+                if let Some(peak) = trusted
+                    .iter()
+                    .filter(|(_, r)| r.started_at == local.started_at)
+                    .map(|(_, r)| r.recovery_seq)
+                    .max()
+                {
+                    record.recovery_seq = record.recovery_seq.max(peak);
+                }
+                Some(self.adopt_replacement(root, record, Some(bar))?)
+            }
+            (None, None) => None,
+        };
+        match replaced {
+            Some(false) => return Ok(false),
+            // A live replacement continues through the recovery tail below
+            // — the inherited marker cleared, restart cleanup owed — as
+            // the crawl-adopted record would have (Codex trains review,
+            // P2).
+            Some(true) => {}
+            None => {
+                if !self.recover_inherited_comment(root, &local, &comments)? {
+                    return Ok(false);
+                }
+            }
+        }
+        self.inherited_mid_flight.remove(&root);
+        self.needs_restart_cleanup.insert(root);
+        info!(%root, "recovered an inherited mid-cascade train; resuming");
+        Ok(true)
+    }
+
+    /// The comment-recovery half of [`Processor::recover_inherited`]:
+    /// [`decide_comment_recovery`]'s verdict, applied. `Ok(false)` parks
+    /// the recovery.
+    fn recover_inherited_comment(
+        &mut self,
+        root: PrNumber,
+        local: &TrainRecord,
+        comments: &[CommentData],
+    ) -> Result<bool, StoreError> {
+        let local = local.clone();
+        let comments = comments.to_vec();
         match decide_comment_recovery(&local, &comments, self.deps.bot_user_id) {
             CommentRecovery::Adopt(record) => {
                 info!(
@@ -1786,13 +2023,9 @@ impl Processor {
                     "status comment is ahead of the store (restored from \
                      backup?); adopting its record"
                 );
-                self.store.append_batch(
-                    &[StateEventPayload::TrainRecordAdopted {
-                        root_pr: root,
-                        record: *record,
-                    }],
-                    Utc::now(),
-                )?;
+                if !self.adopt_replacement(root, *record, None)? {
+                    return Ok(false);
+                }
             }
             CommentRecovery::RefreshComment(comment_id) => {
                 // The recorded comment is live but behind the store (the
@@ -1888,9 +2121,6 @@ impl Processor {
             }
             CommentRecovery::KeepLocal => {}
         }
-        self.inherited_mid_flight.remove(&root);
-        self.needs_restart_cleanup.insert(root);
-        info!(%root, "recovered an inherited mid-cascade train; resuming");
         Ok(true)
     }
 
