@@ -7,3 +7,6 @@
 cc 85591b26152167703745eabe2377689554238dc0b7b3ab5d1c30a104f8e33c33 # shrinks to pred_content = "aaaaaaaazw", desc_content = "enwjrnojcbeeaxjpaxiphjfewxq"
 cc 13dd3691380d284ef7bb327da0372c46d2ddaa122ea114cfd58155b6457eac52 # shrinks to pred_content = "uodxcuebktoqxxpshxvpqkq", desc_content = "cudaqbabzrpocxgoffclsbazqklktvvnz", intervening_content = "ssapdwckixuin"
 cc 58d6dfcafad5fc7e95773e2e1f15701ef2ec7784432ad2944dd910a544bfc081 # shrinks to pred_content = "wygjfgiglpdmxmvybhtxngrezrlhjzan", desc_content = "vjfsczjkvsfvqacgzgyuxb"
+cc 9ae8e5fb86d24303fb291f0462464a260429c1527af4297640c7bcb03d27a6df # shrinks to file_content = "uhbmyjjyjdlnrqwtmxsmdtyabvzahzospzuyrzrp"
+cc e104c51f550773afd893ee0260221febde2f8eb1b2bc9a9333d6d009c520c258 # shrinks to pr_numbers = [825, 793, 192], active_pr = 926
+cc 8632488498eac39e131a81557dcaa7839d180d28d8e654407fbac6c334843108 # shrinks to pr_numbers = [786], active_pr = 690

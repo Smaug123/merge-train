@@ -872,7 +872,26 @@ fn begin_step(
         }
     }
 
-    let phase = start_preparing(frozen.clone());
+    // The whole stack this train knows, recorded with the freeze: a
+    // lost-DB crawl needs it to tell a legitimately pre-declared
+    // descendant from one attached during the gap, and comment ids cannot
+    // answer that (they prove creation order, not when a declaration
+    // entered the bot's state — Codex crawl review round 4, P1).
+    // The root and current PR are always included, so a descendant-free
+    // stack still records a NON-EMPTY known stack — empty means "written
+    // before this field existed", and such a record falls back to the
+    // weaker comment-id watermark (Codex crawl review round 6, P1).
+    let mut known_stack: Vec<PrNumber> = [ctx.root(), current]
+        .into_iter()
+        .flat_map(|anchor| {
+            collect_all_descendants(anchor, &ctx.state.descendants, &ctx.state.prs)
+                .into_iter()
+                .chain(std::iter::once(anchor))
+        })
+        .collect();
+    known_stack.sort_unstable();
+    known_stack.dedup();
+    let phase = start_preparing(frozen.clone(), known_stack);
     let entering = phase.kind();
     events.push(phase_transition(ctx, phase.clone(), None, None, None));
 

@@ -23,9 +23,12 @@
 //! its `pr` field names: a ledger found anywhere else is forged or
 //! misplaced, the same gate status comments apply to `original_root_pr`.
 //! Where a PR carries two (a crash between `PostComment` and the event
-//! that records its id leaves an orphan), the highest `seq` wins — it is
-//! the store's own event sequence number, so it orders writes exactly as
-//! the store made them.
+//! that records its id leaves an orphan, and a maintainer can edit any bot
+//! reply into one), a crawl takes the highest comment id — never the
+//! stated `seq`, which restarts with a rebuilt database — and corroborates
+//! it against the comment it names, so a forgery can cost an edge but
+//! never add one. The live path neutralizes every other ledger-shaped
+//! comment of the bot's on that PR.
 //!
 //! # The two rules a crawl obeys
 //!
