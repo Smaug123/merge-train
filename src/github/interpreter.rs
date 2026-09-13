@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cascade::EffectError;
 use crate::effects::github::CollaboratorRole;
+use crate::effects::github::Edited;
 use crate::effects::{
     BranchProtectionData, CommentData, GitHubEffect, GitHubResponse, PrData, Reaction,
     RepoSettingsData, RulesetData,
@@ -96,6 +97,12 @@ query($owner: String!, $repo: String!, $number: Int!, $after: String) {
                     }
                     body
                     lastEditedAt
+                    editor {
+                        ... on User { databaseId }
+                        ... on Bot { databaseId }
+                        ... on Organization { databaseId }
+                        ... on Mannequin { databaseId }
+                    }
                 }
             }
         }
@@ -148,6 +155,8 @@ struct CommentNode {
     #[serde(default)]
     body: String,
     last_edited_at: Option<String>,
+    /// The LAST editor, set alongside `lastEditedAt`.
+    editor: Option<ActorId>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -935,7 +944,16 @@ async fn list_comments(
                 // commenter, so author-gated decisions fail closed.
                 author_id: node.author.and_then(|a| a.database_id).unwrap_or(0),
                 body: node.body,
-                edited: node.last_edited_at.is_some(),
+                // GitHub names the editor only alongside `lastEditedAt`;
+                // an edit whose editor it cannot name (a deleted account)
+                // is an edit by nobody the bot can trust.
+                edited: if node.last_edited_at.is_some() {
+                    Edited::By {
+                        editor: node.editor.and_then(|e| e.database_id),
+                    }
+                } else {
+                    Edited::Never
+                },
             });
         }
 
@@ -2068,12 +2086,14 @@ mod tests {
             id: u64,
             author: Option<u64>,
             last_edited_at: Option<&str>,
+            editor: Option<u64>,
         ) -> serde_json::Value {
             serde_json::json!({
                 "fullDatabaseId": id.to_string(),
                 "author": author.map(|a| serde_json::json!({ "databaseId": a })),
                 "body": format!("comment {id}"),
                 "lastEditedAt": last_edited_at,
+                "editor": editor.map(|e| serde_json::json!({ "databaseId": e })),
             })
         }
 
@@ -2081,15 +2101,41 @@ mod tests {
         /// comparison of second-resolution timestamps: an edit made within
         /// the creation second must still count, or an editor with comment
         /// rights could have their body attributed to the original author
+        /// The mock server answers whatever it is asked, so the QUERY is
+        /// pinned here: the listing reads an edit's editor, and the query
+        /// must ask GitHub for it, on every actor type an editor can be.
+        #[test]
+        fn the_comments_query_asks_for_the_last_editor() {
+            let editor = COMMENTS_QUERY
+                .split_once("editor {")
+                .map(|(_, rest)| rest)
+                .expect("the query asks who last edited each comment");
+            let fragments = editor
+                .split_once('}')
+                .map(|(fields, _)| fields)
+                .unwrap_or("");
+            for actor in ["User", "Bot", "Organization", "Mannequin"] {
+                assert!(
+                    editor.contains(&format!("... on {actor} {{ databaseId }}")),
+                    "the editor's id is read for a {actor}"
+                );
+            }
+            assert!(fragments.contains("databaseId"));
+            assert!(COMMENTS_QUERY.contains("lastEditedAt"));
+        }
+
         /// (Codex plumbing review, P1). A deleted author is id 0, matching
-        /// no real commenter.
+        /// no real commenter. An edit names its LAST editor — the one
+        /// whose bytes are in the comment now — or nobody, when GitHub
+        /// cannot name the account any more.
         #[tokio::test]
         async fn list_comments_reports_edits_from_edit_history() {
             let (base, hits) = spawn_mock_server(vec![comments_page(
                 vec![
-                    comment_node(10, Some(7), None),
-                    comment_node(11, Some(7), Some("2026-07-01T12:00:00Z")),
-                    comment_node(12, None, None),
+                    comment_node(10, Some(7), None, None),
+                    comment_node(11, Some(7), Some("2026-07-01T12:00:00Z"), Some(9)),
+                    comment_node(12, None, None, None),
+                    comment_node(13, Some(7), Some("2026-07-01T12:00:00Z"), None),
                 ],
                 None,
             )])
@@ -2109,19 +2155,25 @@ mod tests {
                         id: CommentId(10),
                         author_id: 7,
                         body: "comment 10".to_owned(),
-                        edited: false,
+                        edited: Edited::Never,
                     },
                     CommentData {
                         id: CommentId(11),
                         author_id: 7,
                         body: "comment 11".to_owned(),
-                        edited: true,
+                        edited: Edited::By { editor: Some(9) },
                     },
                     CommentData {
                         id: CommentId(12),
                         author_id: 0,
                         body: "comment 12".to_owned(),
-                        edited: false,
+                        edited: Edited::Never,
+                    },
+                    CommentData {
+                        id: CommentId(13),
+                        author_id: 7,
+                        body: "comment 13".to_owned(),
+                        edited: Edited::By { editor: None },
                     },
                 ]
             );
@@ -2135,12 +2187,12 @@ mod tests {
             let (base, hits) = spawn_mock_server(vec![
                 comments_page(
                     vec![
-                        comment_node(1, Some(7), None),
-                        comment_node(2, Some(7), None),
+                        comment_node(1, Some(7), None, None),
+                        comment_node(2, Some(7), None, None),
                     ],
                     Some("cursor-1"),
                 ),
-                comments_page(vec![comment_node(3, Some(7), None)], None),
+                comments_page(vec![comment_node(3, Some(7), None, None)], None),
             ])
             .await;
             let client = mock_client(&base);
@@ -2162,7 +2214,7 @@ mod tests {
         async fn list_comments_handles_ids_beyond_32_bits() {
             let big = 3_000_000_000u64;
             let (base, _hits) = spawn_mock_server(vec![comments_page(
-                vec![comment_node(big, Some(7), None)],
+                vec![comment_node(big, Some(7), None, None)],
                 None,
             )])
             .await;
@@ -2196,7 +2248,7 @@ mod tests {
                     body: serde_json::json!({
                         "data": { "repository": { "pullRequest": { "comments": {
                             "pageInfo": { "hasNextPage": true, "endCursor": null },
-                            "nodes": [comment_node(1, Some(7), None)],
+                            "nodes": [comment_node(1, Some(7), None, None)],
                         }}}},
                         "errors": [error],
                     })

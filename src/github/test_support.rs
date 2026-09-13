@@ -49,9 +49,9 @@ pub struct FakeComment {
     pub pr: PrNumber,
     pub author_id: u64,
     pub body: String,
-    /// Set by `UpdateComment` (and seedable): mirrors GitHub's
-    /// `updated_at > created_at`.
-    pub edited: bool,
+    /// GitHub's edit history: `UpdateComment` records an edit by
+    /// `comment_author` (the bot); tests seed a maintainer's edit directly.
+    pub edited: crate::effects::github::Edited,
 }
 
 /// The GitHub half of a test world whose git half is real.
@@ -331,7 +331,7 @@ impl FakeGitHub {
                         pr: *pr,
                         author_id: self.comment_author,
                         body: body.clone(),
-                        edited: false,
+                        edited: crate::effects::github::Edited::Never,
                     },
                 );
                 if self.post_comment_response_lost {
@@ -358,7 +358,9 @@ impl FakeGitHub {
                 match self.comments.get_mut(comment_id) {
                     Some(comment) => {
                         comment.body = body.clone();
-                        comment.edited = true;
+                        comment.edited = crate::effects::github::Edited::By {
+                            editor: Some(self.comment_author),
+                        };
                         *updates += 1;
                         Ok(GitHubResponse::CommentUpdated)
                     }
