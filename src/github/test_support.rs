@@ -95,6 +95,26 @@ pub struct FakeGitHub {
     /// `UpdateComment` calls that reached a live comment, so a test can
     /// assert that a satisfied obligation writes nothing further.
     pub comment_updates: u32,
+    /// Comments `ListComments` still serves although they no longer
+    /// exist: GitHub's listing cache can keep returning a deleted
+    /// comment for a while. Writes to them 404, exactly like GitHub.
+    pub stale_listing_ghosts: std::collections::BTreeMap<CommentId, FakeComment>,
+    /// Bodies `ListComments` serves INSTEAD of the stored ones, per
+    /// comment id: GitHub's listing cache can lag an edit, returning a
+    /// pre-edit body for a comment whose true content has moved on.
+    /// `UpdateComment` and direct reads see the real comment.
+    pub stale_listing_bodies: std::collections::BTreeMap<CommentId, String>,
+    /// While set, `PostComment` CREATES the comment but reports a
+    /// transient failure — the response is lost on the wire. The comment
+    /// exists; nothing acknowledged it.
+    pub post_comment_response_lost: bool,
+    /// While set, `UpdateComment` answers 404 for comments that EXIST:
+    /// GitHub does this when repository access is temporarily revoked,
+    /// so a 404 is not proof of deletion.
+    pub update_comment_notfound: bool,
+    /// While set, `ListComments` fails transiently while writes still
+    /// land: a sync's discovery is lost, its rewrite is not.
+    pub list_comments_broken: bool,
     /// While set, `UpdateComment` fails `Permanent` while everything else
     /// keeps working: the token can still READ comments but has lost the
     /// right to edit them, so an owed rewrite can never land.
@@ -118,6 +138,11 @@ impl FakeGitHub {
             blocked: std::collections::HashSet::new(),
             hidden_from_listings: std::collections::HashSet::new(),
             comment_updates: 0,
+            stale_listing_ghosts: std::collections::BTreeMap::new(),
+            stale_listing_bodies: std::collections::BTreeMap::new(),
+            post_comment_response_lost: false,
+            update_comment_notfound: false,
+            list_comments_broken: false,
             update_comment_broken: false,
         }
     }
@@ -309,9 +334,20 @@ impl FakeGitHub {
                         edited: false,
                     },
                 );
+                if self.post_comment_response_lost {
+                    return Err(EffectError::Transient {
+                        detail: "post landed but the response was lost (test-injected)".to_owned(),
+                    });
+                }
                 Ok(GitHubResponse::CommentPosted { id })
             }
             GitHubEffect::UpdateComment { comment_id, body } => {
+                if self.update_comment_notfound {
+                    return Err(EffectError::Permanent {
+                        kind: TrainErrorKind::NotFound,
+                        detail: format!("comment {comment_id} 404s (auth glitch, test-injected)"),
+                    });
+                }
                 if self.update_comment_broken {
                     return Err(EffectError::Permanent {
                         kind: TrainErrorKind::ApiError,
@@ -358,6 +394,11 @@ impl FakeGitHub {
                     may_be_incomplete: false,
                 })
             }
+            GitHubEffect::ListComments { .. } if self.list_comments_broken => {
+                Err(EffectError::Transient {
+                    detail: "listing comments failed (test-injected)".to_owned(),
+                })
+            }
             GitHubEffect::ListComments { pr } => Ok(GitHubResponse::Comments(
                 self.comments
                     .iter()
@@ -365,9 +406,24 @@ impl FakeGitHub {
                     .map(|(id, c)| crate::effects::github::CommentData {
                         id: *id,
                         author_id: c.author_id,
-                        body: c.body.clone(),
+                        body: self
+                            .stale_listing_bodies
+                            .get(id)
+                            .cloned()
+                            .unwrap_or_else(|| c.body.clone()),
                         edited: c.edited,
                     })
+                    .chain(
+                        self.stale_listing_ghosts
+                            .iter()
+                            .filter(|(_, c)| c.pr == *pr)
+                            .map(|(id, c)| crate::effects::github::CommentData {
+                                id: *id,
+                                author_id: c.author_id,
+                                body: c.body.clone(),
+                                edited: c.edited,
+                            }),
+                    )
                     .collect(),
             )),
             GitHubEffect::AddReaction { .. } => Ok(GitHubResponse::ReactionAdded),
