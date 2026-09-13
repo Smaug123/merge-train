@@ -150,6 +150,34 @@ pub enum StateEventPayload {
         comment_id: CommentId,
     },
 
+    /// The PR's stack ledger comment was created (or found again after a
+    /// crash lost its id).
+    ///
+    /// Durable so the bot rewrites that comment rather than posting a
+    /// second one: the ledger is the topology's off-disk backup, and two
+    /// of them on one PR is a duplicate a crawl then has to arbitrate.
+    #[serde(rename = "stack_ledger_posted")]
+    StackLedgerPosted {
+        /// The PR the ledger is about, and sits on.
+        pr: PrNumber,
+        /// The comment id GitHub assigned.
+        comment_id: CommentId,
+    },
+
+    /// The PR's recorded stack ledger comment no longer exists — its
+    /// deletion was reported, or a write to it found nothing there — so
+    /// the id is forgotten and the next write posts a fresh comment.
+    ///
+    /// Names the comment it retires: applied against a state that has
+    /// already moved on to another comment, it changes nothing.
+    #[serde(rename = "stack_ledger_retired")]
+    StackLedgerRetired {
+        /// The PR the ledger is about, and sits on.
+        pr: PrNumber,
+        /// The comment the state must stop addressing.
+        comment_id: CommentId,
+    },
+
     // ─── Phase transitions (always critical) ───
     /// The cascade has transitioned to a new phase.
     ///
@@ -581,6 +609,8 @@ impl StateEventPayload {
 
             // Observational events (not critical for recovery)
             StateEventPayload::StatusCommentPosted { .. }
+            | StateEventPayload::StackLedgerPosted { .. }
+            | StateEventPayload::StackLedgerRetired { .. }
             | StateEventPayload::PrMerged { .. }
             | StateEventPayload::PrStateChanged { .. }
             | StateEventPayload::PredecessorDeclared { .. }
