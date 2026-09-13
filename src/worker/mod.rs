@@ -39,7 +39,7 @@ pub mod recovery;
 #[cfg(test)]
 mod tests;
 
-pub use pipeline::{GitSettings, PipelineOutcome, WorkerDeps};
+pub use pipeline::{Clock, GitSettings, PipelineOutcome, WorkerDeps};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -218,6 +218,7 @@ impl SharedDeps {
             bot_name: self.bot_name.clone(),
             stall_retry_delay: self.stall_retry_delay,
             poll_interval: self.poll_interval,
+            clock: Clock::System,
         }
     }
 }
