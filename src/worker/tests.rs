@@ -140,7 +140,7 @@ fn comment_body_with_action(
                 "id": {comment_id},
                 "body": "{text}",
                 "user": {{ "id": {commenter_id}, "login": "{commenter_login}" }},
-                "updated_at": "2026-07-01T10:00:0{comment_id}Z"
+                "updated_at": "2026-07-01T10:00:00Z"
             }},
             "issue": {{
                 "number": {pr},
@@ -150,7 +150,6 @@ fn comment_body_with_action(
             "repository": {repo},
             "sender": {{ "id": {commenter_id}, "login": "{commenter_login}" }}
         }}"#,
-        comment_id = comment_id % 10,
         repo = repo_json(config),
     )
     .into_bytes()
@@ -903,7 +902,7 @@ fn stranger_cannot_retract_a_predecessor_declaration() {
     world.enqueue(
         &mut processor,
         "issue_comment",
-        delete_body(0, STRANGER, "stranger"),
+        delete_body(20, STRANGER, "stranger"),
     );
     drain(&mut processor);
 
@@ -923,7 +922,7 @@ fn stranger_cannot_retract_a_predecessor_declaration() {
         "expected a denial comment"
     );
 
-    // The author re-declares in a fresh comment (id 5), then deletes it:
+    // The author re-declares in a fresh comment (id 900), then deletes it:
     // their own retraction proceeds.
     let body = comment_body(
         &world.config,
@@ -931,14 +930,14 @@ fn stranger_cannot_retract_a_predecessor_declaration() {
         "@merge-train predecessor #1",
         AUTHOR,
         "author",
-        5,
+        900,
     );
     world.enqueue(&mut processor, "issue_comment", body);
     drain(&mut processor);
     world.enqueue(
         &mut processor,
         "issue_comment",
-        delete_body(5, AUTHOR, "author"),
+        delete_body(900, AUTHOR, "author"),
     );
     drain(&mut processor);
     assert_eq!(
@@ -1006,7 +1005,7 @@ fn an_authorized_retraction_posts_a_receipt_naming_the_retracted_comment() {
     world.enqueue(
         &mut processor,
         "issue_comment",
-        delete_body(0, STRANGER, "stranger"),
+        delete_body(20, STRANGER, "stranger"),
     );
     drain(&mut processor);
     assert_eq!(
@@ -1015,21 +1014,21 @@ fn an_authorized_retraction_posts_a_receipt_naming_the_retracted_comment() {
         "a denied retraction posts no receipt"
     );
 
-    // The author re-declares in a fresh comment (id 5) and deletes it.
+    // The author re-declares in a fresh comment (id 900) and deletes it.
     let body = comment_body(
         &world.config,
         2,
         "@merge-train predecessor #1",
         AUTHOR,
         "author",
-        5,
+        900,
     );
     world.enqueue(&mut processor, "issue_comment", body);
     drain(&mut processor);
     world.enqueue(
         &mut processor,
         "issue_comment",
-        delete_body(5, AUTHOR, "author"),
+        delete_body(900, AUTHOR, "author"),
     );
     drain(&mut processor);
     assert_eq!(
@@ -1039,7 +1038,7 @@ fn an_authorized_retraction_posts_a_receipt_naming_the_retracted_comment() {
     );
     assert_eq!(
         receipts(&world),
-        vec![(PrNumber(2), crate::types::CommentId(5))],
+        vec![(PrNumber(2), crate::types::CommentId(900))],
         "exactly one receipt, on the retracting PR, anchored at the RETRACTED comment"
     );
 }
@@ -2126,13 +2125,13 @@ fn bot_performed_comment_edits_are_closed_without_handling() {
         Some(PrNumber(1))
     );
 
-    // The bot "edits" the author's declaring comment (id 0) away:
+    // The bot "edits" the author's declaring comment (id 20) away:
     // author stays the user, sender is the bot.
     let body = format!(
         r#"{{
             "action": "edited",
             "comment": {{
-                "id": 0,
+                "id": 20,
                 "body": "nothing here now",
                 "user": {{ "id": {AUTHOR}, "login": "author" }},
                 "updated_at": "2026-07-01T14:00:00Z"
