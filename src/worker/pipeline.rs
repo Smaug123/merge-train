@@ -50,7 +50,7 @@ use tracing::{error, info, warn};
 
 use crate::cascade::{self, Control, EffectError, Observation, ReplayFacts, StepPlan, observe};
 use crate::commands::{Command, parse_command};
-use crate::effects::github::GitHubEffect;
+use crate::effects::github::{CommentData, GitHubEffect};
 use crate::effects::{Effect, GitHubResponse, PrData};
 use crate::git::{CommitIdentity, GitConfig};
 use crate::persistence::event::StateEventPayload;
@@ -64,6 +64,7 @@ use crate::webhooks::{GitHubEvent, parse_webhook};
 use super::authz::{
     AuthorDecision, RoleDecision, authorize_by_author, authorize_by_role, authorize_retraction,
 };
+use super::bootstrap::{CrawlInput, CrawlOutcome};
 use super::executor::{GitHubExec, SagaBatch};
 use super::recovery::{CommentRecovery, decide_comment_recovery};
 
@@ -253,6 +254,16 @@ pub(crate) struct Processor {
     /// one is out, further retry requests coalesce into it instead of
     /// arming more (see [`Self::take_retry_request`]).
     retry_timer_outstanding: bool,
+    /// Deliveries released because a listing DOUBTED their triggering
+    /// comment — absent from it, or present with another body (GitHub is
+    /// not read-after-write consistent, and the listing may be the older
+    /// of the two) — with WHEN the doubt was first raised. A doubt is
+    /// believed only once it has stood for the stall cadence: another
+    /// webhook can wake the worker and retry a released delivery at once,
+    /// and two reads within one propagation window prove nothing (Codex
+    /// topology review, P2 and P1). In-memory: a restart re-crawls anyway,
+    /// by which point the listing has long caught up.
+    doubted_triggers: HashMap<String, chrono::DateTime<Utc>>,
     /// The incarnation whose obligation the in-flight batch is PROBING
     /// (`ListComments` on the root), keyed by that root: the probe's
     /// outcome decides between the rewrite and clearing the obligation.
@@ -394,6 +405,7 @@ impl Processor {
             needs_restart_cleanup: HashSet::new(),
             retry_requested: false,
             retry_timer_outstanding: false,
+            doubted_triggers: HashMap::new(),
             sync_probes: HashMap::new(),
             deferred_for_sync: HashSet::new(),
             ledger_probes: HashMap::new(),
@@ -513,6 +525,102 @@ impl Processor {
             }
         };
 
+        // The dedupe key, before anything can close the delivery: a close
+        // records it, so a redelivery under a fresh id — received after
+        // the crawl landed, and so unmarked — is a duplicate, not a fresh
+        // payload (Codex first-contact review, P1).
+        // It is consulted BEFORE a crawled delivery is judged for freshness,
+        // below: a second copy of a stale webhook, queued under its own id
+        // when the crawl landed, is a duplicate of the first copy's close,
+        // discarded at once rather than doubted for another whole stall
+        // cadence with every delivery behind it waiting (Codex first-contact
+        // review, P2).
+        let key = DedupeKey::for_event(&event);
+
+        // First contact — a fresh store (brand-new repo, or a LOST state
+        // db) has an empty default branch. It comes before anything that
+        // could WRITE: a delayed edit webhook for a ledger the bot has
+        // already restored would otherwise queue a repair before the crawl
+        // has landed, and a crawl that fails would leave that repair to
+        // neutralize the genuine ledger against an empty cache (Codex
+        // topology review, P1). Webhooks only describe the
+        // future, so bootstrap crawls the present: settings, open and
+        // recently merged PRs, their comments (predecessor topology,
+        // author-gated), and the bot's own status comments (train recovery
+        // — DESIGN §Bootstrap Phase 2). Any failure releases the delivery:
+        // there is no safe way to process anything without the bootstrap,
+        // and closing would silently drop webhooks GitHub will never
+        // resend — the repo's queue pauses at the stall cadence (which
+        // also heals "permanent" auth errors the moment the operator fixes
+        // the token).
+        //
+        // The crawl must NOT consume THIS delivery's own comment as a
+        // historical declaration: it is live input the command handler
+        // The crawl reads the bot's own records — status comments and
+        // stack ledgers — so the triggering comment shapes nothing in it:
+        // a fresh declaration has no ledger yet, and the handler below
+        // processes it against the crawled present as it would any other.
+        // What the crawl still decides about the trigger is whether the
+        // DELIVERY is current: a `created`/`edited` trigger whose comment
+        // is no longer in the PR's listing — or a `created` one whose
+        // comment has since been edited — is a stale redelivery, and
+        // handling it would record a body the comment no longer has.
+        if self.store.state().default_branch.is_empty() {
+            let freshness = TriggerFreshness::of(&event);
+            let retried = self.doubt_has_stood(&id);
+            match self.bootstrap_crawl(&event.referenced_prs(), freshness, retried)? {
+                Bootstrap::Unavailable => return self.release(&id),
+                Bootstrap::TriggerDoubted => {
+                    self.doubt(&id);
+                    return self.release(&id);
+                }
+                Bootstrap::Landed { outcome, stale } => {
+                    if stale {
+                        // The crawl and the close of the stale delivery
+                        // commit TOGETHER: were the crawl to land alone and
+                        // the process die before the close, the retried
+                        // delivery would find a bootstrapped store, skip
+                        // this check, and be handled after all (Codex crawl
+                        // review round 2, P1).
+                        // The trigger's own suppressed creation may
+                        // transfer ownership too — judged against the
+                        // state the crawl's events produce, and committed
+                        // with them.
+                        let mut events = outcome.events.clone();
+                        let mut preview = self.store.state().clone();
+                        for payload in &events {
+                            preview.apply_event(&crate::persistence::event::StateEvent {
+                                seq: 0,
+                                ts: Utc::now(),
+                                payload: payload.clone(),
+                            });
+                        }
+                        if let Some(t) = restatement_transfer(&preview, &event, &self.deps) {
+                            info!(delivery = %id, event = ?t, "the suppressed trigger takes ownership");
+                            events.push(t);
+                        }
+                        self.store.commit_delivery_closing_crawl(
+                            &id,
+                            &events,
+                            key.as_ref(),
+                            Utc::now(),
+                        )?;
+                        self.after_bootstrap(outcome)?;
+                        info!(delivery = %id, "closed: the trigger is stale against the crawl");
+                        return Ok(PipelineOutcome::Processed);
+                    }
+                    // The crawl's events and the mark on THIS delivery
+                    // commit together: the crawl judged the delivery
+                    // current by reading GitHub, and if that judgement
+                    // does not survive to the close, the retry must not
+                    // act on it (Codex crawl review round 14, P1).
+                    self.store
+                        .append_batch_marking(&outcome.events, Utc::now(), Some(&id))?;
+                    self.after_bootstrap(outcome)?;
+                }
+            }
+        }
+
         // A change to one of the bot's own stack-ledger comments is noted
         // BEFORE the duplicate-content check: the note is idempotent (it
         // owes a rewrite that states the truth, however often), while
@@ -523,53 +631,204 @@ impl Processor {
 
         // Dedupe: identical content already handled under a different
         // delivery id (GitHub redelivers with fresh ids).
-        let key = DedupeKey::for_event(&event);
         if let Some(k) = &key
             && self.store.is_duplicate(k)?
         {
             return self.close(&id, None, "duplicate content");
         }
 
-        // First-contact default-branch discovery: a fresh store has an empty
-        // default branch, and root detection / base validation read it.
-        if self.store.state().default_branch.is_empty() {
-            match self.deps.github.execute(GitHubEffect::GetRepoSettings) {
-                Ok(GitHubResponse::RepoSettings(settings)) => {
-                    info!(default_branch = %settings.default_branch, "discovered default branch");
-                    self.store.append_batch(
-                        &[StateEventPayload::DefaultBranchSet {
-                            branch: settings.default_branch,
-                        }],
-                        Utc::now(),
-                    )?;
+        // A crawl already landed for this delivery — in an earlier process,
+        // or in this one before an unrelated transient failure released
+        // it. That crawl checked whether the delivery was still current by
+        // reading GitHub, and the comment may have been edited or deleted
+        // since; the store is now bootstrapped, so the crawl will not run
+        // again. What the check guarded decides what happens now:
+        // - a COMMENT may have been edited or deleted while we were down,
+        //   and an edited-away `start` has no retraction path at all:
+        //   closed unhandled, the user re-issues (Codex crawl review round
+        //   14, P1);
+        // - a PULL REQUEST event is re-checked against the present the
+        //   crawl cached: one that disagrees (an old `closed` after a
+        //   reopen) is stale and closed; one that agrees is handled;
+        // - anything else (a review dismissal, a check suite) carries a
+        //   consequence the crawl cannot reconstruct — an adopted train's
+        //   required abort, say — and is handled as it would have been.
+        // The store is bootstrapped: the crawl's events and the mark on
+        // the delivery committed together, so first contact above did
+        // not run again, and the note and the dedupe check have had
+        // their say.
+        if delivery.crawled {
+            debug_assert!(
+                !self.store.state().default_branch.is_empty(),
+                "a crawled delivery finds a bootstrapped store"
+            );
+            let stale = match &event {
+                // A comment is re-checked against GitHub's present, exactly
+                // as the crawl checked it: listed with this body, in the
+                // sender's own bytes. A maintainer's `stop` that
+                // survived the gap unchanged is handled — an adopted train
+                // it was meant to stop would otherwise resume; one edited
+                // or gone is closed unheard. GitHub unavailable: released,
+                // as the crawl itself would be.
+                GitHubEvent::IssueComment(_) => match TriggerFreshness::of(&event) {
+                    Some(TriggerFreshness::Comment {
+                        pr,
+                        id: trigger_id,
+                        body,
+                        sender,
+                    }) => match self.deps.github.execute(GitHubEffect::ListComments { pr }) {
+                        Ok(GitHubResponse::Comments(listed)) => {
+                            match listed.iter().find(|c| c.id == trigger_id) {
+                                Some(c) if c.body == body && written_by_the_sender(c, sender) => {
+                                    false
+                                }
+                                // Another body, or absent: doubted, as at
+                                // first contact — the listing may be the
+                                // older of the two. Stale only once the doubt
+                                // has stood for the stall cadence.
+                                _ => {
+                                    if self.doubt_has_stood(&id) {
+                                        true
+                                    } else {
+                                        self.doubt(&id);
+                                        return self.release(&id);
+                                    }
+                                }
+                            }
+                        }
+                        // GitHub unavailable: released, as the crawl itself
+                        // would be. A PERMANENT failure — the PR gone, or
+                        // the token without access — is not: released, the
+                        // delivery would sit at the head of the queue for
+                        // ever; handled, the handler's own precache refuses
+                        // a command on an unfetchable PR with an answer
+                        // (Codex first-contact review, P2).
+                        Err(e @ EffectError::Transient { .. }) => {
+                            warn!(
+                                delivery_id = %id, error = ?e,
+                                "cannot re-check a crawled comment delivery; releasing it"
+                            );
+                            return self.release(&id);
+                        }
+                        other => {
+                            warn!(
+                                delivery_id = %id, outcome = ?other.err(),
+                                "cannot list the PR of a crawled comment delivery; refusing it"
+                            );
+                            if let Some((pr, _)) = command_in(&event, &self.deps) {
+                                self.best_effort_github(GitHubEffect::PostComment {
+                                    pr,
+                                    body: format!(
+                                        "The bot cannot list PR {pr}'s comments (permanent API \
+                                         failure — does the bot's token have access to this \
+                                         repository?); refusing the command."
+                                    ),
+                                });
+                            }
+                            return self.close(&id, key.as_ref(), "crawled but unverifiable");
+                        }
+                    },
+                    // A DELETION is not re-checked: the comment is gone, and
+                    // the retraction handler is author-gated and removes an
+                    // edge only if the store holds one — which it may, from
+                    // a listing that still showed the deleted comment (GitHub
+                    // is not read-after-write consistent), or from an older
+                    // comment the deleted one would have superseded. Closing
+                    // it unheard would leave that edge standing (Codex
+                    // topology review, P1; first-contact review, P1). A
+                    // comment on an issue rather than a PR has no freshness
+                    // either, and the handler ignores it.
+                    None => false,
+                    Some(TriggerFreshness::PullRequest { .. }) => {
+                        unreachable!("a comment event has comment freshness")
+                    }
+                },
+                GitHubEvent::PullRequest(_) => match TriggerFreshness::of(&event) {
+                    Some(trigger) if trigger.disagrees_with_cache(self.store.state()) => {
+                        // Doubted, as a comment is: the cache is the
+                        // snapshot the crawl took, and GitHub's listing
+                        // can lag a `closed` it has already delivered.
+                        // Once the doubt has stood for the stall cadence,
+                        // the PRESENT decides — the PR fetched afresh, not
+                        // the cache (Codex topology review, P2).
+                        if !self.doubt_has_stood(&id) {
+                            self.doubt(&id);
+                            return self.release(&id);
+                        }
+                        let TriggerFreshness::PullRequest { pr, .. } = &trigger else {
+                            unreachable!("a pull-request event has pull-request freshness")
+                        };
+                        match self.deps.github.execute(GitHubEffect::GetPr { pr: *pr }) {
+                            Ok(GitHubResponse::Pr(present)) => {
+                                // The fresh snapshot IS the present: the
+                                // cache is reconciled to it whatever the
+                                // verdict on the delivery, or a stale
+                                // reopen closed unheard would leave the PR
+                                // cached closed while GitHub has it open
+                                // (Codex first-contact review, P1).
+                                let reconcile =
+                                    reconcile_cache_events(self.store.state(), *pr, &present);
+                                self.store.append_batch(&reconcile, Utc::now())?;
+                                trigger.disagrees_with(&present)
+                            }
+                            // GitHub unavailable: released. A PERMANENT
+                            // failure — the PR gone, or the token without
+                            // access — is not: released, the delivery would
+                            // sit at the head of the repository's queue for
+                            // ever, every unrelated delivery behind it; and
+                            // a payload the present cannot confirm is not
+                            // believed, so the cache keeps the crawl's
+                            // snapshot (Codex first-contact review, P2).
+                            Err(e @ EffectError::Transient { .. }) => {
+                                warn!(
+                                    delivery_id = %id, error = ?e,
+                                    "cannot re-fetch a crawled pull-request delivery's PR; \
+                                     releasing it"
+                                );
+                                return self.release(&id);
+                            }
+                            other => {
+                                warn!(
+                                    delivery_id = %id, outcome = ?other.err(),
+                                    "cannot re-fetch a crawled pull-request delivery's PR for \
+                                     good; refusing the delivery"
+                                );
+                                return self.close(&id, key.as_ref(), "crawled but unverifiable");
+                            }
+                        }
+                    }
+                    _ => false,
+                },
+                _ => false,
+            };
+            if stale {
+                warn!(
+                    delivery_id = %id,
+                    "a crawl landed for this delivery before the process died; its \
+                     freshness check did not survive, so it is not acted on"
+                );
+                // ...but the ownership a suppressed creation would have
+                // transferred is recorded with the close.
+                let transfer = restatement_transfer(self.store.state(), &event, &self.deps);
+                if let Some(t) = &transfer {
+                    info!(delivery_id = %id, event = ?t, "a suppressed restatement takes ownership");
                 }
-                Ok(other) => {
-                    error!(?other, "GetRepoSettings answered the wrong variant");
-                    return self.release(&id);
-                }
-                Err(e @ EffectError::Transient { .. }) => {
-                    warn!(error = ?e, "cannot discover default branch; releasing delivery");
-                    return self.release(&id);
-                }
-                // Permanent (token lacks access, repo deleted/renamed):
-                // release too — DELIBERATELY, unlike role lookups. There a
-                // denial is a safe answer; here there is none: without the
-                // default branch nothing can be processed, and closing the
-                // delivery would silently drop webhooks GitHub will never
-                // resend. The repo's queue pauses (retrying at the stall
-                // cadence, which also heals "permanent" auth errors the
-                // moment the operator fixes the token) and this error says
-                // so as loudly as we can.
-                Err(e) => {
-                    error!(
-                        error = ?e,
-                        "cannot discover the default branch and the failure is \
-                         permanent; the repo's queue is PAUSED until discovery \
-                         succeeds — operator action likely required (token \
-                         scopes? repo moved?)"
-                    );
-                    return self.release(&id);
-                }
+                self.store.commit_delivery(
+                    &id,
+                    transfer.as_slice(),
+                    key.as_ref(),
+                    &[],
+                    Utc::now(),
+                )?;
+                // The transfer changed the owner, so the ledger is owed a
+                // rewrite — queued HERE, as after a handled delivery: this
+                // close may be a cooldown retry with nothing else queued
+                // and no timer outstanding, and the ledger would name the
+                // old owner until a restart (Codex first-contact review,
+                // P2).
+                self.queue_owed_status_syncs()?;
+                info!(delivery_id = %id, "delivery closed: crawled but never closed");
+                return Ok(PipelineOutcome::Processed);
             }
         }
 
@@ -687,33 +946,6 @@ impl Processor {
             })
             .collect();
 
-        // A retraction's durable tombstone, captured against the PRE-commit
-        // state (the commit clears the edge). `PredecessorRemoved` is
-        // emitted only when an AUTHORIZED retraction is applied, and the
-        // deletion behind it leaves no trace in GitHub's present — an older
-        // declaration comment on the PR would resurrect the edge in a
-        // lost-DB crawl, whose recovered train could then DRIVE the
-        // descendant the user unstacked (owner ruling 2026-07-18). The
-        // receipt comment outlives the DB; the crawl reads it as a
-        // tombstone for every declaration on the PR up to the RETRACTED
-        // comment's id (its anchor — the receipt's own id would race a
-        // re-declaration posted while this delivery sat in the backlog).
-        // Posted best-effort after the close, like every status update — a
-        // receipt lost to an outage re-opens the window for that one
-        // retraction (documented residual).
-        let retraction_receipts: Vec<(PrNumber, crate::types::CommentId, Option<PrNumber>)> =
-            events
-                .iter()
-                .filter_map(|e| match e {
-                    StateEventPayload::PredecessorRemoved { pr, comment_id } => Some((
-                        *pr,
-                        *comment_id,
-                        self.store.state().prs.get(pr).and_then(|c| c.predecessor),
-                    )),
-                    _ => None,
-                })
-                .collect();
-
         let command_ids =
             self.store
                 .commit_delivery(&id, &events, key.as_ref(), &commands, Utc::now())?;
@@ -746,13 +978,6 @@ impl Processor {
             }
         }
 
-        for (pr, retracted, predecessor) in retraction_receipts {
-            self.best_effort_github(GitHubEffect::PostComment {
-                pr,
-                body: crate::status::format_retraction_receipt(pr, retracted, predecessor),
-            });
-        }
-
         // A handler-committed terminal event (a topology abort) may owe a
         // status sync that no later outcome refers to.
         self.queue_owed_status_syncs()?;
@@ -771,21 +996,18 @@ impl Processor {
                     merged_predecessor,
                     comment_id,
                 } => {
-                    // Detected by M3, answered here: the reconciliation flow
-                    // for late additions is explicitly deferred. The answer
-                    // is a rejection RECEIPT for the declaring comment: live
-                    // recorded nothing for it, and a lost-DB crawl must not
-                    // replay it as a declaration.
+                    // Detected by M3, answered here: the reconciliation
+                    // flow for late additions is explicitly deferred. The
+                    // answer records nothing, and needs to record nothing:
+                    // a declaration with no stack ledger behind it is one
+                    // a crawl will never turn into an edge.
+                    let _ = comment_id;
                     self.best_effort_github(GitHubEffect::PostComment {
                         pr,
-                        body: crate::status::format_rejection_receipt(
-                            pr,
-                            comment_id,
-                            &format!(
-                                "PR #{merged_predecessor} is already merged. Adding a PR onto a \
-                                 merged predecessor (\"late addition\") is not supported yet — \
-                                 rebase onto the default branch, or restart the train."
-                            ),
+                        body: format!(
+                            "PR #{merged_predecessor} is already merged. Adding a PR onto a \
+                             merged predecessor (\"late addition\") is not supported yet — \
+                             rebase onto the default branch, or restart the train."
                         ),
                     });
                 }
@@ -931,6 +1153,26 @@ impl Processor {
     }
 
     /// Releases a delivery for a later retry (GitHub unavailable).
+    /// Records that a listing doubted delivery `id`'s trigger, from now if
+    /// this is the first time.
+    fn doubt(&mut self, id: &str) {
+        let now = self.deps.clock.now();
+        self.doubted_triggers.entry(id.to_owned()).or_insert(now);
+    }
+
+    /// Whether a doubt about delivery `id` has stood for the stall cadence:
+    /// GitHub is not read-after-write consistent, so one read proves
+    /// nothing, and a doubt confirmed within the same propagation window
+    /// proves nothing more.
+    fn doubt_has_stood(&self, id: &str) -> bool {
+        let now = self.deps.clock.now();
+        self.doubted_triggers.get(id).is_some_and(|first| {
+            now.signed_duration_since(*first)
+                >= chrono::Duration::from_std(self.deps.stall_retry_delay)
+                    .unwrap_or(chrono::Duration::MAX)
+        })
+    }
+
     fn release(&mut self, id: &str) -> Result<PipelineOutcome, StoreError> {
         self.store.release_delivery(id)?;
         Ok(PipelineOutcome::Released)
@@ -1047,7 +1289,8 @@ impl Processor {
                 Err(e) if required => {
                     error!(%pr, error = ?e, "the command's PR is permanently unfetchable; denying");
                     return Ok(PrecacheOutcome::Deny(format!(
-                        "The bot cannot fetch PR #{pr} (permanent API failure — does the                          bot's token have access to this repository?); refusing the command."
+                        "The bot cannot fetch PR {pr} (permanent API failure — does the bot's \
+                         token have access to this repository?); refusing the command."
                     )));
                 }
                 Err(e) => {
@@ -1096,7 +1339,7 @@ impl Processor {
     fn best_effort_github(&self, effect: GitHubEffect) {
         let github = self.deps.github.clone();
         #[cfg(test)]
-        if matches!(github, GitHubExec::Fake(_)) {
+        if matches!(github, GitHubExec::Fake(..)) {
             if let Err(e) = github.execute(effect) {
                 warn!(error = ?e, "best-effort GitHub effect failed (ignored)");
             }
@@ -1132,6 +1375,312 @@ impl Processor {
             return;
         }
         self.pending.push_back(work);
+    }
+
+    /// The first-contact crawl (DESIGN §Bootstrap algorithm, Phase 2):
+    /// fetches settings, open + recently merged PRs, and every crawled
+    /// PR's comments, then appends [`super::bootstrap::crawl_events`]'s
+    /// result as ONE atomic batch — a crash or a released retry re-crawls
+    /// from nothing (idempotent reads, no partial state). Returns `false` when GitHub was
+    /// unavailable (any failure: transient, permanent, or a wrong
+    /// variant): the caller releases the delivery and the queue pauses at
+    /// the stall cadence — there is no safe degraded answer at bootstrap.
+    fn bootstrap_crawl(
+        &mut self,
+        seed_prs: &[PrNumber],
+        freshness: Option<TriggerFreshness>,
+        retried: bool,
+    ) -> Result<Bootstrap, StoreError> {
+        /// How many days of merged PRs the crawl considers: predecessor
+        /// targets and mid-cascade roots older than this are treated as
+        /// history (DESIGN bounds the resurrection window the same way).
+        const MERGED_SINCE_DAYS: u32 = 30;
+        /// How many PRs one bootstrap will list comments for. Each listing
+        /// is a paginated API call, and nothing is committed until the
+        /// whole crawl finishes, so an unbounded crawl of a very large
+        /// repository can exhaust the rate-limit window, discard all its
+        /// progress, and never bootstrap at all (Codex crawl review round
+        /// 6, P2). Beyond the cap the crawl proceeds with the PRs it has:
+        /// their cache entries stand, and topology it could not read is
+        /// reported as loudly as we can.
+        const MAX_COMMENT_LISTINGS: usize = 1000;
+        /// How many individually-fetched PRs one bootstrap will pay for.
+        /// Referenced-but-uncrawled PRs cost one `GetPr` each, and a PR
+        /// author can leave arbitrarily many distinct declaration targets;
+        /// unbounded, a long junk history could exhaust the API quota, and
+        /// the crawl abandons all progress on a rate limit and starts over
+        /// — pausing the repo's queue indefinitely (Codex crawl review
+        /// round 3, P1). Beyond the cap the remaining PRs are treated as
+        /// UNFETCHABLE: declaration edges onto them drop, and a train that
+        /// references one aborts loudly rather than recovering broken.
+        const MAX_REFERENCED_FETCHES: usize = 200;
+
+        macro_rules! fetch {
+            ($effect:expr, $expected:pat => $value:expr) => {
+                match self.deps.github.execute($effect) {
+                    Ok($expected) => $value,
+                    Ok(other) => {
+                        error!(?other, "bootstrap fetch answered the wrong variant");
+                        return Ok(Bootstrap::Unavailable);
+                    }
+                    Err(e) => {
+                        warn!(error = ?e, "bootstrap crawl failed; the repo's queue \
+                               pauses until it succeeds");
+                        return Ok(Bootstrap::Unavailable);
+                    }
+                }
+            };
+        }
+
+        let settings = fetch!(
+            GitHubEffect::GetRepoSettings,
+            GitHubResponse::RepoSettings(s) => s
+        );
+        if settings.default_branch.is_empty() {
+            error!("repository settings carry an empty default branch");
+            return Ok(Bootstrap::Unavailable);
+        }
+        let open = fetch!(GitHubEffect::ListOpenPrs, GitHubResponse::PrList(prs) => prs);
+        let (merged, may_be_incomplete) = fetch!(
+            GitHubEffect::ListRecentlyMergedPrs { since_days: MERGED_SINCE_DAYS },
+            GitHubResponse::RecentlyMergedPrList { prs, may_be_incomplete } => (prs, may_be_incomplete)
+        );
+        if may_be_incomplete {
+            warn!(
+                "the recently-merged crawl hit its pagination limit; trains \
+                 rooted at older merged PRs will not be recovered"
+            );
+        }
+        // Discover PRs to a fixpoint. The list endpoints miss a PR closed
+        // *unmerged* during the gap, but the wake-up webhook names some PRs
+        // (`seed_prs`) and the crawl surfaces more — declaration targets and
+        // adopted-train members it referenced but did not fetch. A closed
+        // root reachable only through its descendants' declarations is found
+        // this way: fetch the referenced PRs, list their comments, re-crawl,
+        // repeat until nothing new is referenced (Codex crawl review rounds
+        // 6–7). `attempted` bounds it — every PR is fetched at most once
+        // (a 404 counts), and the PR universe is finite — so it terminates.
+        let mut crawled: Vec<PrData> = open;
+        crawled.extend(merged);
+        let mut attempted: HashSet<PrNumber> = crawled.iter().map(|p| p.number).collect();
+        let mut comments: Vec<(PrNumber, Vec<CommentData>)> = Vec::new();
+        let mut listed: HashSet<PrNumber> = HashSet::new();
+        // Seeds a permanent `GetPr` failure could not fetch: their comments
+        // were never listed because the PR could not be reached, not
+        // because the cap bit, and a command on one is answered by the
+        // handler's own refusal rather than closed unheard.
+        let mut unfetchable: HashSet<PrNumber> = HashSet::new();
+        // Set when the cap stops us reading a crawled PR's comments: a
+        // ledger may then be missing from the crawl, and the topology it
+        // rebuilt is incomplete.
+        let mut pending: Vec<PrNumber> = seed_prs
+            .iter()
+            .copied()
+            .filter(|pr| !attempted.contains(pr))
+            .collect();
+
+        let mut fetched = 0usize;
+        let outcome = loop {
+            for pr in std::mem::take(&mut pending) {
+                if !attempted.insert(pr) {
+                    continue;
+                }
+                if fetched >= MAX_REFERENCED_FETCHES {
+                    warn!(
+                        %pr,
+                        "the bootstrap crawl hit its referenced-PR fetch cap; \
+                         treating the rest as unfetchable"
+                    );
+                    continue;
+                }
+                fetched += 1;
+                match self.deps.github.execute(GitHubEffect::GetPr { pr }) {
+                    Ok(GitHubResponse::Pr(data)) => crawled.push(data),
+                    Err(e @ EffectError::Transient { .. }) => {
+                        warn!(%pr, error = ?e, "cannot fetch a referenced PR; bootstrap paused");
+                        return Ok(Bootstrap::Unavailable);
+                    }
+                    other => {
+                        warn!(%pr, ?other, "referenced PR unfetchable; skipping it in the crawl");
+                        unfetchable.insert(pr);
+                    }
+                }
+            }
+            // The SEED PRs first. The trigger's freshness is decided by
+            // whether its comment is in its PR's listing, so a cap reached
+            // before that PR would leave the delivery unverifiable — and
+            // the arm below cannot tell "not there" from "never looked"
+            // (Codex crawl review round 10, P1).
+            let mut unlisted: Vec<PrNumber> = crawled
+                .iter()
+                .map(|p| p.number)
+                .filter(|pr| !listed.contains(pr))
+                .collect();
+            unlisted.sort_by_key(|pr| !seed_prs.contains(pr));
+            for pr in unlisted {
+                if listed.len() >= MAX_COMMENT_LISTINGS {
+                    error!(
+                        %pr, listed = listed.len(),
+                        "the bootstrap crawl hit its comment-listing cap; deliveries on \
+                         the remaining PRs cannot be verified against the present — \
+                         operator action likely required (split the repository, or \
+                         raise the cap)"
+                    );
+                    break;
+                }
+                listed.insert(pr);
+                let pr_comments = fetch!(
+                    GitHubEffect::ListComments { pr },
+                    GitHubResponse::Comments(c) => c
+                );
+                comments.push((pr, pr_comments));
+            }
+            let outcome = super::bootstrap::crawl_events(&CrawlInput {
+                default_branch: &settings.default_branch,
+                crawled_prs: &crawled,
+            });
+            let fresh: Vec<PrNumber> = outcome
+                .referenced_uncrawled
+                .iter()
+                .copied()
+                .filter(|pr| !attempted.contains(pr))
+                .collect();
+            if fresh.is_empty() {
+                break outcome;
+            }
+            pending = fresh;
+        };
+        info!(
+            default_branch = %settings.default_branch,
+            crawled_prs = crawled.len(),
+            "bootstrapped the repo from a crawl"
+        );
+        // Is the triggering delivery CURRENT against the present the crawl
+        // just fetched? A comment trigger must still be listed, unedited if
+        // the payload is a `created`, and its body must match the listed
+        // body (an `edited` payload superseded by a later edit is as stale
+        // as a deleted one). A PR trigger must agree with the crawled PR:
+        // an old `closed` redelivered after the PR was reopened would
+        // otherwise close — and abort the recovered train of — a PR the
+        // crawl just cached as open (Codex crawl review round 2, P1s). The
+        // crawl itself stands either way; only the delivery is stale.
+        let stale = match &freshness {
+            Some(TriggerFreshness::Comment {
+                pr,
+                id: trigger_id,
+                body,
+                sender,
+            }) => {
+                let listed_comments: Vec<&CommentData> = comments
+                    .iter()
+                    .filter(|(p, _)| p == pr)
+                    .flat_map(|(_, cs)| cs.iter())
+                    .collect();
+                match listed_comments.iter().find(|c| c.id == *trigger_id) {
+                    // Present with ANOTHER body. Either an edit superseded
+                    // this payload, or the listing is the older of the two
+                    // — an author's retraction edit can trigger the crawl
+                    // while the listing still serves the declaration, and
+                    // closing on that would keep the withdrawn edge (Codex
+                    // topology review, P1). Doubted like an absence: stale
+                    // only if it still disagrees after the stall cadence.
+                    Some(c) if c.body != *body || !written_by_the_sender(c, *sender) => {
+                        if retried {
+                            true
+                        } else {
+                            info!(
+                                %pr, comment = %trigger_id,
+                                "the triggering comment's listed body differs from the \
+                                 payload's; retrying after the stall cadence"
+                            );
+                            return Ok(Bootstrap::TriggerDoubted);
+                        }
+                    }
+                    Some(_) => false,
+                    // ABSENT. GitHub is not read-after-write consistent, so
+                    // a just-created comment can be missing from a listing
+                    // taken moments later — absence alone is not proof the
+                    // comment was deleted, and closing on it would silently
+                    // lose a valid command (Codex crawl review round 6,
+                    // P1). Release instead: the delivery is retried at the
+                    // stall cadence, by which point the listing has caught
+                    // up or the comment is genuinely gone (the retry runs
+                    // after the crawl landed, so the handler decides).
+                    // ONCE: the listing may simply not have caught up, so
+                    // the delivery is released and re-crawled. If it is
+                    // still absent on that retry, the comment really is
+                    // gone and the delivery is stale.
+                    // The PR itself could not be fetched, so its comments
+                    // were never listed: not stale — the handler refuses a
+                    // command on an unfetchable PR with an answer, as it
+                    // would after bootstrap (Codex first-contact review,
+                    // P2).
+                    None if unfetchable.contains(pr) => false,
+                    None if !listed.contains(pr) => {
+                        // The cap bit before this PR's comments were read,
+                        // so the trigger cannot be verified at all. Seeds
+                        // are listed first, so reaching this means the
+                        // repository is past what the bot supports;
+                        // executing an unverifiable command after a DB
+                        // loss is the one thing recovery must not do
+                        // (Codex crawl review round 10, P1).
+                        error!(
+                            %pr, comment = %trigger_id,
+                            "the triggering PR's comments were never listed; refusing to \
+                             act on a delivery the crawl cannot verify"
+                        );
+                        true
+                    }
+                    None if !retried => {
+                        info!(
+                            %pr, comment = %trigger_id,
+                            "the triggering comment is not in the listing yet; retrying after \
+                             the stall cadence"
+                        );
+                        return Ok(Bootstrap::TriggerDoubted);
+                    }
+                    None => true,
+                }
+            }
+            Some(pr_trigger @ TriggerFreshness::PullRequest { pr, .. }) => {
+                let disagrees = crawled
+                    .iter()
+                    .find(|p| p.number == *pr)
+                    .is_some_and(|present| pr_trigger.disagrees_with(present));
+                // Doubted like a comment the listing disagrees with: the
+                // PR listing can lag a `closed` it has already delivered
+                // (Codex topology review, P2). The retry re-crawls, and is
+                // stale only if it still disagrees after the stall cadence.
+                if disagrees && !retried {
+                    info!(
+                        %pr,
+                        "the triggering pull-request event disagrees with the crawled \
+                         snapshot; retrying after the stall cadence"
+                    );
+                    return Ok(Bootstrap::TriggerDoubted);
+                }
+                disagrees
+            }
+            None => false,
+        };
+        // The crawl itself does not depend on the trigger — it reads the
+        // bot's own records — so a stale delivery needs no re-crawl: the
+        // same events stand, and only the delivery is closed unhandled.
+        Ok(Bootstrap::Landed { outcome, stale })
+    }
+
+    /// What every landed crawl owes, after its events are committed: the
+    /// inherited markers, the rewrite of any ledger it disbelieved, the
+    /// abort cleanups, and the recovery requeue.
+    fn after_bootstrap(&mut self, outcome: CrawlOutcome) -> Result<(), StoreError> {
+        self.clear_inherited_markers(&outcome.events);
+        // (The ledgers the crawl disbelieved were marked owed in the same
+        // transaction as its events; the sync below picks them up.)
+        // The recoveries defer behind the backlog drain, exactly like
+        // startup evaluations (the round-6/round-20 gating); owed status
+        // syncs (a synthesized completion) queue too.
+        self.requeue_marked_recoveries()?;
+        Ok(())
     }
 
     /// Supplementary GitHub recovery for a train inherited mid-cascade
@@ -2373,6 +2922,14 @@ impl Processor {
                     if !self.store.ledger_pending(pr)? {
                         continue; // settled meanwhile
                     }
+                    // Nothing touches a ledger before the crawl has landed:
+                    // an obligation reloaded into an unbootstrapped store
+                    // would be discharged against an empty cache. It is
+                    // durable, and re-queued once the crawl commits
+                    // (`after_bootstrap`).
+                    if state.default_branch.is_empty() {
+                        continue;
+                    }
                     // The probe, always: the listing is where forgeries,
                     // orphans and lost posts are discovered, and topology
                     // changes are rare next to the cascade's own traffic.
@@ -2991,6 +3548,206 @@ fn command_in(event: &GitHubEvent, deps: &WorkerDeps) -> Option<(PrNumber, Comma
     }
 }
 
+/// What the first-contact crawl decided about the delivery that woke it.
+enum Bootstrap {
+    /// GitHub was unavailable (any failure): release the delivery; the
+    /// repo's queue pauses at the stall cadence.
+    Unavailable,
+    /// The triggering comment was not in the listing, seen for the first
+    /// time: GitHub is not read-after-write consistent, so the delivery is
+    /// released and re-crawled once before being believed.
+    TriggerDoubted,
+    /// The crawl computed its events (not yet committed — the caller
+    /// commits them, atomically with the delivery's close when the trigger
+    /// is `stale`: a redelivery the present has overtaken).
+    Landed { outcome: CrawlOutcome, stale: bool },
+}
+
+/// The facts a first-contact trigger asserts about the present, checked
+/// against what the crawl fetched: a stale redelivery must not be handled
+/// on top of a fresher crawl.
+enum TriggerFreshness {
+    /// A `created`/`edited` comment: must still be listed with this body,
+    /// and with the payload's sender — the creator, or the editor — as the
+    /// writer of its current bytes: equal bodies alone prove nothing about
+    /// who wrote them, and a non-author restoring the author's withdrawn
+    /// text must not pass as the author's own utterance.
+    Comment {
+        pr: PrNumber,
+        id: crate::types::CommentId,
+        body: String,
+        sender: u64,
+    },
+    /// A pull_request event: its claims must match the crawled PR.
+    PullRequest {
+        pr: PrNumber,
+        action: crate::webhooks::events::PrAction,
+        head_sha: crate::types::Sha,
+        head_branch: String,
+        base_branch: String,
+        is_draft: bool,
+        merged: bool,
+    },
+}
+
+impl TriggerFreshness {
+    fn of(event: &GitHubEvent) -> Option<Self> {
+        match event {
+            GitHubEvent::IssueComment(c) => match c.action {
+                CommentAction::Deleted => None,
+                CommentAction::Created | CommentAction::Edited => {
+                    c.pr_number.map(|pr| TriggerFreshness::Comment {
+                        pr,
+                        id: c.comment_id,
+                        body: c.body.clone(),
+                        sender: c.sender_id,
+                    })
+                }
+            },
+            GitHubEvent::PullRequest(p) => Some(TriggerFreshness::PullRequest {
+                pr: p.pr_number,
+                action: p.action,
+                head_sha: p.head_sha.clone(),
+                head_branch: p.head_branch.clone(),
+                base_branch: p.base_branch.clone(),
+                is_draft: p.is_draft,
+                merged: matches!(
+                    p.merge_status,
+                    crate::webhooks::events::MergeStatus::Merged { .. }
+                ),
+            }),
+            _ => None,
+        }
+    }
+
+    /// Whether a PR trigger's claims contradict the crawled PR.
+    fn disagrees_with(&self, present: &PrData) -> bool {
+        use crate::webhooks::events::PrAction;
+        let TriggerFreshness::PullRequest {
+            action,
+            head_sha,
+            head_branch,
+            base_branch,
+            is_draft,
+            merged,
+            ..
+        } = self
+        else {
+            return false;
+        };
+        match action {
+            PrAction::Closed => {
+                if *merged {
+                    !matches!(present.state, PrState::Merged { .. })
+                } else {
+                    present.state != PrState::Closed
+                }
+            }
+            // `PrOpened` (and the refresh a reopen drives) writes the
+            // payload's head, base and draft over what the crawl just
+            // fetched, so an old delivery must agree with all three or it
+            // would regress authoritative data (Codex crawl review round
+            // 3, P1).
+            PrAction::Opened | PrAction::Reopened => {
+                present.state != PrState::Open
+                    || present.head_sha != *head_sha
+                    // `PrOpened` writes the payload's head REF over the
+                    // crawled one, so a delayed delivery from before a
+                    // branch rename would restore a branch that no longer
+                    // exists (Codex crawl review round 6, P2).
+                    || present.head_ref != *head_branch
+                    || present.base_ref != *base_branch
+                    || present.is_draft != *is_draft
+            }
+            PrAction::Synchronize => {
+                present.state != PrState::Open || present.head_sha != *head_sha
+            }
+            PrAction::Edited => present.state != PrState::Open || present.base_ref != *base_branch,
+            PrAction::ConvertedToDraft | PrAction::ReadyForReview => {
+                present.state != PrState::Open || present.is_draft != *is_draft
+            }
+        }
+    }
+}
+
+impl TriggerFreshness {
+    /// [`TriggerFreshness::disagrees_with`], against the state a crawl
+    /// already cached rather than the PR it fetched: after a restart the
+    /// cache IS the present the crawl saw.
+    fn disagrees_with_cache(&self, state: &crate::state::RepoState) -> bool {
+        let TriggerFreshness::PullRequest { pr, .. } = self else {
+            return false;
+        };
+        let Some(cached) = state.prs.get(pr) else {
+            return false;
+        };
+        let present = PrData {
+            number: cached.number,
+            head_sha: cached.head_sha.clone(),
+            head_ref: cached.head_ref.clone(),
+            base_ref: cached.base_ref.clone(),
+            state: cached.state.clone(),
+            is_draft: cached.is_draft,
+            author_id: 0,
+        };
+        self.disagrees_with(&present)
+    }
+}
+
+/// The ownership a comment delivery the crawl SUPPRESSES as stale would
+/// have transferred, decided once, here, and recorded durably with the
+/// close. A creation or an edit is suppressed when the comment is gone,
+/// or reads otherwise, by the time the crawl judges it: handling it would
+/// record a body the comment no longer has. But if what it SAID was the
+/// PR author's own restatement of the very predecessor the PR holds, from
+/// a comment newer than the current owner, then live it took ownership of
+/// that edge — a creation and an edit alike, the restatement branch of
+/// the handler — and every later deletion or edit of that comment was the
+/// owner's, a retraction or an update. The transfer records no body, only
+/// that this comment owns the edge from here on, so every later event on
+/// it — the final one or any in between, a stranger's or the author's —
+/// goes through the owner's own logic and the sender gate. Anything else
+/// a suppressed delivery said — prose, a declaration the store would have
+/// refused — is no ownership, and a verdict this store hands down on a
+/// later edit of the comment stands (Codex first-contact review, P1 and
+/// P2, twice; the recovery model found the edit case: an author who
+/// restated by editing a stranger's comment, then edited it away, was
+/// left stacked). The handler's own exclusions apply first: one of the
+/// BOT's comments is never a command, whatever anyone edits it into, so
+/// live it took nothing — and handing it the edge would hand it to a
+/// comment every later event on which is ignored, with the original
+/// declaration's deletion no longer retracting anything (Codex
+/// first-contact review, P2).
+fn restatement_transfer(
+    state: &crate::state::RepoState,
+    event: &GitHubEvent,
+    deps: &WorkerDeps,
+) -> Option<StateEventPayload> {
+    let GitHubEvent::IssueComment(c) = event else {
+        return None;
+    };
+    if c.author_id == deps.bot_user_id {
+        return None;
+    }
+    // The utterance is the sender's: the creator of a created payload, the
+    // editor of an edited one. Only the PR author's own declares.
+    if c.action == CommentAction::Deleted || c.sender_id == 0 || c.sender_id != c.pr_author_id {
+        return None;
+    }
+    let pr = c.pr_number?;
+    let cached = state.prs.get(&pr)?;
+    let (predecessor, owner) = (cached.predecessor?, cached.predecessor_comment_id?);
+    let restates = matches!(
+        parse_command(&c.body, &deps.bot_name),
+        Some(Command::Predecessor(target)) if target == predecessor
+    );
+    (restates && c.comment_id > owner).then_some(StateEventPayload::PredecessorDeclared {
+        pr,
+        predecessor,
+        comment_id: c.comment_id,
+    })
+}
+
 /// The PR whose predecessor declaration this event would *retract*, if any:
 /// a deletion of the declaring comment, or an edit whose new body no longer
 /// declares a predecessor. Mirrors the handler's retraction conditions
@@ -3033,6 +3790,41 @@ fn retraction_in(
 /// The events that upsert a PR the bot has never seen into the cache, from a
 /// fresh fetch. (The engine's own `refresh_events` diffs against a cached
 /// entry; this is the cache-miss counterpart.)
+/// The events that bring the cache's picture of `pr` to `present`: a fill
+/// (which refreshes head, base and draft state, and closes or merges), and
+/// a REOPEN when the cache has the PR closed and GitHub has it open — a
+/// fill alone preserves a cached terminal state.
+/// Whether the listed comment's current bytes are the payload's sender's:
+/// its creator's for a `created` payload, its editor's for an `edited`
+/// one, by GitHub's own provenance (`body_written_by`). An equal body
+/// alone proves nothing about who put it there: the author may have
+/// created the declaration, retracted it by edit, and a stranger restored
+/// its text — believing the creation would revive the withdrawn edge
+/// (Codex first-contact review, P1, twice: the edit case, then the
+/// creation case). The price is an edge live keeps and recovery drops —
+/// a stranger's edit to the SAME text — which is the permitted direction:
+/// the author re-declares. A listing that lags shows an older writer,
+/// which is a doubt like any other.
+fn written_by_the_sender(listed: &CommentData, sender: u64) -> bool {
+    listed.body_written_by(sender).is_some()
+}
+
+pub(crate) fn reconcile_cache_events(
+    state: &crate::state::RepoState,
+    pr: PrNumber,
+    present: &PrData,
+) -> Vec<StateEventPayload> {
+    let mut events = cache_fill_events(pr, present, MergeStateStatus::Unknown);
+    let cached_closed = state
+        .prs
+        .get(&pr)
+        .is_some_and(|c| matches!(c.state, PrState::Closed));
+    if cached_closed && present.state.is_open() {
+        events.push(StateEventPayload::PrReopened { pr });
+    }
+    events
+}
+
 pub(crate) fn cache_fill_events(
     pr: PrNumber,
     data: &PrData,

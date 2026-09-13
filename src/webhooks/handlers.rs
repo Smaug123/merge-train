@@ -229,7 +229,14 @@ fn handle_comment_command(
     let command = parse_command(body, bot_name);
 
     if let Some(Command::Predecessor(predecessor)) = command {
-        return handle_predecessor_command(pr, predecessor, comment_id, declared, state);
+        return handle_predecessor_command(
+            pr,
+            predecessor,
+            comment_id,
+            declared,
+            action == CommentAction::Created,
+            state,
+        );
     }
 
     // Any non-predecessor outcome: if this comment had declared a predecessor,
@@ -268,6 +275,7 @@ fn handle_predecessor_command(
     predecessor: PrNumber,
     comment_id: CommentId,
     declared_by_this_comment: bool,
+    created: bool,
     state: &RepoState,
 ) -> HandlerOutput {
     // We can only validate a predecessor declaration once the PR is cached. If
@@ -280,14 +288,28 @@ fn handle_predecessor_command(
         };
     };
 
-    // Idempotent re-statement of the same declaration.
-    if declared_by_this_comment && cached.predecessor == Some(predecessor) {
+    // A CREATED declaration at or below the settlement watermark is a
+    // redelivery, superseded: comment ids are monotonic, so the comment
+    // was created before the watermark comment, and every declaration
+    // through that id has been processed, or retracted by a later one.
+    // Live, dedupe keys stop such a redelivery; after a database loss they
+    // are gone, and the watermark — restored from the bot's own record —
+    // is what stops a surviving older declaration from reinstalling an
+    // edge the author withdrew (Codex trains review, P1). An EDIT is a
+    // live utterance whenever it arrives: the author editing the withdrawn
+    // comment back into a declaration declares afresh.
+    if created
+        && cached
+            .declarations_settled_through
+            .is_some_and(|through| comment_id <= through)
+    {
         return HandlerOutput::default();
     }
 
-    // Re-stating the current declaration from a *newer* comment transfers
-    // ownership to it — the topology is unchanged, so nothing to validate.
-    // This is also the recovery path after a refused unauthorized
+    // Re-stating the current declaration: the topology is unchanged, so
+    // nothing to validate. From the owner itself, or an OLDER comment, it
+    // is idempotent; from a *newer* comment it transfers ownership. That
+    // transfer is also the recovery path after a refused unauthorized
     // retraction (Codex M5 round 3): if the owning comment was deleted on
     // GitHub but the bot kept the declaration, the author re-states it in a
     // live comment and can then edit or delete *that* one.
@@ -299,8 +321,8 @@ fn handle_predecessor_command(
     // declaration at or below the owner's id is superseded" — and a
     // receipt anchored at the older comment would leave the newer one
     // standing for a lost-DB crawl to resurrect (Codex receipts review
-    // round 2, P1). An older restatement is idempotent.
-    if !declared_by_this_comment && cached.predecessor == Some(predecessor) {
+    // round 2, P1).
+    if cached.predecessor == Some(predecessor) {
         if cached
             .predecessor_comment_id
             .is_some_and(|owner| owner >= comment_id)
@@ -776,6 +798,73 @@ mod tests {
             snap.prs.insert(pr.number, pr);
         }
         RepoState::from_snapshot(snap)
+    }
+
+    /// A created declaration at or below the settlement watermark is a
+    /// redelivery, superseded: it does nothing — neither declares nor
+    /// rejects — whether the PR now has no predecessor (the author withdrew
+    /// it by a later comment) or another one. A newer comment declares as
+    /// ever, and so does an EDIT of an old comment: an edit is a live
+    /// utterance whenever it arrives (Codex trains review, P1).
+    #[test]
+    fn a_created_declaration_below_the_settlement_watermark_is_superseded() {
+        let mut two = open_pr(2, "feature-1", None);
+        two.declarations_settled_through = Some(CommentId(701));
+        let withdrawn = state_with(vec![open_pr(1, "main", None), two]);
+        let declare_by = |action: CommentAction, id: u64| match comment(
+            action,
+            Some(2),
+            "@merge-train predecessor #1",
+            5,
+        ) {
+            GitHubEvent::IssueComment(mut c) => {
+                c.comment_id = CommentId(id);
+                GitHubEvent::IssueComment(c)
+            }
+            other => other,
+        };
+        let declare = |id: u64| declare_by(CommentAction::Created, id);
+        let out = handle_event(&declare_by(CommentAction::Edited, 701), &withdrawn, &ctx());
+        assert_eq!(
+            out.events,
+            vec![StateEventPayload::PredecessorDeclared {
+                pr: PrNumber(2),
+                predecessor: PrNumber(1),
+                comment_id: CommentId(701)
+            }],
+            "the withdrawn comment edited back into a declaration declares"
+        );
+        let out = handle_event(&declare(700), &withdrawn, &ctx());
+        assert!(
+            out.events.is_empty() && out.effects.is_empty(),
+            "superseded: {out:?}"
+        );
+        let out = handle_event(&declare(702), &withdrawn, &ctx());
+        assert_eq!(
+            out.events,
+            vec![StateEventPayload::PredecessorDeclared {
+                pr: PrNumber(2),
+                predecessor: PrNumber(1),
+                comment_id: CommentId(702)
+            }],
+            "a newer comment declares"
+        );
+
+        // With another predecessor standing, a superseded declaration is
+        // not even rejected: it is a stale redelivery, not a command.
+        let mut two = open_pr(2, "feature-3", Some(3));
+        two.predecessor_comment_id = Some(CommentId(705));
+        two.declarations_settled_through = Some(CommentId(705));
+        let restacked = state_with(vec![
+            open_pr(1, "main", None),
+            two,
+            open_pr(3, "main", None),
+        ]);
+        let out = handle_event(&declare(700), &restacked, &ctx());
+        assert!(
+            out.events.is_empty() && out.effects.is_empty(),
+            "superseded: {out:?}"
+        );
     }
 
     fn state_with_train(prs: Vec<CachedPr>, root: u64) -> RepoState {

@@ -33,6 +33,7 @@
 //! work they trigger queues for the saga slot.
 
 pub mod authz;
+mod bootstrap;
 pub mod executor;
 mod pipeline;
 pub mod recovery;
@@ -88,6 +89,11 @@ pub struct IntakeDelivery {
     pub headers: String,
     /// The raw webhook payload bytes (parsed at drain time).
     pub body: Vec<u8>,
+    /// When the webhook was RECEIVED, at HTTP intake — not when the worker
+    /// stored it: a delivery received during a first-contact crawl's reads
+    /// waits in the mailbox, and is judged against the present that crawl
+    /// fetched by this time, not by its storage time.
+    pub received_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// The outcome of a durable enqueue, reported back to the handler.
@@ -692,7 +698,7 @@ fn handle_msg(
                     &delivery.event_type,
                     &delivery.headers,
                     &delivery.body,
-                    Utc::now(),
+                    delivery.received_at,
                 )
                 .map(|inserted| {
                     if inserted {

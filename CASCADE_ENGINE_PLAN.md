@@ -867,6 +867,35 @@ but `SquashCommitted` lost — is closed here by supplementary GitHub recovery
 
 ---
 
+## Amendment (2026-09-13): first contact, and the deliveries that straddle it
+
+A fresh store — a brand-new repository, or one whose state DB was lost —
+has an empty default branch. The first delivery triggers a crawl of the
+present (settings, open and recently merged PRs, the wake-up webhook's PR
+if the list endpoints miss it, and every crawled PR's comments), appended
+as ONE atomic batch. Nothing that could write runs before it: a delayed
+edit webhook for a ledger the bot has already restored would otherwise
+queue a repair against an empty cache, and ledger work waits for a
+bootstrapped store.
+
+Webhooks only describe the future, and GitHub is not read-after-write
+consistent, so every delivery that was waiting when the crawl landed is
+judged against the present the crawl fetched — the trigger and the backlog
+behind it alike, marked `crawled` in the crawl's own transaction. A comment
+must still be listed, unedited if the payload is a `created`, with this
+body; a pull-request event must agree with the crawled PR. A listing that
+DOUBTS a delivery — the comment absent, or present with another body, the
+PR snapshot disagreeing — is not believed on one read: the delivery is
+released, and the doubt believed only once it has stood for the stall
+cadence (another webhook can wake the worker and retry at once). A
+pull-request delivery is then judged by the PR fetched afresh, not the
+cache. A deletion has no body to re-check and is handled.
+
+What the crawl does not rebuild yet: the predecessor topology and the
+trains. Those are the next two changes, and read the bot's own records
+(the stack ledgers and the status comments) rather than re-deriving from
+the users' comments.
+
 ## Explicitly deferred (with ordering rationale)
 
 - ~~**Polling fallback (`PollActiveTrains`)**~~ — **LANDED 2026-07-03**
