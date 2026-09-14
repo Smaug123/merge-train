@@ -111,8 +111,9 @@ use crate::webhooks::dedupe::DedupeKey;
 /// v2 added the `deliveries` and `dedupe_keys` tables (the webhook queue).
 ///
 /// v6 added the stack-ledger obligations; v7 the repairs, unresolved
-/// comments and settled verdicts the ledger's hardening keeps.
-const STORE_SCHEMA_VERSION: i64 = 7;
+/// comments and settled verdicts the ledger's hardening keeps; v8 the
+/// `deliveries.crawled` mark the first-contact crawl leaves.
+const STORE_SCHEMA_VERSION: i64 = 8;
 
 /// Errors from the store.
 #[derive(Debug, Error)]
@@ -174,6 +175,12 @@ pub struct Delivery {
     pub body: Vec<u8>,
     /// When the delivery was received.
     pub received_at: DateTime<Utc>,
+    /// A first-contact crawl already landed FOR this delivery in an
+    /// earlier process. The crawl decided the delivery was current by
+    /// reading GitHub at that moment; that decision did not survive, and
+    /// the comment may have changed since — so the delivery is closed
+    /// unhandled rather than acted on (Codex crawl review round 14, P1).
+    pub crawled: bool,
 }
 
 /// A user command persisted in `pending_commands`: authorized at intake,
@@ -347,10 +354,19 @@ impl Store {
         payloads: &[StateEventPayload],
         ts: DateTime<Utc>,
     ) -> Result<Vec<StateEvent>, StoreError> {
-        if payloads.is_empty() {
-            return Ok(Vec::new());
-        }
+        self.append_batch_marking(payloads, ts, None)
+    }
 
+    /// `append_batch`, additionally marking one delivery as CRAWLED in the
+    /// same transaction. A crash between the crawl's events and that mark
+    /// would leave the delivery looking un-crawled, and its retry would
+    /// skip the freshness check the crawl performed.
+    pub fn append_batch_marking(
+        &mut self,
+        payloads: &[StateEventPayload],
+        ts: DateTime<Utc>,
+        crawled_delivery: Option<&str>,
+    ) -> Result<Vec<StateEvent>, StoreError> {
         let mut next_state = self.state.clone();
         let mut seq = self.next_seq;
         let mut events = Vec::with_capacity(payloads.len());
@@ -366,7 +382,12 @@ impl Store {
             events.push(event);
             seq += 1;
         }
-        upsert_cache(&tx, &next_state, seq, ts)?;
+        if !payloads.is_empty() {
+            upsert_cache(&tx, &next_state, seq, ts)?;
+        }
+        if crawled_delivery.is_some() {
+            mark_backlog_crawled_in(&tx)?;
+        }
         tx.commit()?;
 
         self.state = next_state;
@@ -414,16 +435,35 @@ impl Store {
         body: &[u8],
         received_at: DateTime<Utc>,
     ) -> Result<bool, StoreError> {
+        // A delivery RECEIVED before the first-contact crawl landed but
+        // stored only after it — the worker that runs the crawl is the
+        // worker that services intake, so webhooks received during the
+        // crawl's reads wait in the mailbox — describes a change the crawled
+        // present may or may not hold, and is judged against that present
+        // like the backlog the crawl marked: the mark follows the time the
+        // webhook was received (Codex first-contact review, P1).
+        // Microseconds: at second resolution a webhook received just after
+        // the crawl landed would look received before it.
+        let landed_at: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT value FROM counters WHERE name = 'crawl_landed_at'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let crawled = landed_at.is_some_and(|landed| received_at.timestamp_micros() <= landed);
         let n = self.conn.execute(
             "INSERT OR IGNORE INTO deliveries
-                 (delivery_id, event_type, headers, body, status, received_at)
-             VALUES (?1, ?2, ?3, ?4, 'pending', ?5)",
+                 (delivery_id, event_type, headers, body, status, received_at, crawled)
+             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6)",
             rusqlite::params![
                 delivery_id,
                 event_type,
                 headers,
                 body,
-                received_at.to_rfc3339()
+                received_at.to_rfc3339(),
+                crawled as i64,
             ],
         )?;
         Ok(n > 0)
@@ -434,7 +474,7 @@ impl Store {
         let tx = self.conn.transaction()?;
         let row = tx
             .query_row(
-                "SELECT arrival, delivery_id, event_type, headers, body, received_at
+                "SELECT arrival, delivery_id, event_type, headers, body, received_at, crawled
                  FROM deliveries WHERE status = 'pending' ORDER BY arrival LIMIT 1",
                 [],
                 |r| {
@@ -445,12 +485,13 @@ impl Store {
                         r.get::<_, String>(3)?,
                         r.get::<_, Vec<u8>>(4)?,
                         r.get::<_, String>(5)?,
+                        r.get::<_, i64>(6)? != 0,
                     ))
                 },
             )
             .optional()?;
         let delivery = match row {
-            Some((arrival, delivery_id, event_type, headers, body, received_at)) => {
+            Some((arrival, delivery_id, event_type, headers, body, received_at, crawled)) => {
                 tx.execute(
                     "UPDATE deliveries SET status = 'processing' WHERE arrival = ?1",
                     rusqlite::params![arrival],
@@ -462,6 +503,7 @@ impl Store {
                     headers,
                     body,
                     received_at: parse_ts(&received_at)?,
+                    crawled,
                 })
             }
             None => None,
@@ -528,6 +570,49 @@ impl Store {
         self.state = next_state;
         self.next_seq = seq;
         Ok(command_ids)
+    }
+
+    /// [`Store::commit_delivery`] for a first-contact crawl whose trigger
+    /// proved STALE: the crawl's events and the close of the delivery
+    /// commit together, with the backlog marked. A crash after the close
+    /// loses none of them.
+    pub fn commit_delivery_closing_crawl(
+        &mut self,
+        delivery_id: &str,
+        events: &[StateEventPayload],
+        dedupe: Option<&DedupeKey>,
+        ts: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        let mut next_state = self.state.clone();
+        let mut seq = self.next_seq;
+
+        let tx = self.conn.transaction()?;
+        for payload in events {
+            let event = StateEvent {
+                seq,
+                ts,
+                payload: payload.clone(),
+            };
+            insert_and_apply(&tx, &mut next_state, &event)?;
+            seq += 1;
+        }
+        upsert_cache(&tx, &next_state, seq, ts)?;
+        if let Some(key) = dedupe {
+            tx.execute(
+                "INSERT OR IGNORE INTO dedupe_keys (key, seen_at) VALUES (?1, ?2)",
+                rusqlite::params![key.as_str(), ts.to_rfc3339()],
+            )?;
+        }
+        tx.execute(
+            "UPDATE deliveries SET status = 'done' WHERE delivery_id = ?1",
+            rusqlite::params![delivery_id],
+        )?;
+        mark_backlog_crawled_in(&tx)?;
+        tx.commit()?;
+
+        self.state = next_state;
+        self.next_seq = seq;
+        Ok(())
     }
 
     /// The persisted user commands not yet answered, in arrival (`id`) order
@@ -1358,6 +1443,27 @@ fn next_ledger_generation(tx: &rusqlite::Transaction<'_>) -> Result<i64, StoreEr
 }
 
 /// Dirties a PR's ledger at a FRESH generation, inside `tx`.
+/// Every delivery still waiting when a crawl lands was received BEFORE
+/// the present the crawl fetched, and is judged against it exactly as the
+/// trigger is: re-checked on GitHub if it is a comment, against the cache
+/// if it is a pull-request event (Codex topology review, P1 — an old
+/// `closed` queued behind the trigger would otherwise close a PR the crawl
+/// just cached as open).
+fn mark_backlog_crawled_in(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreError> {
+    tx.execute(
+        "UPDATE deliveries SET crawled = 1 WHERE status IN ('pending', 'processing')",
+        [],
+    )?;
+    // ...and every delivery received before this moment that is not yet
+    // stored (see `enqueue`). Wall-clock microseconds, as `received_at`
+    // is — the HTTP handler's clock, not the worker's.
+    tx.execute(
+        "INSERT OR REPLACE INTO counters (name, value) VALUES ('crawl_landed_at', ?1)",
+        rusqlite::params![Utc::now().timestamp_micros()],
+    )?;
+    Ok(())
+}
+
 fn mark_ledger_owed_in(tx: &rusqlite::Transaction<'_>, pr: PrNumber) -> Result<(), StoreError> {
     let generation = next_ledger_generation(tx)?;
     tx.execute(
@@ -1519,7 +1625,14 @@ fn init_schema(conn: &Connection) -> Result<(), StoreError> {
             headers     TEXT NOT NULL,
             body        BLOB NOT NULL,
             status      TEXT NOT NULL,
-            received_at TEXT NOT NULL
+            received_at TEXT NOT NULL,
+            -- Set when a first-contact crawl landed FOR this delivery.
+            -- The crawl decides whether the delivery is still current by
+            -- reading GitHub; if the process then dies before the delivery
+            -- is closed, the retry finds a bootstrapped store, skips that
+            -- check, and would act on a payload whose comment may have
+            -- changed in the meantime (Codex crawl review round 14, P1).
+            crawled     INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX deliveries_drain ON deliveries (status, arrival);
         -- Seen dedupe keys with the time first seen, for TTL pruning.
@@ -2085,13 +2198,13 @@ mod tests {
                 .unwrap();
             let g1 = generation_of(&store, 2).expect("the declaration owes PR 2's ledger");
             assert_eq!(generation_of(&store, 1), None, "PR 1's ledger is untouched");
-            // A removal naming a comment that does not own the declaration
-            // changes nothing, and owes nothing new.
+            // A removal naming an OLDER comment than the owner is stale:
+            // it changes nothing, and owes nothing new.
             store
                 .append(
                     StateEventPayload::PredecessorRemoved {
                         pr: PrNumber(2),
-                        comment_id: CommentId(99),
+                        comment_id: CommentId(4),
                     },
                     ts,
                 )

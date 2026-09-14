@@ -24,14 +24,14 @@ use crate::github::test_support::{FakeComment, FakeGitHub, FakePr, FakePrState};
 use crate::persistence::StateEventPayload;
 use crate::state::RepoState;
 use crate::store::Store;
-use crate::types::{PrNumber, Sha};
+use crate::types::{CommentId, PrNumber, Sha};
 
 use super::executor::{GitHubExec, SagaBatch, execute_batch};
 use super::pipeline::{PipelineOutcome, Processor, WorkerDeps};
 use super::test_support::TEST_BOT_ID;
 use super::{GitSettings, IntakeDelivery, WorkerMsg};
 use crate::effects::Effect;
-use crate::effects::github::GitHubEffect;
+use crate::effects::github::{Edited, GitHubEffect};
 
 // ─── Identities ───
 
@@ -98,6 +98,62 @@ fn pr_merged_body(
                 "base": {{ "sha": "{base_sha}", "ref": "{base}" }},
                 "user": {{ "id": {AUTHOR}, "login": "author" }},
                 "updated_at": "2026-07-01T12:00:00Z"
+            }},
+            "repository": {repo}
+        }}"#,
+        base_sha = "0".repeat(40),
+        repo = repo_json(config),
+    )
+    .into_bytes()
+}
+
+fn pr_closed_body(
+    config: &GitConfig,
+    number: u64,
+    head: &Sha,
+    branch: &str,
+    base: &str,
+) -> Vec<u8> {
+    format!(
+        r#"{{
+            "action": "closed",
+            "pull_request": {{
+                "number": {number},
+                "state": "closed",
+                "draft": false,
+                "merged": false,
+                "head": {{ "sha": "{head}", "ref": "{branch}" }},
+                "base": {{ "sha": "{base_sha}", "ref": "{base}" }},
+                "user": {{ "id": {AUTHOR}, "login": "author" }},
+                "updated_at": "2026-07-01T12:30:00Z"
+            }},
+            "repository": {repo}
+        }}"#,
+        base_sha = "0".repeat(40),
+        repo = repo_json(config),
+    )
+    .into_bytes()
+}
+
+fn pr_reopened_body(
+    config: &GitConfig,
+    number: u64,
+    head: &Sha,
+    branch: &str,
+    base: &str,
+) -> Vec<u8> {
+    format!(
+        r#"{{
+            "action": "reopened",
+            "pull_request": {{
+                "number": {number},
+                "state": "open",
+                "draft": false,
+                "merged": false,
+                "head": {{ "sha": "{head}", "ref": "{branch}" }},
+                "base": {{ "sha": "{base_sha}", "ref": "{base}" }},
+                "user": {{ "id": {AUTHOR}, "login": "author" }},
+                "updated_at": "2026-07-01T12:30:00Z"
             }},
             "repository": {repo}
         }}"#,
@@ -290,14 +346,80 @@ impl World {
         Processor::new(Store::open(&self.db_path()).unwrap(), self.deps()).unwrap()
     }
 
-    /// Durably enqueues a raw delivery (as the intake path would).
+    /// Durably enqueues a raw delivery (as the intake path would). A comment
+    /// webhook describes a comment that exists on GitHub at that moment, so
+    /// it is mirrored into the fake's comment store — the crawl and
+    /// recovery list comments, and a `created` delivery for a comment the
+    /// listing cannot see is exactly the stale-redelivery shape the
+    /// pipeline closes.
     fn enqueue(&mut self, processor: &mut Processor, event_type: &str, body: Vec<u8>) {
+        self.enqueue_received_at(processor, event_type, body, chrono::Utc::now());
+    }
+
+    /// As `enqueue`, with the time the webhook was RECEIVED: a delivery
+    /// received while a crawl was fetching reaches the store only after
+    /// the crawl landed, and must be judged against its present all the
+    /// same.
+    fn enqueue_received_at(
+        &mut self,
+        processor: &mut Processor,
+        event_type: &str,
+        body: Vec<u8>,
+        received_at: chrono::DateTime<chrono::Utc>,
+    ) {
+        if event_type == "issue_comment" {
+            self.mirror_comment(&body);
+        }
         self.next_delivery += 1;
         let id = format!("delivery-{}", self.next_delivery);
         processor
             .store_mut()
-            .enqueue(&id, event_type, "{}", &body, chrono::Utc::now())
+            .enqueue(&id, event_type, "{}", &body, received_at)
             .unwrap();
+    }
+
+    fn mirror_comment(&self, body: &[u8]) {
+        let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) else {
+            return;
+        };
+        let Some(id) = json["comment"]["id"].as_u64() else {
+            return;
+        };
+        let mut github = self.github.lock().unwrap();
+        match json["action"].as_str() {
+            Some("deleted") => {
+                github.comments.remove(&CommentId(id));
+            }
+            Some(action @ ("created" | "edited")) => {
+                let Some(pr) = json["issue"]["number"].as_u64() else {
+                    return;
+                };
+                let author_id = json["comment"]["user"]["id"].as_u64().unwrap_or(0);
+                let text = json["comment"]["body"].as_str().unwrap_or("").to_owned();
+                // An edit's bytes are the SENDER's, whoever authored the
+                // comment (GitHub's `editor`).
+                let edited = if action == "edited" {
+                    Edited::By {
+                        editor: json["sender"]["id"].as_u64(),
+                    }
+                } else {
+                    github
+                        .comments
+                        .get(&CommentId(id))
+                        .map_or(Edited::Never, |c| c.edited)
+                };
+                github.comments.insert(
+                    CommentId(id),
+                    FakeComment {
+                        pr: PrNumber(pr),
+                        author_id,
+                        body: text,
+                        edited,
+                    },
+                );
+            }
+            _ => {}
+        }
     }
 
     /// The standard opening moves: every PR announced, predecessors declared
@@ -957,12 +1079,25 @@ fn plant_bot_comment(world: &World, pr: u64, body: &str) -> crate::types::Commen
             pr: PrNumber(pr),
             author_id: TEST_BOT_ID,
             body: body.to_owned(),
-            edited: crate::effects::github::Edited::By {
+            edited: Edited::By {
                 editor: Some(TEST_BOT_ID),
             },
         },
     );
     id
+}
+
+/// The bot's own write of `body` into comment `id`, as GitHub would then
+/// list it: the bytes are the bot's, and the bot is the last editor.
+/// Models the delayed-webhook shape, where the bot's update has already
+/// restored a comment whose edit webhook is still in the queue.
+fn restored_by_bot(world: &World, id: crate::types::CommentId, body: &str) {
+    let mut github = world.github.lock().unwrap();
+    let comment = github.comments.get_mut(&id).unwrap();
+    comment.body = body.to_owned();
+    comment.edited = Edited::By {
+        editor: Some(TEST_BOT_ID),
+    };
 }
 
 /// Whether the ledger machinery has anything left to do for `pr`.
@@ -1271,7 +1406,10 @@ fn a_ledger_write_lost_to_an_outage_is_owed_and_lands_later() {
     );
 
     world.github.lock().unwrap().unavailable = false;
-    let remark = comment_body(&world.config, 2, "a remark", AUTHOR, "author", 21);
+    // Well clear of the ids the bot's own comments take: this harness
+    // mirrors user comments into the fake, and a collision would overwrite
+    // the very ledger under test.
+    let remark = comment_body(&world.config, 2, "a remark", AUTHOR, "author", 9001);
     world.enqueue(&mut processor, "issue_comment", remark);
     drain(&mut processor);
 
@@ -1360,7 +1498,10 @@ fn an_orphaned_ledger_comment_is_adopted_not_duplicated() {
         "precondition: still owed"
     );
 
-    let remark = comment_body(&world.config, 2, "a remark", AUTHOR, "author", 21);
+    // Well clear of the ids the bot's own comments take: this harness
+    // mirrors user comments into the fake, and a collision would overwrite
+    // the very ledger under test.
+    let remark = comment_body(&world.config, 2, "a remark", AUTHOR, "author", 9001);
     world.enqueue(&mut processor, "issue_comment", remark);
     drain(&mut processor);
 
@@ -2201,6 +2342,18 @@ fn a_forged_ledger_on_an_uncached_pr_is_neutralized() {
     world.enqueue_stack_setup(&mut processor, 2, &heads);
     drain(&mut processor);
 
+    // PR 9 exists on GitHub; the bot has simply never heard of it.
+    let head = create_branch_with_file(&world.config, "pr-9", "pr-9.txt", "content 9", "main");
+    create_pr_ref(&world.config, 9, &head);
+    world.github.lock().unwrap().prs.insert(
+        PrNumber(9),
+        FakePr {
+            branch: "pr-9".to_owned(),
+            base_ref: "main".to_owned(),
+            state: FakePrState::Open,
+            author_id: AUTHOR,
+        },
+    );
     let forged = forged_ledger_body(9);
     let planted = plant_bot_comment(&world, 9, &forged);
     let hook = bot_comment_webhook(&world.config, 9, planted.0, "edited", &forged);
@@ -2520,11 +2673,13 @@ fn a_status_comment_edited_into_a_ledger_is_never_neutralized() {
     };
     let updates_before = world.github.lock().unwrap().comment_updates;
 
-    // The edit's webhook names it as a ledger; the comment itself has
-    // since been restored (the delayed-webhook shape).
+    // The edit's webhook names it as a ledger. The harness mirrors the
+    // edit into the fake; the terminal update has since restored the
+    // comment (the delayed-webhook shape).
     let forged = forged_ledger_body(1);
     let hook = bot_comment_webhook(&world.config, 1, status_id.0, "edited", &forged);
     world.enqueue(&mut processor, "issue_comment", hook);
+    restored_by_bot(&world, status_id, &status_body);
     drain(&mut processor);
     tick(&world, &mut processor);
 
@@ -2556,9 +2711,12 @@ fn a_status_comment_resolved_by_the_terminal_sync_is_never_neutralized() {
     );
     let restored = world.github.lock().unwrap().comments[&live].body.clone();
 
+    // The harness mirrors the edit into the fake; the terminal update has
+    // since restored the comment (the delayed-webhook shape).
     let forged = forged_ledger_body(1);
     let hook = bot_comment_webhook(&world.config, 1, live.0, "edited", &forged);
     world.enqueue(&mut processor, "issue_comment", hook);
+    restored_by_bot(&world, live, &restored);
     drain(&mut processor);
     tick(&world, &mut processor);
     assert_eq!(
@@ -2672,9 +2830,13 @@ fn a_status_comment_named_before_its_post_is_recorded_is_never_neutralized() {
 #[test]
 fn an_orphaned_status_comment_is_never_neutralized() {
     let (mut world, mut processor, live) = train_with_orphaned_status_comment();
+    let before = world.github.lock().unwrap().comments[&live].body.clone();
     let forged = forged_ledger_body(1);
     let hook = bot_comment_webhook(&world.config, 1, live.0, "edited", &forged);
     world.enqueue(&mut processor, "issue_comment", hook);
+    // The harness mirrors the edit into the fake; the status machinery
+    // has since restored the comment (the delayed-webhook shape).
+    restored_by_bot(&world, live, &before);
     while let Some(delivery) = processor.claim().unwrap() {
         processor.process_claimed(delivery).unwrap();
     }
@@ -4208,6 +4370,39 @@ mod ledger_property {
     }
 }
 
+/// A first-contact crawl checks whether the delivery that woke it is still
+/// current by reading GitHub. If the process dies before that delivery is
+/// closed, the retry finds a bootstrapped store, skips the check, and
+/// would act on a payload whose comment may have been edited or deleted
+/// meanwhile — and an edited-away `start` has no retraction path at all.
+/// The crawl's mark commits with its events, and a marked delivery is
+/// closed unhandled (Codex crawl review round 14, P1).
+#[test]
+fn a_delivery_whose_crawl_outlived_its_close_is_not_acted_on() {
+    let (mut world, heads) = World::linear_stack(1);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 1, &heads);
+    drain(&mut processor);
+
+    start_command(&mut world, &mut processor, 1);
+    let delivery_id = format!("delivery-{}", world.next_delivery);
+    // What the crawl's own transaction would have left behind.
+    processor
+        .store_mut()
+        .append_batch_marking(&[], chrono::Utc::now(), Some(&delivery_id))
+        .unwrap();
+    drain(&mut processor);
+
+    assert!(
+        processor.state().active_trains.is_empty(),
+        "a delivery whose freshness check did not survive must not start a train"
+    );
+    assert!(
+        processor.store_mut().pending_commands().unwrap().is_empty(),
+        "and it leaves no durable command behind"
+    );
+}
+
 // ─── Authorization ───
 
 #[test]
@@ -4388,8 +4583,9 @@ fn stranger_cannot_retract_a_predecessor_declaration() {
         "expected a denial comment"
     );
 
-    // The author re-declares in a fresh comment (id 900), then deletes it:
-    // their own retraction proceeds.
+    // The author re-declares in a fresh comment, then deletes it: their
+    // own retraction proceeds. Ownership only moves FORWARD in comment id,
+    // so the restatement sits above the setup's declaration (id 20).
     let body = comment_body(
         &world.config,
         2,
@@ -4413,17 +4609,22 @@ fn stranger_cannot_retract_a_predecessor_declaration() {
     );
 }
 
-/// An authorized retraction leaves no trace in GitHub's present — the
-/// declaring comment is gone — so the worker posts a durable RECEIPT on
-/// the PR naming the retracted comment's id. A lost-DB crawl reads it as
-/// a tombstone for that declaration and everything it had superseded. A
-/// denied retraction posts none: nothing was retracted.
+/// A retraction the AUTHOR makes is applied, and the PR's stack ledger is
+/// rewritten to say the PR declares nothing — the ledger is state, not a
+/// log, so the retraction leaves no separate trace to interpret. A
+/// stranger's is denied and the ledger does not move.
 #[test]
-fn an_authorized_retraction_posts_a_receipt_naming_the_retracted_comment() {
+fn an_authorized_retraction_rewrites_the_ledger_to_not_stacked() {
     let (mut world, heads) = World::linear_stack(2);
     let mut processor = world.processor();
     world.enqueue_stack_setup(&mut processor, 2, &heads);
     drain(&mut processor);
+    let declared_ledger = ledger_on(&world, 2).expect("PR 2's ledger");
+    assert_eq!(
+        declared_ledger.declared.map(|d| d.predecessor),
+        Some(PrNumber(1)),
+        "precondition: the ledger records the edge"
+    );
 
     let repo = repo_json(&world.config);
     let delete_body = move |comment_id: u64, sender_id: u64, sender_login: &str| {
@@ -4447,27 +4648,9 @@ fn an_authorized_retraction_posts_a_receipt_naming_the_retracted_comment() {
         )
         .into_bytes()
     };
-    let receipts = |world: &World| -> Vec<(PrNumber, crate::types::CommentId)> {
-        world
-            .github
-            .lock()
-            .unwrap()
-            .posted_comments
-            .iter()
-            .filter_map(|(pr, text)| match crate::status::parse_receipt(text) {
-                Some(crate::status::Receipt::Retraction {
-                    pr: named,
-                    retracted,
-                }) => {
-                    assert_eq!(*pr, named, "a receipt sits on the PR it names");
-                    Some((named, retracted))
-                }
-                _ => None,
-            })
-            .collect()
-    };
 
-    // A stranger's deletion is denied: no retraction, no receipt.
+    // A stranger deletes the author's declaring comment (id 20, from the
+    // stack setup): denied, and nothing moves.
     world.enqueue(
         &mut processor,
         "issue_comment",
@@ -4475,12 +4658,21 @@ fn an_authorized_retraction_posts_a_receipt_naming_the_retracted_comment() {
     );
     drain(&mut processor);
     assert_eq!(
-        receipts(&world),
-        vec![],
-        "a denied retraction posts no receipt"
+        processor.state().prs[&PrNumber(2)].predecessor,
+        Some(PrNumber(1)),
+        "a denied retraction changes nothing"
+    );
+    assert_eq!(
+        ledger_on(&world, 2)
+            .and_then(|l| l.declared)
+            .map(|d| d.predecessor),
+        Some(PrNumber(1)),
+        "and the ledger still records the edge"
     );
 
-    // The author re-declares in a fresh comment (id 900) and deletes it.
+    // The author re-declares in a fresh comment and deletes that one.
+    // Ownership only ever moves FORWARD in comment id, so the restatement
+    // must sit above the setup's declaration (id 20) to take it.
     let body = comment_body(
         &world.config,
         2,
@@ -4503,10 +4695,11 @@ fn an_authorized_retraction_posts_a_receipt_naming_the_retracted_comment() {
         "the author's own deletion retracts the declaration"
     );
     assert_eq!(
-        receipts(&world),
-        vec![(PrNumber(2), crate::types::CommentId(900))],
-        "exactly one receipt, on the retracting PR, anchored at the RETRACTED comment"
+        ledger_on(&world, 2).map(|l| l.declared),
+        Some(None),
+        "and the ledger now says the PR declares no predecessor"
     );
+    assert_ledgers_match_store(&world, &processor);
 }
 
 /// A terminal train's status comment is the off-disk backup's last word:
@@ -6819,7 +7012,7 @@ fn command_on_an_unfetchable_pr_is_denied_not_dropped() {
         github
             .posted_comments
             .iter()
-            .any(|(pr, text)| *pr == PrNumber(99) && text.contains("cannot fetch")),
+            .any(|(pr, text)| *pr == PrNumber(99) && text.contains("refusing the command")),
         "expected an explanatory denial, got {:?}",
         github.posted_comments
     );
@@ -7633,6 +7826,2477 @@ fn a_second_train_runs_over_a_compacted_log() {
     assert_eq!(processor.state(), &replayed);
 }
 
+// ─── First-contact bootstrap: the crawl ───
+
+/// Announces `n` open PRs (a linear stack by base branch) WITHOUT declaring
+/// predecessors — for tests that place the declaration comments on GitHub
+/// themselves.
+fn enqueue_pr_opens(world: &mut World, processor: &mut Processor, n: usize, heads: &[Sha]) {
+    let config = world.config.clone();
+    for i in 1..=n {
+        let base = if i == 1 {
+            "main".to_owned()
+        } else {
+            format!("pr-{}", i - 1)
+        };
+        let body = pr_opened_body(&config, i as u64, &heads[i - 1], &format!("pr-{i}"), &base);
+        world.enqueue(processor, "pull_request", body);
+    }
+}
+
+/// The disaster: the state DB (and its WAL) is gone; the clone survives.
+fn destroy_state_db(world: &World) {
+    let db = world.db_path();
+    for path in [
+        db.clone(),
+        db.with_extension("db-wal"),
+        db.with_extension("db-shm"),
+        db.with_extension("lock"),
+    ] {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// An issue_comment payload with an exact comment id (no `% 10`) and a
+/// separate sender: `text` is `None` for a deletion.
+#[allow(clippy::too_many_arguments)]
+fn raw_comment_json(
+    config: &GitConfig,
+    pr: u64,
+    text: Option<&str>,
+    author_id: u64,
+    author_login: &str,
+    sender_id: u64,
+    sender_login: &str,
+    id: u64,
+    action: &str,
+) -> Vec<u8> {
+    let body = match text {
+        Some(t) => format!("\"{t}\""),
+        None => "null".to_owned(),
+    };
+    format!(
+        r#"{{
+            "action": "{action}",
+            "comment": {{
+                "id": {id},
+                "body": {body},
+                "user": {{ "id": {author_id}, "login": "{author_login}" }},
+                "updated_at": "2026-07-01T13:00:00Z"
+            }},
+            "issue": {{
+                "number": {pr},
+                "pull_request": {{ "url": "..." }},
+                "user": {{ "id": {AUTHOR}, "login": "author" }}
+            }},
+            "repository": {repo},
+            "sender": {{ "id": {sender_id}, "login": "{sender_login}" }}
+        }}"#,
+        repo = repo_json(config),
+    )
+    .into_bytes()
+}
+
+/// An `edited` payload for comment `id` on `pr`: `from` before, `to` after
+/// (GitHub's `changes.body.from`).
+#[allow(clippy::too_many_arguments)]
+fn raw_edited_comment_json(
+    config: &GitConfig,
+    pr: u64,
+    from: &str,
+    to: &str,
+    author_id: u64,
+    author_login: &str,
+    sender_id: u64,
+    sender_login: &str,
+    id: u64,
+) -> Vec<u8> {
+    let raw = raw_comment_json(
+        config,
+        pr,
+        Some(to),
+        author_id,
+        author_login,
+        sender_id,
+        sender_login,
+        id,
+        "edited",
+    );
+    let mut json: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    json["changes"] = serde_json::json!({ "body": { "from": from } });
+    serde_json::to_vec(&json).unwrap()
+}
+
+/// After a DB loss, a redelivered `created` webhook for a comment that has
+/// SINCE BEEN DELETED must not be handled: the crawl cannot see the comment,
+/// so nothing would stop the handler recreating a retracted declaration
+/// (monolith review, P1). But absence is believed only on the SECOND look:
+/// GitHub is not read-after-write consistent, so the first attempt
+/// releases and re-crawls, and only a comment still missing then is
+/// treated as gone (Codex crawl review round 6, P1). The crawl itself
+/// lands on the first attempt.
+#[test]
+fn a_redelivered_created_webhook_for_a_deleted_comment_is_not_handled() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    enqueue_pr_opens(&mut world, &mut processor, 2, &heads);
+    drain(&mut processor);
+    destroy_state_db(&world);
+
+    let mut processor = world.processor();
+    let body = raw_comment_json(
+        &world.config,
+        2,
+        Some("@merge-train predecessor #1"),
+        AUTHOR,
+        "author",
+        AUTHOR,
+        "author",
+        777,
+        "created",
+    );
+    world.enqueue(&mut processor, "issue_comment", body);
+    // The comment was deleted after this delivery was first made (its
+    // deletion was processed before the loss); the redelivery describes a
+    // comment GitHub no longer has.
+    world
+        .github
+        .lock()
+        .unwrap()
+        .comments
+        .remove(&CommentId(777));
+
+    // First attempt: the crawl lands, and the delivery is RELEASED — the
+    // listing may simply not have caught up yet.
+    let delivery = processor.claim().unwrap().expect("the redelivery");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Released,
+        "an absent trigger is retried once, not believed"
+    );
+    // The retry, once GitHub has had time to catch up, finds it absent
+    // again: now it is stale, so the crawl lands and the delivery closes
+    // unhandled.
+    world.advance_past_cooldown();
+    drain(&mut processor);
+    assert_eq!(processor.state().default_branch, "main", "the crawl landed");
+
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor,
+        None,
+        "no declaration survives on GitHub; the stale redelivery must not recreate one"
+    );
+}
+
+/// A redelivered `created` webhook for a comment that has SINCE BEEN EDITED
+/// to ANOTHER text is stale: its body is no longer the comment's, and
+/// handling it would record a declaration nothing on GitHub says. One
+/// edited to the SAME text is handled: the creation is the author's own
+/// utterance, and the listing still shows it, whoever touched the comment
+/// since (the recovery model found the stricter rule losing an edge live
+/// keeps).
+#[test]
+fn a_redelivered_created_webhook_for_an_edited_comment_is_handled_only_if_its_text_stands() {
+    for (final_text, edge_expected) in [
+        ("@merge-train predecessor #1", true),
+        ("(edited away)", false),
+    ] {
+        let action = "created";
+        let (mut world, heads) = World::linear_stack(2);
+        let mut processor = world.processor();
+        enqueue_pr_opens(&mut world, &mut processor, 2, &heads);
+        drain(&mut processor);
+        destroy_state_db(&world);
+
+        let mut processor = world.processor();
+        let body = raw_comment_json(
+            &world.config,
+            2,
+            Some("@merge-train predecessor #1"),
+            AUTHOR,
+            "author",
+            AUTHOR,
+            "author",
+            777,
+            action,
+        );
+        world.enqueue(&mut processor, "issue_comment", body);
+        // The comment was edited after the `created` delivery was first
+        // made — GitHub records the edit even to the same text.
+        {
+            let mut github = world.github.lock().unwrap();
+            let comment = github.comments.get_mut(&CommentId(777)).unwrap();
+            comment.body = final_text.to_owned();
+            comment.edited = Edited::By {
+                editor: Some(AUTHOR),
+            };
+        }
+        drain_with_cooldowns(&world, &mut processor);
+
+        assert_eq!(
+            processor.state().prs[&PrNumber(2)].predecessor.is_some(),
+            edge_expected,
+            "action {action}, final text {final_text:?}"
+        );
+    }
+}
+
+/// An `edited` redelivery whose body the comment has since moved past is
+/// as stale as a deleted one: the crawl saw the current body, and handling
+/// the old payload would record what the comment no longer says (Codex
+/// crawl review round 2, P1). A matching `edited` payload is current.
+#[test]
+fn a_superseded_edited_redelivery_is_not_handled() {
+    for (current_body, edge_expected) in [
+        ("(edited away)", false),
+        ("@merge-train predecessor #1", true),
+    ] {
+        let (mut world, heads) = World::linear_stack(2);
+        let mut processor = world.processor();
+        enqueue_pr_opens(&mut world, &mut processor, 2, &heads);
+        drain(&mut processor);
+        destroy_state_db(&world);
+
+        let mut processor = world.processor();
+        let body = raw_comment_json(
+            &world.config,
+            2,
+            Some("@merge-train predecessor #1"),
+            AUTHOR,
+            "author",
+            AUTHOR,
+            "author",
+            777,
+            "edited",
+        );
+        world.enqueue(&mut processor, "issue_comment", body);
+        {
+            let mut github = world.github.lock().unwrap();
+            let comment = github.comments.get_mut(&CommentId(777)).unwrap();
+            comment.body = current_body.to_owned();
+            comment.edited = Edited::By {
+                editor: Some(AUTHOR),
+            };
+        }
+        if !edge_expected {
+            // The listed body differs from the payload's: doubted, and
+            // stale only once the doubt has stood for the stall cadence.
+            let delivery = processor.claim().unwrap().expect("the redelivery");
+            assert_eq!(
+                processor.process_claimed(delivery).unwrap(),
+                PipelineOutcome::Released
+            );
+            world.advance_past_cooldown();
+        }
+        drain(&mut processor);
+        assert_eq!(
+            processor.state().prs[&PrNumber(2)].predecessor.is_some(),
+            edge_expected,
+            "current body {current_body:?}"
+        );
+    }
+}
+
+/// A stale PR webhook redelivered after a DB loss — here an unmerged
+/// `closed` for a PR the crawl just found OPEN (it was reopened) — must
+/// not be handled: it would close the PR in the store, against the present
+/// the crawl just fetched (Codex crawl review round 2, P1).
+#[test]
+fn a_stale_pr_close_redelivered_after_a_db_loss_is_not_handled() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    drain(&mut processor);
+    assert!(processor.state().prs[&PrNumber(2)].predecessor.is_some());
+    drop(processor);
+    destroy_state_db(&world);
+
+    let mut processor = world.processor();
+    let (head, branch, base) = {
+        let github = world.github.lock().unwrap();
+        let fake = &github.prs[&PrNumber(2)];
+        (
+            github.branch_head(&fake.branch),
+            fake.branch.clone(),
+            fake.base_ref.clone(),
+        )
+    };
+    // The PR is open on GitHub; this `closed` is an old redelivery. It
+    // disagrees with the crawled snapshot: doubted, and stale only once
+    // the doubt has stood for the stall cadence.
+    let body = pr_closed_body(&world.config, 2, &head, &branch, &base);
+    world.enqueue(&mut processor, "pull_request", body);
+    let delivery = processor.claim().unwrap().expect("the close");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Released
+    );
+    world.advance_past_cooldown();
+    drain(&mut processor);
+    assert!(
+        processor.state().prs[&PrNumber(2)].state.is_open(),
+        "the stale close must not have closed #2: {:?}",
+        processor.state().prs[&PrNumber(2)].state
+    );
+}
+
+/// GitHub down at first contact: the delivery releases (nothing can be
+/// processed without the bootstrap) and succeeds when retried.
+#[test]
+fn bootstrap_outage_releases_and_retries() {
+    let (mut world, heads) = World::linear_stack(1);
+    world.github.lock().unwrap().unavailable = true;
+    let mut processor = world.processor();
+    let body = pr_opened_body(&world.config, 1, &heads[0], "pr-1", "main");
+    world.enqueue(&mut processor, "pull_request", body);
+    let delivery = processor.claim().unwrap().expect("queued");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Released
+    );
+    assert!(processor.state().default_branch.is_empty());
+
+    world.github.lock().unwrap().unavailable = false;
+    let delivery = processor
+        .claim()
+        .unwrap()
+        .expect("released back to pending");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Processed
+    );
+    assert_eq!(processor.state().default_branch, "main");
+}
+
+/// A first-contact command whose crawl LANDS and whose handling is then
+/// released for an unrelated transient failure (the role lookup) is
+/// retried normally in the same process: its freshness check ran against
+/// the present the crawl fetched. Only a crawl mark left by a process that
+/// died closes the delivery unhandled.
+#[test]
+fn a_crawled_delivery_released_for_a_transient_failure_is_still_handled() {
+    let (mut world, heads) = World::linear_stack(1);
+    {
+        let mut github = world.github.lock().unwrap();
+        github.roles.insert(
+            "maintainer".to_owned(),
+            crate::effects::github::CollaboratorRole::Maintain,
+        );
+        github.permission_lookup_transient = true;
+    }
+    let mut processor = world.processor();
+    let body = pr_opened_body(&world.config, 1, &heads[0], "pr-1", "main");
+    world.enqueue(&mut processor, "pull_request", body);
+    drain(&mut processor);
+    // Not first contact any more? It is: the store's default branch is
+    // set by the crawl, which the PR-opened delivery above triggered. So
+    // reset to a fresh store to make the STOP the first contact.
+    drop(processor);
+    let mut world2 = world;
+    world2.state_dir = TempDir::new().unwrap();
+    let mut processor = world2.processor();
+    let stop = comment_body(&world2.config, 1, "@merge-train stop", 777, "maintainer", 9);
+    world2.enqueue(&mut processor, "issue_comment", stop);
+    let delivery = processor.claim().unwrap().expect("queued");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Released,
+        "the crawl landed; the role lookup's outage released the delivery"
+    );
+    assert_eq!(processor.state().default_branch, "main", "the crawl landed");
+    world2.github.lock().unwrap().permission_lookup_transient = false;
+    let delivery = processor
+        .claim()
+        .unwrap()
+        .expect("released back to pending");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Processed
+    );
+    // A delivery closed unheard records no dedupe key; a handled one does.
+    assert!(
+        processor
+            .store_mut()
+            .is_duplicate(&crate::webhooks::dedupe::DedupeKey::issue_comment_created(
+                PrNumber(1),
+                crate::types::CommentId(9),
+            ))
+            .unwrap(),
+        "the stop was handled, not closed unheard"
+    );
+}
+
+/// A crawled comment delivery whose comment survived the gap UNCHANGED is
+/// handled after a restart — a maintainer's `stop` that recovered a train
+/// must still stop it — while one whose comment is gone is closed unheard.
+#[test]
+fn a_crawled_comment_delivery_is_re_checked_against_github_after_a_restart() {
+    for comment_survives in [true, false] {
+        let (mut world, heads) = World::linear_stack(1);
+        let mut processor = world.processor();
+        let body = pr_opened_body(&world.config, 1, &heads[0], "pr-1", "main");
+        world.enqueue(&mut processor, "pull_request", body);
+        drain(&mut processor);
+        // A command: handled, it answers (no train to stop); closed
+        // unheard, it leaves no trace.
+        let stop = comment_body(&world.config, 1, "@merge-train stop", AUTHOR, "author", 9);
+        world.enqueue(&mut processor, "issue_comment", stop);
+        let delivery = processor.claim().unwrap().expect("queued");
+        // The crawl mark lands; the process dies before handling.
+        processor
+            .store_mut()
+            .append_batch_marking(&[], Utc::now(), Some(&delivery.delivery_id))
+            .unwrap();
+        drop(processor);
+        if !comment_survives {
+            world
+                .github
+                .lock()
+                .unwrap()
+                .comments
+                .remove(&crate::types::CommentId(9));
+        }
+        let mut processor = world.processor();
+        if !comment_survives {
+            // Absent from the listing: doubted first, believed gone once
+            // the doubt has stood for the stall cadence.
+            let delivery = processor.claim().unwrap().expect("pending");
+            assert_eq!(
+                processor.process_claimed(delivery).unwrap(),
+                PipelineOutcome::Released
+            );
+            world.advance_past_cooldown();
+        }
+        drain(&mut processor);
+        let handled = !world.github.lock().unwrap().posted_comments.is_empty();
+        assert_eq!(
+            handled, comment_survives,
+            "handled exactly when the comment is still there unchanged (survives={comment_survives})"
+        );
+    }
+}
+
+/// A crawled comment delivery released in the SAME process (a transient
+/// role-lookup failure) is re-checked against GitHub on its retry too:
+/// the comment edited away or deleted in between is a withdrawn command,
+/// closed unheard rather than acted on.
+#[test]
+fn a_crawled_delivery_withdrawn_before_its_retry_is_not_acted_on() {
+    let (mut world, heads) = World::linear_stack(1);
+    {
+        let mut github = world.github.lock().unwrap();
+        github.roles.insert(
+            "maintainer".to_owned(),
+            crate::effects::github::CollaboratorRole::Maintain,
+        );
+        github.permission_lookup_transient = true;
+    }
+    let mut processor = world.processor();
+    let body = pr_opened_body(&world.config, 1, &heads[0], "pr-1", "main");
+    world.enqueue(&mut processor, "pull_request", body);
+    drain(&mut processor);
+    drop(processor);
+    let mut world2 = world;
+    world2.state_dir = TempDir::new().unwrap();
+    let mut processor = world2.processor();
+    let stop = comment_body(&world2.config, 1, "@merge-train stop", 777, "maintainer", 9);
+    world2.enqueue(&mut processor, "issue_comment", stop);
+    let delivery = processor.claim().unwrap().expect("queued");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Released
+    );
+    // Withdrawn before the retry: the comment is deleted.
+    {
+        let mut github = world2.github.lock().unwrap();
+        github.permission_lookup_transient = false;
+        github.comments.remove(&crate::types::CommentId(9));
+    }
+    // Absent from the listing: doubted, and believed gone only once the
+    // doubt has stood for the stall cadence.
+    let delivery = processor
+        .claim()
+        .unwrap()
+        .expect("released back to pending");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Released
+    );
+    world2.advance_past_cooldown();
+    let delivery = processor
+        .claim()
+        .unwrap()
+        .expect("released back to pending");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Processed
+    );
+    assert!(
+        world2.github.lock().unwrap().posted_comments.is_empty(),
+        "closed unheard: the withdrawn command was not answered"
+    );
+}
+
+/// Nothing touches a ledger before the crawl has landed. A delayed edit
+/// webhook for a ledger the bot has already restored arrives at a fresh
+/// store first; the crawl it triggers fails; the repair the webhook would
+/// queue must not then run against the empty cache and neutralize the
+/// genuine ledger (Codex topology review, P1) — the record the topology
+/// crawl will read back.
+#[test]
+fn no_ledger_is_touched_before_the_crawl_has_landed() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    drain(&mut processor);
+    tick(&world, &mut processor);
+    let (ledger_id, _) = ledgers_on(&world, 2)
+        .into_iter()
+        .next()
+        .expect("#2's ledger is written");
+    let ledger_body = world.github.lock().unwrap().comments[&ledger_id]
+        .body
+        .clone();
+    drop(processor);
+    destroy_state_db(&world);
+
+    // The crawl cannot list comments; comment WRITES still work.
+    world.github.lock().unwrap().list_comments_broken = true;
+    let updates_before = world.github.lock().unwrap().comment_updates;
+    let mut processor = world.processor();
+    let hook = bot_comment_webhook(&world.config, 2, ledger_id.0, "edited", &ledger_body);
+    world.enqueue(&mut processor, "issue_comment", hook);
+    // The delayed-webhook shape: the bot restored the comment before the
+    // webhook for the edit was delivered.
+    restored_by_bot(&world, ledger_id, &ledger_body);
+    let delivery = processor.claim().unwrap().expect("the edit");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Released,
+        "the crawl could not land"
+    );
+    run_sagas(&mut processor);
+    assert_eq!(
+        world.github.lock().unwrap().comments[&ledger_id].body,
+        ledger_body,
+        "the genuine ledger is untouched while the store is unbootstrapped"
+    );
+    assert_eq!(world.github.lock().unwrap().comment_updates, updates_before);
+
+    world.github.lock().unwrap().list_comments_broken = false;
+    world.advance_past_cooldown();
+    // The crawl lands; the edit's payload is the maintainer's while the
+    // comment's current bytes are the bot's (its restoration superseded
+    // the edit): doubted, then stale — closed unheard, and rightly so.
+    let delivery = processor.claim().unwrap().expect("the edit");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Released
+    );
+    world.advance_past_cooldown();
+    drain(&mut processor);
+    assert_eq!(processor.state().default_branch, "main", "the crawl landed");
+    assert_eq!(
+        world.github.lock().unwrap().comments[&ledger_id].body,
+        ledger_body,
+        "the superseded edit touched nothing"
+    );
+    // (What becomes of the ledger once the store IS bootstrapped is the
+    // topology crawl's concern: it adopts the ledger the store did not
+    // write, and only then may the sync touch it.)
+}
+
+/// The deletion of a restatement the store never saw own the edge is a
+/// retraction, and retractions are the PR author's alone: a stranger
+/// deleting the author's restatement is refused with an answer, and the
+/// edge stands (Codex first-contact review, P1).
+#[test]
+fn a_strangers_deletion_of_the_restatement_is_refused() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    enqueue_pr_opens(&mut world, &mut processor, 2, &heads);
+    drain(&mut processor);
+    drop(processor);
+    destroy_state_db(&world);
+
+    let mut processor = world.processor();
+    let config = world.config.clone();
+    let declare = |id: u64| {
+        raw_comment_json(
+            &config,
+            2,
+            Some("@merge-train predecessor #1"),
+            AUTHOR,
+            "author",
+            AUTHOR,
+            "author",
+            id,
+            "created",
+        )
+    };
+    world.enqueue(&mut processor, "issue_comment", declare(700));
+    world.enqueue(&mut processor, "issue_comment", declare(701));
+    let delete_b = raw_comment_json(
+        &world.config,
+        2,
+        Some("@merge-train predecessor #1"),
+        AUTHOR,
+        "author",
+        STRANGER,
+        "stranger",
+        701,
+        "deleted",
+    );
+    world.enqueue(&mut processor, "issue_comment", delete_b);
+    world
+        .github
+        .lock()
+        .unwrap()
+        .comments
+        .remove(&CommentId(701));
+    let delivery = processor.claim().unwrap().expect("A");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Processed
+    );
+    let delivery = processor.claim().unwrap().expect("B created");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Released
+    );
+    world.advance_past_cooldown();
+    drain(&mut processor);
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor,
+        Some(PrNumber(1)),
+        "a stranger's deletion retracts nothing"
+    );
+    assert!(
+        world
+            .github
+            .lock()
+            .unwrap()
+            .posted_comments
+            .iter()
+            .any(|(pr, body)| *pr == PrNumber(2) && body.contains("Only the PR author")),
+        "and is answered"
+    );
+}
+
+/// A `pull_request` `edited` payload retargeting PR `number` from `from`
+/// onto `base`.
+fn pr_retargeted_body(
+    config: &GitConfig,
+    number: u64,
+    head: &Sha,
+    branch: &str,
+    from: &str,
+    base: &str,
+) -> Vec<u8> {
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&pr_opened_body(config, number, head, branch, base)).unwrap();
+    json["action"] = serde_json::json!("edited");
+    json["changes"] = serde_json::json!({ "base": { "ref": { "from": from } } });
+    serde_json::to_vec(&json).unwrap()
+}
+
+/// Live — no database loss — a higher comment id establishes nothing: A
+/// declares #1, the author's newer B declares #3 and is rejected, the
+/// author retargets the PR and edits A to declare #3. B now names the
+/// predecessor, is newer than the owner and is the author's, yet never
+/// owned anything: its deletion retracts nothing. What a comment said
+/// before is consulted only for a delivery that straddled the crawl
+/// (Codex trains review, P2).
+#[test]
+fn deleting_a_rejected_declaration_live_retracts_nothing() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    enqueue_pr_opens(&mut world, &mut processor, 2, &heads);
+    // PR 3, on main: a valid predecessor for PR 2 once PR 2 targets it.
+    let config = world.config.clone();
+    let three = create_branch_with_file(&config, "pr-3", "pr-3.txt", "content 3", "main");
+    create_pr_ref(&config, 3, &three);
+    world.github.lock().unwrap().prs.insert(
+        PrNumber(3),
+        FakePr {
+            branch: "pr-3".to_owned(),
+            base_ref: "main".to_owned(),
+            state: FakePrState::Open,
+            author_id: AUTHOR,
+        },
+    );
+    world.enqueue(
+        &mut processor,
+        "pull_request",
+        pr_opened_body(&config, 3, &three, "pr-3", "main"),
+    );
+    drain(&mut processor);
+    let comment = |id: u64, body: &str, action: &str| {
+        raw_comment_json(
+            &config,
+            2,
+            Some(body),
+            AUTHOR,
+            "author",
+            AUTHOR,
+            "author",
+            id,
+            action,
+        )
+    };
+    world.enqueue(
+        &mut processor,
+        "issue_comment",
+        comment(700, "@merge-train predecessor #1", "created"),
+    );
+    world.enqueue(
+        &mut processor,
+        "issue_comment",
+        comment(701, "@merge-train predecessor #3", "created"),
+    );
+    drain(&mut processor);
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor,
+        Some(PrNumber(1))
+    );
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor_comment_id,
+        Some(CommentId(700)),
+        "B was rejected"
+    );
+
+    world
+        .github
+        .lock()
+        .unwrap()
+        .prs
+        .get_mut(&PrNumber(2))
+        .unwrap()
+        .base_ref = "pr-3".to_owned();
+    let retarget = pr_retargeted_body(&config, 2, &heads[1], "pr-2", "pr-1", "pr-3");
+    world.enqueue(&mut processor, "pull_request", retarget);
+    let edit_a = raw_edited_comment_json(
+        &config,
+        2,
+        "@merge-train predecessor #1",
+        "@merge-train predecessor #3",
+        AUTHOR,
+        "author",
+        AUTHOR,
+        "author",
+        700,
+    );
+    world.enqueue(&mut processor, "issue_comment", edit_a);
+    drain(&mut processor);
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor,
+        Some(PrNumber(3))
+    );
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor_comment_id,
+        Some(CommentId(700))
+    );
+
+    world.enqueue(
+        &mut processor,
+        "issue_comment",
+        comment(701, "@merge-train predecessor #3", "deleted"),
+    );
+    drain(&mut processor);
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor,
+        Some(PrNumber(3)),
+        "deleting the rejected B retracts nothing"
+    );
+}
+
+/// The crawl suppresses B's creation as stale — B is gone, or edited —
+/// and B's retraction arrives only AFTER the crawl landed, unmarked. The
+/// ownership B's creation would have taken is transferred to B when the
+/// creation is suppressed, durably, so the later retraction is the
+/// owner's own whenever it arrives (Codex first-contact review, P1).
+#[test]
+fn a_restatement_the_crawl_suppressed_is_retracted_after_the_crawl() {
+    for by_edit in [false, true] {
+        let (mut world, heads) = World::linear_stack(2);
+        let mut processor = world.processor();
+        enqueue_pr_opens(&mut world, &mut processor, 2, &heads);
+        drain(&mut processor);
+        drop(processor);
+        destroy_state_db(&world);
+
+        let mut processor = world.processor();
+        let config = world.config.clone();
+        let declare = |id: u64| {
+            raw_comment_json(
+                &config,
+                2,
+                Some("@merge-train predecessor #1"),
+                AUTHOR,
+                "author",
+                AUTHOR,
+                "author",
+                id,
+                "created",
+            )
+        };
+        world.enqueue(&mut processor, "issue_comment", declare(700));
+        world.enqueue(&mut processor, "issue_comment", declare(701));
+        {
+            let mut github = world.github.lock().unwrap();
+            if by_edit {
+                let b = github.comments.get_mut(&CommentId(701)).unwrap();
+                b.body = "never mind".to_owned();
+                b.edited = Edited::By {
+                    editor: Some(AUTHOR),
+                };
+            } else {
+                github.comments.remove(&CommentId(701));
+            }
+        }
+        // A: the crawl lands, A is fresh and handled.
+        let delivery = processor.claim().unwrap().expect("A");
+        assert_eq!(
+            processor.process_claimed(delivery).unwrap(),
+            PipelineOutcome::Processed
+        );
+        assert_eq!(
+            processor.state().prs[&PrNumber(2)].predecessor,
+            Some(PrNumber(1))
+        );
+        // B's creation: doubted — the comment is gone, or reads otherwise —
+        // and stale once the doubt has stood.
+        let delivery = processor.claim().unwrap().expect("B created");
+        assert_eq!(
+            processor.process_claimed(delivery).unwrap(),
+            PipelineOutcome::Released
+        );
+        world.advance_past_cooldown();
+        drain(&mut processor);
+        assert_eq!(
+            processor.state().prs[&PrNumber(2)].predecessor_comment_id,
+            Some(CommentId(701)),
+            "B's creation was suppressed, and B took ownership of the edge"
+        );
+
+        // B's retraction, received after the crawl landed.
+        let retraction = if by_edit {
+            raw_edited_comment_json(
+                &config,
+                2,
+                "@merge-train predecessor #1",
+                "never mind",
+                AUTHOR,
+                "author",
+                AUTHOR,
+                "author",
+                701,
+            )
+        } else {
+            raw_comment_json(
+                &config,
+                2,
+                Some("@merge-train predecessor #1"),
+                AUTHOR,
+                "author",
+                AUTHOR,
+                "author",
+                701,
+                "deleted",
+            )
+        };
+        world.enqueue(&mut processor, "issue_comment", retraction);
+        drain(&mut processor);
+        assert_eq!(
+            processor.state().prs[&PrNumber(2)].predecessor,
+            None,
+            "the suppressed restatement's retraction (by_edit = {by_edit}) retracted the edge"
+        );
+    }
+}
+
+/// A crawled command whose PR the crawl DID cache, and which then became
+/// unreadable before the delivery was processed: the freshness check
+/// fails permanently, and the precache — which skips cached PRs — will
+/// not refuse it. The delivery is refused explicitly, with an answer, and
+/// not acted on (Codex first-contact review, P1).
+#[test]
+fn a_crawled_command_whose_pr_became_unreadable_is_refused() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    enqueue_pr_opens(&mut world, &mut processor, 2, &heads);
+    drain(&mut processor);
+    // A trace of the bot on the repository: a crawl that could rebuild the
+    // topology from the users' comments (an ONBOARDING) would grant the
+    // edge itself, and the refusal of the delivery would be unobservable.
+    plant_bot_comment(&world, 1, "Hello from the bot.");
+    drop(processor);
+    destroy_state_db(&world);
+
+    let mut processor = world.processor();
+    let wake = pr_opened_body(&world.config, 1, &heads[0], "pr-1", "main");
+    world.enqueue(&mut processor, "pull_request", wake);
+    let declare = raw_comment_json(
+        &world.config,
+        2,
+        Some("@merge-train predecessor #1"),
+        AUTHOR,
+        "author",
+        AUTHOR,
+        "author",
+        700,
+        "created",
+    );
+    world.enqueue(&mut processor, "issue_comment", declare);
+    let delivery = processor.claim().unwrap().expect("the wake-up");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Processed
+    );
+    assert!(
+        processor.state().prs.contains_key(&PrNumber(2)),
+        "the crawl cached PR 2"
+    );
+    world.github.lock().unwrap().prs.remove(&PrNumber(2));
+
+    let delivery = processor.claim().unwrap().expect("the declaration");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Processed,
+        "refused, not retried for ever"
+    );
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor,
+        None,
+        "an unverifiable command is not acted on"
+    );
+    let posted = world.github.lock().unwrap().posted_comments.clone();
+    assert!(
+        posted
+            .iter()
+            .any(|(pr, body)| *pr == PrNumber(2) && body.contains("refusing the command")),
+        "and it is answered: {posted:?}"
+    );
+}
+
+/// Processes everything queued, letting a RELEASED delivery (a doubted
+/// trigger) retry past the cooldown.
+fn drain_with_cooldowns(world: &World, processor: &mut Processor) {
+    let mut rounds = 0;
+    while let Some(delivery) = processor.claim().unwrap() {
+        rounds += 1;
+        assert!(rounds < 50, "drain did not settle");
+        if processor.process_claimed(delivery).unwrap() == PipelineOutcome::Released {
+            world.advance_past_cooldown();
+        }
+    }
+    run_sagas(processor);
+}
+
+/// A STRANGER's restatement, suppressed, transfers nothing: only the PR
+/// author's own declaration can own an edge, live or in recovery. The
+/// author then deleting the stranger's comment retracts nothing either.
+#[test]
+fn a_strangers_suppressed_restatement_transfers_nothing() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    enqueue_pr_opens(&mut world, &mut processor, 2, &heads);
+    drain(&mut processor);
+    drop(processor);
+    destroy_state_db(&world);
+
+    let mut processor = world.processor();
+    let config = world.config.clone();
+    // A creation's sender is its author; a deletion's is whoever deleted.
+    let comment = |id: u64, author: u64, login: &str, sender: u64, slogin: &str, action: &str| {
+        raw_comment_json(
+            &config,
+            2,
+            Some("@merge-train predecessor #1"),
+            author,
+            login,
+            sender,
+            slogin,
+            id,
+            action,
+        )
+    };
+    world.enqueue(
+        &mut processor,
+        "issue_comment",
+        comment(700, AUTHOR, "author", AUTHOR, "author", "created"),
+    );
+    world.enqueue(
+        &mut processor,
+        "issue_comment",
+        comment(701, STRANGER, "stranger", STRANGER, "stranger", "created"),
+    );
+    world
+        .github
+        .lock()
+        .unwrap()
+        .comments
+        .remove(&CommentId(701));
+    drain_with_cooldowns(&world, &mut processor);
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor_comment_id,
+        Some(CommentId(700)),
+        "the stranger's suppressed restatement took nothing"
+    );
+    world.enqueue(
+        &mut processor,
+        "issue_comment",
+        comment(701, STRANGER, "stranger", AUTHOR, "author", "deleted"),
+    );
+    drain(&mut processor);
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor,
+        Some(PrNumber(1)),
+        "and its deletion retracts nothing"
+    );
+}
+
+/// The author restates by EDITING a stranger's comment into the
+/// declaration — live, that edit takes ownership — then edits it away.
+/// Both edits are in the backlog, and the first is suppressed: the listing
+/// shows the final prose. The ownership that suppressed edit would have
+/// transferred is recorded, as a suppressed creation's is, so the final
+/// edit is the owner's retraction; without it the PR stayed stacked after
+/// the author unstacked it (the recovery model's finding).
+#[test]
+fn an_authors_restatement_by_edit_suppressed_still_takes_ownership() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    enqueue_pr_opens(&mut world, &mut processor, 2, &heads);
+    drain(&mut processor);
+    drop(processor);
+    destroy_state_db(&world);
+
+    let mut processor = world.processor();
+    let config = world.config.clone();
+    let declare = "@merge-train predecessor #1";
+    world.enqueue(
+        &mut processor,
+        "issue_comment",
+        raw_comment_json(
+            &config,
+            2,
+            Some(declare),
+            AUTHOR,
+            "author",
+            AUTHOR,
+            "author",
+            700,
+            "created",
+        ),
+    );
+    world.enqueue(
+        &mut processor,
+        "issue_comment",
+        raw_comment_json(
+            &config,
+            2,
+            Some(declare),
+            STRANGER,
+            "stranger",
+            STRANGER,
+            "stranger",
+            701,
+            "created",
+        ),
+    );
+    world.enqueue(
+        &mut processor,
+        "issue_comment",
+        raw_edited_comment_json(
+            &config, 2, declare, declare, STRANGER, "stranger", AUTHOR, "author", 701,
+        ),
+    );
+    world.enqueue(
+        &mut processor,
+        "issue_comment",
+        raw_edited_comment_json(
+            &config, 2, declare, "hello", STRANGER, "stranger", AUTHOR, "author", 701,
+        ),
+    );
+    drain_with_cooldowns(&world, &mut processor);
+    assert_eq!(processor.state().default_branch, "main", "the crawl landed");
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor,
+        None,
+        "the author unstacked the PR by editing their restatement away"
+    );
+}
+
+/// A suppressed restatement by editing one of the BOT's own comments
+/// transfers nothing: live, the handler ignores a bot-authored comment
+/// whatever anyone edits it into, so the author's edit of it into the
+/// declaration takes no ownership, and the original declaration keeps
+/// the edge — and its deletion retracts it. Recovery must not hand the
+/// edge to a comment every later event on which is ignored (Codex
+/// first-contact review, P2).
+#[test]
+fn a_suppressed_restatement_in_a_bot_comment_transfers_nothing() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    enqueue_pr_opens(&mut world, &mut processor, 2, &heads);
+    drain(&mut processor);
+    drop(processor);
+    destroy_state_db(&world);
+
+    let mut processor = world.processor();
+    let config = world.config.clone();
+    let declare = "@merge-train predecessor #1";
+    world.enqueue(
+        &mut processor,
+        "issue_comment",
+        raw_comment_json(
+            &config,
+            2,
+            Some(declare),
+            AUTHOR,
+            "author",
+            AUTHOR,
+            "author",
+            700,
+            "created",
+        ),
+    );
+    // The bot's own comment, edited by the PR author into the declaration
+    // and then away again; the listing shows the final prose.
+    world.enqueue(
+        &mut processor,
+        "issue_comment",
+        raw_edited_comment_json(
+            &config,
+            2,
+            "status",
+            declare,
+            TEST_BOT_ID,
+            "merge-train",
+            AUTHOR,
+            "author",
+            701,
+        ),
+    );
+    world.enqueue(
+        &mut processor,
+        "issue_comment",
+        raw_edited_comment_json(
+            &config,
+            2,
+            declare,
+            "hello",
+            TEST_BOT_ID,
+            "merge-train",
+            AUTHOR,
+            "author",
+            701,
+        ),
+    );
+    drain_with_cooldowns(&world, &mut processor);
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor_comment_id,
+        Some(CommentId(700)),
+        "a bot comment owns nothing, suppressed or not"
+    );
+    world.enqueue(
+        &mut processor,
+        "issue_comment",
+        raw_comment_json(
+            &config, 2, None, AUTHOR, "author", AUTHOR, "author", 700, "deleted",
+        ),
+    );
+    drain(&mut processor);
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor,
+        None,
+        "and deleting the declaration retracts the edge"
+    );
+}
+
+/// A suppressed transfer recorded on a cooldown retry owes the ledger a
+/// rewrite — the owner changed — and the retry is the last thing in the
+/// queue, with no timer outstanding: the rewrite must be queued with the
+/// close, or GitHub's ledger names the old owner until unrelated traffic
+/// or a restart happens by (Codex first-contact review, P2).
+#[test]
+fn a_suppressed_transfer_on_a_retry_queues_the_ledger_rewrite() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    enqueue_pr_opens(&mut world, &mut processor, 2, &heads);
+    drain(&mut processor);
+    drop(processor);
+    destroy_state_db(&world);
+
+    let mut processor = world.processor();
+    let config = world.config.clone();
+    let comment = |id: u64| {
+        raw_comment_json(
+            &config,
+            2,
+            Some("@merge-train predecessor #1"),
+            AUTHOR,
+            "author",
+            AUTHOR,
+            "author",
+            id,
+            "created",
+        )
+    };
+    world.enqueue(&mut processor, "issue_comment", comment(700));
+    world.enqueue(&mut processor, "issue_comment", comment(701));
+    // The restatement was deleted meanwhile; its deletion webhook is
+    // still on its way.
+    world
+        .github
+        .lock()
+        .unwrap()
+        .comments
+        .remove(&CommentId(701));
+    let delivery = processor.claim().unwrap().expect("the declaration");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Processed
+    );
+    run_sagas(&mut processor);
+    assert_eq!(
+        ledger_on(&world, 2)
+            .and_then(|l| l.declared)
+            .map(|d| d.owner),
+        Some(CommentId(700)),
+        "the ledger names the declaration"
+    );
+    let delivery = processor.claim().unwrap().expect("the restatement");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Released,
+        "absent: doubted"
+    );
+    world.advance_past_cooldown();
+    let delivery = processor
+        .claim()
+        .unwrap()
+        .expect("the restatement, retried");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Processed,
+        "still absent: closed, the ownership it would have taken recorded"
+    );
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor_comment_id,
+        Some(CommentId(701))
+    );
+    assert!(
+        processor.claim().unwrap().is_none(),
+        "nothing else is queued"
+    );
+    run_sagas(&mut processor);
+    assert_eq!(
+        ledger_on(&world, 2)
+            .and_then(|l| l.declared)
+            .map(|d| d.owner),
+        Some(CommentId(701)),
+        "the rewrite the transfer owed was queued with the close"
+    );
+}
+
+/// The backlog holds A, the author's restatement B, and TWO edits of B:
+/// to `never mind`, then to other prose. B's creation is suppressed (B is
+/// edited), B's first edit is stale (the listing shows the final prose),
+/// and only the final edit is handled — whose previous text is prose. The
+/// retraction the author made must still land: ownership passed to B
+/// when its creation was suppressed, durably, so the final edit is an
+/// owner's edit away from a declaration (Codex first-contact review, P1).
+#[test]
+fn a_restatement_edited_twice_in_the_backlog_still_retracts() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    enqueue_pr_opens(&mut world, &mut processor, 2, &heads);
+    drain(&mut processor);
+    drop(processor);
+    destroy_state_db(&world);
+
+    let mut processor = world.processor();
+    let config = world.config.clone();
+    let declare = |id: u64| {
+        raw_comment_json(
+            &config,
+            2,
+            Some("@merge-train predecessor #1"),
+            AUTHOR,
+            "author",
+            AUTHOR,
+            "author",
+            id,
+            "created",
+        )
+    };
+    let edit_b = |from: &str, to: &str| {
+        raw_edited_comment_json(
+            &config, 2, from, to, AUTHOR, "author", AUTHOR, "author", 701,
+        )
+    };
+    world.enqueue(&mut processor, "issue_comment", declare(700));
+    world.enqueue(&mut processor, "issue_comment", declare(701));
+    world.enqueue(
+        &mut processor,
+        "issue_comment",
+        edit_b("@merge-train predecessor #1", "never mind"),
+    );
+    world.enqueue(
+        &mut processor,
+        "issue_comment",
+        edit_b("never mind", "on second thought, this stands alone"),
+    );
+    drain_with_cooldowns(&world, &mut processor);
+    assert_eq!(processor.state().default_branch, "main", "the crawl landed");
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor,
+        None,
+        "the author's retraction, edited over, still retracted the edge"
+    );
+}
+
+/// A suppressed creation is not ownership: B was created as PROSE and
+/// edited into a declaration of #3 before the crawl — its creation is
+/// suppressed, its edit handled and REJECTED. The author then retargets
+/// the PR and edits A to declare #3. Deleting B, whose final text names
+/// today's predecessor, must retract nothing: B never owned the edge
+/// (Codex first-contact review, P2).
+#[test]
+fn deleting_a_rejected_declaration_whose_creation_was_suppressed_retracts_nothing() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    enqueue_pr_opens(&mut world, &mut processor, 2, &heads);
+    let config = world.config.clone();
+    let three = create_branch_with_file(&config, "pr-3", "pr-3.txt", "content 3", "main");
+    create_pr_ref(&config, 3, &three);
+    world.github.lock().unwrap().prs.insert(
+        PrNumber(3),
+        FakePr {
+            branch: "pr-3".to_owned(),
+            base_ref: "main".to_owned(),
+            state: FakePrState::Open,
+            author_id: AUTHOR,
+        },
+    );
+    world.enqueue(
+        &mut processor,
+        "pull_request",
+        pr_opened_body(&config, 3, &three, "pr-3", "main"),
+    );
+    drain(&mut processor);
+    drop(processor);
+    destroy_state_db(&world);
+
+    let mut processor = world.processor();
+    let comment = |id: u64, body: &str, action: &str| {
+        raw_comment_json(
+            &config,
+            2,
+            Some(body),
+            AUTHOR,
+            "author",
+            AUTHOR,
+            "author",
+            id,
+            action,
+        )
+    };
+    world.enqueue(
+        &mut processor,
+        "issue_comment",
+        comment(700, "@merge-train predecessor #1", "created"),
+    );
+    world.enqueue(
+        &mut processor,
+        "issue_comment",
+        comment(701, "hello", "created"),
+    );
+    world.enqueue(
+        &mut processor,
+        "issue_comment",
+        raw_edited_comment_json(
+            &config,
+            2,
+            "hello",
+            "@merge-train predecessor #3",
+            AUTHOR,
+            "author",
+            AUTHOR,
+            "author",
+            701,
+        ),
+    );
+    drain_with_cooldowns(&world, &mut processor);
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor,
+        Some(PrNumber(1))
+    );
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor_comment_id,
+        Some(CommentId(700)),
+        "B's declaration of #3 was rejected"
+    );
+
+    world
+        .github
+        .lock()
+        .unwrap()
+        .prs
+        .get_mut(&PrNumber(2))
+        .unwrap()
+        .base_ref = "pr-3".to_owned();
+    let retarget = pr_retargeted_body(&config, 2, &heads[1], "pr-2", "pr-1", "pr-3");
+    world.enqueue(&mut processor, "pull_request", retarget);
+    world.enqueue(
+        &mut processor,
+        "issue_comment",
+        raw_edited_comment_json(
+            &config,
+            2,
+            "@merge-train predecessor #1",
+            "@merge-train predecessor #3",
+            AUTHOR,
+            "author",
+            AUTHOR,
+            "author",
+            700,
+        ),
+    );
+    drain(&mut processor);
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor,
+        Some(PrNumber(3))
+    );
+    world.enqueue(
+        &mut processor,
+        "issue_comment",
+        comment(701, "@merge-train predecessor #3", "deleted"),
+    );
+    drain(&mut processor);
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor,
+        Some(PrNumber(3)),
+        "deleting B, which never owned the edge, retracts nothing"
+    );
+}
+
+/// The edit-side twin: a stranger editing the author's restatement away
+/// is refused with an answer, and the edge stands (Codex first-contact
+/// review, P1).
+#[test]
+fn a_strangers_edit_of_the_restatement_is_refused() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    enqueue_pr_opens(&mut world, &mut processor, 2, &heads);
+    drain(&mut processor);
+    drop(processor);
+    destroy_state_db(&world);
+
+    let mut processor = world.processor();
+    let config = world.config.clone();
+    let declare = |id: u64| {
+        raw_comment_json(
+            &config,
+            2,
+            Some("@merge-train predecessor #1"),
+            AUTHOR,
+            "author",
+            AUTHOR,
+            "author",
+            id,
+            "created",
+        )
+    };
+    world.enqueue(&mut processor, "issue_comment", declare(700));
+    world.enqueue(&mut processor, "issue_comment", declare(701));
+    let edit_b = raw_edited_comment_json(
+        &world.config,
+        2,
+        "@merge-train predecessor #1",
+        "never mind",
+        AUTHOR,
+        "author",
+        STRANGER,
+        "stranger",
+        701,
+    );
+    world.enqueue(&mut processor, "issue_comment", edit_b);
+    let delivery = processor.claim().unwrap().expect("A");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Processed
+    );
+    drain_with_cooldowns(&world, &mut processor);
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor,
+        Some(PrNumber(1)),
+        "a stranger's edit retracts nothing"
+    );
+    assert!(
+        world
+            .github
+            .lock()
+            .unwrap()
+            .posted_comments
+            .iter()
+            .any(|(pr, body)| *pr == PrNumber(2) && body.contains("Only the PR author")),
+        "and is answered"
+    );
+}
+
+/// The backlog holds the author's declaration A, a newer restatement B,
+/// and the author's edit of B to `never mind`. B's creation is stale — the
+/// comment has been edited — so the crawl leaves A owning the edge; but
+/// live, B would have taken ownership and its edit retracted. The edit
+/// carries what B said before, and the retraction happens (Codex
+/// first-contact review, P1).
+#[test]
+fn an_edited_away_restatement_in_the_backlog_still_retracts() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    enqueue_pr_opens(&mut world, &mut processor, 2, &heads);
+    drain(&mut processor);
+    drop(processor);
+    destroy_state_db(&world);
+
+    let mut processor = world.processor();
+    let config = world.config.clone();
+    let declare = |id: u64| {
+        raw_comment_json(
+            &config,
+            2,
+            Some("@merge-train predecessor #1"),
+            AUTHOR,
+            "author",
+            AUTHOR,
+            "author",
+            id,
+            "created",
+        )
+    };
+    world.enqueue(&mut processor, "issue_comment", declare(700));
+    world.enqueue(&mut processor, "issue_comment", declare(701));
+    let edit_b = raw_edited_comment_json(
+        &world.config,
+        2,
+        "@merge-train predecessor #1",
+        "never mind",
+        AUTHOR,
+        "author",
+        AUTHOR,
+        "author",
+        701,
+    );
+    world.enqueue(&mut processor, "issue_comment", edit_b);
+    let delivery = processor.claim().unwrap().expect("A");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Processed
+    );
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor,
+        Some(PrNumber(1))
+    );
+    drain_with_cooldowns(&world, &mut processor);
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor,
+        None,
+        "the author's edit of the restatement retracted the edge"
+    );
+}
+
+/// A newly created comment can be missing from a listing taken moments
+/// later; a second absence is evidence it was deleted only once GitHub
+/// has had time to catch up. Another webhook can wake the worker and
+/// retry a released delivery at once, so the retry is judged by the
+/// clock, not by its count (Codex topology review, P2).
+#[test]
+fn an_absent_trigger_is_not_believed_gone_within_the_cooldown() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    enqueue_pr_opens(&mut world, &mut processor, 2, &heads);
+    drain(&mut processor);
+    destroy_state_db(&world);
+
+    let mut processor = world.processor();
+    let body = raw_comment_json(
+        &world.config,
+        2,
+        Some("@merge-train predecessor #1"),
+        AUTHOR,
+        "author",
+        AUTHOR,
+        "author",
+        777,
+        "created",
+    );
+    world.enqueue(&mut processor, "issue_comment", body);
+    world
+        .github
+        .lock()
+        .unwrap()
+        .comments
+        .remove(&CommentId(777));
+    for attempt in 0..2 {
+        let delivery = processor.claim().unwrap().expect("pending");
+        assert_eq!(
+            processor.process_claimed(delivery).unwrap(),
+            PipelineOutcome::Released,
+            "attempt {attempt}: absence within the cooldown is not yet evidence"
+        );
+    }
+    world.advance_past_cooldown();
+    let delivery = processor.claim().unwrap().expect("pending");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Processed,
+        "absent again after the cooldown: closed unheard"
+    );
+    assert_eq!(processor.state().prs[&PrNumber(2)].predecessor, None);
+}
+
+/// An author's RETRACTION edit can trigger the crawl while the listing
+/// still serves the pre-edit declaration: the crawl restores that edge,
+/// and the webhook's body differs from the listed one. A mismatch is
+/// not proof the webhook is stale — the listing may be the older of the
+/// two — so the delivery is doubted and retried after the stall cadence,
+/// as an absent trigger is; closed on the first read, the withdrawn edge
+/// would stand and a later train would drive the PR (Codex topology
+/// review, P1).
+#[test]
+fn a_retraction_edit_the_listing_has_not_caught_up_with_is_retried() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    enqueue_pr_opens(&mut world, &mut processor, 2, &heads);
+    drain(&mut processor);
+    destroy_state_db(&world);
+
+    let mut processor = world.processor();
+    let body = raw_comment_json(
+        &world.config,
+        2,
+        Some("never mind"),
+        AUTHOR,
+        "author",
+        AUTHOR,
+        "author",
+        777,
+        "edited",
+    );
+    world.enqueue(&mut processor, "issue_comment", body);
+    // GitHub has the edit; the listing lags, still serving the declaration.
+    world
+        .github
+        .lock()
+        .unwrap()
+        .stale_listing_bodies
+        .insert(CommentId(777), "@merge-train predecessor #1".to_owned());
+    let delivery = processor.claim().unwrap().expect("the edit");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Released,
+        "a body the listing disagrees with is doubted, not disbelieved"
+    );
+    // The listing catches up; the retry after the cadence handles the edit.
+    world.github.lock().unwrap().stale_listing_bodies.clear();
+    world.advance_past_cooldown();
+    drain(&mut processor);
+    assert_eq!(processor.state().default_branch, "main", "the crawl landed");
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor,
+        None,
+        "the retraction was handled, not discarded as stale"
+    );
+}
+
+/// Every delivery queued before the crawl landed is judged against the
+/// present the crawl fetched, not only the one that triggered it: an old
+/// `closed` for a PR the crawl just cached as open, queued behind an
+/// unrelated wake-up, would otherwise close it in the store — and the
+/// next freeze would omit an open descendant (Codex topology review,
+/// P1).
+#[test]
+fn every_delivery_queued_before_the_crawl_landed_is_judged_against_its_present() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    drain(&mut processor);
+    tick(&world, &mut processor);
+    drop(processor);
+    destroy_state_db(&world);
+
+    let mut processor = world.processor();
+    // The wake-up, then the stale close queued behind it.
+    let wake = pr_opened_body(&world.config, 1, &heads[0], "pr-1", "main");
+    world.enqueue(&mut processor, "pull_request", wake);
+    let (head, branch, base) = {
+        let github = world.github.lock().unwrap();
+        let fake = &github.prs[&PrNumber(2)];
+        (
+            github.branch_head(&fake.branch),
+            fake.branch.clone(),
+            fake.base_ref.clone(),
+        )
+    };
+    let stale_close = pr_closed_body(&world.config, 2, &head, &branch, &base);
+    world.enqueue(&mut processor, "pull_request", stale_close);
+    let delivery = processor.claim().unwrap().expect("the wake-up");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Processed
+    );
+    assert_eq!(processor.state().default_branch, "main", "the crawl landed");
+    // Marked by the crawl, and disagreeing with its snapshot: doubted,
+    // and stale only once the doubt has stood for the stall cadence.
+    let delivery = processor.claim().unwrap().expect("the close");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Released
+    );
+    world.advance_past_cooldown();
+    drain(&mut processor);
+    assert!(
+        processor.state().prs[&PrNumber(2)].state.is_open(),
+        "the stale close queued behind the trigger must not close #2: {:?}",
+        processor.state().prs[&PrNumber(2)].state
+    );
+}
+
+/// When a doubted pull-request delivery is judged by the PR fetched
+/// afresh, that snapshot is the present — and the cache is RECONCILED to
+/// it whatever the verdict. A reopen the crawl saw as closed (the listing
+/// lagged) and whose payload the fresh PR has since moved past (a retarget
+/// followed it) is stale, but the PR is open: closing the delivery
+/// unheard and leaving the cache closed would keep the PR out of every
+/// later train (Codex first-contact review, P1).
+#[test]
+fn a_fresh_snapshot_reconciles_the_cache_even_when_the_delivery_is_stale() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    enqueue_pr_opens(&mut world, &mut processor, 2, &heads);
+    drain(&mut processor);
+    drop(processor);
+    destroy_state_db(&world);
+
+    // GitHub's listing lags: #2 reads closed there while the backlog holds
+    // its close and then its reopen.
+    world
+        .github
+        .lock()
+        .unwrap()
+        .prs
+        .get_mut(&PrNumber(2))
+        .unwrap()
+        .state = crate::github::test_support::FakePrState::Closed;
+    let mut processor = world.processor();
+    let (head, branch) = {
+        let github = world.github.lock().unwrap();
+        let fake = &github.prs[&PrNumber(2)];
+        (github.branch_head(&fake.branch), fake.branch.clone())
+    };
+    let close = pr_closed_body(&world.config, 2, &head, &branch, "pr-1");
+    world.enqueue(&mut processor, "pull_request", close);
+    let reopen = pr_reopened_body(&world.config, 2, &head, &branch, "pr-1");
+    world.enqueue(&mut processor, "pull_request", reopen);
+    // The close triggers the crawl, which seeds #2 and caches it CLOSED.
+    let delivery = processor.claim().unwrap().expect("the close");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Processed
+    );
+    assert!(!processor.state().prs[&PrNumber(2)].state.is_open());
+    // The reopen, marked by the crawl, disagrees with that snapshot.
+    let delivery = processor.claim().unwrap().expect("the reopen");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Released
+    );
+    // GitHub catches up — and #2 was retargeted onto main meanwhile, so the
+    // reopen's payload is stale against the fresh snapshot.
+    {
+        let mut github = world.github.lock().unwrap();
+        let fake = github.prs.get_mut(&PrNumber(2)).unwrap();
+        fake.state = crate::github::test_support::FakePrState::Open;
+        fake.base_ref = "main".to_owned();
+    }
+    world.advance_past_cooldown();
+    drain(&mut processor);
+    let cached = &processor.state().prs[&PrNumber(2)];
+    assert!(
+        cached.state.is_open(),
+        "the fresh snapshot reconciled the cache: {:?}",
+        cached.state
+    );
+    assert_eq!(cached.base_ref, "main", "base too");
+}
+
+/// A delivery RECEIVED while the crawl was fetching reaches the store only
+/// after the crawl landed — the worker that runs the crawl is the worker
+/// that services intake — so it is absent when the crawl marks its
+/// backlog. It describes a change the crawled present may or may not
+/// hold, and is judged against that present like the backlog is: the mark
+/// follows the time the webhook was received, not the time it was stored
+/// (Codex first-contact review, P1).
+#[test]
+fn a_delivery_received_during_the_crawl_is_judged_against_its_present() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    drain(&mut processor);
+    drop(processor);
+    destroy_state_db(&world);
+
+    let mut processor = world.processor();
+    let wake = pr_opened_body(&world.config, 1, &heads[0], "pr-1", "main");
+    world.enqueue(&mut processor, "pull_request", wake);
+    let delivery = processor.claim().unwrap().expect("the wake-up");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Processed,
+        "the crawl landed"
+    );
+    // A stale close for #2, received a minute before the crawl landed but
+    // stored only now.
+    let (head, branch, base) = {
+        let github = world.github.lock().unwrap();
+        let fake = &github.prs[&PrNumber(2)];
+        (
+            github.branch_head(&fake.branch),
+            fake.branch.clone(),
+            fake.base_ref.clone(),
+        )
+    };
+    let stale_close = pr_closed_body(&world.config, 2, &head, &branch, &base);
+    world.enqueue_received_at(
+        &mut processor,
+        "pull_request",
+        stale_close,
+        chrono::Utc::now() - chrono::Duration::minutes(1),
+    );
+    let delivery = processor.claim().unwrap().expect("the close");
+    assert!(delivery.crawled, "received before the crawl landed: marked");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Released,
+        "and doubted against the crawled present, not handled"
+    );
+    assert!(processor.state().prs[&PrNumber(2)].state.is_open());
+}
+
+/// A first-contact command on a PR the crawl cannot fetch at all (a
+/// permanent failure on the seed) is not stale — its comments were never
+/// listed because the PR could not be reached, not because the cap bit —
+/// and reaches the handler, which refuses it with an answer, as it would
+/// after bootstrap (Codex first-contact review, P2).
+#[test]
+fn a_first_contact_command_on_an_unfetchable_pr_is_refused_with_an_answer() {
+    let (mut world, _heads) = World::linear_stack(1);
+    let mut processor = world.processor();
+    let stop = comment_body(&world.config, 9, "@merge-train stop", AUTHOR, "author", 90);
+    world.enqueue(&mut processor, "issue_comment", stop);
+    let delivery = processor.claim().unwrap().expect("the command");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Processed
+    );
+    assert_eq!(processor.state().default_branch, "main", "the crawl landed");
+    run_sagas(&mut processor);
+    let posted = world.github.lock().unwrap().posted_comments.clone();
+    assert!(
+        posted
+            .iter()
+            .any(|(pr, body)| *pr == PrNumber(9) && body.contains("cannot fetch PR #9")),
+        "the command was answered, not closed unheard: {posted:?}"
+    );
+}
+
+/// An `edited` payload is current only if the listed comment's current
+/// bytes were written by the payload's SENDER: equal bodies alone prove
+/// nothing about who wrote them. The author declares, retracts, and a
+/// non-author with comment-edit rights restores the declaration text, all
+/// queued behind the crawl. Judged by bodies, the author's first edit
+/// would be accepted (its text matches the restored text), the retraction
+/// discarded as stale, and the non-author's edit refused — leaving the
+/// withdrawn edge standing (Codex first-contact review, P1).
+#[test]
+fn an_edited_payload_is_current_only_if_its_sender_wrote_the_listed_bytes() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    enqueue_pr_opens(&mut world, &mut processor, 2, &heads);
+    drain(&mut processor);
+    drop(processor);
+    destroy_state_db(&world);
+
+    let mut processor = world.processor();
+    let edit = |sender: u64, login: &str, text: &str| {
+        raw_comment_json(
+            &world.config,
+            2,
+            Some(text),
+            AUTHOR,
+            "author",
+            sender,
+            login,
+            777,
+            "edited",
+        )
+    };
+    let declare = edit(AUTHOR, "author", "@merge-train predecessor #1");
+    let retract = edit(AUTHOR, "author", "never mind");
+    let restore = edit(STRANGER, "stranger", "@merge-train predecessor #1");
+    world.enqueue(&mut processor, "issue_comment", declare);
+    world.enqueue(&mut processor, "issue_comment", retract);
+    world.enqueue(&mut processor, "issue_comment", restore);
+    // The listing shows the restored text, in the stranger's bytes.
+    for expected in [
+        PipelineOutcome::Released, // the author's declaration: bytes match, writer does not
+        PipelineOutcome::Released, // the retraction: bytes differ
+    ] {
+        let delivery = processor.claim().unwrap().expect("queued");
+        assert_eq!(processor.process_claimed(delivery).unwrap(), expected);
+        world.advance_past_cooldown();
+        let delivery = processor.claim().unwrap().expect("doubted, retried");
+        assert_eq!(
+            processor.process_claimed(delivery).unwrap(),
+            PipelineOutcome::Processed,
+            "still disagreeing after the cadence: closed unheard"
+        );
+    }
+    drain(&mut processor);
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor,
+        None,
+        "the stranger's restoration is refused, and nothing else was believed"
+    );
+}
+
+/// The same for a CREATED payload: the author creates the declaration,
+/// retracts it by edit, and a non-author restores its text, all queued
+/// behind the crawl. The listing shows the declaration in the stranger's
+/// bytes. Judged by bodies, the creation would be believed (its text
+/// matches), the retraction discarded as stale, and the stranger's edit
+/// refused — the withdrawn edge revived. A creation is current only while
+/// the comment's bytes are still its creator's (Codex first-contact
+/// review, P1, second finding).
+#[test]
+fn a_created_payload_is_current_only_if_its_creator_still_wrote_the_listed_bytes() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    enqueue_pr_opens(&mut world, &mut processor, 2, &heads);
+    drain(&mut processor);
+    drop(processor);
+    destroy_state_db(&world);
+
+    let mut processor = world.processor();
+    let config = world.config.clone();
+    let declare = "@merge-train predecessor #1";
+    world.enqueue(
+        &mut processor,
+        "issue_comment",
+        raw_comment_json(
+            &config,
+            2,
+            Some(declare),
+            AUTHOR,
+            "author",
+            AUTHOR,
+            "author",
+            777,
+            "created",
+        ),
+    );
+    world.enqueue(
+        &mut processor,
+        "issue_comment",
+        raw_edited_comment_json(
+            &config,
+            2,
+            declare,
+            "never mind",
+            AUTHOR,
+            "author",
+            AUTHOR,
+            "author",
+            777,
+        ),
+    );
+    world.enqueue(
+        &mut processor,
+        "issue_comment",
+        raw_edited_comment_json(
+            &config,
+            2,
+            "never mind",
+            declare,
+            AUTHOR,
+            "author",
+            STRANGER,
+            "stranger",
+            777,
+        ),
+    );
+    drain_with_cooldowns(&world, &mut processor);
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor,
+        None,
+        "the retraction stood live, and recovery must not revive the edge"
+    );
+}
+
+/// The receipt time a delivery carries into the mailbox is the HTTP
+/// intake's, not the time the worker got round to storing it: a webhook
+/// received during a crawl's reads is stored only after the crawl landed,
+/// and must still be marked as received before it — stored with the
+/// worker's clock it would not be (Codex first-contact review, P1).
+#[test]
+fn a_delivery_carries_its_receipt_time_into_the_store() {
+    let (world, heads) = World::linear_stack(1);
+    let mut processor = world.processor();
+    // A crawl has landed.
+    processor
+        .store_mut()
+        .append_batch_marking(
+            &[StateEventPayload::DefaultBranchSet {
+                branch: "main".to_owned(),
+            }],
+            chrono::Utc::now(),
+            Some("the-trigger"),
+        )
+        .unwrap();
+    // Received an hour ago, stored now, through the mailbox.
+    let body = pr_opened_body(&world.config, 1, &heads[0], "pr-1", "main");
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    let permit = std::sync::Arc::new(tokio::sync::Semaphore::new(1))
+        .try_acquire_owned()
+        .unwrap();
+    let mut parked = None;
+    super::handle_msg(
+        &mut processor,
+        WorkerMsg::Enqueue {
+            delivery: IntakeDelivery {
+                delivery_id: "late".to_owned(),
+                event_type: "pull_request".to_owned(),
+                headers: "{}".to_owned(),
+                body,
+                received_at: chrono::Utc::now() - chrono::Duration::hours(1),
+            },
+            ack: ack_tx,
+            permit,
+        },
+        &mut parked,
+    )
+    .unwrap();
+    assert_eq!(
+        ack_rx.blocking_recv().unwrap().unwrap(),
+        super::EnqueueOutcome::Enqueued
+    );
+    let stored = processor.claim().unwrap().expect("stored");
+    assert_eq!(stored.delivery_id, "late");
+    assert!(stored.crawled, "received before the crawl landed: marked");
+}
+
+/// A crawled delivery closed as stale records its dedupe key, exactly as
+/// a stale trigger's close does: GitHub redelivers with fresh ids, and a
+/// redelivery received after the crawl landed carries no mark and would
+/// otherwise run the obsolete payload — here a declaration whose comment
+/// was deleted during the gap (Codex first-contact review, P1).
+#[test]
+fn a_crawled_delivery_closed_as_stale_dedupes_its_redelivery() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    enqueue_pr_opens(&mut world, &mut processor, 2, &heads);
+    drain(&mut processor);
+    let body = raw_comment_json(
+        &world.config,
+        2,
+        Some("@merge-train predecessor #1"),
+        AUTHOR,
+        "author",
+        AUTHOR,
+        "author",
+        777,
+        "created",
+    );
+    world.enqueue(&mut processor, "issue_comment", body.clone());
+    // The crawl landed for it; the process died before it was handled,
+    // and the comment was deleted meanwhile.
+    let delivery = processor.claim().unwrap().expect("queued");
+    processor
+        .store_mut()
+        .append_batch_marking(&[], Utc::now(), Some(&delivery.delivery_id))
+        .unwrap();
+    drop(processor);
+    world
+        .github
+        .lock()
+        .unwrap()
+        .comments
+        .remove(&CommentId(777));
+    let mut processor = world.processor();
+    let delivery = processor.claim().unwrap().expect("pending");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Released,
+        "absent: doubted"
+    );
+    world.advance_past_cooldown();
+    drain(&mut processor);
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor,
+        None,
+        "closed unheard"
+    );
+    // GitHub redelivers the same webhook under a fresh id, received now.
+    world.enqueue(&mut processor, "issue_comment", body);
+    drain(&mut processor);
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor,
+        None,
+        "the redelivery is a duplicate of a closed delivery, not a fresh declaration"
+    );
+}
+
+/// Two copies of one stale webhook, queued under different delivery ids
+/// when the crawl lands: the first is doubted, then closed as stale,
+/// recording its dedupe key — and the second is a duplicate of that close,
+/// discarded at once. Judged for freshness first, it would be doubted and
+/// released for another whole stall cadence, and every unrelated delivery
+/// behind it would wait it out (Codex first-contact review, P2).
+#[test]
+fn a_duplicate_crawled_delivery_is_deduped_before_its_freshness_is_doubted() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    enqueue_pr_opens(&mut world, &mut processor, 2, &heads);
+    drain(&mut processor);
+    let body = raw_comment_json(
+        &world.config,
+        2,
+        Some("@merge-train predecessor #1"),
+        AUTHOR,
+        "author",
+        AUTHOR,
+        "author",
+        777,
+        "created",
+    );
+    world.enqueue(&mut processor, "issue_comment", body.clone());
+    world.enqueue(&mut processor, "issue_comment", body);
+    // The crawl landed for both; the process died before either was
+    // handled, and the comment was deleted meanwhile.
+    let first = processor.claim().unwrap().expect("the first copy");
+    let second = processor.claim().unwrap().expect("the second copy");
+    assert_ne!(first.delivery_id, second.delivery_id);
+    for id in [&first.delivery_id, &second.delivery_id] {
+        processor
+            .store_mut()
+            .append_batch_marking(&[], Utc::now(), Some(id))
+            .unwrap();
+    }
+    drop(processor);
+    world
+        .github
+        .lock()
+        .unwrap()
+        .comments
+        .remove(&CommentId(777));
+    let mut processor = world.processor();
+    let delivery = processor.claim().unwrap().expect("the first copy");
+    assert_eq!(delivery.delivery_id, first.delivery_id);
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Released,
+        "absent: doubted"
+    );
+    world.advance_past_cooldown();
+    let delivery = processor.claim().unwrap().expect("the first copy, retried");
+    assert_eq!(delivery.delivery_id, first.delivery_id);
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Processed,
+        "still absent after the cadence: closed"
+    );
+    let delivery = processor.claim().unwrap().expect("the second copy");
+    assert_eq!(delivery.delivery_id, second.delivery_id);
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Processed,
+        "a duplicate of a closed delivery: discarded at once, not doubted"
+    );
+    assert!(processor.claim().unwrap().is_none(), "nothing left");
+    assert_eq!(processor.state().prs[&PrNumber(2)].predecessor, None);
+}
+
+/// The pre-crawl backlog holds a declaration A, a restatement B of the
+/// same predecessor, and the author's deletion of B; the listing shows A
+/// alone. Live, B's creation moved the edge's ownership to B and B's
+/// deletion retracted it. Here B's creation is stale (B is gone) — but its
+/// deletion still carries B's body: an author's deletion of a declaration
+/// of the very predecessor the PR holds, made after the current owner, is
+/// the retraction it would have been (Codex first-contact review, P1).
+#[test]
+fn a_deleted_restatement_still_retracts_the_edge_it_would_have_owned() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    enqueue_pr_opens(&mut world, &mut processor, 2, &heads);
+    drain(&mut processor);
+    drop(processor);
+    destroy_state_db(&world);
+
+    let mut processor = world.processor();
+    let config = world.config.clone();
+    let declare = |id: u64| {
+        raw_comment_json(
+            &config,
+            2,
+            Some("@merge-train predecessor #1"),
+            AUTHOR,
+            "author",
+            AUTHOR,
+            "author",
+            id,
+            "created",
+        )
+    };
+    world.enqueue(&mut processor, "issue_comment", declare(700));
+    world.enqueue(&mut processor, "issue_comment", declare(701));
+    let delete_b = raw_comment_json(
+        &world.config,
+        2,
+        Some("@merge-train predecessor #1"),
+        AUTHOR,
+        "author",
+        AUTHOR,
+        "author",
+        701,
+        "deleted",
+    );
+    world.enqueue(&mut processor, "issue_comment", delete_b);
+    // A (700) is listed; B (701) is gone.
+    world
+        .github
+        .lock()
+        .unwrap()
+        .comments
+        .remove(&CommentId(701));
+    // A: fresh, handled. B's creation: absent — doubted, then stale.
+    let delivery = processor.claim().unwrap().expect("A");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Processed
+    );
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor,
+        Some(PrNumber(1))
+    );
+    let delivery = processor.claim().unwrap().expect("B created");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Released
+    );
+    world.advance_past_cooldown();
+    drain(&mut processor);
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor,
+        None,
+        "the author's deletion of the restatement retracted the edge"
+    );
+}
+
+/// A command queued behind the first-contact trigger, on a PR that now
+/// answers permanently "not found", cannot have its comments listed — and
+/// must not be released for ever at the head of the queue. It reaches the
+/// handler, whose precache refuses a command on an unfetchable PR with an
+/// answer, as a fresh trigger's would (Codex first-contact review, P2).
+#[test]
+fn a_crawled_command_on_an_unfetchable_pr_is_refused_not_retried_for_ever() {
+    let (mut world, heads) = World::linear_stack(1);
+    let mut processor = world.processor();
+    let wake = pr_opened_body(&world.config, 1, &heads[0], "pr-1", "main");
+    world.enqueue(&mut processor, "pull_request", wake);
+    let stop = comment_body(&world.config, 9, "@merge-train stop", AUTHOR, "author", 90);
+    world.enqueue(&mut processor, "issue_comment", stop);
+    drain(&mut processor);
+    let posted = world.github.lock().unwrap().posted_comments.clone();
+    assert!(
+        posted
+            .iter()
+            .any(|(pr, body)| *pr == PrNumber(9) && body.contains("refusing the command")),
+        "the command was answered, not retried: {posted:?}"
+    );
+}
+
+/// A pull-request delivery that disagrees with the crawled snapshot is
+/// DOUBTED like a comment that disagrees with the listing: GitHub's PR
+/// listing can lag a `closed` it has already delivered, and closing the
+/// delivery on the first read would leave the PR open in the store for
+/// good. After the cooldown the PR is fetched afresh — the present, not
+/// the cache the crawl took — and the delivery handled if it agrees,
+/// closed unheard if not (Codex topology review, P2).
+#[test]
+fn a_close_the_crawl_listing_lagged_behind_is_handled_after_the_cooldown() {
+    for github_catches_up in [true, false] {
+        let (mut world, heads) = World::linear_stack(2);
+        let mut processor = world.processor();
+        world.enqueue_stack_setup(&mut processor, 2, &heads);
+        drain(&mut processor);
+        tick(&world, &mut processor);
+        drop(processor);
+        destroy_state_db(&world);
+
+        let mut processor = world.processor();
+        let wake = pr_opened_body(&world.config, 1, &heads[0], "pr-1", "main");
+        world.enqueue(&mut processor, "pull_request", wake);
+        let (head, branch, base) = {
+            let github = world.github.lock().unwrap();
+            let fake = &github.prs[&PrNumber(2)];
+            (
+                github.branch_head(&fake.branch),
+                fake.branch.clone(),
+                fake.base_ref.clone(),
+            )
+        };
+        let close = pr_closed_body(&world.config, 2, &head, &branch, &base);
+        world.enqueue(&mut processor, "pull_request", close);
+        // The crawl lands for the wake-up, with #2 listed OPEN.
+        let delivery = processor.claim().unwrap().expect("the wake-up");
+        assert_eq!(
+            processor.process_claimed(delivery).unwrap(),
+            PipelineOutcome::Processed
+        );
+        assert!(processor.state().prs[&PrNumber(2)].state.is_open());
+        // The close disagrees with that snapshot: doubted, not disbelieved.
+        let delivery = processor.claim().unwrap().expect("the close");
+        assert_eq!(
+            processor.process_claimed(delivery).unwrap(),
+            PipelineOutcome::Released
+        );
+        if github_catches_up {
+            world
+                .github
+                .lock()
+                .unwrap()
+                .prs
+                .get_mut(&PrNumber(2))
+                .unwrap()
+                .state = crate::github::test_support::FakePrState::Closed;
+        }
+        world.advance_past_cooldown();
+        drain(&mut processor);
+        assert_eq!(
+            processor.state().prs[&PrNumber(2)].state.is_open(),
+            !github_catches_up,
+            "handled exactly when the fresh fetch agrees (catches_up={github_catches_up}): {:?}",
+            processor.state().prs[&PrNumber(2)].state
+        );
+    }
+}
+
+/// A doubted pull-request delivery whose PR then cannot be fetched at all
+/// — a permanent 404, the PR or the bot's access gone — is closed as
+/// unverifiable, exactly as a comment delivery whose PR cannot be listed
+/// is. Released, it would sit at the head of the repository's queue for
+/// ever, and every unrelated delivery behind it with it (Codex
+/// first-contact review, P2). The cache keeps the crawl's snapshot: the
+/// delivery was never believed.
+#[test]
+fn a_crawled_pull_request_delivery_whose_pr_vanished_is_closed_not_retried_for_ever() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    drain(&mut processor);
+    tick(&world, &mut processor);
+    drop(processor);
+    destroy_state_db(&world);
+
+    let mut processor = world.processor();
+    let wake = pr_opened_body(&world.config, 1, &heads[0], "pr-1", "main");
+    world.enqueue(&mut processor, "pull_request", wake);
+    let (head, branch, base) = {
+        let github = world.github.lock().unwrap();
+        let fake = &github.prs[&PrNumber(2)];
+        (
+            github.branch_head(&fake.branch),
+            fake.branch.clone(),
+            fake.base_ref.clone(),
+        )
+    };
+    let close = pr_closed_body(&world.config, 2, &head, &branch, &base);
+    world.enqueue(&mut processor, "pull_request", close);
+    // Behind it, an unrelated delivery: the wake-up again, which agrees
+    // with the cache and is handled.
+    let behind = pr_opened_body(&world.config, 1, &heads[0], "pr-1", "main");
+    world.enqueue(&mut processor, "pull_request", behind);
+    // The crawl lands for the wake-up, with #2 listed OPEN.
+    let delivery = processor.claim().unwrap().expect("the wake-up");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Processed
+    );
+    // The close disagrees with that snapshot: doubted.
+    let delivery = processor.claim().unwrap().expect("the close");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Released
+    );
+    // Then the PR is gone from GitHub: fetching it 404s, permanently.
+    world.github.lock().unwrap().prs.remove(&PrNumber(2));
+    world.advance_past_cooldown();
+    let delivery = processor.claim().unwrap().expect("the close, retried");
+    assert_eq!(delivery.event_type, "pull_request");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Processed,
+        "unverifiable for good: closed, not released for ever"
+    );
+    assert!(
+        processor.state().prs[&PrNumber(2)].state.is_open(),
+        "closed unheard: the cache keeps the crawl's snapshot"
+    );
+    let delivery = processor.claim().unwrap().expect("the delivery behind it");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Processed,
+        "the queue moved on"
+    );
+    assert!(processor.claim().unwrap().is_none(), "nothing left");
+}
+
+/// A non-comment delivery whose crawl landed before the process died is
+/// handled on restart: a PR event that agrees with the crawled present
+/// carries no staleness risk, and a review or check event carries a
+/// consequence the crawl cannot reconstruct. Only comment deliveries are
+/// closed unheard.
+#[test]
+fn a_crawled_pull_request_delivery_that_agrees_with_the_cache_is_handled_after_a_restart() {
+    let (mut world, heads) = World::linear_stack(1);
+    let mut processor = world.processor();
+    let body = pr_opened_body(&world.config, 1, &heads[0], "pr-1", "main");
+    world.enqueue(&mut processor, "pull_request", body);
+    let delivery = processor.claim().unwrap().expect("queued");
+    // Land the crawl by hand, as the pipeline does before handling, and
+    // die before handling.
+    processor
+        .store_mut()
+        .append_batch_marking(
+            &[StateEventPayload::DefaultBranchSet {
+                branch: "main".to_owned(),
+            }],
+            Utc::now(),
+            Some(&delivery.delivery_id),
+        )
+        .unwrap();
+    drop(processor);
+    let mut processor = world.processor();
+    drain(&mut processor);
+    assert!(
+        processor.state().prs.contains_key(&PrNumber(1)),
+        "the PR-opened delivery was handled: the PR is cached"
+    );
+}
+
 // ─── cache_fill_events: the unknown-PR upsert oracle ───
 
 mod cache_fill {
@@ -7741,6 +10405,7 @@ mod registry {
                     event_type: "pull_request".into(),
                     headers: "{}".into(),
                     body: body.clone(),
+                    received_at: chrono::Utc::now(),
                 },
                 ack: ack_tx,
                 permit: registry.reserve_intake(body.len()).await,
@@ -8507,6 +11172,323 @@ mod interleaving {
             // schedules must reach the same exact store/GitHub agreement
             // no-crash schedules do.
             run.assert_full_consistency();
+        }
+    }
+}
+
+// ─── The lost-DB crawl conformance harness ───
+
+// ─── The recovery oracle: first contact against live processing ───
+
+/// Recovery must reach what live processing reached. For any history of
+/// comment events on a stack, processing each delivery LIVE — GitHub in
+/// step at every event — and recovering from a LOST database — the whole
+/// history unacked in the backlog, judged by the first-contact crawl
+/// against GitHub's final state — must leave the same predecessor edge
+/// and the same owning comment, with ONE permitted deviation: when the
+/// comment that owns the edge live no longer READS as that declaration IN
+/// THE AUTHOR'S OWN BYTES — a stranger changed its text, re-wrote the
+/// same text, or deleted it (live refuses all three and keeps what the
+/// author declared), or the author edited it to a declaration live
+/// rejected (and kept the old one) — recovery may drop the edge, or
+/// attribute it to another comment that does read as the author's own
+/// declaration. The crawl believes only what GitHub shows and attributes;
+/// the backlog alone cannot prove the author never retracted before the
+/// loss, and treating a stranger's bytes as the author's would let a
+/// stranger restoring the author's withdrawn text pass as the author's
+/// own edit. Dropping fails safe (a PR off the default branch with no
+/// predecessor is refused a train). Nothing else may differ: no edge
+/// invented, moved, or owned by a comment that does not say so. The
+/// histories are small:
+/// creations, edits and deletions of PR 2's comments by the author or a
+/// stranger, saying a declaration of #1, a declaration of a PR that does
+/// not exist, or prose.
+mod recovery_model {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    const DECLARE_1: &str = "@merge-train predecessor #1";
+    const DECLARE_9: &str = "@merge-train predecessor #9";
+    const PROSE: &str = "hello";
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Actor {
+        Author,
+        Stranger,
+    }
+
+    impl Actor {
+        fn id(self) -> u64 {
+            match self {
+                Actor::Author => AUTHOR,
+                Actor::Stranger => STRANGER,
+            }
+        }
+        fn login(self) -> &'static str {
+            match self {
+                Actor::Author => "author",
+                Actor::Stranger => "stranger",
+            }
+        }
+    }
+
+    /// One event of a history, already valid against the comments that
+    /// exist at that point. Comments are named by INDEX: their GitHub ids
+    /// are allocated by the fake as they are created, in step with the
+    /// bot's own replies and ledgers (GitHub's ids are globally monotonic,
+    /// and a fixed id would land on top of a reply the bot posted in
+    /// between).
+    #[derive(Clone, Debug)]
+    enum Event {
+        Create {
+            k: usize,
+            by: Actor,
+            body: &'static str,
+        },
+        Edit {
+            k: usize,
+            by: Actor,
+            from: &'static str,
+            to: &'static str,
+        },
+        Delete {
+            k: usize,
+            by: Actor,
+        },
+    }
+
+    /// A raw choice per step; interpreted against the live comment set so
+    /// that every generated vector is a valid history and shrinks cleanly.
+    #[derive(Clone, Copy, Debug)]
+    struct Choice {
+        kind: u8,
+        which: u8,
+        body: u8,
+        by_author: bool,
+    }
+
+    fn arb_choice() -> impl Strategy<Value = Choice> {
+        (0u8..3, 0u8..4, 0u8..3, any::<bool>()).prop_map(|(kind, which, body, by_author)| Choice {
+            kind,
+            which,
+            body,
+            by_author,
+        })
+    }
+
+    fn body(n: u8) -> &'static str {
+        match n {
+            0 => DECLARE_1,
+            1 => DECLARE_9,
+            _ => PROSE,
+        }
+    }
+
+    /// Interprets the choices: a creation gets the next id; an edit or a
+    /// deletion picks among the comments alive at that point, and with
+    /// none alive becomes a creation. Each comment's author is whoever
+    /// created it; an edit or deletion may be by anyone.
+    fn history(choices: &[Choice]) -> Vec<Event> {
+        let mut events = Vec::new();
+        // (index, author, current body) of the comments alive.
+        let mut alive: Vec<(usize, Actor, &'static str)> = Vec::new();
+        let mut next = 0;
+        for c in choices {
+            let by = if c.by_author {
+                Actor::Author
+            } else {
+                Actor::Stranger
+            };
+            let kind = if alive.is_empty() { 0 } else { c.kind };
+            match kind {
+                0 => {
+                    let k = next;
+                    next += 1;
+                    let text = body(c.body);
+                    alive.push((k, by, text));
+                    events.push(Event::Create { k, by, body: text });
+                }
+                1 => {
+                    let i = usize::from(c.which) % alive.len();
+                    let (k, _, from) = alive[i];
+                    let to = body(c.body);
+                    alive[i].2 = to;
+                    events.push(Event::Edit { k, by, from, to });
+                }
+                _ => {
+                    let i = usize::from(c.which) % alive.len();
+                    let (k, _, _) = alive.remove(i);
+                    events.push(Event::Delete { k, by });
+                }
+            }
+        }
+        events
+    }
+
+    /// The next comment id GitHub would hand out: above every comment the
+    /// fake holds, the bot's own replies included.
+    fn allocate_id(world: &World) -> u64 {
+        let mut github = world.github.lock().unwrap();
+        let floor = github
+            .comments
+            .keys()
+            .next_back()
+            .map_or(0, |max| max.0 + 1);
+        let id = github.next_comment.max(floor);
+        github.next_comment = id + 1;
+        id
+    }
+
+    /// The comments a run has created so far: index to (id, author).
+    type Created = HashMap<usize, (u64, Actor)>;
+
+    /// The webhook payload of an event, allocating a creation's id from
+    /// the fake. A creation's author is the actor; an edit or deletion
+    /// keeps the comment's author and carries the actor as the sender.
+    fn payload(world: &World, created: &mut Created, event: &Event) -> Vec<u8> {
+        let config = &world.config;
+        match event {
+            Event::Create { k, by, body } => {
+                let id = allocate_id(world);
+                created.insert(*k, (id, *by));
+                raw_comment_json(
+                    config,
+                    2,
+                    Some(body),
+                    by.id(),
+                    by.login(),
+                    by.id(),
+                    by.login(),
+                    id,
+                    "created",
+                )
+            }
+            Event::Edit { k, by, from, to } => {
+                let (id, author) = created[k];
+                raw_edited_comment_json(
+                    config,
+                    2,
+                    from,
+                    to,
+                    author.id(),
+                    author.login(),
+                    by.id(),
+                    by.login(),
+                    id,
+                )
+            }
+            Event::Delete { k, by } => {
+                let (id, author) = created[k];
+                raw_comment_json(
+                    config,
+                    2,
+                    Some(PROSE),
+                    author.id(),
+                    author.login(),
+                    by.id(),
+                    by.login(),
+                    id,
+                    "deleted",
+                )
+            }
+        }
+    }
+
+    /// Whether comment `k` reads, at the end of the history, as the
+    /// author's own declaration of #1 — as the crawl attributes text, by
+    /// who wrote the comment's current bytes: the declaration, written
+    /// last by the author (its creator, or its last editor). A stranger's
+    /// edit to the very same text makes the bytes the stranger's — an
+    /// edge live keeps and recovery may drop, never the reverse: a
+    /// creation whose text matches but whose bytes are no longer the
+    /// author's may hide an author's retraction in between (Codex
+    /// first-contact review, P1). A deleted comment reads as nothing.
+    fn authors_declaration(events: &[Event], k: usize) -> bool {
+        let mut state: Option<(&'static str, Actor)> = None;
+        for e in events {
+            match e {
+                Event::Create { k: c, by, body } if *c == k => state = Some((*body, *by)),
+                Event::Edit { k: c, by, to, .. } if *c == k => state = Some((*to, *by)),
+                Event::Delete { k: c, .. } if *c == k => state = None,
+                _ => {}
+            }
+        }
+        state == Some((DECLARE_1, Actor::Author))
+    }
+
+    /// PR 2's edge as the store holds it: the predecessor and the INDEX of
+    /// the comment that owns the declaration.
+    fn edge(processor: &Processor, created: &Created) -> (Option<PrNumber>, Option<usize>) {
+        let pr = &processor.state().prs[&PrNumber(2)];
+        let owner = pr.predecessor_comment_id.map(|id| {
+            *created
+                .iter()
+                .find(|(_, (created_id, _))| *created_id == id.0)
+                .map(|(k, _)| k)
+                .expect("the owner is a comment the history created")
+        });
+        (pr.predecessor, owner)
+    }
+
+    /// Every event processed as it happens.
+    fn live(events: &[Event]) -> (Option<PrNumber>, Option<usize>) {
+        let (mut world, heads) = World::linear_stack(2);
+        let mut processor = world.processor();
+        enqueue_pr_opens(&mut world, &mut processor, 2, &heads);
+        drain(&mut processor);
+        let mut created = Created::new();
+        for event in events {
+            let body = payload(&world, &mut created, event);
+            world.enqueue(&mut processor, "issue_comment", body);
+            drain(&mut processor);
+        }
+        edge(&processor, &created)
+    }
+
+    /// The whole history unacked when the database is lost: GitHub holds
+    /// its final state, and the crawl judges the backlog against it.
+    fn recovered(events: &[Event]) -> (Option<PrNumber>, Option<usize>) {
+        let (mut world, heads) = World::linear_stack(2);
+        let mut processor = world.processor();
+        enqueue_pr_opens(&mut world, &mut processor, 2, &heads);
+        drain(&mut processor);
+        drop(processor);
+        destroy_state_db(&world);
+        let mut processor = world.processor();
+        let mut created = Created::new();
+        for event in events {
+            let body = payload(&world, &mut created, event);
+            world.enqueue(&mut processor, "issue_comment", body);
+        }
+        drain_with_cooldowns(&world, &mut processor);
+        assert_eq!(processor.state().default_branch, "main", "the crawl landed");
+        edge(&processor, &created)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 48,
+            .. ProptestConfig::default()
+        })]
+
+        #[test]
+        fn recovery_reaches_what_live_processing_reached(
+            choices in proptest::collection::vec(arb_choice(), 1..=8),
+        ) {
+            let events = history(&choices);
+            let expected = live(&events);
+            let actual = recovered(&events);
+            let live_owner_unattributable =
+                expected.1.is_some_and(|owner| !authors_declaration(&events, owner));
+            let deviation_permitted = live_owner_unattributable
+                && (actual == (None, None)
+                    || (actual.0 == expected.0
+                        && actual.1.is_some_and(|owner| authors_declaration(&events, owner))));
+            prop_assert!(
+                actual == expected || deviation_permitted,
+                "recovered {actual:?}, live {expected:?}; history: {events:#?}"
+            );
         }
     }
 }

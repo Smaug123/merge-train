@@ -80,6 +80,9 @@ pub struct FakeGitHub {
     /// While set, `GetCollaboratorPermission` fails `Permanent` (e.g. the
     /// token lacks the scope for the collaborators API).
     pub permission_lookup_broken: bool,
+    /// While set, `GetCollaboratorPermission` fails `Transient`: the
+    /// lookup is released and retried, as any outage is.
+    pub permission_lookup_transient: bool,
     /// `GetRepoSettings` attempts (including failed ones), for asserting the
     /// worker's stall-retry behaviour.
     pub settings_fetches: u32,
@@ -134,6 +137,7 @@ impl FakeGitHub {
             comment_author: 0,
             unavailable: false,
             permission_lookup_broken: false,
+            permission_lookup_transient: false,
             settings_fetches: 0,
             blocked: std::collections::HashSet::new(),
             hidden_from_listings: std::collections::HashSet::new(),
@@ -301,6 +305,11 @@ impl FakeGitHub {
             }
 
             GitHubEffect::GetCollaboratorPermission { username } => {
+                if self.permission_lookup_transient {
+                    return Err(EffectError::Transient {
+                        detail: "permission lookup outage (test-injected)".to_owned(),
+                    });
+                }
                 if self.permission_lookup_broken {
                     return Err(EffectError::Permanent {
                         kind: TrainErrorKind::ApiError,
@@ -399,6 +408,14 @@ impl FakeGitHub {
             GitHubEffect::ListComments { .. } if self.list_comments_broken => {
                 Err(EffectError::Transient {
                     detail: "listing comments failed (test-injected)".to_owned(),
+                })
+            }
+            // GitHub 404s a listing for a PR it does not have: permanent,
+            // as the PR fetch is.
+            GitHubEffect::ListComments { pr } if !self.prs.contains_key(pr) => {
+                Err(EffectError::Permanent {
+                    kind: TrainErrorKind::NotFound,
+                    detail: format!("no such PR #{pr}: cannot list its comments (fake 404)"),
                 })
             }
             GitHubEffect::ListComments { pr } => Ok(GitHubResponse::Comments(

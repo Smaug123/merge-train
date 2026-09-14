@@ -175,6 +175,10 @@ pub async fn webhook_handler(
     // handler waiting here holds only axum's request `body` (bounded by HTTP
     // concurrency), not yet a second `Vec` copy. The permit travels with the
     // delivery and releases once the worker durably enqueues it.
+    // The receipt time, before the wait for intake capacity: that wait can
+    // outlast a first-contact crawl, and a webhook received before the
+    // crawl landed must be marked as such however long it waited.
+    let received_at = chrono::Utc::now();
     let permit = app_state.workers().reserve_intake(body.len()).await;
 
     let delivery = IntakeDelivery {
@@ -182,6 +186,7 @@ pub async fn webhook_handler(
         event_type: event_type.clone(),
         headers: captured_headers(&delivery_id, &event_type, &signature_header),
         body: body.to_vec(),
+        received_at,
     };
 
     // Route to the repo's worker and await its durable-enqueue ack before
