@@ -178,6 +178,15 @@ pub enum StateEventPayload {
         comment_id: CommentId,
     },
 
+    /// The settled-declaration watermark a crawl read back from a PR's
+    /// ledger: the highest declaration comment the bot had acted on
+    /// before the database was lost. Monotone, like the watermark itself;
+    /// without it a recovered PR's next ledger rewrite would erase the
+    /// history and a later crawl would read already-settled comments as
+    /// fresh evidence.
+    #[serde(rename = "declarations_settled")]
+    DeclarationsSettled { pr: PrNumber, through: CommentId },
+
     // ─── Phase transitions (always critical) ───
     /// The cascade has transitioned to a new phase.
     ///
@@ -611,6 +620,7 @@ impl StateEventPayload {
             StateEventPayload::StatusCommentPosted { .. }
             | StateEventPayload::StackLedgerPosted { .. }
             | StateEventPayload::StackLedgerRetired { .. }
+            | StateEventPayload::DeclarationsSettled { .. }
             | StateEventPayload::PrMerged { .. }
             | StateEventPayload::PrStateChanged { .. }
             | StateEventPayload::PredecessorDeclared { .. }

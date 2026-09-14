@@ -604,6 +604,8 @@ impl Processor {
                             &events,
                             key.as_ref(),
                             Utc::now(),
+                            &outcome.stale_ledgers,
+                            outcome.topology_incomplete,
                         )?;
                         self.after_bootstrap(outcome)?;
                         info!(delivery = %id, "closed: the trigger is stale against the crawl");
@@ -614,8 +616,13 @@ impl Processor {
                     // current by reading GitHub, and if that judgement
                     // does not survive to the close, the retry must not
                     // act on it (Codex crawl review round 14, P1).
-                    self.store
-                        .append_batch_marking(&outcome.events, Utc::now(), Some(&id))?;
+                    self.store.append_batch_marking(
+                        &outcome.events,
+                        Utc::now(),
+                        Some(&id),
+                        &outcome.stale_ledgers,
+                        outcome.topology_incomplete,
+                    )?;
                     self.after_bootstrap(outcome)?;
                 }
             }
@@ -834,6 +841,28 @@ impl Processor {
 
         // Command authorization + referenced-PR precache (commands only).
         if let Some((pr, command)) = command_in(&event, &self.deps) {
+            // A topology the first-contact crawl could not read in full
+            // must not be driven: a train started over it would freeze a
+            // stack missing the descendants whose ledgers went unread, and
+            // squash the root without preparing them. Refused, loudly,
+            // until an operator resolves it.
+            if matches!(command, Command::Start) && self.store.topology_incomplete()? {
+                error!(
+                    %pr,
+                    "start refused: the first-contact crawl could not read every PR's \
+                     comments, so the topology is incomplete — operator action required"
+                );
+                self.store
+                    .commit_delivery(&id, &[], key.as_ref(), &[], Utc::now())?;
+                self.best_effort_github(GitHubEffect::PostComment {
+                    pr,
+                    body: "Cannot start: this repository's first-contact crawl could not \
+                           read every pull request's comments, so the stack topology is \
+                           incomplete. An operator must resolve this before trains can run."
+                        .to_owned(),
+                });
+                return Ok(PipelineOutcome::Processed);
+            }
             match self.authorize(&command, &event) {
                 Ok(None) => {}
                 Ok(Some(rejection)) => {
@@ -1473,6 +1502,7 @@ impl Processor {
         // Set when the cap stops us reading a crawled PR's comments: a
         // ledger may then be missing from the crawl, and the topology it
         // rebuilt is incomplete.
+        let mut comments_truncated = false;
         let mut pending: Vec<PrNumber> = seed_prs
             .iter()
             .copied()
@@ -1519,11 +1549,12 @@ impl Processor {
             unlisted.sort_by_key(|pr| !seed_prs.contains(pr));
             for pr in unlisted {
                 if listed.len() >= MAX_COMMENT_LISTINGS {
+                    comments_truncated = true;
                     error!(
                         %pr, listed = listed.len(),
-                        "the bootstrap crawl hit its comment-listing cap; deliveries on \
-                         the remaining PRs cannot be verified against the present — \
-                         operator action likely required (split the repository, or \
+                        "the bootstrap crawl hit its comment-listing cap; predecessor \
+                         topology and trains on the remaining PRs cannot be recovered \
+                         — operator action likely required (split the repository, or \
                          raise the cap)"
                     );
                     break;
@@ -1538,6 +1569,11 @@ impl Processor {
             let outcome = super::bootstrap::crawl_events(&CrawlInput {
                 default_branch: &settings.default_branch,
                 crawled_prs: &crawled,
+                comments: &comments,
+                bot_name: &self.deps.bot_name,
+                bot_user_id: self.deps.bot_user_id,
+                comments_truncated,
+                now: Utc::now(),
             });
             let fresh: Vec<PrNumber> = outcome
                 .referenced_uncrawled

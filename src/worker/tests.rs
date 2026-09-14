@@ -4389,7 +4389,7 @@ fn a_delivery_whose_crawl_outlived_its_close_is_not_acted_on() {
     // What the crawl's own transaction would have left behind.
     processor
         .store_mut()
-        .append_batch_marking(&[], chrono::Utc::now(), Some(&delivery_id))
+        .append_batch_marking(&[], chrono::Utc::now(), Some(&delivery_id), &[], false)
         .unwrap();
     drain(&mut processor);
 
@@ -7828,6 +7828,34 @@ fn a_second_train_runs_over_a_compacted_log() {
 
 // ─── First-contact bootstrap: the crawl ───
 
+/// Onboarding: a stack that predates the bot — its predecessor declaration
+/// exists only as a comment on GitHub, never delivered as a webhook — is
+/// learned by the first-contact crawl, and a single `start` runs it to
+/// completion.
+#[test]
+fn onboarding_crawl_learns_an_existing_stack() {
+    let (mut world, _heads) = World::linear_stack(2);
+    world.github.lock().unwrap().comments.insert(
+        CommentId(1000),
+        FakeComment {
+            pr: PrNumber(2),
+            author_id: AUTHOR,
+            body: "@merge-train predecessor #1".to_owned(),
+            edited: Edited::Never,
+        },
+    );
+    let mut processor = world.processor();
+    // The first thing the bot ever hears about this repo is the start.
+    start_command(&mut world, &mut processor, 1);
+    drive_to_completion(&mut world, &mut processor);
+    for i in 1..=2u64 {
+        assert!(
+            processor.state().prs[&PrNumber(i)].state.is_merged(),
+            "PR #{i} must merge off crawl-learned topology"
+        );
+    }
+}
+
 /// Announces `n` open PRs (a linear stack by base branch) WITHOUT declaring
 /// predecessors — for tests that place the declaration comments on GitHub
 /// themselves.
@@ -7988,6 +8016,201 @@ fn a_redelivered_created_webhook_for_a_deleted_comment_is_not_handled() {
     );
 }
 
+/// A declares, the author's newer B restates (B owns), the author deletes
+/// B: the edge is retracted, and the ledger records no predecessor,
+/// settled through B — while A survives on GitHub, unedited. The database
+/// is lost and A's `created` webhook redelivered. The crawl finds A
+/// listed, unedited, with this body: fresh, and the handler runs. What
+/// stops A from reinstalling the withdrawn edge is the watermark the crawl
+/// restored from the ledger: a created declaration at or below it is a
+/// redelivery, superseded (Codex trains review, P1).
+#[test]
+fn a_surviving_older_declaration_redelivered_after_a_loss_is_superseded() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    enqueue_pr_opens(&mut world, &mut processor, 2, &heads);
+    drain(&mut processor);
+    let config = world.config.clone();
+    let comment = |id: u64, action: &str| {
+        raw_comment_json(
+            &config,
+            2,
+            Some("@merge-train predecessor #1"),
+            AUTHOR,
+            "author",
+            AUTHOR,
+            "author",
+            id,
+            action,
+        )
+    };
+    world.enqueue(&mut processor, "issue_comment", comment(700, "created"));
+    world.enqueue(&mut processor, "issue_comment", comment(701, "created"));
+    drain(&mut processor);
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor_comment_id,
+        Some(CommentId(701)),
+        "B took ownership"
+    );
+    world.enqueue(&mut processor, "issue_comment", comment(701, "deleted"));
+    drain(&mut processor);
+    assert_eq!(processor.state().prs[&PrNumber(2)].predecessor, None);
+    let (_, ledger) = ledgers_on(&world, 2)[0];
+    assert_eq!(ledger.declared, None, "the ledger records the retraction");
+    assert_eq!(ledger.settled_through, Some(CommentId(701)));
+    drop(processor);
+    destroy_state_db(&world);
+
+    let mut processor = world.processor();
+    world.enqueue(&mut processor, "issue_comment", comment(700, "created"));
+    drain(&mut processor);
+    assert_eq!(processor.state().default_branch, "main", "the crawl landed");
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].declarations_settled_through,
+        Some(CommentId(701)),
+        "the watermark was restored"
+    );
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor,
+        None,
+        "the surviving older declaration is superseded, not reinstalled"
+    );
+    assert_eq!(
+        ledgers_on(&world, 2)[0].1.declared,
+        None,
+        "and the ledger still records the retraction"
+    );
+}
+
+/// The same, beside an older orphan record: a second trusted ledger of the
+/// bot's — a crash orphan — states a LOWER watermark. The watermark the
+/// crawl restores is the highest, so the redelivered declaration between
+/// the two is still superseded (Codex topology review, P1).
+#[test]
+fn the_highest_trusted_watermark_supersedes_a_redelivery_beside_an_orphan() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    enqueue_pr_opens(&mut world, &mut processor, 2, &heads);
+    drain(&mut processor);
+    let config = world.config.clone();
+    let comment = |id: u64, action: &str| {
+        raw_comment_json(
+            &config,
+            2,
+            Some("@merge-train predecessor #1"),
+            AUTHOR,
+            "author",
+            AUTHOR,
+            "author",
+            id,
+            action,
+        )
+    };
+    world.enqueue(&mut processor, "issue_comment", comment(700, "created"));
+    world.enqueue(&mut processor, "issue_comment", comment(701, "created"));
+    world.enqueue(&mut processor, "issue_comment", comment(701, "deleted"));
+    drain(&mut processor);
+    assert_eq!(processor.state().prs[&PrNumber(2)].predecessor, None);
+    assert_eq!(
+        ledgers_on(&world, 2)[0].1.settled_through,
+        Some(CommentId(701))
+    );
+    // An older orphan of the bot's own, settled only through 699.
+    plant_bot_comment(
+        &world,
+        2,
+        &crate::status::format_stack_ledger(&crate::status::StackLedger {
+            pr: PrNumber(2),
+            declared: None,
+            seq: 1,
+            settled_through: Some(CommentId(699)),
+        }),
+    );
+    drop(processor);
+    destroy_state_db(&world);
+
+    let mut processor = world.processor();
+    world.enqueue(&mut processor, "issue_comment", comment(700, "created"));
+    drain(&mut processor);
+    assert_eq!(processor.state().default_branch, "main", "the crawl landed");
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].declarations_settled_through,
+        Some(CommentId(701)),
+        "the highest watermark was restored"
+    );
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor,
+        None,
+        "the surviving older declaration is superseded"
+    );
+}
+
+/// The same, on a TAINTED PR: a maintainer edited one of the bot's replies
+/// there. The crawl grants no edge and owes the ledger a rewrite, but the
+/// genuine retraction ledger's watermark is restored, so the redelivered
+/// older declaration is still superseded and the rewrite keeps the
+/// watermark (Codex topology review, P1).
+#[test]
+fn a_tainted_prs_watermark_still_supersedes_a_redelivery() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    enqueue_pr_opens(&mut world, &mut processor, 2, &heads);
+    drain(&mut processor);
+    let config = world.config.clone();
+    let comment = |id: u64, action: &str| {
+        raw_comment_json(
+            &config,
+            2,
+            Some("@merge-train predecessor #1"),
+            AUTHOR,
+            "author",
+            AUTHOR,
+            "author",
+            id,
+            action,
+        )
+    };
+    world.enqueue(&mut processor, "issue_comment", comment(700, "created"));
+    world.enqueue(&mut processor, "issue_comment", comment(701, "created"));
+    world.enqueue(&mut processor, "issue_comment", comment(701, "deleted"));
+    drain(&mut processor);
+    assert_eq!(processor.state().prs[&PrNumber(2)].predecessor, None);
+    // A reply of the bot's, edited by somebody else.
+    let reply = plant_bot_comment(&world, 2, "Heads up: something");
+    world
+        .github
+        .lock()
+        .unwrap()
+        .comments
+        .get_mut(&reply)
+        .unwrap()
+        .edited = Edited::By {
+        editor: Some(STRANGER),
+    };
+    drop(processor);
+    destroy_state_db(&world);
+
+    let mut processor = world.processor();
+    world.enqueue(&mut processor, "issue_comment", comment(700, "created"));
+    drain(&mut processor);
+    assert_eq!(processor.state().default_branch, "main", "the crawl landed");
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].declarations_settled_through,
+        Some(CommentId(701)),
+        "the trusted watermark was restored despite the taint"
+    );
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor,
+        None,
+        "the surviving older declaration is superseded"
+    );
+    assert_eq!(
+        ledgers_on(&world, 2)[0].1.settled_through,
+        Some(CommentId(701)),
+        "and the rewrite kept the watermark"
+    );
+}
+
 /// A redelivered `created` webhook for a comment that has SINCE BEEN EDITED
 /// to ANOTHER text is stale: its body is no longer the comment's, and
 /// handling it would record a declaration nothing on GitHub says. One
@@ -8138,6 +8361,92 @@ fn a_stale_pr_close_redelivered_after_a_db_loss_is_not_handled() {
         "the stale close must not have closed #2: {:?}",
         processor.state().prs[&PrNumber(2)].state
     );
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor,
+        Some(PrNumber(1)),
+        "the crawl rebuilt the edge from the ledger"
+    );
+}
+
+/// The comment a ledger names is the edge's corroboration: with it gone,
+/// the edge is gone, whoever deleted it and whatever older comments happen
+/// to declare the same thing. This is the rule that makes a retraction
+/// survive a DB loss without any receipt to interpret — and the reason an
+/// older surviving declaration cannot resurrect what the user retracted.
+///
+/// RESIDUAL: a maintainer's deletion of somebody else's declaration is
+/// refused by the live path but revokes the edge for a crawl. Stop-shaped,
+/// and it costs a DB loss to reach.
+#[test]
+fn a_deleted_owning_comment_revokes_its_edge_after_a_db_loss() {
+    for (sender, login) in [(STRANGER, "stranger"), (AUTHOR, "author")] {
+        let (mut world, heads) = World::linear_stack(2);
+        let mut processor = world.processor();
+        enqueue_pr_opens(&mut world, &mut processor, 2, &heads);
+        // The declaration the bot records, in comment 900.
+        let body = comment_body(
+            &world.config,
+            2,
+            "@merge-train predecessor #1",
+            AUTHOR,
+            "author",
+            900,
+        );
+        world.enqueue(&mut processor, "issue_comment", body);
+        drain(&mut processor);
+        assert_eq!(
+            ledger_on(&world, 2)
+                .and_then(|l| l.declared)
+                .map(|d| d.owner),
+            Some(CommentId(900)),
+            "precondition: the ledger names comment 900"
+        );
+        // An older comment declaring the same predecessor survives. No
+        // ledger names it, so it is not evidence of anything.
+        world.github.lock().unwrap().comments.insert(
+            CommentId(500),
+            FakeComment {
+                pr: PrNumber(2),
+                author_id: AUTHOR,
+                body: "@merge-train predecessor #1".to_owned(),
+                edited: Edited::Never,
+            },
+        );
+        destroy_state_db(&world);
+
+        // The first delivery after the loss deletes comment 900.
+        let mut processor = world.processor();
+        world
+            .github
+            .lock()
+            .unwrap()
+            .comments
+            .remove(&CommentId(900));
+        let body = raw_comment_json(
+            &world.config,
+            2,
+            None,
+            AUTHOR,
+            "author",
+            sender,
+            login,
+            900,
+            "deleted",
+        );
+        world.enqueue(&mut processor, "issue_comment", body);
+        drain(&mut processor);
+
+        assert_eq!(
+            processor.state().prs[&PrNumber(2)].predecessor,
+            None,
+            "sender {login}: the edge is not resurrected from the older comment"
+        );
+        assert_eq!(
+            ledger_on(&world, 2).map(|l| l.declared),
+            Some(None),
+            "sender {login}: and the ledger is rewritten to match"
+        );
+    }
 }
 
 /// GitHub down at first contact: the delivery releases (nothing can be
@@ -8226,6 +8535,81 @@ fn a_crawled_delivery_released_for_a_transient_failure_is_still_handled() {
     );
 }
 
+/// A first-contact crawl triggered by a STALE delivery still commits what
+/// it owes: a ledger it disbelieved is owed its rewrite, in the same
+/// transaction as the close.
+#[test]
+fn a_stale_first_contact_trigger_still_owes_the_disbelieved_ledgers() {
+    let (mut world, _heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    // Comment 10 on PR 2 does not declare; a signed ledger names it as the
+    // owner of an edge (the crawl will disbelieve the ledger).
+    world.github.lock().unwrap().comments.insert(
+        crate::types::CommentId(10),
+        FakeComment {
+            pr: PrNumber(2),
+            author_id: AUTHOR,
+            body: "never mind".to_owned(),
+            edited: Edited::By {
+                editor: Some(AUTHOR),
+            },
+        },
+    );
+    let body = crate::status::format_stack_ledger(&crate::status::StackLedger {
+        pr: PrNumber(2),
+        declared: Some(crate::status::Declaration {
+            predecessor: PrNumber(1),
+            owner: crate::types::CommentId(10),
+        }),
+        seq: 3,
+        settled_through: Some(crate::types::CommentId(10)),
+    });
+    plant_bot_comment(&world, 2, &body);
+    // The trigger: an edit of comment 10 the listing has since moved past
+    // (the fake's body differs from the delivery's), so it is stale.
+    let trigger = comment_body_with_action(
+        &world.config,
+        2,
+        "@merge-train predecessor #1",
+        AUTHOR,
+        "author",
+        10,
+        "edited",
+    );
+    world.enqueue(&mut processor, "issue_comment", trigger);
+    world
+        .github
+        .lock()
+        .unwrap()
+        .comments
+        .get_mut(&crate::types::CommentId(10))
+        .unwrap()
+        .body = "never mind".to_owned();
+    // The listed body differs from the payload's: doubted, and stale only
+    // once the doubt has stood for the stall cadence.
+    let delivery = processor.claim().unwrap().expect("the trigger");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Released
+    );
+    world.advance_past_cooldown();
+    drain(&mut processor);
+    assert_eq!(processor.state().default_branch, "main", "the crawl landed");
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor,
+        None,
+        "the stale trigger declared nothing"
+    );
+    // The rewrite it was owed has landed: the ledger now states what the
+    // recovered store holds, not the edge nobody declared.
+    assert_eq!(
+        ledgers_on(&world, 2).first().map(|(_, l)| l.declared),
+        Some(None),
+        "the disbelieved ledger was owed its rewrite, and rewritten"
+    );
+    assert!(!ledger_pending(&mut processor, 2));
+}
+
 /// A crawled comment delivery whose comment survived the gap UNCHANGED is
 /// handled after a restart — a maintainer's `stop` that recovered a train
 /// must still stop it — while one whose comment is gone is closed unheard.
@@ -8245,7 +8629,7 @@ fn a_crawled_comment_delivery_is_re_checked_against_github_after_a_restart() {
         // The crawl mark lands; the process dies before handling.
         processor
             .store_mut()
-            .append_batch_marking(&[], Utc::now(), Some(&delivery.delivery_id))
+            .append_batch_marking(&[], Utc::now(), Some(&delivery.delivery_id), &[], false)
             .unwrap();
         drop(processor);
         if !comment_survives {
@@ -8337,12 +8721,123 @@ fn a_crawled_delivery_withdrawn_before_its_retry_is_not_acted_on() {
     );
 }
 
+/// A maintainer's edit to a ledger is the first delivery a rebuilt store
+/// sees: the edit webhook queues a repair against a comment the empty
+/// store cannot place, and the crawl then adopts that very comment as the
+/// PR's ledger. The repair must go with the adoption — the same
+/// settlement `StackLedgerPosted` gets on the live path — or the ledger
+/// stays owed for ever: the repair refuses to neutralize the recorded
+/// ledger, and nothing else discharges it (Codex crawl review, P2).
+#[test]
+fn a_repair_queued_before_the_crawl_adopts_its_comment_is_settled_by_the_adoption() {
+    let (mut world, _) = World::linear_stack(1);
+    let body = crate::status::format_stack_ledger(&crate::status::StackLedger {
+        pr: PrNumber(1),
+        declared: None,
+        seq: 3,
+        settled_through: None,
+    });
+    let ledger_id = plant_bot_comment(&world, 1, &body);
+    let mut processor = world.processor();
+    let trigger = bot_comment_webhook(&world.config, 1, ledger_id.0, "edited", &body);
+    world.enqueue(&mut processor, "issue_comment", trigger);
+    drain(&mut processor);
+    for _ in 0..3 {
+        tick(&world, &mut processor);
+    }
+    assert_eq!(
+        processor.state().prs[&PrNumber(1)].ledger_comment_id,
+        Some(ledger_id),
+        "the crawl adopted the comment as the PR's ledger"
+    );
+    assert!(
+        !ledger_pending(&mut processor, 1),
+        "still pending: repairs={:?}, owed={:?}",
+        processor.store_mut().ledger_repairs(PrNumber(1)).unwrap(),
+        processor.store_mut().owed_stack_ledgers().unwrap()
+    );
+}
+
+/// A crawl triggered by a declaration's DELETION can read a listing that
+/// still shows the deleted comment (GitHub is not read-after-write
+/// consistent) and restore the edge the deletion retracts; the deletion
+/// delivery then retracts it again. It must still do so when the crawl
+/// landed for it and the process died before it was handled: a deletion
+/// has no body to re-check against the present, so it is handled, not
+/// closed unheard — or the removed edge stands, and a later train drives
+/// the PR the user unstacked (Codex topology review, P1).
+#[test]
+fn a_crawled_deletion_delivery_is_handled_after_a_restart() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    drain(&mut processor);
+    tick(&world, &mut processor);
+    assert_eq!(
+        ledgers_on(&world, 2).len(),
+        1,
+        "precondition: #2's ledger is written"
+    );
+    drop(processor);
+    destroy_state_db(&world);
+    // The author deletes #2's declaration; the listing still shows it.
+    {
+        let mut github = world.github.lock().unwrap();
+        let removed = github.comments.remove(&CommentId(20)).unwrap();
+        github.stale_listing_ghosts.insert(CommentId(20), removed);
+    }
+    // The crawl lands (here for an unrelated wake-up), restoring the edge
+    // from the ghost.
+    let mut processor = world.processor();
+    let wake = pr_opened_body(&world.config, 1, &heads[0], "pr-1", "main");
+    world.enqueue(&mut processor, "pull_request", wake);
+    drain(&mut processor);
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor,
+        Some(PrNumber(1)),
+        "precondition: the ghost restored the edge"
+    );
+    // The deletion's delivery: the crawl landed for it and the process
+    // died before it was handled — marked crawled, still pending.
+    let hook = raw_comment_json(
+        &world.config,
+        2,
+        None,
+        AUTHOR,
+        "author",
+        AUTHOR,
+        "author",
+        20,
+        "deleted",
+    );
+    world.enqueue(&mut processor, "issue_comment", hook);
+    let delivery = processor.claim().unwrap().expect("the deletion");
+    processor
+        .store_mut()
+        .append_batch_marking(&[], Utc::now(), Some(&delivery.delivery_id), &[], false)
+        .unwrap();
+    processor
+        .store_mut()
+        .release_delivery(&delivery.delivery_id)
+        .unwrap();
+    drop(processor);
+
+    let mut processor = world.processor();
+    drain(&mut processor);
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor,
+        None,
+        "the deletion was handled: the edge is gone"
+    );
+}
+
 /// Nothing touches a ledger before the crawl has landed. A delayed edit
 /// webhook for a ledger the bot has already restored arrives at a fresh
 /// store first; the crawl it triggers fails; the repair the webhook would
 /// queue must not then run against the empty cache and neutralize the
-/// genuine ledger (Codex topology review, P1) — the record the topology
-/// crawl will read back.
+/// genuine ledger — the next crawl would find no bot record, onboard the
+/// repository, and resurrect a retracted declaration (Codex topology
+/// review, P1).
 #[test]
 fn no_ledger_is_touched_before_the_crawl_has_landed() {
     let (mut world, heads) = World::linear_stack(2);
@@ -8401,9 +8896,11 @@ fn no_ledger_is_touched_before_the_crawl_has_landed() {
         ledger_body,
         "the superseded edit touched nothing"
     );
-    // (What becomes of the ledger once the store IS bootstrapped is the
-    // topology crawl's concern: it adopts the ledger the store did not
-    // write, and only then may the sync touch it.)
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor,
+        Some(PrNumber(1)),
+        "the crawl read the ledger it was not allowed to destroy"
+    );
 }
 
 /// The deletion of a restatement the store never saw own the edge is a
@@ -9563,6 +10060,10 @@ fn every_delivery_queued_before_the_crawl_landed_is_judged_against_its_present()
         "the stale close queued behind the trigger must not close #2: {:?}",
         processor.state().prs[&PrNumber(2)].state
     );
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor,
+        Some(PrNumber(1))
+    );
 }
 
 /// When a doubted pull-request delivery is judged by the PR fetched
@@ -9864,6 +10365,8 @@ fn a_delivery_carries_its_receipt_time_into_the_store() {
             }],
             chrono::Utc::now(),
             Some("the-trigger"),
+            &[],
+            false,
         )
         .unwrap();
     // Received an hour ago, stored now, through the mailbox.
@@ -9926,7 +10429,7 @@ fn a_crawled_delivery_closed_as_stale_dedupes_its_redelivery() {
     let delivery = processor.claim().unwrap().expect("queued");
     processor
         .store_mut()
-        .append_batch_marking(&[], Utc::now(), Some(&delivery.delivery_id))
+        .append_batch_marking(&[], Utc::now(), Some(&delivery.delivery_id), &[], false)
         .unwrap();
     drop(processor);
     world
@@ -9992,7 +10495,7 @@ fn a_duplicate_crawled_delivery_is_deduped_before_its_freshness_is_doubted() {
     for id in [&first.delivery_id, &second.delivery_id] {
         processor
             .store_mut()
-            .append_batch_marking(&[], Utc::now(), Some(id))
+            .append_batch_marking(&[], Utc::now(), Some(id), &[], false)
             .unwrap();
     }
     drop(processor);
@@ -10264,6 +10767,35 @@ fn a_crawled_pull_request_delivery_whose_pr_vanished_is_closed_not_retried_for_e
     assert!(processor.claim().unwrap().is_none(), "nothing left");
 }
 
+/// A crawl that could not read every PR's comments leaves the topology
+/// incomplete, durably: a `start` is refused with an operator-facing
+/// answer rather than freezing a stack missing the descendants whose
+/// ledgers went unread.
+#[test]
+fn a_start_is_refused_while_the_topology_is_incomplete() {
+    let (mut world, heads) = World::linear_stack(1);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 1, &heads);
+    drain(&mut processor);
+    processor.store_mut().mark_topology_incomplete().unwrap();
+    start_command(&mut world, &mut processor, 1);
+    drain(&mut processor);
+    assert!(
+        processor.state().active_trains.is_empty(),
+        "no train started over an incomplete topology"
+    );
+    assert!(
+        world
+            .github
+            .lock()
+            .unwrap()
+            .posted_comments
+            .iter()
+            .any(|(pr, text)| *pr == PrNumber(1) && text.contains("incomplete")),
+        "the refusal is answered"
+    );
+}
+
 /// A non-comment delivery whose crawl landed before the process died is
 /// handled on restart: a PR event that agrees with the crawled present
 /// carries no staleness risk, and a review or check event carries a
@@ -10286,6 +10818,8 @@ fn a_crawled_pull_request_delivery_that_agrees_with_the_cache_is_handled_after_a
             }],
             Utc::now(),
             Some(&delivery.delivery_id),
+            &[],
+            false,
         )
         .unwrap();
     drop(processor);
@@ -11198,8 +11732,10 @@ mod interleaving {
 /// stranger restoring the author's withdrawn text pass as the author's
 /// own edit. Dropping fails safe (a PR off the default branch with no
 /// predecessor is refused a train). Nothing else may differ: no edge
-/// invented, moved, or owned by a comment that does not say so. The
-/// histories are small:
+/// invented, moved, or owned by a comment that does not say so. With the
+/// LEDGER, the crash may fall anywhere in the history: what was processed
+/// live before the loss is restored from the bot's own record, the rest
+/// from the backlog. The histories are small:
 /// creations, edits and deletions of PR 2's comments by the author or a
 /// stranger, saying a declaration of #1, a declaration of a PR that does
 /// not exist, or prose.
@@ -11488,6 +12024,77 @@ mod recovery_model {
             prop_assert!(
                 actual == expected || deviation_permitted,
                 "recovered {actual:?}, live {expected:?}; history: {events:#?}"
+            );
+        }
+    }
+    /// The history split at `crash`: everything before it processed live —
+    /// the ledger writes it owes landed — the database lost, and the rest
+    /// unacked in the backlog when the crawl runs. A remark of a stranger's
+    /// wakes the crawl in case nothing was left in the backlog.
+    fn recovered_after(events: &[Event], crash: usize) -> (Option<PrNumber>, Option<usize>) {
+        let (mut world, heads) = World::linear_stack(2);
+        let mut processor = world.processor();
+        enqueue_pr_opens(&mut world, &mut processor, 2, &heads);
+        drain(&mut processor);
+        let mut created = Created::new();
+        for event in &events[..crash] {
+            let body = payload(&world, &mut created, event);
+            world.enqueue(&mut processor, "issue_comment", body);
+            drain(&mut processor);
+        }
+        drop(processor);
+        destroy_state_db(&world);
+        let mut processor = world.processor();
+        for event in &events[crash..] {
+            let body = payload(&world, &mut created, event);
+            world.enqueue(&mut processor, "issue_comment", body);
+        }
+        let remark = allocate_id(&world);
+        world.enqueue(
+            &mut processor,
+            "issue_comment",
+            raw_comment_json(
+                &world.config,
+                2,
+                Some("just a remark"),
+                STRANGER,
+                "stranger",
+                STRANGER,
+                "stranger",
+                remark,
+                "created",
+            ),
+        );
+        drain_with_cooldowns(&world, &mut processor);
+        assert_eq!(processor.state().default_branch, "main", "the crawl landed");
+        edge(&processor, &created)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 48,
+            .. ProptestConfig::default()
+        })]
+
+        /// With the ledger: the crash may fall anywhere in the history.
+        #[test]
+        fn recovery_from_any_crash_point_reaches_what_live_processing_reached(
+            choices in proptest::collection::vec(arb_choice(), 1..=8),
+            crash_at in 0usize..=8,
+        ) {
+            let events = history(&choices);
+            let crash = crash_at.min(events.len());
+            let expected = live(&events);
+            let actual = recovered_after(&events, crash);
+            let live_owner_unattributable =
+                expected.1.is_some_and(|owner| !authors_declaration(&events, owner));
+            let deviation_permitted = live_owner_unattributable
+                && (actual == (None, None)
+                    || (actual.0 == expected.0
+                        && actual.1.is_some_and(|owner| authors_declaration(&events, owner))));
+            prop_assert!(
+                actual == expected || deviation_permitted,
+                "recovered {actual:?}, live {expected:?}; crash at {crash}; history: {events:#?}"
             );
         }
     }

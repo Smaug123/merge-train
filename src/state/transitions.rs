@@ -235,10 +235,10 @@ fn make_phase(
 /// The frozen_descendants list is captured here and carried through all
 /// subsequent phases. With no descendants there is no preparation work, so
 /// the cascade starts at SquashPending.
-pub fn start_preparing(descendants: Vec<PrNumber>) -> CascadePhase {
+pub fn start_preparing(descendants: Vec<PrNumber>, known_stack: Vec<PrNumber>) -> CascadePhase {
     enter(
         PhaseKind::Preparing,
-        DescendantProgress::new(descendants),
+        DescendantProgress::with_known_stack(descendants, known_stack),
         None,
     )
     .expect("no path from Preparing to a squash-sha-bearing phase")
@@ -408,7 +408,7 @@ mod tests {
         fn idle_accepts_no_outcomes() {
             // Cascade entry goes through start_preparing, never through next_phase.
             // (Idle, AllComplete) used to be a back door meaning "start with empty
-            // descendants"; that is start_preparing(vec![])'s job.
+            // descendants"; that is start_preparing(vec![], Vec::new())'s job.
             let result = next_phase(&CascadePhase::Idle, PhaseOutcome::AllComplete);
             assert!(result.is_err());
         }
@@ -590,7 +590,7 @@ mod tests {
 
         #[test]
         fn with_descendants_returns_preparing() {
-            let phase = start_preparing(vec![PrNumber(1), PrNumber(2)]);
+            let phase = start_preparing(vec![PrNumber(1), PrNumber(2)], Vec::new());
 
             assert!(matches!(phase, CascadePhase::Preparing { .. }));
             if let CascadePhase::Preparing { progress: p } = phase {
@@ -600,7 +600,7 @@ mod tests {
 
         #[test]
         fn with_empty_descendants_returns_squash_pending() {
-            let phase = start_preparing(vec![]);
+            let phase = start_preparing(vec![], Vec::new());
 
             assert!(matches!(phase, CascadePhase::SquashPending { .. }));
         }
@@ -691,7 +691,7 @@ mod tests {
                 sha in arb_sha()
             ) {
                 // start_preparing with non-empty descendants will create Preparing phase
-                let initial = start_preparing(descendants.clone());
+                let initial = start_preparing(descendants.clone(), Vec::new());
                 let frozen = match &initial {
                     CascadePhase::Preparing { progress: p } => p.frozen_descendants().to_vec(),
                     CascadePhase::SquashPending { progress } => progress.frozen_descendants().to_vec(),
@@ -784,7 +784,7 @@ mod tests {
                 sha in arb_sha()
             ) {
                 let to_skip = descendants[skip_idx % descendants.len()];
-                let initial = start_preparing(descendants.clone());
+                let initial = start_preparing(descendants.clone(), Vec::new());
 
                 let mut phase = initial;
 
@@ -827,7 +827,7 @@ mod tests {
                 skip_mask in any::<u8>(),
                 sha in arb_sha()
             ) {
-                let mut phase = start_preparing(descendants.clone());
+                let mut phase = start_preparing(descendants.clone(), Vec::new());
                 let mut steps = 0;
                 while !matches!(phase, CascadePhase::Idle) {
                     steps += 1;
@@ -877,7 +877,7 @@ mod tests {
             ) {
                 let phases = [
                     CascadePhase::Idle,
-                    start_preparing(descendants.clone()),
+                    start_preparing(descendants.clone(), Vec::new()),
                     CascadePhase::SquashPending { progress: DescendantProgress::new(descendants.clone()) },
                     CascadePhase::Reconciling {
                         progress: DescendantProgress::new(descendants.clone()),

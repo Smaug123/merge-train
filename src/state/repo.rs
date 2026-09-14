@@ -356,6 +356,15 @@ impl RepoState {
                 }
             }
 
+            // Monotone, as every move of the watermark is.
+            StateEventPayload::DeclarationsSettled { pr, through } => {
+                if let Some(p) = self.prs.get_mut(pr) {
+                    p.declarations_settled_through =
+                        p.declarations_settled_through.max(Some(*through));
+                    prs_mutated = true;
+                }
+            }
+
             StateEventPayload::PredecessorDeclared {
                 pr,
                 predecessor,
@@ -782,6 +791,9 @@ mod tests {
             (arb_small_pr(), arb_small_comment()).prop_map(|(pr, comment_id)| {
                 StateEventPayload::StackLedgerRetired { pr, comment_id }
             }),
+            (arb_small_pr(), arb_small_comment()).prop_map(|(pr, through)| {
+                StateEventPayload::DeclarationsSettled { pr, through }
+            }),
             (
                 arb_small_pr(),
                 prop::collection::vec(arb_small_pr(), 1..4),
@@ -867,6 +879,9 @@ mod tests {
             }),
             (pr(), arb_small_comment()).prop_map(|(pr, comment_id)| {
                 StateEventPayload::StackLedgerRetired { pr, comment_id }
+            }),
+            (pr(), arb_small_comment()).prop_map(|(pr, through)| {
+                StateEventPayload::DeclarationsSettled { pr, through }
             }),
             (pr(), pr(), arb_small_comment()).prop_map(|(pr, pred, c)| {
                 StateEventPayload::PredecessorDeclared {
@@ -996,6 +1011,11 @@ mod tests {
                             && r.ledger == Some(*comment_id)
                         {
                             r.ledger = None;
+                        }
+                    }
+                    StateEventPayload::DeclarationsSettled { pr, through } => {
+                        if let Some(r) = reference.get_mut(pr) {
+                            r.settled = r.settled.max(Some(*through));
                         }
                     }
                     StateEventPayload::PredecessorDeclared { pr, comment_id, .. } => {
