@@ -231,6 +231,27 @@ pub struct CommentData {
     pub edited: Edited,
 }
 
+/// The answer to `ListComments`: every comment on the PR, or a refusal.
+///
+/// Truncation is a property of the ANSWER, not a failure of the call, and
+/// carries no comments: absence from a listing is evidence in this system
+/// (it discharges ledger obligations, corroborates 404s, neutralizes
+/// forgeries), so a partial listing must be unrepresentable — a caller
+/// cannot accidentally treat "the comments I got before the cap" as "the
+/// comments". Contrast `RecentlyMergedPrList::may_be_incomplete`, where a
+/// shorter list only narrows a search and a flag suffices.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "listing", content = "comments", rename_all = "snake_case")]
+pub enum CommentListing {
+    /// Every comment on the PR, in id order.
+    Complete(Vec<CommentData>),
+    /// The listing exceeded the interpreter's page or body-byte cap
+    /// (`github::interpreter::MAX_COMMENT_PAGES` /
+    /// `MAX_COMMENT_BODY_BYTES`). Retrying cannot shrink the PR: callers
+    /// fail closed, loudly.
+    Truncated,
+}
+
 impl CommentData {
     /// The current body, if `user` is who wrote it: the author of a
     /// never-edited comment, the LAST editor of an edited one. Nothing
@@ -396,7 +417,7 @@ pub enum GitHubResponse {
     ReactionAdded,
 
     /// Response to `ListComments`.
-    Comments(Vec<CommentData>),
+    Comments(CommentListing),
 
     /// Response to `GetCollaboratorPermission`.
     CollaboratorPermission {
@@ -629,7 +650,11 @@ mod tests {
             arb_comment_id().prop_map(|id| GitHubResponse::CommentPosted { id }),
             Just(GitHubResponse::CommentUpdated),
             Just(GitHubResponse::ReactionAdded),
-            prop::collection::vec(arb_comment_data(), 0..10).prop_map(GitHubResponse::Comments),
+            prop_oneof![
+                prop::collection::vec(arb_comment_data(), 0..10)
+                    .prop_map(|c| GitHubResponse::Comments(CommentListing::Complete(c))),
+                Just(GitHubResponse::Comments(CommentListing::Truncated)),
+            ],
             arb_branch_protection_data().prop_map(GitHubResponse::BranchProtection),
             Just(GitHubResponse::BranchProtectionUnknown),
             prop::collection::vec(arb_ruleset_data(), 0..5).prop_map(GitHubResponse::Rulesets),

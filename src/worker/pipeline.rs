@@ -50,7 +50,7 @@ use tracing::{error, info, warn};
 
 use crate::cascade::{self, Control, EffectError, Observation, ReplayFacts, StepPlan, observe};
 use crate::commands::{Command, parse_command};
-use crate::effects::github::{CommentData, GitHubEffect};
+use crate::effects::github::{CommentData, CommentListing, GitHubEffect};
 use crate::effects::{Effect, GitHubResponse, PrData};
 use crate::git::{CommitIdentity, GitConfig};
 use crate::persistence::event::StateEventPayload;
@@ -684,7 +684,7 @@ impl Processor {
                         body,
                         sender,
                     }) => match self.deps.github.execute(GitHubEffect::ListComments { pr }) {
-                        Ok(GitHubResponse::Comments(listed)) => {
+                        Ok(GitHubResponse::Comments(CommentListing::Complete(listed))) => {
                             match listed.iter().find(|c| c.id == trigger_id) {
                                 Some(c) if c.body == body && written_by_the_sender(c, sender) => {
                                     false
@@ -1568,7 +1568,7 @@ impl Processor {
                 listed.insert(pr);
                 let pr_comments = fetch!(
                     GitHubEffect::ListComments { pr },
-                    GitHubResponse::Comments(c) => c
+                    GitHubResponse::Comments(CommentListing::Complete(c)) => c
                 );
                 comments.push((pr, pr_comments));
             }
@@ -1887,7 +1887,7 @@ impl Processor {
             .github
             .execute(GitHubEffect::ListComments { pr: root })
         {
-            Ok(GitHubResponse::Comments(comments)) => comments,
+            Ok(GitHubResponse::Comments(CommentListing::Complete(comments))) => comments,
             Ok(other) => {
                 error!(?other, "ListComments answered the wrong variant");
                 self.retry_requested = true;
@@ -2405,9 +2405,9 @@ impl Processor {
             return self.finish_boundary(root, cleanup);
         };
         let listing = outcomes.into_iter().find_map(|o| match o.result {
-            Ok(crate::cascade::EffectResponse::GitHub(GitHubResponse::Comments(comments))) => {
-                Some(comments)
-            }
+            Ok(crate::cascade::EffectResponse::GitHub(GitHubResponse::Comments(
+                CommentListing::Complete(comments),
+            ))) => Some(comments),
             _ => None,
         });
         let Some(comments) = listing else {
@@ -2662,9 +2662,9 @@ impl Processor {
     ) -> Result<Option<SagaBatch>, StoreError> {
         let mut cleanup = self.boundary_cleanup(pr)?;
         let listing = outcomes.into_iter().find_map(|o| match o.result {
-            Ok(crate::cascade::EffectResponse::GitHub(GitHubResponse::Comments(comments))) => {
-                Some(comments)
-            }
+            Ok(crate::cascade::EffectResponse::GitHub(GitHubResponse::Comments(
+                CommentListing::Complete(comments),
+            ))) => Some(comments),
             _ => None,
         });
         let Some(comments) = listing else {

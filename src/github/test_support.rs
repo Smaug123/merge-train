@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 
 use crate::cascade::EffectError;
-use crate::effects::github::{CollaboratorRole, GitHubEffect};
+use crate::effects::github::{CollaboratorRole, CommentListing, GitHubEffect};
 use crate::effects::{GitHubResponse, PrData, RepoSettingsData};
 use crate::git::test_support::{create_pr_ref, squash_merge_to_main};
 use crate::git::{GitConfig, run_git_stdout};
@@ -95,6 +95,12 @@ pub struct FakeGitHub {
     /// missing from a listing that a moment later returns it. Recovery
     /// paths that read absence as deletion must survive this.
     pub hidden_from_listings: std::collections::HashSet<CommentId>,
+
+    /// PRs whose comment listing exceeds the interpreter's page or
+    /// body-byte cap: `ListComments` answers
+    /// [`CommentListing::Truncated`] — the whole listing is refused, no
+    /// partial vector exists to leak.
+    pub oversized_prs: std::collections::HashSet<PrNumber>,
     /// `UpdateComment` calls that reached a live comment, so a test can
     /// assert that a satisfied obligation writes nothing further.
     pub comment_updates: u32,
@@ -141,6 +147,7 @@ impl FakeGitHub {
             settings_fetches: 0,
             blocked: std::collections::HashSet::new(),
             hidden_from_listings: std::collections::HashSet::new(),
+            oversized_prs: std::collections::HashSet::new(),
             comment_updates: 0,
             stale_listing_ghosts: std::collections::BTreeMap::new(),
             stale_listing_bodies: std::collections::BTreeMap::new(),
@@ -418,33 +425,38 @@ impl FakeGitHub {
                     detail: format!("no such PR #{pr}: cannot list its comments (fake 404)"),
                 })
             }
-            GitHubEffect::ListComments { pr } => Ok(GitHubResponse::Comments(
-                self.comments
-                    .iter()
-                    .filter(|(id, c)| c.pr == *pr && !self.hidden_from_listings.contains(id))
-                    .map(|(id, c)| crate::effects::github::CommentData {
-                        id: *id,
-                        author_id: c.author_id,
-                        body: self
-                            .stale_listing_bodies
-                            .get(id)
-                            .cloned()
-                            .unwrap_or_else(|| c.body.clone()),
-                        edited: c.edited,
-                    })
-                    .chain(
-                        self.stale_listing_ghosts
-                            .iter()
-                            .filter(|(_, c)| c.pr == *pr)
-                            .map(|(id, c)| crate::effects::github::CommentData {
-                                id: *id,
-                                author_id: c.author_id,
-                                body: c.body.clone(),
-                                edited: c.edited,
-                            }),
-                    )
-                    .collect(),
-            )),
+            GitHubEffect::ListComments { pr } if self.oversized_prs.contains(pr) => {
+                Ok(GitHubResponse::Comments(CommentListing::Truncated))
+            }
+            GitHubEffect::ListComments { pr } => {
+                Ok(GitHubResponse::Comments(CommentListing::Complete(
+                    self.comments
+                        .iter()
+                        .filter(|(id, c)| c.pr == *pr && !self.hidden_from_listings.contains(id))
+                        .map(|(id, c)| crate::effects::github::CommentData {
+                            id: *id,
+                            author_id: c.author_id,
+                            body: self
+                                .stale_listing_bodies
+                                .get(id)
+                                .cloned()
+                                .unwrap_or_else(|| c.body.clone()),
+                            edited: c.edited,
+                        })
+                        .chain(
+                            self.stale_listing_ghosts
+                                .iter()
+                                .filter(|(_, c)| c.pr == *pr)
+                                .map(|(id, c)| crate::effects::github::CommentData {
+                                    id: *id,
+                                    author_id: c.author_id,
+                                    body: c.body.clone(),
+                                    edited: c.edited,
+                                }),
+                        )
+                        .collect(),
+                )))
+            }
             GitHubEffect::AddReaction { .. } => Ok(GitHubResponse::ReactionAdded),
 
             other => panic!("the engine does not emit {other:?}"),
