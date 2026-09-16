@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cascade::EffectError;
 use crate::effects::github::CollaboratorRole;
+use crate::effects::github::CommentListing;
 use crate::effects::github::Edited;
 use crate::effects::{
     BranchProtectionData, CommentData, GitHubEffect, GitHubResponse, PrData, Reaction,
@@ -872,6 +873,82 @@ async fn add_reaction(
     }
 }
 
+/// Bounds one comment listing: at most this many GraphQL pages of 100.
+/// 2,000 comments is far beyond any conversation the bot can meaningfully
+/// manage; a PR beyond it needs an operator, and an unbounded listing
+/// spends unbounded API quota, memory, and wall-clock time on the worker
+/// thread (Codex crawl review, deferred P2 — COMMENT_PAGINATION_PLAN.md).
+pub(crate) const MAX_COMMENT_PAGES: usize = 20;
+
+/// ...and at most this many accumulated comment-body bytes, whichever
+/// trips first: pages bound API spend, bytes bound memory (GitHub allows
+/// 64 KiB per body, so pages alone admit ~128 MiB).
+pub(crate) const MAX_COMMENT_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// The pure half of the listing's bounds: pages are fed in as they
+/// arrive, and the verdict after each page says whether to keep fetching.
+/// Pure and cap-parameterized so the caps are property-testable against a
+/// naive concatenation reference with small caps.
+struct BoundedListing {
+    comments: Vec<CommentData>,
+    pages: usize,
+    body_bytes: usize,
+    max_pages: usize,
+    max_body_bytes: usize,
+}
+
+/// What to do after a page: keep fetching, stop with a complete listing,
+/// or refuse the whole listing.
+#[derive(Debug, PartialEq, Eq)]
+enum PageVerdict {
+    Continue,
+    Done,
+    Truncated,
+}
+
+impl BoundedListing {
+    fn new() -> BoundedListing {
+        BoundedListing::with_caps(MAX_COMMENT_PAGES, MAX_COMMENT_BODY_BYTES)
+    }
+
+    fn with_caps(max_pages: usize, max_body_bytes: usize) -> BoundedListing {
+        BoundedListing {
+            comments: Vec::new(),
+            pages: 0,
+            body_bytes: 0,
+            max_pages,
+            max_body_bytes,
+        }
+    }
+
+    /// Accepts one fetched page. `has_next` is whether GitHub says more
+    /// pages FOLLOW this one (with a usable cursor). The page counts
+    /// against the caps whatever the verdict, so `Truncated` is returned
+    /// the moment a cap is reached with pages still to fetch — the bound
+    /// is on API spend and memory, not just on the answer.
+    fn push_page(&mut self, page: Vec<CommentData>, has_next: bool) -> PageVerdict {
+        self.pages += 1;
+        self.body_bytes += page.iter().map(|c| c.body.len()).sum::<usize>();
+        self.comments.extend(page);
+        if self.body_bytes > self.max_body_bytes {
+            return PageVerdict::Truncated;
+        }
+
+        if !has_next {
+            return PageVerdict::Done;
+        }
+        if self.pages >= self.max_pages {
+            return PageVerdict::Truncated;
+        }
+        PageVerdict::Continue
+    }
+
+    /// The complete listing; meaningful only after [`PageVerdict::Done`].
+    fn finish(self) -> Vec<CommentData> {
+        self.comments
+    }
+}
+
 async fn list_comments(
     client: &OctocrabClient,
     pr: PrNumber,
@@ -884,7 +961,7 @@ async fn list_comments(
         after: Option<String>,
     }
 
-    let mut all_comments = Vec::new();
+    let mut listing = BoundedListing::new();
     let mut after: Option<String> = None;
     loop {
         let variables = Variables {
@@ -923,6 +1000,7 @@ async fn list_comments(
             .map(|p| p.comments)
             .ok_or_else(|| graphql_missing_object_error(errors.as_ref(), &format!("PR {pr}")))?;
 
+        let mut page = Vec::new();
         for node in connection.nodes {
             // Every issue comment has a database id; a response without one
             // (or one that is not a decimal integer) is malformed, and
@@ -938,7 +1016,7 @@ async fn list_comments(
                         node.full_database_id
                     ))
                 })?;
-            all_comments.push(CommentData {
+            page.push(CommentData {
                 id: CommentId(id),
                 // A deleted account has no author: id 0 matches no real
                 // commenter, so author-gated decisions fail closed.
@@ -957,16 +1035,32 @@ async fn list_comments(
             });
         }
 
-        match (
+        // `hasNextPage` without a cursor cannot be followed; the current
+        // page is then the last one we can have, as before the bounds.
+        let next = match (
             connection.page_info.has_next_page,
             connection.page_info.end_cursor,
         ) {
-            (true, Some(cursor)) => after = Some(cursor),
-            _ => break,
+            (true, Some(cursor)) => Some(cursor),
+            _ => None,
+        };
+        match listing.push_page(page, next.is_some()) {
+            PageVerdict::Continue => after = next,
+            PageVerdict::Done => break,
+            PageVerdict::Truncated => {
+                tracing::warn!(
+                    %pr,
+                    "PR comment listing exceeds the page or body-byte cap; refusing it \
+                     (a partial listing is not a listing) — operator action likely required"
+                );
+                return Ok(GitHubResponse::Comments(CommentListing::Truncated));
+            }
         }
     }
 
-    Ok(GitHubResponse::Comments(all_comments))
+    Ok(GitHubResponse::Comments(CommentListing::Complete(
+        listing.finish(),
+    )))
 }
 
 // ─── Collaborators ────────────────────────────────────────────────────────────
@@ -1327,6 +1421,89 @@ async fn get_repo_settings(client: &OctocrabClient) -> Result<GitHubResponse, Gi
 
 #[cfg(test)]
 mod tests {
+    mod listing_bounds {
+        use super::super::{BoundedListing, PageVerdict};
+        use crate::effects::github::{CommentData, Edited};
+        use crate::types::CommentId;
+        use proptest::prelude::*;
+
+        /// Feeds `pages` (each a list of body lengths; every page but the
+        /// last says more follow) into a cap-injected accumulator, the way
+        /// the pagination loop does, and returns what came of it.
+        fn run(
+            pages: &[Vec<usize>],
+            max_pages: usize,
+            max_bytes: usize,
+        ) -> (Option<Vec<CommentData>>, usize) {
+            let mut listing = BoundedListing::with_caps(max_pages, max_bytes);
+            let mut fetched = 0;
+            for (i, lens) in pages.iter().enumerate() {
+                fetched += 1;
+                let page: Vec<CommentData> = lens
+                    .iter()
+                    .enumerate()
+                    .map(|(j, len)| CommentData {
+                        id: CommentId((i * 100 + j + 1) as u64),
+                        author_id: 7,
+                        body: "x".repeat(*len),
+                        edited: Edited::Never,
+                    })
+                    .collect();
+                let has_next = i + 1 < pages.len();
+                match listing.push_page(page, has_next) {
+                    PageVerdict::Continue => continue,
+                    PageVerdict::Done => return (Some(listing.finish()), fetched),
+                    PageVerdict::Truncated => return (None, fetched),
+                }
+            }
+            unreachable!("the last page always verdicts Done or Truncated")
+        }
+
+        proptest! {
+            /// The bounded listing against the naive reference: under both
+            /// caps it is exactly the concatenation of the pages; over
+            /// either cap it is refused whole, and fetching stopped within
+            /// the caps — no page beyond the page cap, no page after the
+            /// byte cap tripped.
+            #[test]
+            fn bounded_listing_equals_the_naive_reference_under_the_caps(
+                pages in prop::collection::vec(
+                    prop::collection::vec(0usize..64, 0..4),
+                    1..12,
+                ),
+                max_pages in 1usize..10,
+                max_bytes in 0usize..600,
+            ) {
+                let (outcome, fetched) = run(&pages, max_pages, max_bytes);
+                let total_bytes: usize = pages.iter().flatten().sum();
+                let under = pages.len() <= max_pages && total_bytes <= max_bytes;
+                match outcome {
+                    Some(comments) => {
+                        prop_assert!(under, "over a cap yet listed");
+                        let naive: Vec<usize> =
+                            pages.iter().flatten().copied().collect();
+                        prop_assert_eq!(
+                            comments.iter().map(|c| c.body.len()).collect::<Vec<_>>(),
+                            naive,
+                            "the listing is the concatenation of the pages"
+                        );
+                        prop_assert_eq!(fetched, pages.len());
+                    }
+                    None => {
+                        prop_assert!(!under, "under both caps yet refused");
+                        prop_assert!(fetched <= max_pages, "fetched past the page cap");
+                        let bytes_before_last: usize =
+                            pages[..fetched - 1].iter().flatten().sum();
+                        prop_assert!(
+                            bytes_before_last <= max_bytes,
+                            "kept fetching after the byte cap tripped"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     use super::*;
     use crate::github::error::test_support::github_error;
     use proptest::prelude::*;
@@ -2145,8 +2322,8 @@ mod tests {
             let response = list_comments(&client, PrNumber(5))
                 .await
                 .expect("must succeed");
-            let GitHubResponse::Comments(comments) = response else {
-                panic!("expected Comments");
+            let GitHubResponse::Comments(CommentListing::Complete(comments)) = response else {
+                panic!("expected a complete listing");
             };
             assert_eq!(
                 comments,
@@ -2200,8 +2377,8 @@ mod tests {
             let response = list_comments(&client, PrNumber(5))
                 .await
                 .expect("must succeed");
-            let GitHubResponse::Comments(comments) = response else {
-                panic!("expected Comments");
+            let GitHubResponse::Comments(CommentListing::Complete(comments)) = response else {
+                panic!("expected a complete listing");
             };
             let ids: Vec<u64> = comments.iter().map(|c| c.id.0).collect();
             assert_eq!(ids, vec![1, 2, 3]);
@@ -2222,10 +2399,70 @@ mod tests {
             let response = list_comments(&client, PrNumber(5))
                 .await
                 .expect("must succeed");
-            let GitHubResponse::Comments(comments) = response else {
-                panic!("expected Comments");
+            let GitHubResponse::Comments(CommentListing::Complete(comments)) = response else {
+                panic!("expected a complete listing");
             };
             assert_eq!(comments[0].id, CommentId(big));
+        }
+
+        /// A PR whose comments exceed the page cap is REFUSED, not
+        /// partially listed: absence from a listing is evidence, so "the
+        /// comments before the cap" must be unrepresentable. Pagination
+        /// also stops AT the cap — the bound is on API spend, not just on
+        /// the answer.
+        #[tokio::test]
+        async fn a_listing_over_the_page_cap_is_refused_not_partial() {
+            let pages: Vec<CannedResponse> = (0..MAX_COMMENT_PAGES + 1)
+                .map(|p| {
+                    comments_page(
+                        vec![comment_node(1 + p as u64, Some(7), None, None)],
+                        Some(&format!("cursor-{p}")),
+                    )
+                })
+                .collect();
+            let (base, hits) = spawn_mock_server(pages).await;
+            let client = mock_client(&base);
+            let response = list_comments(&client, PrNumber(5))
+                .await
+                .expect("truncation is an answer, not an error");
+            assert_eq!(
+                response,
+                GitHubResponse::Comments(CommentListing::Truncated)
+            );
+            assert_eq!(
+                hits.load(Ordering::SeqCst) as usize,
+                MAX_COMMENT_PAGES,
+                "pagination stops at the cap"
+            );
+        }
+
+        /// The byte cap trips on accumulated body bytes: one page of
+        /// near-limit bodies over the cap refuses the listing on the
+        /// first page.
+        #[tokio::test]
+        async fn a_listing_over_the_body_byte_cap_is_refused_not_partial() {
+            let big_body = "x".repeat(MAX_COMMENT_BODY_BYTES / 4 + 1);
+            let nodes: Vec<serde_json::Value> = (1..=5u64)
+                .map(|id| {
+                    serde_json::json!({
+                        "fullDatabaseId": id.to_string(),
+                        "author": { "databaseId": 7 },
+                        "body": big_body,
+                        "lastEditedAt": null,
+                        "editor": null,
+                    })
+                })
+                .collect();
+            let (base, hits) = spawn_mock_server(vec![comments_page(nodes, Some("more"))]).await;
+            let client = mock_client(&base);
+            let response = list_comments(&client, PrNumber(5))
+                .await
+                .expect("truncation is an answer, not an error");
+            assert_eq!(
+                response,
+                GitHubResponse::Comments(CommentListing::Truncated)
+            );
+            assert_eq!(hits.load(Ordering::SeqCst), 1, "no second page is fetched");
         }
 
         /// A response carrying `data` AND `errors` is a PARTIAL listing

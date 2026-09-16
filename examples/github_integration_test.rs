@@ -417,7 +417,9 @@ async fn test_get_merge_state(
 async fn test_list_comments(client: &OctocrabClient, pr: PrNumber) -> anyhow::Result<usize> {
     let response = client.interpret(GitHubEffect::ListComments { pr }).await?;
     match response {
-        GitHubResponse::Comments(comments) => {
+        GitHubResponse::Comments(merge_train::effects::github::CommentListing::Complete(
+            comments,
+        )) => {
             for comment in &comments {
                 tracing::debug!(
                     id = comment.id.0,
@@ -427,6 +429,9 @@ async fn test_list_comments(client: &OctocrabClient, pr: PrNumber) -> anyhow::Re
                 );
             }
             Ok(comments.len())
+        }
+        GitHubResponse::Comments(merge_train::effects::github::CommentListing::Truncated) => {
+            anyhow::bail!("listing truncated: the PR exceeds the comment caps")
         }
         other => anyhow::bail!("Unexpected response: {:?}", other),
     }
