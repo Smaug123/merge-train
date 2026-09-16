@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc ab21ac0da39d6620e3c938bf04fe6ddcef85771df3021a7e95a706190cb34736 # shrinks to choices = [Index(657319590237597767), Index(7100187818035279893), Index(17689789363152037914)], advanced_bits = [true, true, true, false]
+cc 4afb29a13b9d700fd1b518ea455d5831cc79c08976fb91f544e38a47d9f5d282 # shrinks to choices = [Index(6379519358496778297), Index(10826102482269387972), Index(15506780254007302673)], advanced_bits = [false, true, false, true]

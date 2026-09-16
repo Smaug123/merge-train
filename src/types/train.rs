@@ -152,6 +152,17 @@ pub struct DescendantProgress {
     /// Frozen and carried through all subsequent phases.
     /// Recovery must use this, not re-query the descendants index.
     frozen_descendants: Vec<PrNumber>,
+
+    /// The WHOLE stack the train knew when it froze: the recorded
+    /// descendant closure of its root and current PR. `frozen_descendants`
+    /// holds only the current phase's DIRECT children, so it cannot answer
+    /// "was this PR part of the stack?" for a grandchild — and a lost-DB
+    /// crawl must answer exactly that to tell a legitimately pre-declared
+    /// descendant from one attached during the gap. Empty in records
+    /// written before this field existed (the crawl then falls back to the
+    /// status comment's id as a watermark).
+    #[serde(default)]
+    known_stack: Vec<PrNumber>,
 }
 
 /// Serde mirror of [`DescendantProgress`]. Deserialization goes through
@@ -163,6 +174,8 @@ struct RawDescendantProgress {
     completed: HashSet<PrNumber>,
     skipped: HashSet<PrNumber>,
     frozen_descendants: Vec<PrNumber>,
+    #[serde(default)]
+    known_stack: Vec<PrNumber>,
 }
 
 impl TryFrom<RawDescendantProgress> for DescendantProgress {
@@ -175,10 +188,16 @@ impl TryFrom<RawDescendantProgress> for DescendantProgress {
                 return Err(ProgressError::DuplicateFrozen { pr: *pr });
             }
         }
+        let mut known = HashSet::new();
         let mut progress = DescendantProgress {
             completed: HashSet::new(),
             skipped: HashSet::new(),
             frozen_descendants: raw.frozen_descendants,
+            known_stack: raw
+                .known_stack
+                .into_iter()
+                .filter(|pr| known.insert(*pr))
+                .collect(),
         };
         for pr in raw.completed {
             progress.mark_completed(pr)?;
@@ -196,8 +215,19 @@ impl DescendantProgress {
     /// Duplicates are removed, preserving first-occurrence order: progress is
     /// tracked per PR, so a PR listed twice is still one unit of work.
     pub fn new(frozen_descendants: Vec<PrNumber>) -> Self {
+        Self::with_known_stack(frozen_descendants, Vec::new())
+    }
+
+    /// As [`DescendantProgress::new`], recording the whole stack the train
+    /// knew at the freeze (see [`DescendantProgress::known_stack`]).
+    pub fn with_known_stack(frozen_descendants: Vec<PrNumber>, known_stack: Vec<PrNumber>) -> Self {
         let mut seen = HashSet::new();
-        let frozen_descendants = frozen_descendants
+        let frozen_descendants: Vec<PrNumber> = frozen_descendants
+            .into_iter()
+            .filter(|pr| seen.insert(*pr))
+            .collect();
+        let mut seen = HashSet::new();
+        let known_stack = known_stack
             .into_iter()
             .filter(|pr| seen.insert(*pr))
             .collect();
@@ -205,7 +235,14 @@ impl DescendantProgress {
             completed: HashSet::new(),
             skipped: HashSet::new(),
             frozen_descendants,
+            known_stack,
         }
+    }
+
+    /// The whole stack the train knew when it froze, empty for records
+    /// written before the field existed.
+    pub fn known_stack(&self) -> &[PrNumber] {
+        &self.known_stack
     }
 
     /// Descendants that have completed the current phase.
@@ -267,6 +304,7 @@ impl DescendantProgress {
             completed: HashSet::new(),
             skipped: self.skipped.clone(),
             frozen_descendants: self.frozen_descendants.clone(),
+            known_stack: self.known_stack.clone(),
         }
     }
 }

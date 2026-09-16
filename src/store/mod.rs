@@ -354,7 +354,7 @@ impl Store {
         payloads: &[StateEventPayload],
         ts: DateTime<Utc>,
     ) -> Result<Vec<StateEvent>, StoreError> {
-        self.append_batch_marking(payloads, ts, None)
+        self.append_batch_marking(payloads, ts, None, &[], false)
     }
 
     /// `append_batch`, additionally marking one delivery as CRAWLED in the
@@ -366,6 +366,8 @@ impl Store {
         payloads: &[StateEventPayload],
         ts: DateTime<Utc>,
         crawled_delivery: Option<&str>,
+        owed_ledgers: &[PrNumber],
+        topology_incomplete: bool,
     ) -> Result<Vec<StateEvent>, StoreError> {
         let mut next_state = self.state.clone();
         let mut seq = self.next_seq;
@@ -388,11 +390,56 @@ impl Store {
         if crawled_delivery.is_some() {
             mark_backlog_crawled_in(&tx)?;
         }
+        settle_adopted_ledgers_in(&tx, payloads)?;
+        // Everything the crawl owes lands with its events: a ledger the
+        // crawl disbelieved is owed a rewrite (no topology event marks it,
+        // and a bootstrapped store never crawls again), and a crawl that
+        // could not read every PR's comments leaves the topology
+        // INCOMPLETE, which refuses starts until an operator resolves it.
+        for pr in owed_ledgers {
+            mark_ledger_owed_in(&tx, *pr)?;
+        }
+        if topology_incomplete {
+            tx.execute(
+                "INSERT OR REPLACE INTO counters (name, value) VALUES ('topology_incomplete', 1)",
+                [],
+            )?;
+        }
         tx.commit()?;
 
         self.state = next_state;
         self.next_seq = seq;
         Ok(events)
+    }
+
+    /// Whether the first-contact crawl could not read every PR's comments:
+    /// the recovered topology may be missing a descendant's ledger, and a
+    /// train started over it would squash its root without preparing that
+    /// descendant. Starts are refused while this stands. It is cleared by
+    /// an operator (a fresh crawl of a repository within the bot's limits),
+    /// never by the bot: nothing it does later re-reads what it missed.
+    pub fn topology_incomplete(&self) -> Result<bool, StoreError> {
+        // A store first contact created (schema 8, before this counter
+        // existed) has no row: not incomplete (Codex topology review, P1).
+        let value: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT value FROM counters WHERE name = 'topology_incomplete'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(value.unwrap_or(0) != 0)
+    }
+
+    /// Records the crawl's incompleteness by hand (tests, and the marking
+    /// batch above).
+    pub fn mark_topology_incomplete(&mut self) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO counters (name, value) VALUES ('topology_incomplete', 1)",
+            [],
+        )?;
+        Ok(())
     }
 
     /// Reads the full event log in append order.
@@ -573,15 +620,19 @@ impl Store {
     }
 
     /// [`Store::commit_delivery`] for a first-contact crawl whose trigger
-    /// proved STALE: the crawl's events and the close of the delivery
-    /// commit together, with the backlog marked. A crash after the close
-    /// loses none of them.
+    /// proved STALE: the crawl's events, the close of the delivery, and
+    /// everything the crawl owes — the rewrite of each ledger it
+    /// disbelieved, and the incompleteness of a truncated read — commit
+    /// together. A crash after the close loses none of them.
+    #[allow(clippy::too_many_arguments)]
     pub fn commit_delivery_closing_crawl(
         &mut self,
         delivery_id: &str,
         events: &[StateEventPayload],
         dedupe: Option<&DedupeKey>,
         ts: DateTime<Utc>,
+        owed_ledgers: &[PrNumber],
+        topology_incomplete: bool,
     ) -> Result<(), StoreError> {
         let mut next_state = self.state.clone();
         let mut seq = self.next_seq;
@@ -601,6 +652,16 @@ impl Store {
             tx.execute(
                 "INSERT OR IGNORE INTO dedupe_keys (key, seen_at) VALUES (?1, ?2)",
                 rusqlite::params![key.as_str(), ts.to_rfc3339()],
+            )?;
+        }
+        settle_adopted_ledgers_in(&tx, events)?;
+        for pr in owed_ledgers {
+            mark_ledger_owed_in(&tx, *pr)?;
+        }
+        if topology_incomplete {
+            tx.execute(
+                "INSERT OR REPLACE INTO counters (name, value) VALUES ('topology_incomplete', 1)",
+                [],
             )?;
         }
         tx.execute(
@@ -1187,22 +1248,7 @@ impl Store {
         insert_and_apply(&tx, &mut next_state, &event)?;
         next_seq += 1;
         upsert_cache(&tx, &next_state, next_seq, ts)?;
-        tx.execute(
-            "DELETE FROM unresolved_ledger_comments WHERE pr = ?1 \
-             AND (comment_id = ?2 OR (comment_id IS NULL AND seq = ?3))",
-            rusqlite::params![pr.0 as i64, comment_id.0 as i64, seq as i64],
-        )?;
-        tx.execute(
-            "DELETE FROM owed_ledger_repairs WHERE pr = ?1 AND comment_id = ?2",
-            rusqlite::params![pr.0 as i64, comment_id.0 as i64],
-        )?;
-        // ...and any verdict that it reads as nothing: it is the ledger
-        // now, and the rewrite that follows states its content. Left in
-        // place, a later listing would skip the comment for ever.
-        tx.execute(
-            "DELETE FROM settled_ledger_comments WHERE comment_id = ?2 AND dead = 0",
-            rusqlite::params![pr.0 as i64, comment_id.0 as i64],
-        )?;
+        settle_adopted_ledger_in(&tx, pr, comment_id, Some(seq))?;
         tx.commit()?;
         self.state = next_state;
         self.next_seq = next_seq;
@@ -1443,6 +1489,40 @@ fn next_ledger_generation(tx: &rusqlite::Transaction<'_>) -> Result<i64, StoreEr
 }
 
 /// Dirties a PR's ledger at a FRESH generation, inside `tx`.
+/// What adopting comment `comment_id` as `pr`'s ledger settles, in the
+/// adoption's own transaction: the comment is no longer unresolved (an
+/// orphan of the post the store recorded under `seq`, when it was one),
+/// no longer owed a repair — a repair refuses to neutralize the recorded
+/// ledger, so one left behind would keep the PR pending for ever (Codex
+/// crawl review, P2) — and no longer under a verdict that it reads as
+/// nothing: it is the ledger now, and the rewrite that follows states its
+/// content. Left in place, a later listing would skip the comment for
+/// ever.
+fn settle_adopted_ledger_in(
+    tx: &rusqlite::Transaction<'_>,
+    pr: PrNumber,
+    comment_id: CommentId,
+    seq: Option<u64>,
+) -> Result<(), StoreError> {
+    tx.execute(
+        "DELETE FROM unresolved_ledger_comments WHERE pr = ?1 \
+         AND (comment_id = ?2 OR (comment_id IS NULL AND seq = ?3))",
+        rusqlite::params![pr.0 as i64, comment_id.0 as i64, seq.map(|s| s as i64)],
+    )?;
+    tx.execute(
+        "DELETE FROM owed_ledger_repairs WHERE pr = ?1 AND comment_id = ?2",
+        rusqlite::params![pr.0 as i64, comment_id.0 as i64],
+    )?;
+    tx.execute(
+        "DELETE FROM settled_ledger_comments WHERE comment_id = ?2 AND dead = 0",
+        rusqlite::params![pr.0 as i64, comment_id.0 as i64],
+    )?;
+    Ok(())
+}
+
+/// Every ledger a crawl's batch adopts (`StackLedgerPosted`) is settled
+/// exactly as a live post is: a repair the webhook queued against the
+/// comment before the crawl placed it must not outlive the adoption.
 /// Every delivery still waiting when a crawl lands was received BEFORE
 /// the present the crawl fetched, and is judged against it exactly as the
 /// trigger is: re-checked on GitHub if it is a comment, against the cache
@@ -1461,6 +1541,18 @@ fn mark_backlog_crawled_in(tx: &rusqlite::Transaction<'_>) -> Result<(), StoreEr
         "INSERT OR REPLACE INTO counters (name, value) VALUES ('crawl_landed_at', ?1)",
         rusqlite::params![Utc::now().timestamp_micros()],
     )?;
+    Ok(())
+}
+
+fn settle_adopted_ledgers_in(
+    tx: &rusqlite::Transaction<'_>,
+    payloads: &[StateEventPayload],
+) -> Result<(), StoreError> {
+    for payload in payloads {
+        if let StateEventPayload::StackLedgerPosted { pr, comment_id } = payload {
+            settle_adopted_ledger_in(tx, *pr, *comment_id, None)?;
+        }
+    }
     Ok(())
 }
 
@@ -2457,6 +2549,63 @@ mod tests {
         assert!(store.ledger_repairs(PrNumber(1)).unwrap().is_empty());
         assert!(store.unresolved_ledgers(PrNumber(1)).unwrap().is_empty());
         assert!(store.ledger_pending_prs().unwrap().is_empty());
+    }
+
+    /// A store first contact created has no `topology_incomplete` row —
+    /// schema 8 predates the counter — and must read as complete, and be
+    /// markable; a start would otherwise fail on the missing row (Codex
+    /// topology review, P1).
+    #[test]
+    fn a_store_without_the_incompleteness_row_reads_complete_and_is_markable() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let mut store = Store::open(&path).unwrap();
+        store
+            .conn
+            .execute(
+                "DELETE FROM counters WHERE name = 'topology_incomplete'",
+                [],
+            )
+            .unwrap();
+        assert!(!store.topology_incomplete().unwrap());
+        store.mark_topology_incomplete().unwrap();
+        assert!(store.topology_incomplete().unwrap());
+    }
+
+    /// What a landed crawl owes commits with its events: the rewrite of a
+    /// ledger it disbelieved, and the incompleteness of a truncated read.
+    /// A crash after the commit loses neither.
+    #[test]
+    fn a_crawls_obligations_commit_with_its_events() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        {
+            let mut store = Store::open(&path).unwrap();
+            assert!(!store.topology_incomplete().unwrap());
+            store
+                .append_batch_marking(
+                    &[StateEventPayload::DefaultBranchSet {
+                        branch: "main".to_owned(),
+                    }],
+                    test_timestamp(),
+                    None,
+                    &[PrNumber(2), PrNumber(3)],
+                    true,
+                )
+                .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store
+                .owed_stack_ledgers()
+                .unwrap()
+                .iter()
+                .map(|o| o.pr)
+                .collect::<Vec<_>>(),
+            vec![PrNumber(2), PrNumber(3)]
+        );
+        assert!(store.topology_incomplete().unwrap());
+        assert_eq!(store.state().default_branch, "main");
     }
 
     /// A root that retires TWICE under two different status comments owes
