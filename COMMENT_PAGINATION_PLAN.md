@@ -173,12 +173,16 @@ than blaming the token — and pins all four behaviours with tests.
 
 **Implements**: end-to-end confidence across the guarantee.
 
-Extend the worker recovery model's generator with an "oversized PR"
-shape (the fake's knob): histories where a referenced PR answers
-`Truncated`. The model's assertion: live processing and post-loss
-recovery agree — both fail closed, neither ever starts or resumes a
-train over the incomplete topology, and processing on OTHER repos'
-shapes is unaffected.
+Extend the worker recovery model with the "oversized PR" shape (the
+fake's knob), asserted from both sides of a loss rather than as naive
+live/recovered agreement — the two sides are RIGHT to differ:
+
+- LIVE, the listing gates nothing about the edge: webhooks carry the
+  truth, so the edge an unlistable world builds is exactly the edge a
+  listable one builds (only ledger discharge waits).
+- RECOVERED, the crawl cannot read the PR, so it grants NOTHING — no
+  edge, from any crash point — and the topology is incomplete durably,
+  refusing starts, instead of the repository's queue pausing for ever.
 
 **Correctness oracle**:
 - The extended model passes a `PROPTEST_CASES=300` shake-out.
