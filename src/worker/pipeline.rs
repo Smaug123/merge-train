@@ -565,6 +565,7 @@ impl Processor {
         // is no longer in the PR's listing — or a `created` one whose
         // comment has since been edited — is a stale redelivery, and
         // handling it would record a body the comment no longer has.
+        let mut crawl_context = delivery.crawled;
         if self.store.state().default_branch.is_empty() {
             let freshness = TriggerFreshness::of(&event);
             let retried = self.doubt_has_stood(&id);
@@ -624,6 +625,13 @@ impl Processor {
                         outcome.topology_incomplete,
                     )?;
                     self.after_bootstrap(outcome)?;
+                    // The trigger is judged against the crawled present
+                    // exactly as a crash-marked delivery is: the founding
+                    // gate below must see it (the crawl may just have
+                    // dropped an uncorroborated ledger edge whose
+                    // retraction still sits unacked behind this very
+                    // delivery).
+                    crawl_context = true;
                 }
             }
         }
@@ -837,6 +845,43 @@ impl Processor {
                 info!(delivery_id = %id, "delivery closed: crawled but never closed");
                 return Ok(PipelineOutcome::Processed);
             }
+        }
+
+        // A crawled EDIT may not FOUND an edge on a comment its author
+        // did not create; it may only move an existing one. The same
+        // final bytes — a stranger's comment the author edited into a
+        // declaration — arise both from the author genuinely founding
+        // that way and from the author RETRACTING elsewhere after a
+        // restating edit (their own declaration deleted, its deliveries
+        // unacked): no point-in-time check can tell the two apart, and
+        // acting on the edit would resurrect the retracted stack. The
+        // ruling picks the direction — recovery is stricter than live,
+        // and a false drop costs one re-declaration (the ledger rewrite
+        // states the truth either way).
+
+        if crawl_context
+            && let GitHubEvent::IssueComment(c) = &event
+            && c.action == crate::webhooks::events::CommentAction::Edited
+            && let Some(pr) = c.pr_number
+            && c.author_id != c.pr_author_id
+            && matches!(
+                parse_command(&c.body, &self.deps.bot_name),
+                Some(Command::Predecessor(_))
+            )
+            && self
+                .store
+                .state()
+                .prs
+                .get(&pr)
+                .is_none_or(|p| p.predecessor.is_none())
+        {
+            warn!(
+                delivery_id = %id, %pr, comment = %c.comment_id,
+                "a crawled edit of a comment the PR author did not create cannot \
+                 FOUND a predecessor edge (a retraction may hide behind it); the \
+                 author re-declares if the edge is wanted"
+            );
+            return self.close(&id, key.as_ref(), "crawled edit cannot found an edge");
         }
 
         // Command authorization + referenced-PR precache (commands only).
