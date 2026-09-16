@@ -12454,6 +12454,124 @@ fn a_start_is_refused_while_the_topology_is_incomplete() {
     );
 }
 
+/// A repository containing an over-cap PR still BOOTSTRAPS: the truncated
+/// listing maps to `comments_truncated` — the crawl lands, deliveries
+/// close, and the existing fail-closed machinery refuses `start` — rather
+/// than to Unavailable, which would release the delivery and pause the
+/// repository's queue at the stall cadence for ever (a PR cannot shrink
+/// on retry). Degraded, characterized, loud.
+#[test]
+fn a_repo_with_an_oversized_pr_still_bootstraps_and_refuses_starts() {
+    let (mut world, heads) = World::linear_stack(2);
+    world
+        .github
+        .lock()
+        .unwrap()
+        .oversized_prs
+        .insert(PrNumber(2));
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    drain(&mut processor);
+    assert!(
+        !processor.state().default_branch.is_empty(),
+        "the crawl landed despite the oversized PR"
+    );
+    assert!(
+        processor.store_mut().topology_incomplete().unwrap(),
+        "the unread comments leave the topology incomplete, durably"
+    );
+    start_command(&mut world, &mut processor, 1);
+    drain(&mut processor);
+    assert!(
+        processor.state().active_trains.is_empty(),
+        "no train starts over an incomplete topology"
+    );
+    assert!(
+        world
+            .github
+            .lock()
+            .unwrap()
+            .posted_comments
+            .iter()
+            .any(|(pr, text)| *pr == PrNumber(1) && text.contains("incomplete")),
+        "the refusal is answered"
+    );
+}
+
+/// An adopted active train on a repository with an over-cap member is
+/// aborted `Truncated`, exactly as under the PR-count cap: the crawl
+/// cannot know what the unread comments say about the stack.
+#[test]
+fn an_adopted_train_on_a_repo_with_an_oversized_pr_aborts() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    start_command(&mut world, &mut processor, 1);
+    run_batches_then_crash(&mut world, processor, 4);
+    world
+        .github
+        .lock()
+        .unwrap()
+        .oversized_prs
+        .insert(PrNumber(2));
+    destroy_state_db(&world);
+    let mut processor = world.processor();
+    let wake = comment_body(&world.config, 1, "just a remark", AUTHOR, "author", 990);
+    world.enqueue(&mut processor, "issue_comment", wake);
+    drain(&mut processor);
+    drive_to_completion(&mut world, &mut processor);
+    assert!(
+        processor
+            .state()
+            .active_trains
+            .get(&PrNumber(1))
+            .is_some_and(|t| matches!(t.state, crate::types::TrainState::Aborted { .. })),
+        "the adopted train aborts on the unreadable topology: {:?}",
+        processor
+            .state()
+            .active_trains
+            .get(&PrNumber(1))
+            .map(|t| &t.state)
+    );
+    assert!(
+        world
+            .github
+            .lock()
+            .unwrap()
+            .squash_count
+            .values()
+            .all(|n| *n == 0),
+        "nothing may be squashed"
+    );
+}
+
+/// Truncation and unavailability stay distinct: a TRANSIENT listing
+/// failure at first contact still releases the delivery (retrying can
+/// heal an outage; it cannot shrink a PR).
+#[test]
+fn a_transient_listing_failure_at_first_contact_still_releases() {
+    let (mut world, heads) = World::linear_stack(1);
+    world.github.lock().unwrap().list_comments_broken = true;
+    let mut processor = world.processor();
+    let body = pr_opened_body(&world.config, 1, &heads[0], "pr-1", "main");
+    world.enqueue(&mut processor, "pull_request", body);
+    let delivery = processor.claim().unwrap().expect("queued");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Released
+    );
+    world.github.lock().unwrap().list_comments_broken = false;
+    let delivery = processor.claim().unwrap().expect("released back");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Processed
+    );
+    assert!(
+        !processor.store_mut().topology_incomplete().unwrap(),
+        "a healed outage leaves the topology complete"
+    );
+}
+
 /// A non-comment delivery whose crawl landed before the process died is
 /// handled on restart: a PR event that agrees with the crawled present
 /// carries no staleness risk, and a review or check event carries a

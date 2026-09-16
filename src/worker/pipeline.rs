@@ -1611,11 +1611,39 @@ impl Processor {
                     break;
                 }
                 listed.insert(pr);
-                let pr_comments = fetch!(
-                    GitHubEffect::ListComments { pr },
-                    GitHubResponse::Comments(CommentListing::Complete(c)) => c
-                );
-                comments.push((pr, pr_comments));
+                match self.deps.github.execute(GitHubEffect::ListComments { pr }) {
+                    Ok(GitHubResponse::Comments(CommentListing::Complete(c))) => {
+                        comments.push((pr, c));
+                    }
+                    // An over-cap PR cannot shrink on a retry, so this must
+                    // NOT be Unavailable: releasing would pause the
+                    // repository's queue at the stall cadence for ever. Its
+                    // unread comments leave the topology incomplete instead
+                    // — the same fail-closed machinery as the PR-count cap
+                    // above (COMMENT_PAGINATION_PLAN.md Stage 2).
+                    Ok(GitHubResponse::Comments(CommentListing::Truncated)) => {
+                        error!(
+                            %pr,
+                            "the bootstrap crawl cannot list this PR's comments within \
+                             the page and body-byte caps; predecessor topology and \
+                             trains touching it cannot be recovered — operator action \
+                             likely required"
+                        );
+                        comments_truncated = true;
+                    }
+                    Ok(other) => {
+                        error!(?other, "bootstrap fetch answered the wrong variant");
+                        return Ok(Bootstrap::Unavailable);
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = ?e,
+                            "bootstrap crawl failed; the repo's queue pauses until it \
+                             succeeds"
+                        );
+                        return Ok(Bootstrap::Unavailable);
+                    }
+                }
             }
             let outcome = super::bootstrap::crawl_events(&CrawlInput {
                 default_branch: &settings.default_branch,
