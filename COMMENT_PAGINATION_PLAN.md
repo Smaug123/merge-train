@@ -151,11 +151,21 @@ trains abort `Abort::Truncated`.
 
 **Correctness oracle**:
 - One worker test per consumer (four), each asserting the mapped
-  behaviour AND that no state event was appended from a truncated
-  listing.
-- Property (store-level): for all obligation states, applying a
-  `Truncated` probe outcome is an identity on the ledger obligations —
-  nothing discharges, nothing settles.
+  behaviour — refusal answered, park-and-heal, obligation kept then
+  discharged on heal — so a truncated listing observably changes
+  nothing an obligation depends on.
+- The ∀-form of "a truncated probe discharges nothing" is carried by
+  Stage 4's recovery-model extension rather than a store-level
+  property: generating arbitrary obligation states in isolation would
+  duplicate the store harness for little marginal power over the
+  deterministic heal tests plus the model.
+
+**Resolved in implementation**: Stage 1's conservative mappings already
+gave every consumer its final BEHAVIOUR (the probes' `find_map` treats
+`Truncated` as a failed listing; recovery's wrong-variant arm parks);
+this stage makes each site a distinguished match with an accurate,
+operator-facing message — the freshness refusal names the caps rather
+than blaming the token — and pins all four behaviours with tests.
 
 ## Stage 4: the recovery model covers oversized PRs
 

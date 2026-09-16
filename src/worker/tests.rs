@@ -12572,6 +12572,260 @@ fn a_transient_listing_failure_at_first_contact_still_releases() {
     );
 }
 
+/// A crawled delivery whose freshness re-check meets a truncated listing
+/// is refused with an answer naming the caps — not the token — and not
+/// released for ever: the PR cannot shrink on a retry.
+#[test]
+fn a_crawled_delivery_on_an_oversized_pr_is_refused_with_the_caps_named() {
+    let (mut world, heads) = World::linear_stack(1);
+    {
+        let mut github = world.github.lock().unwrap();
+        github.roles.insert(
+            "maintainer".to_owned(),
+            crate::effects::github::CollaboratorRole::Maintain,
+        );
+        github.permission_lookup_transient = true;
+    }
+    let mut processor = world.processor();
+    let body = pr_opened_body(&world.config, 1, &heads[0], "pr-1", "main");
+    world.enqueue(&mut processor, "pull_request", body);
+    drain(&mut processor);
+    drop(processor);
+    let mut world2 = world;
+    world2.state_dir = TempDir::new().unwrap();
+    let mut processor = world2.processor();
+    let stop = comment_body(&world2.config, 1, "@merge-train stop", 777, "maintainer", 9);
+    world2.enqueue(&mut processor, "issue_comment", stop);
+    let delivery = processor.claim().unwrap().expect("queued");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Released,
+        "the crawl landed; the role lookup's outage released the delivery"
+    );
+    {
+        let mut github = world2.github.lock().unwrap();
+        github.permission_lookup_transient = false;
+        github.oversized_prs.insert(PrNumber(1));
+    }
+    let delivery = processor.claim().unwrap().expect("released back");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Processed,
+        "refused for good, not released for ever"
+    );
+    assert!(
+        world2
+            .github
+            .lock()
+            .unwrap()
+            .posted_comments
+            .iter()
+            .any(|(pr, text)| *pr == PrNumber(1) && text.contains("cap")),
+        "the refusal names the caps, not the token"
+    );
+}
+
+/// Supplementary recovery on a root whose listing is truncated PARKS at
+/// the stall cadence — resuming unverified risks the double squash the
+/// check exists to prevent — and resumes once the listing is listable
+/// again (an operator raised the cap, or the comments were pruned).
+#[test]
+fn inherited_recovery_parks_on_an_oversized_root_and_heals() {
+    let (mut world, heads) = World::linear_stack(1);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 1, &heads);
+    start_command(&mut world, &mut processor, 1);
+    run_batches_then_crash(&mut world, processor, 3);
+    world
+        .github
+        .lock()
+        .unwrap()
+        .oversized_prs
+        .insert(PrNumber(1));
+    let mut processor = world.processor();
+    drain(&mut processor);
+    {
+        let github = world.github.lock().unwrap();
+        assert!(
+            github.squash_count.values().all(|n| *n == 0),
+            "parked: nothing resumed over an unverifiable root"
+        );
+    }
+    assert!(
+        processor
+            .state()
+            .active_trains
+            .get(&PrNumber(1))
+            .is_some_and(|t| t.state.is_active()),
+        "the train is parked, not retired"
+    );
+    world
+        .github
+        .lock()
+        .unwrap()
+        .oversized_prs
+        .remove(&PrNumber(1));
+    tick(&world, &mut processor);
+    drive_to_completion(&mut world, &mut processor);
+    assert_eq!(
+        world
+            .github
+            .lock()
+            .unwrap()
+            .squash_count
+            .get(&PrNumber(1))
+            .copied()
+            .unwrap_or(0),
+        1,
+        "healed: the recovery completed and the train went on"
+    );
+}
+
+/// A truncated ledger probe discharges NOTHING: the obligation stays
+/// owed — and the store is otherwise untouched by the probe — until a
+/// complete listing discovers what is really there.
+#[test]
+fn a_truncated_ledger_probe_discharges_nothing() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    drain(&mut processor);
+    for _ in 0..3 {
+        tick(&world, &mut processor);
+    }
+    assert!(
+        !ledger_pending(&mut processor, 2),
+        "precondition: the setup's ledgers discharged"
+    );
+    // Somebody edits the bot's ledger comment into prose: a repair is
+    // owed — and the PR's listing is truncated when the probe looks.
+    let ledger_id = {
+        let mut github = world.github.lock().unwrap();
+        let id = *github
+            .comments
+            .iter()
+            .find(|(_, c)| {
+                c.pr == PrNumber(2)
+                    && c.author_id == TEST_BOT_ID
+                    && crate::status::parse_stack_ledger(&c.body).is_some()
+            })
+            .map(|(id, _)| id)
+            .expect("PR 2 carries its ledger");
+        let comment = github.comments.get_mut(&id).unwrap();
+        comment.body = "someone scribbled over the ledger".to_owned();
+        comment.edited = Edited::By {
+            editor: Some(STRANGER),
+        };
+        github.oversized_prs.insert(PrNumber(2));
+        id
+    };
+    let hook = bot_comment_webhook(
+        &world.config,
+        2,
+        ledger_id.0,
+        "edited",
+        "someone scribbled over the ledger",
+    );
+    world.enqueue(&mut processor, "issue_comment", hook);
+    drain(&mut processor);
+    for _ in 0..3 {
+        tick(&world, &mut processor);
+    }
+    assert!(
+        ledger_pending(&mut processor, 2),
+        "the truncated probe discharged nothing: the repair stays owed"
+    );
+    world
+        .github
+        .lock()
+        .unwrap()
+        .oversized_prs
+        .remove(&PrNumber(2));
+    for _ in 0..3 {
+        tick(&world, &mut processor);
+    }
+    assert!(
+        !ledger_pending(&mut processor, 2),
+        "a complete listing let the repair land"
+    );
+}
+
+/// A truncated status-sync probe keeps the terminal update owed: the
+/// final word lands once the root is listable again, never silently
+/// dropped.
+#[test]
+fn a_truncated_sync_probe_keeps_the_terminal_update_owed() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    world.enqueue_stack_setup(&mut processor, 2, &heads);
+    start_command(&mut world, &mut processor, 1);
+    let claim_all = |p: &mut Processor| {
+        while let Some(delivery) = p.claim().unwrap() {
+            p.process_claimed(delivery).unwrap();
+        }
+    };
+    claim_all(&mut processor);
+    let preflight = pump_cascade(&mut processor).expect("the start's preflight");
+    let outcomes = execute(&mut processor, &preflight);
+    let step = processor
+        .on_outcomes(preflight.root, outcomes, preflight.feedback)
+        .unwrap()
+        .expect("the first cascade step");
+    // The user stops mid-step; the boundary's cleanup carries the final
+    // status update — and GitHub is down when it runs, so the update is
+    // owed.
+    let stop = comment_body(&world.config, 1, "@merge-train stop", AUTHOR, "author", 7);
+    world.enqueue(&mut processor, "issue_comment", stop);
+    claim_all(&mut processor);
+    let outcomes = execute(&mut processor, &step);
+    let cleanup = processor
+        .on_outcomes(step.root, outcomes, step.feedback)
+        .unwrap()
+        .expect("the stop's cleanup batch");
+    world.github.lock().unwrap().unavailable = true;
+    let outcomes = execute(&mut processor, &cleanup);
+    let mut next = processor
+        .on_outcomes(cleanup.root, outcomes, cleanup.feedback)
+        .unwrap();
+    while let Some(batch) = next {
+        let outcomes = execute(&mut processor, &batch);
+        next = processor
+            .on_outcomes(batch.root, outcomes, batch.feedback)
+            .unwrap();
+    }
+    assert_eq!(processor.owed_status_syncs(), vec![PrNumber(1)]);
+    assert!(processor.take_retry_request());
+    // The outage ends, but the root's listing is truncated: the probe
+    // discovers nothing, so the final word stays owed.
+    {
+        let mut github = world.github.lock().unwrap();
+        github.unavailable = false;
+        github.oversized_prs.insert(PrNumber(1));
+    }
+    processor.requeue_marked_recoveries().unwrap();
+    drain(&mut processor);
+    assert_eq!(
+        processor.owed_status_syncs(),
+        vec![PrNumber(1)],
+        "the terminal update stays owed behind the truncated listing"
+    );
+    // Listable again: the update lands.
+    world
+        .github
+        .lock()
+        .unwrap()
+        .oversized_prs
+        .remove(&PrNumber(1));
+    for _ in 0..3 {
+        tick(&world, &mut processor);
+        drain(&mut processor);
+    }
+    assert!(
+        processor.owed_status_syncs().is_empty(),
+        "listable again: the final word landed"
+    );
+}
+
 /// A non-comment delivery whose crawl landed before the process died is
 /// handled on restart: a PR event that agrees with the crawled present
 /// carries no staleness risk, and a review or check event carries a

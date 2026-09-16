@@ -711,6 +711,29 @@ impl Processor {
                                 }
                             }
                         }
+                        // An over-cap PR cannot shrink on a retry:
+                        // refused for good, with the caps named — not the
+                        // token (COMMENT_PAGINATION_PLAN.md Stage 3).
+                        Ok(GitHubResponse::Comments(CommentListing::Truncated)) => {
+                            warn!(
+                                delivery_id = %id,
+                                "the PR's comment listing exceeds the page or body-byte \
+                                 cap; the delivery cannot be re-checked and is refused"
+                            );
+                            if let Some((pr, _)) = command_in(&event, &self.deps) {
+                                self.best_effort_github(GitHubEffect::PostComment {
+                                    pr,
+                                    body: format!(
+                                        "The bot cannot verify this command: PR {pr}'s \
+                                         comment listing exceeds the bot's page or \
+                                         body-byte cap, so the comment cannot be \
+                                         re-checked against GitHub — operator action \
+                                         likely required."
+                                    ),
+                                });
+                            }
+                            return self.close(&id, key.as_ref(), "crawled but unverifiable");
+                        }
                         // GitHub unavailable: released, as the crawl itself
                         // would be. A PERMANENT failure — the PR gone, or
                         // the token without access — is not: released, the
@@ -1961,6 +1984,22 @@ impl Processor {
             .execute(GitHubEffect::ListComments { pr: root })
         {
             Ok(GitHubResponse::Comments(CommentListing::Complete(comments))) => comments,
+            // Resuming unverified risks exactly the double squash this
+            // check exists to prevent, so an over-cap root PARKS the
+            // recovery at the stall cadence, loudly: an operator can
+            // prune the conversation or raise the caps, and
+            // `@merge-train stop` works throughout
+            // (COMMENT_PAGINATION_PLAN.md Stage 3).
+            Ok(GitHubResponse::Comments(CommentListing::Truncated)) => {
+                error!(
+                    %root,
+                    "the root's comment listing exceeds the page or body-byte caps; \
+                     recovery is PARKED at the stall cadence — operator action \
+                     required. `@merge-train stop` still works."
+                );
+                self.retry_requested = true;
+                return Ok(false);
+            }
             Ok(other) => {
                 error!(?other, "ListComments answered the wrong variant");
                 self.retry_requested = true;
@@ -2478,15 +2517,29 @@ impl Processor {
             return self.finish_boundary(root, cleanup);
         };
         let listing = outcomes.into_iter().find_map(|o| match o.result {
-            Ok(crate::cascade::EffectResponse::GitHub(GitHubResponse::Comments(
-                CommentListing::Complete(comments),
-            ))) => Some(comments),
+            Ok(crate::cascade::EffectResponse::GitHub(GitHubResponse::Comments(l))) => Some(l),
             _ => None,
         });
-        let Some(comments) = listing else {
-            warn!(%root, "status-sync probe failed; retrying at the stall cadence");
-            self.retry_requested = true;
-            return self.finish_boundary(root, cleanup);
+        let comments = match listing {
+            Some(CommentListing::Complete(comments)) => comments,
+            // A truncated listing discovers nothing: the final word stays
+            // owed until the root is listable again — never silently
+            // dropped (COMMENT_PAGINATION_PLAN.md Stage 3).
+            Some(CommentListing::Truncated) => {
+                warn!(
+                    %root,
+                    "the status-sync probe's listing exceeds the page or body-byte \
+                     caps; the terminal update stays owed — operator action likely \
+                     required"
+                );
+                self.retry_requested = true;
+                return self.finish_boundary(root, cleanup);
+            }
+            None => {
+                warn!(%root, "status-sync probe failed; retrying at the stall cadence");
+                self.retry_requested = true;
+                return self.finish_boundary(root, cleanup);
+            }
         };
         // The stored id FIRST, whatever the body says: a live comment at
         // that id is this train's backup, and one whose body is mangled or
@@ -2735,19 +2788,32 @@ impl Processor {
     ) -> Result<Option<SagaBatch>, StoreError> {
         let mut cleanup = self.boundary_cleanup(pr)?;
         let listing = outcomes.into_iter().find_map(|o| match o.result {
-            Ok(crate::cascade::EffectResponse::GitHub(GitHubResponse::Comments(
-                CommentListing::Complete(comments),
-            ))) => Some(comments),
+            Ok(crate::cascade::EffectResponse::GitHub(GitHubResponse::Comments(l))) => Some(l),
             _ => None,
         });
-        let Some(comments) = listing else {
-            // The writes that rode along may have landed — but a sync is
-            // a rewrite AND a discovery, and this one discovered nothing:
-            // the discovery stays owed, and the next look lists again
-            // (the extra rewrite is idempotent).
-            warn!(%pr, "stack-ledger probe failed; retrying at the stall cadence");
-            self.retry_requested = true;
-            return self.finish_boundary(pr, cleanup);
+        let comments = match listing {
+            Some(CommentListing::Complete(comments)) => comments,
+            // A truncated listing discharges NOTHING: only a complete one
+            // discovers, so every obligation stays owed at a bounded
+            // per-attempt cost (COMMENT_PAGINATION_PLAN.md Stage 3).
+            Some(CommentListing::Truncated) => {
+                warn!(
+                    %pr,
+                    "the ledger probe's listing exceeds the page or body-byte caps; \
+                     its obligations stay owed — operator action likely required"
+                );
+                self.retry_requested = true;
+                return self.finish_boundary(pr, cleanup);
+            }
+            None => {
+                // The writes that rode along may have landed — but a sync is
+                // a rewrite AND a discovery, and this one discovered nothing:
+                // the discovery stays owed, and the next look lists again
+                // (the extra rewrite is idempotent).
+                warn!(%pr, "stack-ledger probe failed; retrying at the stall cadence");
+                self.retry_requested = true;
+                return self.finish_boundary(pr, cleanup);
+            }
         };
         // What the store knows better than the listing: a comment whose
         // deletion webhook arrived is a ghost here (Codex ledger review
