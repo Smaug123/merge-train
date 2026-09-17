@@ -12625,6 +12625,66 @@ fn a_crawled_delivery_on_an_oversized_pr_is_refused_with_the_caps_named() {
     );
 }
 
+/// A first-contact COMMAND on the over-cap PR itself is answered, not
+/// discarded. The crawl lists the PR's comments and is refused, so the
+/// trigger cannot be verified — and an over-cap PR cannot shrink on a
+/// retry, so doubting it (a release, a whole second crawl, then a
+/// silent stale close) answers nobody. Refused in ONE attempt, with the
+/// caps named, as the crawled-delivery re-check refuses (Codex
+/// bounded-listings review on #80, P2).
+#[test]
+fn a_first_contact_command_on_an_oversized_pr_is_answered_not_discarded() {
+    let (mut world, heads) = World::linear_stack(1);
+    {
+        let mut github = world.github.lock().unwrap();
+        github.roles.insert(
+            "maintainer".to_owned(),
+            crate::effects::github::CollaboratorRole::Maintain,
+        );
+    }
+    let mut processor = world.processor();
+    let body = pr_opened_body(&world.config, 1, &heads[0], "pr-1", "main");
+    world.enqueue(&mut processor, "pull_request", body);
+    drain(&mut processor);
+    drop(processor);
+    destroy_state_db(&world);
+    world
+        .github
+        .lock()
+        .unwrap()
+        .oversized_prs
+        .insert(PrNumber(1));
+
+    let mut processor = world.processor();
+    let stop = comment_body(&world.config, 1, "@merge-train stop", 777, "maintainer", 9);
+    world.enqueue(&mut processor, "issue_comment", stop);
+    let delivery = processor.claim().unwrap().expect("queued");
+    assert_eq!(
+        processor.process_claimed(delivery).unwrap(),
+        PipelineOutcome::Processed,
+        "refused in one attempt: an over-cap listing is not a doubt"
+    );
+    assert_eq!(
+        processor.state().default_branch,
+        "main",
+        "the crawl landed despite the oversized PR"
+    );
+    assert!(
+        processor.claim().unwrap().is_none(),
+        "the delivery is closed, not released"
+    );
+    assert!(
+        world
+            .github
+            .lock()
+            .unwrap()
+            .posted_comments
+            .iter()
+            .any(|(pr, text)| *pr == PrNumber(1) && text.contains("cap")),
+        "the refusal names the caps"
+    );
+}
+
 /// Supplementary recovery on a root whose listing is truncated PARKS at
 /// the stall cadence — resuming unverified risks the double squash the
 /// check exists to prevent — and resumes once the listing is listable
