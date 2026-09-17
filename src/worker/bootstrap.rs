@@ -50,11 +50,13 @@
 
 use std::collections::{HashMap, HashSet};
 
-use tracing::{error, warn};
+use chrono::Utc;
+use tracing::{error, info, warn};
 
+use crate::cascade::EffectError;
 use crate::commands::{Command, parse_command};
-use crate::effects::PrData;
-use crate::effects::github::CommentData;
+use crate::effects::github::{CommentData, CommentListing, GitHubEffect};
+use crate::effects::{GitHubResponse, PrData};
 use crate::persistence::event::{StateEvent, StateEventPayload};
 use crate::persistence::snapshot::PersistedRepoSnapshot;
 use crate::state::RepoState;
@@ -63,6 +65,7 @@ use crate::status::parse::parse_status_comment;
 use crate::types::{CommentId, MergeStateStatus, PrNumber, TrainLineage, TrainRecord};
 
 use super::adoption;
+use super::executor::GitHubExec;
 use super::pipeline::cache_fill_events;
 
 /// The crawl's decision: events to append, the roots of adopted ACTIVE
@@ -73,6 +76,7 @@ use super::pipeline::cache_fill_events;
 /// is absent from both list endpoints but named by its descendants'
 /// declarations, and only by pulling it in can its status comment be found
 /// and its train adopted/aborted (Codex crawl review rounds 6–7).
+#[derive(Debug)]
 pub(crate) struct CrawlOutcome {
     pub events: Vec<StateEventPayload>,
     pub recovered_roots: Vec<PrNumber>,
@@ -172,6 +176,283 @@ fn replay_topology(
         });
     }
     state
+}
+
+/// Everything one first-contact crawl needs, snapshotted by the caller:
+/// nothing here comes from the store (a first-contact store is empty)
+/// and nothing comes from the trigger (the crawl reads the bot's own
+/// records). Plain data, so the reads can run on any thread.
+#[derive(Debug, Clone)]
+pub(crate) struct CrawlRequest {
+    /// The PRs the wake-up webhook named: fetched individually if the
+    /// list endpoints miss them, and listed first.
+    pub seed_prs: Vec<PrNumber>,
+    pub bot_name: String,
+    pub bot_user_id: u64,
+    /// The crawl's notion of now (the resurrection window's reference).
+    pub now: chrono::DateTime<Utc>,
+}
+
+/// What one crawl fetched, or that it could not.
+#[derive(Debug)]
+pub(crate) enum CrawlFetch {
+    /// Any failure: the caller releases the delivery, and the repository's
+    /// queue pauses at the stall cadence until a crawl succeeds.
+    Unavailable,
+    /// Boxed: the reads are a repository's worth of listings, and the
+    /// fetch travels by value through a mailbox.
+    Fetched(Box<CrawlReads>),
+}
+
+/// The present one crawl read, and the decision it computed from it.
+/// The trigger's freshness is judged against these by the caller
+/// (`pipeline::judge_trigger`); nothing here is committed yet.
+#[derive(Debug)]
+pub(crate) struct CrawlReads {
+    /// Every PR the crawl fetched: listed open, listed recently merged,
+    /// and referenced PRs fetched one by one.
+    pub crawled: Vec<PrData>,
+    /// The complete comment listings, per PR read.
+    pub comments: Vec<(PrNumber, Vec<CommentData>)>,
+    /// PRs whose listing was attempted (refused or not).
+    pub listed: HashSet<PrNumber>,
+    /// Referenced PRs a permanent `GetPr` failure could not fetch.
+    pub unfetchable: HashSet<PrNumber>,
+    /// PRs whose listing was attempted and refused (over the caps).
+    pub unread: HashSet<PrNumber>,
+    /// `crawl_events` at the fixpoint.
+    pub outcome: CrawlOutcome,
+}
+
+/// The reads of one first-contact crawl (DESIGN §Bootstrap Phase 2):
+/// settings, open and recently merged PRs, their comments, and the
+/// referenced PRs the fixpoint pulls in — then `crawl_events` on the
+/// lot. Pure over `github`: it touches no store, and the caller commits
+/// (or discards) what comes back.
+pub(crate) fn crawl(github: &GitHubExec, request: &CrawlRequest) -> CrawlFetch {
+    let seed_prs: &[PrNumber] = &request.seed_prs;
+    /// How many days of merged PRs the crawl considers: predecessor
+    /// targets and mid-cascade roots older than this are treated as
+    /// history (DESIGN bounds the resurrection window the same way).
+    const MERGED_SINCE_DAYS: u32 = 30;
+    /// How many PRs one bootstrap will list comments for. Each listing
+    /// is a paginated API call, and nothing is committed until the
+    /// whole crawl finishes, so an unbounded crawl of a very large
+    /// repository can exhaust the rate-limit window, discard all its
+    /// progress, and never bootstrap at all (Codex crawl review round
+    /// 6, P2). Beyond the cap the crawl proceeds with the PRs it has:
+    /// their cache entries stand, and topology it could not read is
+    /// reported as loudly as we can.
+    const MAX_COMMENT_LISTINGS: usize = 1000;
+    /// How many individually-fetched PRs one bootstrap will pay for.
+    /// Referenced-but-uncrawled PRs cost one `GetPr` each, and a PR
+    /// author can leave arbitrarily many distinct declaration targets;
+    /// unbounded, a long junk history could exhaust the API quota, and
+    /// the crawl abandons all progress on a rate limit and starts over
+    /// — pausing the repo's queue indefinitely (Codex crawl review
+    /// round 3, P1). Beyond the cap the remaining PRs are treated as
+    /// UNFETCHABLE: declaration edges onto them drop, and a train that
+    /// references one aborts loudly rather than recovering broken.
+    const MAX_REFERENCED_FETCHES: usize = 200;
+
+    macro_rules! fetch {
+            ($effect:expr, $expected:pat => $value:expr) => {
+                match github.execute($effect) {
+                    Ok($expected) => $value,
+                    Ok(other) => {
+                        error!(?other, "bootstrap fetch answered the wrong variant");
+                        return CrawlFetch::Unavailable;
+                    }
+                    Err(e) => {
+                        warn!(error = ?e, "bootstrap crawl failed; the repo's queue \
+                               pauses until it succeeds");
+                        return CrawlFetch::Unavailable;
+                    }
+                }
+            };
+        }
+
+    let settings = fetch!(
+        GitHubEffect::GetRepoSettings,
+        GitHubResponse::RepoSettings(s) => s
+    );
+    if settings.default_branch.is_empty() {
+        error!("repository settings carry an empty default branch");
+        return CrawlFetch::Unavailable;
+    }
+    let open = fetch!(GitHubEffect::ListOpenPrs, GitHubResponse::PrList(prs) => prs);
+    let (merged, may_be_incomplete) = fetch!(
+        GitHubEffect::ListRecentlyMergedPrs { since_days: MERGED_SINCE_DAYS },
+        GitHubResponse::RecentlyMergedPrList { prs, may_be_incomplete } => (prs, may_be_incomplete)
+    );
+    if may_be_incomplete {
+        warn!(
+            "the recently-merged crawl hit its pagination limit; trains \
+                 rooted at older merged PRs will not be recovered"
+        );
+    }
+    // Discover PRs to a fixpoint. The list endpoints miss a PR closed
+    // *unmerged* during the gap, but the wake-up webhook names some PRs
+    // (`seed_prs`) and the crawl surfaces more — declaration targets and
+    // adopted-train members it referenced but did not fetch. A closed
+    // root reachable only through its descendants' declarations is found
+    // this way: fetch the referenced PRs, list their comments, re-crawl,
+    // repeat until nothing new is referenced (Codex crawl review rounds
+    // 6–7). `attempted` bounds it — every PR is fetched at most once
+    // (a 404 counts), and the PR universe is finite — so it terminates.
+    let mut crawled: Vec<PrData> = open;
+    crawled.extend(merged);
+    let mut attempted: HashSet<PrNumber> = crawled.iter().map(|p| p.number).collect();
+    // Referenced PRs that a permanent `GetPr` failure could not fetch
+    // (deleted, or the token lost access). `crawl_events` aborts a train
+    // that references one rather than recover it into an `UnknownPr`
+    // stall (Codex crawl review round 12).
+    // Their comments were never listed because the PR could not be
+    // reached, not because the cap bit: a command on one is answered by
+    // the handler's own refusal rather than closed unheard.
+    let mut unfetchable: HashSet<PrNumber> = HashSet::new();
+    let mut comments: Vec<(PrNumber, Vec<CommentData>)> = Vec::new();
+    let mut listed: HashSet<PrNumber> = HashSet::new();
+    // Set when the cap stops us reading a crawled PR's comments: a
+    // ledger, or a whole train member, may then be missing from the
+    // crawl, and no train can be recovered from a partial read.
+    let mut comments_truncated = false;
+    // PRs whose listing was ATTEMPTED and refused (over the page or
+    // body-byte cap). `listed` alone cannot say so: it counts every
+    // attempt against the listings cap, refused or not, so a trigger
+    // on one of these would look merely absent from its listing and
+    // be doubted — released, re-crawled whole, and closed as stale
+    // with no answer, although the PR cannot shrink on a retry
+    // (Codex bounded-listings review on #80, P2).
+    let mut unread: HashSet<PrNumber> = HashSet::new();
+    let mut pending: Vec<PrNumber> = seed_prs
+        .iter()
+        .copied()
+        .filter(|pr| !attempted.contains(pr))
+        .collect();
+
+    let mut fetched = 0usize;
+    let outcome = loop {
+        for pr in std::mem::take(&mut pending) {
+            if !attempted.insert(pr) {
+                continue;
+            }
+            if fetched >= MAX_REFERENCED_FETCHES {
+                warn!(
+                    %pr,
+                    "the bootstrap crawl hit its referenced-PR fetch cap; \
+                     treating the rest as unfetchable"
+                );
+                unfetchable.insert(pr);
+                continue;
+            }
+            fetched += 1;
+            match github.execute(GitHubEffect::GetPr { pr }) {
+                Ok(GitHubResponse::Pr(data)) => crawled.push(data),
+                Err(e @ EffectError::Transient { .. }) => {
+                    warn!(%pr, error = ?e, "cannot fetch a referenced PR; bootstrap paused");
+                    return CrawlFetch::Unavailable;
+                }
+                other => {
+                    warn!(%pr, ?other, "referenced PR unfetchable; skipping it in the crawl");
+                    unfetchable.insert(pr);
+                }
+            }
+        }
+        // The SEED PRs first. The trigger's freshness is decided by
+        // whether its comment is in its PR's listing, so a cap reached
+        // before that PR would leave the delivery unverifiable — and
+        // the arm below cannot tell "not there" from "never looked"
+        // (Codex crawl review round 10, P1).
+        let mut unlisted: Vec<PrNumber> = crawled
+            .iter()
+            .map(|p| p.number)
+            .filter(|pr| !listed.contains(pr))
+            .collect();
+        unlisted.sort_by_key(|pr| !seed_prs.contains(pr));
+        for pr in unlisted {
+            if listed.len() >= MAX_COMMENT_LISTINGS {
+                comments_truncated = true;
+                error!(
+                    %pr, listed = listed.len(),
+                    "the bootstrap crawl hit its comment-listing cap; predecessor \
+                     topology and trains on the remaining PRs cannot be recovered \
+                     — operator action likely required (split the repository, or \
+                     raise the cap)"
+                );
+                break;
+            }
+            listed.insert(pr);
+            match github.execute(GitHubEffect::ListComments { pr }) {
+                Ok(GitHubResponse::Comments(CommentListing::Complete(c))) => {
+                    comments.push((pr, c));
+                }
+                // An over-cap PR cannot shrink on a retry, so this must
+                // NOT be Unavailable: releasing would pause the
+                // repository's queue at the stall cadence for ever. Its
+                // unread comments leave the topology incomplete instead
+                // — the same fail-closed machinery as the PR-count cap
+                // above (COMMENT_PAGINATION_PLAN.md Stage 2).
+                Ok(GitHubResponse::Comments(CommentListing::Truncated)) => {
+                    error!(
+                        %pr,
+                        "the bootstrap crawl cannot list this PR's comments within \
+                         the page and body-byte caps; predecessor topology and \
+                         trains touching it cannot be recovered — operator action \
+                         likely required"
+                    );
+                    comments_truncated = true;
+                    unread.insert(pr);
+                }
+                Ok(other) => {
+                    error!(?other, "bootstrap fetch answered the wrong variant");
+                    return CrawlFetch::Unavailable;
+                }
+                Err(e) => {
+                    warn!(
+                        error = ?e,
+                        "bootstrap crawl failed; the repo's queue pauses until it \
+                         succeeds"
+                    );
+                    return CrawlFetch::Unavailable;
+                }
+            }
+        }
+        let outcome = super::bootstrap::crawl_events(&CrawlInput {
+            default_branch: &settings.default_branch,
+            crawled_prs: &crawled,
+            comments: &comments,
+            bot_name: &request.bot_name,
+            bot_user_id: request.bot_user_id,
+            unfetchable: &unfetchable,
+            comments_truncated,
+            now: request.now,
+        });
+        let fresh: Vec<PrNumber> = outcome
+            .referenced_uncrawled
+            .iter()
+            .copied()
+            .filter(|pr| !attempted.contains(pr))
+            .collect();
+        if fresh.is_empty() {
+            break outcome;
+        }
+        pending = fresh;
+    };
+    info!(
+        default_branch = %settings.default_branch,
+        crawled_prs = crawled.len(),
+        recovered_trains = outcome.recovered_roots.len(),
+        "bootstrapped the repo from a crawl"
+    );
+    CrawlFetch::Fetched(Box::new(CrawlReads {
+        crawled,
+        comments,
+        listed,
+        unfetchable,
+        unread,
+        outcome,
+    }))
 }
 
 /// Everything `crawl_events` reads: repository facts, the fetched data, and
@@ -862,6 +1143,16 @@ mod tests {
     /// its predecessor's branch), and it is still recorded: the decision
     /// was made when the state was different, and re-judging it against
     /// the present is precisely the mistake this design removes.
+    /// The request and the fetch cross a thread boundary
+    /// (CRAWL_OFF_THREAD_PLAN.md): a compile-time fact, checked here
+    /// before any thread exists.
+    #[test]
+    fn crawl_types_cross_threads() {
+        fn assert_send<T: Send>() {}
+        assert_send::<CrawlRequest>();
+        assert_send::<CrawlFetch>();
+    }
+
     #[test]
     fn a_ledger_edge_is_recorded_without_re_validating_it() {
         let crawled = vec![
