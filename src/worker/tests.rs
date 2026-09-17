@@ -14014,9 +14014,20 @@ mod recovery_model {
         (pr.predecessor, owner)
     }
 
-    /// Every event processed as it happens.
-    fn live(events: &[Event]) -> (Option<PrNumber>, Option<usize>) {
+    /// Every event processed as it happens. With `oversized`, PR 2's
+    /// comment listing is over the caps from first contact: the live
+    /// path builds its edge from webhooks, not listings, so the edge
+    /// must not change — only ledger discharge is gated.
+    fn live(events: &[Event], oversized: bool) -> (Option<PrNumber>, Option<usize>) {
         let (mut world, heads) = World::linear_stack(2);
+        if oversized {
+            world
+                .github
+                .lock()
+                .unwrap()
+                .oversized_prs
+                .insert(PrNumber(2));
+        }
         let mut processor = world.processor();
         enqueue_pr_opens(&mut world, &mut processor, 2, &heads);
         drain(&mut processor);
@@ -14091,7 +14102,7 @@ mod recovery_model {
                 by: Actor::Author,
             },
         ];
-        assert_eq!(live(&events), (None, None), "the author retracted");
+        assert_eq!(live(&events, false), (None, None), "the author retracted");
         assert_eq!(
             recovered(&events),
             (None, None),
@@ -14121,7 +14132,7 @@ mod recovery_model {
             },
         ];
         assert_eq!(
-            live(&events),
+            live(&events, false),
             (Some(PrNumber(1)), Some(0)),
             "live founds from the author's edit"
         );
@@ -14143,7 +14154,7 @@ mod recovery_model {
             choices in proptest::collection::vec(arb_choice(), 1..=8),
         ) {
             let events = history(&choices);
-            let expected = live(&events);
+            let expected = live(&events, false);
             let actual = recovered(&events);
             let live_owner_unattributable =
                 expected.1.is_some_and(|owner| !authors_own_declaration(&events, owner));
@@ -14161,7 +14172,11 @@ mod recovery_model {
     /// the ledger writes it owes landed — the database lost, and the rest
     /// unacked in the backlog when the crawl runs. A remark of a stranger's
     /// wakes the crawl in case nothing was left in the backlog.
-    fn recovered_after(events: &[Event], crash: usize) -> (Option<PrNumber>, Option<usize>) {
+    fn recovered_after(
+        events: &[Event],
+        crash: usize,
+        oversized: bool,
+    ) -> (Option<PrNumber>, Option<usize>) {
         let (mut world, heads) = World::linear_stack(2);
         let mut processor = world.processor();
         enqueue_pr_opens(&mut world, &mut processor, 2, &heads);
@@ -14174,6 +14189,15 @@ mod recovery_model {
         }
         drop(processor);
         destroy_state_db(&world);
+        if oversized {
+            // The conversation grew over the caps during the gap.
+            world
+                .github
+                .lock()
+                .unwrap()
+                .oversized_prs
+                .insert(PrNumber(2));
+        }
         let mut processor = world.processor();
         for event in &events[crash..] {
             let body = payload(&world, &mut created, event);
@@ -14197,6 +14221,12 @@ mod recovery_model {
         );
         drain_with_cooldowns(&world, &mut processor);
         assert_eq!(processor.state().default_branch, "main", "the crawl landed");
+        if oversized {
+            assert!(
+                processor.store_mut().topology_incomplete().unwrap(),
+                "an unlistable PR leaves the topology incomplete, durably"
+            );
+        }
         edge(&processor, &created)
     }
 
@@ -14214,8 +14244,8 @@ mod recovery_model {
         ) {
             let events = history(&choices);
             let crash = crash_at.min(events.len());
-            let expected = live(&events);
-            let actual = recovered_after(&events, crash);
+            let expected = live(&events, false);
+            let actual = recovered_after(&events, crash, false);
             let live_owner_unattributable =
                 expected.1.is_some_and(|owner| !authors_own_declaration(&events, owner));
             let deviation_permitted = live_owner_unattributable
@@ -14225,6 +14255,43 @@ mod recovery_model {
             prop_assert!(
                 actual == expected || deviation_permitted,
                 "recovered {actual:?}, live {expected:?}; crash at {crash}; history: {events:#?}"
+            );
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 24,
+            .. ProptestConfig::default()
+        })]
+
+        /// An over-cap PR, from both sides of a loss. LIVE, the listing
+        /// gates nothing about the edge: webhooks carry the truth, and
+        /// the edge is exactly what an unlistable world builds — only
+        /// ledger discharge waits. RECOVERED, the crawl cannot read the
+        /// PR, so it grants NOTHING — no edge, from no crash point —
+        /// and the topology is incomplete durably, refusing starts,
+        /// rather than the repository's queue pausing for ever
+        /// (COMMENT_PAGINATION_PLAN.md Stage 4).
+        #[test]
+        fn an_oversized_pr_gates_no_live_edge_and_recovers_nothing(
+            choices in proptest::collection::vec(arb_choice(), 1..=8),
+            crash_at in 0usize..=8,
+        ) {
+            let events = history(&choices);
+            let crash = crash_at.min(events.len());
+            prop_assert_eq!(
+                live(&events, true),
+                live(&events, false),
+                "the live edge is listing-independent; history: {:#?}",
+                events
+            );
+            prop_assert_eq!(
+                recovered_after(&events, crash, true),
+                (None, None),
+                "recovery granted an edge nobody could verify; crash at {}; history: {:#?}",
+                crash,
+                events
             );
         }
     }
