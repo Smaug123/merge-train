@@ -13611,6 +13611,23 @@ mod recovery_model {
         state == Some((DECLARE_1, Actor::Author))
     }
 
+    /// The stricter form: the author CREATED the comment as well as writing
+    /// its final bytes. An edge whose live owner fails this is one recovery
+    /// need not preserve — an edge FOUNDED by editing a stranger's comment
+    /// is indistinguishable at recovery from the retraction shape (the
+    /// author's own declaration deleted after a restating edit), so the
+    /// founding gate refuses it and the drop is a permitted deviation. The
+    /// bytes-only form above still governs what recovery may RE-ATTRIBUTE a
+    /// surviving edge to: a proven (ledgered) edge whose recorded owner was
+    /// vandalized may land on any comment that reads as the author's
+    /// declaration, stranger-created or not.
+    fn authors_own_declaration(events: &[Event], k: usize) -> bool {
+        let created_by_author = events
+            .iter()
+            .any(|e| matches!(e, Event::Create { k: c, by: Actor::Author, .. } if *c == k));
+        created_by_author && authors_declaration(events, k)
+    }
+
     /// PR 2's edge as the store holds it: the predecessor and the INDEX of
     /// the comment that owns the declaration.
     fn edge(processor: &Processor, created: &Created) -> (Option<PrNumber>, Option<usize>) {
@@ -13660,6 +13677,89 @@ mod recovery_model {
         edge(&processor, &created)
     }
 
+    /// The CI-found seed, pinned deterministically (the generator is too
+    /// sparse to re-find 6-specific-choice shapes): the author declares
+    /// (k2), restates by editing a stranger's comment (k0) — which moves
+    /// nothing, k0 being older than the owner — and then retracts by
+    /// deleting k2. Live ends unstacked. At recovery, k2 is invisible
+    /// (deleted, unacked), and k0's replayed edit lands on a store with
+    /// no edge: without the founding gate it RESURRECTS the retracted
+    /// stack. Recovery must not found an edge from an edit of a comment
+    /// the author did not create.
+    #[test]
+    fn a_retraction_hidden_behind_an_authors_restating_edit_is_not_resurrected() {
+        let events = vec![
+            Event::Create {
+                k: 0,
+                by: Actor::Stranger,
+                body: DECLARE_1,
+            },
+            Event::Create {
+                k: 1,
+                by: Actor::Stranger,
+                body: DECLARE_1,
+            },
+            Event::Create {
+                k: 2,
+                by: Actor::Author,
+                body: DECLARE_1,
+            },
+            Event::Edit {
+                k: 0,
+                by: Actor::Author,
+                from: DECLARE_1,
+                to: DECLARE_1,
+            },
+            Event::Delete {
+                k: 1,
+                by: Actor::Stranger,
+            },
+            Event::Delete {
+                k: 2,
+                by: Actor::Author,
+            },
+        ];
+        assert_eq!(live(&events), (None, None), "the author retracted");
+        assert_eq!(
+            recovered(&events),
+            (None, None),
+            "recovery must not resurrect the retracted stack"
+        );
+    }
+
+    /// The same final comment state as above can arise legitimately — the
+    /// author founding the edge by editing a stranger's comment, with no
+    /// retraction anywhere — and no point-in-time rule can tell the two
+    /// apart. The ruling picks the direction: recovery DROPS it (the
+    /// author re-declares with one comment), live keeps it. This is the
+    /// permitted deviation the model's predicate encodes.
+    #[test]
+    fn recovery_drops_an_edge_founded_by_editing_a_strangers_comment() {
+        let events = vec![
+            Event::Create {
+                k: 0,
+                by: Actor::Stranger,
+                body: PROSE,
+            },
+            Event::Edit {
+                k: 0,
+                by: Actor::Author,
+                from: PROSE,
+                to: DECLARE_1,
+            },
+        ];
+        assert_eq!(
+            live(&events),
+            (Some(PrNumber(1)), Some(0)),
+            "live founds from the author's edit"
+        );
+        assert_eq!(
+            recovered(&events),
+            (None, None),
+            "recovery cannot verify a founding edit on a stranger's comment"
+        );
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig {
             cases: 48,
@@ -13674,7 +13774,7 @@ mod recovery_model {
             let expected = live(&events);
             let actual = recovered(&events);
             let live_owner_unattributable =
-                expected.1.is_some_and(|owner| !authors_declaration(&events, owner));
+                expected.1.is_some_and(|owner| !authors_own_declaration(&events, owner));
             let deviation_permitted = live_owner_unattributable
                 && (actual == (None, None)
                     || (actual.0 == expected.0
@@ -13745,7 +13845,7 @@ mod recovery_model {
             let expected = live(&events);
             let actual = recovered_after(&events, crash);
             let live_owner_unattributable =
-                expected.1.is_some_and(|owner| !authors_declaration(&events, owner));
+                expected.1.is_some_and(|owner| !authors_own_declaration(&events, owner));
             let deviation_permitted = live_owner_unattributable
                 && (actual == (None, None)
                     || (actual.0 == expected.0
