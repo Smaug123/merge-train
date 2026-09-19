@@ -6997,7 +6997,7 @@ fn saga_outcomes_park_until_the_backlog_drains() {
     .unwrap();
 
     assert!(
-        next.is_none(),
+        matches!(next, super::Handled::Done),
         "no batch may dispatch before the backlog is applied"
     );
     assert!(parked.is_some(), "the boundary must wait for the backlog");
@@ -13295,6 +13295,119 @@ mod registry {
             &log,
             |e| matches!(e, GitHubEffect::ListComments { pr } if *pr == PrNumber(2)),
         );
+        effect_until(
+            &log,
+            |e| matches!(e, GitHubEffect::PostComment { pr, .. } if *pr == PrNumber(2)),
+        );
+    }
+
+    /// An intake ack does not wait for the crawl (CRAWL_OFF_THREAD_PLAN.md,
+    /// guarantee 2): with the crawl held at its listing, a second delivery
+    /// is durably enqueued and acked; once the gate opens, the crawl lands
+    /// and the engine's work follows. Inline, the ack would wait for the
+    /// gate — which the timeout turns into a failure rather than a hang.
+    #[tokio::test]
+    async fn an_intake_ack_does_not_wait_for_the_crawl() {
+        let (world, _heads) = World::linear_stack(2);
+        let (log_tx, log) = std::sync::mpsc::channel();
+        let gate = crate::github::test_support::Gate::new();
+        {
+            let mut github = world.github.lock().unwrap();
+            github.effect_log = Some(log_tx);
+            github.listing_gate = Some(gate.clone());
+        }
+        let registry = registry_for(&world);
+        let sender = registry
+            .sender_for(&world.config.owner, &world.config.repo)
+            .await
+            .unwrap();
+
+        let declaration = comment_body(
+            &world.config,
+            2,
+            "@merge-train predecessor #1",
+            AUTHOR,
+            "author",
+            41,
+        );
+        world.mirror_comment(&declaration);
+        assert_eq!(
+            send_event(&registry, &sender, "d1", "issue_comment", declaration)
+                .await
+                .unwrap(),
+            EnqueueOutcome::Enqueued
+        );
+        effect_until(&log, |e| matches!(e, GitHubEffect::ListComments { .. }));
+        // The crawl is held. A second webhook arrives — the gate is
+        // closed, so the fake may not be locked: the body is not mirrored,
+        // which a prose remark never needs.
+        let remark = comment_body(&world.config, 2, "just a remark", STRANGER, "stranger", 42);
+        let acked = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            send_event(&registry, &sender, "d2", "issue_comment", remark),
+        )
+        .await
+        .expect("the ack waited for the crawl");
+        assert_eq!(acked.unwrap(), EnqueueOutcome::Enqueued);
+        assert!(
+            matches!(log.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+            "the crawl is still held: the ack came from the worker thread"
+        );
+        gate.open();
+        effect_until(
+            &log,
+            |e| matches!(e, GitHubEffect::PostComment { pr, .. } if *pr == PrNumber(2)),
+        );
+    }
+
+    /// A crawl thread that dies kills its worker — the parked delivery
+    /// would otherwise wait for ever — and the worker respawns on the next
+    /// routing with the trigger requeued: the store reopens unbootstrapped
+    /// (nothing was committed) and the next crawl starts afresh.
+    #[tokio::test]
+    async fn a_crawl_thread_that_dies_kills_the_worker() {
+        let (world, _heads) = World::linear_stack(2);
+        let (log_tx, log) = std::sync::mpsc::channel();
+        {
+            let mut github = world.github.lock().unwrap();
+            github.effect_log = Some(log_tx);
+            github.panic_on_listing = true;
+        }
+        let registry = registry_for(&world);
+        let sender = registry
+            .sender_for(&world.config.owner, &world.config.repo)
+            .await
+            .unwrap();
+
+        let declaration = comment_body(
+            &world.config,
+            2,
+            "@merge-train predecessor #1",
+            AUTHOR,
+            "author",
+            41,
+        );
+        world.mirror_comment(&declaration);
+        assert_eq!(
+            send_event(&registry, &sender, "d1", "issue_comment", declaration)
+                .await
+                .unwrap(),
+            EnqueueOutcome::Enqueued
+        );
+        effect_until(&log, |e| matches!(e, GitHubEffect::ListComments { .. }));
+        // The crawl thread panicked inside that listing; its guard reports
+        // the death, and the worker stops (its mailbox closes).
+        tokio::time::timeout(std::time::Duration::from_secs(60), sender.closed())
+            .await
+            .expect("the worker outlived its dead crawl thread");
+        // The next routing respawns the worker, which reopens the store
+        // with the trigger requeued and crawls again — to the end this time.
+        let sender = registry
+            .sender_for(&world.config.owner, &world.config.repo)
+            .await
+            .unwrap();
+        assert!(!sender.is_closed(), "a fresh worker");
+        effect_until(&log, |e| matches!(e, GitHubEffect::GetRepoSettings));
         effect_until(
             &log,
             |e| matches!(e, GitHubEffect::PostComment { pr, .. } if *pr == PrNumber(2)),

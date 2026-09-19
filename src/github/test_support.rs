@@ -110,6 +110,11 @@ pub struct FakeGitHub {
     /// the gate is closed. Holds a crawl at its listing so a test can
     /// observe what the worker does meanwhile.
     pub listing_gate: Option<std::sync::Arc<Gate>>,
+    /// While set, the next `ListComments` PANICS (once; the flag clears
+    /// first): a crawl thread that dies mid-read. The panic fires before
+    /// any mutation, so the fake's state stays whole behind the poisoned
+    /// mutex (which `GitHubExec` recovers from).
+    pub panic_on_listing: bool,
     /// `UpdateComment` calls that reached a live comment, so a test can
     /// assert that a satisfied obligation writes nothing further.
     pub comment_updates: u32,
@@ -185,6 +190,7 @@ impl FakeGitHub {
             oversized_prs: std::collections::HashSet::new(),
             effect_log: None,
             listing_gate: None,
+            panic_on_listing: false,
             comment_updates: 0,
             stale_listing_ghosts: std::collections::BTreeMap::new(),
             stale_listing_bodies: std::collections::BTreeMap::new(),
@@ -274,6 +280,10 @@ impl FakeGitHub {
             && matches!(effect, GitHubEffect::ListComments { .. })
         {
             gate.wait();
+        }
+        if self.panic_on_listing && matches!(effect, GitHubEffect::ListComments { .. }) {
+            self.panic_on_listing = false;
+            panic!("test-injected panic inside a comment listing");
         }
         if matches!(effect, GitHubEffect::GetRepoSettings) {
             self.settings_fetches += 1;

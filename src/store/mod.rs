@@ -483,12 +483,13 @@ impl Store {
         received_at: DateTime<Utc>,
     ) -> Result<bool, StoreError> {
         // A delivery RECEIVED before the first-contact crawl landed but
-        // stored only after it — the worker that runs the crawl is the
-        // worker that services intake, so webhooks received during the
-        // crawl's reads wait in the mailbox — describes a change the crawled
+        // stored only after it — it waited for intake capacity, or in the
+        // mailbox, across the landing — describes a change the crawled
         // present may or may not hold, and is judged against that present
         // like the backlog the crawl marked: the mark follows the time the
-        // webhook was received (Codex first-contact review, P1).
+        // webhook was received (Codex first-contact review, P1). (Webhooks
+        // received during the crawl's reads are stored during them — the
+        // reads run on a crawl thread — and are marked by the landing.)
         // Microseconds: at second resolution a webhook received just after
         // the crawl landed would look received before it.
         let landed_at: Option<i64> = self
