@@ -781,7 +781,7 @@ pub(crate) fn crawl_events(input: &CrawlInput<'_>) -> CrawlOutcome {
     // Everything predecessor-shaped that the ledgers do not account for. A
     // comment restating the very edge its PR's ledger holds is accounted
     // for; anything else on that PR is a change the bot never recorded.
-    let authors: HashMap<PrNumber, u64> = all_prs.iter().map(|p| (p.number, p.author_id)).collect();
+    let by_number: HashMap<PrNumber, &PrData> = all_prs.iter().map(|p| (p.number, *p)).collect();
     for (pr, pr_comments) in comments {
         let believed = edges
             .iter()
@@ -804,15 +804,28 @@ pub(crate) fn crawl_events(input: &CrawlInput<'_>) -> CrawlOutcome {
                     .get(pr)
                     .is_some_and(|through| comment.id <= *through && !comment.edited.is_edited());
             // And only a comment the live path COULD have accepted is
-            // evidence at all. Authorship is the one gate that needs no
-            // history — the comment carries its author and the PR carries
-            // its own — so a stranger's declaration, which live refuses,
-            // does not abort a recovered train. An EDITED body stays
-            // evidence: the API reports only the original author, never
-            // the editor, so it cannot be cleared this way and the
-            // conservative reading stands.
+            // evidence at all — judged by gates that need no history and
+            // cannot have changed since. An UNEDITED comment's author is
+            // its author — the PR carries its own — so a stranger's
+            // declaration, which live refuses, does not abort a recovered
+            // train; and an unedited PR is never its own predecessor (its
+            // number is fixed for life). Nothing else is safe to infer.
+            // The source's BASE BRANCH looks like a gate (live refuses a
+            // declaration whose base is not the target's head) but it is
+            // mutable — a declaration accepted against one base, then the
+            // base put back, would read as refused and let recovery resume
+            // a train live had aborted over it (Codex review of #89, P1).
+            // An EDITED body is not the author's word and its target is
+            // not what live judged: an accepted declaration edited into a
+            // self-reference after the fact would clear the same way
+            // (Codex review of #89, round 2, P1). Edited bodies stay
+            // evidence, the conservative reading.
             let could_have_been_accepted = comment.edited.is_edited()
-                || (comment.author_id != 0 && authors.get(pr) == Some(&comment.author_id));
+                || (target != *pr
+                    && comment.author_id != 0
+                    && by_number
+                        .get(pr)
+                        .is_some_and(|p| p.author_id == comment.author_id));
             if !accounted_for && could_have_been_accepted {
                 unledgered.push((*pr, target));
             }
@@ -1426,6 +1439,20 @@ mod tests {
             "and the unledgered declaration into its stack aborts the train"
         );
         assert!(outcome.recovered_roots.is_empty());
+        // The abort tells the user WHAT changed, not only that something
+        // did: the declaration the train did not know, by PR and target.
+        let message = outcome
+            .events
+            .iter()
+            .find_map(|e| match e {
+                StateEventPayload::TrainAborted { error, .. } => Some(error.message.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            message.contains("PR #3 declares #2 as its predecessor"),
+            "the abort names the declaration: {message}"
+        );
     }
 
     /// Onboarding: a repository with no trace of the bot has never had a
@@ -2151,6 +2178,278 @@ mod tests {
             ]),
             (vec![PrNumber(1)], false),
             "ledgered: the next freeze picks it up"
+        );
+    }
+
+    /// A predecessor-shaped comment is extension evidence only if the live
+    /// path COULD have accepted it, judged by what cannot have changed
+    /// since: its author, and that a PR is not its own predecessor — in
+    /// an UNEDITED body, an edit changing both what the words say and
+    /// whose they are. Live
+    /// refused a self-declaration when it was made and told the user so; a
+    /// DB loss with nothing else changed must not abort the train over it
+    /// (the lost_db differential harness's finding, once idle trains were
+    /// checked against what they own). A declaration off the target's
+    /// branch is NOT cleared the same way: the base can be put back after
+    /// live accepted it (see the retarget test below), so it stays
+    /// evidence and aborts — the documented refused-junk residual.
+    #[test]
+    fn a_declaration_live_would_have_refused_is_no_extension_evidence() {
+        let ts = test_now();
+        let record = train(PrNumber(1), ts);
+        let run = |crawled: Vec<PrData>, mut comments: Vec<(PrNumber, Vec<CommentData>)>| {
+            comments.insert(
+                0,
+                (
+                    PrNumber(1),
+                    vec![comment(
+                        50,
+                        BOT,
+                        &format_status_comment(&record, "s").unwrap(),
+                    )],
+                ),
+            );
+            let outcome = crawl_events(&CrawlInput {
+                default_branch: "main",
+                crawled_prs: &crawled,
+                comments: &comments,
+                bot_name: "merge-train",
+                bot_user_id: BOT,
+                unfetchable: &HashSet::new(),
+                comments_truncated: false,
+                now: ts,
+            });
+            let aborted = outcome
+                .events
+                .iter()
+                .any(|e| matches!(e, StateEventPayload::TrainAborted { .. }));
+            (outcome.recovered_roots, aborted)
+        };
+        let stacked_member = || {
+            (
+                PrNumber(2),
+                vec![
+                    comment(10, AUTHOR, "@merge-train predecessor #1"),
+                    ledger(11, 2, Some((1, 10)), 3),
+                ],
+            )
+        };
+        assert_eq!(
+            run(
+                vec![
+                    pr(1, AUTHOR, PrState::Open),
+                    child(2, AUTHOR, 1, PrState::Open)
+                ],
+                vec![
+                    (
+                        PrNumber(1),
+                        vec![comment(12, AUTHOR, "@merge-train predecessor #1")],
+                    ),
+                    stacked_member(),
+                ],
+            ),
+            (vec![PrNumber(1)], false),
+            "a self-declaration on the root is no extension"
+        );
+        assert_eq!(
+            run(
+                vec![
+                    pr(1, AUTHOR, PrState::Open),
+                    child(2, AUTHOR, 1, PrState::Open),
+                    // #3 targets main, so it is not stacked on #2 whatever
+                    // it says.
+                    pr(3, AUTHOR, PrState::Open),
+                ],
+                vec![
+                    stacked_member(),
+                    (
+                        PrNumber(3),
+                        vec![comment(60, AUTHOR, "@merge-train predecessor #2")],
+                    ),
+                ],
+            ),
+            (vec![], true),
+            "a declaration off the target's branch stays evidence: the base is mutable"
+        );
+        assert_eq!(
+            run(
+                vec![
+                    pr(1, AUTHOR, PrState::Open),
+                    child(2, AUTHOR, 1, PrState::Open),
+                    child(3, AUTHOR, 2, PrState::Open),
+                ],
+                vec![
+                    stacked_member(),
+                    (
+                        PrNumber(3),
+                        vec![comment(60, AUTHOR, "@merge-train predecessor #2")],
+                    ),
+                ],
+            ),
+            (vec![], true),
+            "a declaration live could have accepted still aborts"
+        );
+        assert_eq!(
+            run(
+                vec![
+                    pr(1, AUTHOR, PrState::Open),
+                    child(2, AUTHOR, 1, PrState::Open)
+                ],
+                vec![
+                    stacked_member(),
+                    // #2 declares a PR the crawl never fetched: unknowable.
+                    (
+                        PrNumber(2),
+                        vec![comment(61, AUTHOR, "@merge-train predecessor #9")],
+                    ),
+                ],
+            ),
+            (vec![], true),
+            "a declaration onto an unfetched target stays conservative"
+        );
+    }
+
+    /// The base branch cannot stand in for live's history. A train's root
+    /// #1 is retargeted onto #9 and declares #9: live ACCEPTS that (the
+    /// base matches) and aborts the train — the root is no longer a root.
+    /// The ledger and terminal-status writes fail, the base is put back
+    /// to `main`, and the database is lost. Returns the recovered roots
+    /// for whatever `surviving` says comment 60 looks like at the loss.
+    fn retargeted_root_aborted_then_lost(surviving: CommentData) -> Vec<PrNumber> {
+        use crate::types::{CascadePhase, DescendantProgress, RepoId};
+        use crate::webhooks::events::{CommentAction, GitHubEvent, IssueCommentEvent};
+        use crate::webhooks::handlers::{HandlerCtx, handle_event};
+        let ts = test_now();
+        let mut record = train(PrNumber(1), ts);
+        record.cascade_phase = CascadePhase::Preparing {
+            progress: DescendantProgress::with_known_stack(
+                vec![PrNumber(2)],
+                vec![PrNumber(1), PrNumber(2)],
+            ),
+        };
+        // Train 1 -> 2 existed before the root was retargeted onto PR 9.
+        let mut crawled = vec![
+            child(1, AUTHOR, 9, PrState::Open),
+            child(2, AUTHOR, 1, PrState::Open),
+            pr(9, AUTHOR, PrState::Open),
+        ];
+        let mut events = Vec::new();
+        for p in &crawled {
+            events.extend(cache_fill_events(p.number, p, MergeStateStatus::Unknown));
+        }
+        events.push(StateEventPayload::PredecessorDeclared {
+            pr: PrNumber(2),
+            predecessor: PrNumber(1),
+            comment_id: CommentId(10),
+        });
+        events.push(StateEventPayload::TrainRecordAdopted {
+            root_pr: PrNumber(1),
+            record: record.clone(),
+        });
+        let live = replay_topology("main", &events, ts);
+        let out = handle_event(
+            &GitHubEvent::IssueComment(IssueCommentEvent {
+                repo: RepoId::new("owner", "repo"),
+                action: CommentAction::Created,
+                pr_number: Some(PrNumber(1)),
+                comment_id: CommentId(60),
+                body: "@merge-train predecessor #9".to_owned(),
+                author_id: AUTHOR,
+                author_login: "author".to_owned(),
+                sender_id: AUTHOR,
+                sender_login: "author".to_owned(),
+                pr_author_id: AUTHOR,
+                updated_at: ts,
+            }),
+            &live,
+            &HandlerCtx {
+                bot_user_id: BOT,
+                bot_name: "merge-train".to_owned(),
+                now: ts,
+            },
+        );
+        assert!(
+            out.events.iter().any(|e| matches!(
+                e,
+                StateEventPayload::PredecessorDeclared {
+                    pr: PrNumber(1),
+                    predecessor: PrNumber(9),
+                    ..
+                }
+            )),
+            "the declaration is accepted live: {out:?}"
+        );
+        assert!(
+            out.events.iter().any(|e| matches!(
+                e,
+                StateEventPayload::TrainAborted {
+                    root_pr: PrNumber(1),
+                    ..
+                }
+            )),
+            "the accepted declaration aborts the train live: {out:?}"
+        );
+        // Comment writes failed, leaving the old status and no ledger for
+        // #1. Then the source base is put back, and the DB is lost.
+        crawled[0].base_ref = "main".to_owned();
+        let comments = vec![
+            (
+                PrNumber(1),
+                vec![
+                    comment(50, BOT, &format_status_comment(&record, "s").unwrap()),
+                    surviving,
+                ],
+            ),
+            (
+                PrNumber(2),
+                vec![
+                    comment(10, AUTHOR, "@merge-train predecessor #1"),
+                    ledger(11, 2, Some((1, 10)), 3),
+                ],
+            ),
+        ];
+        let outcome = crawl_events(&CrawlInput {
+            default_branch: "main",
+            crawled_prs: &crawled,
+            comments: &comments,
+            bot_name: "merge-train",
+            bot_user_id: BOT,
+            unfetchable: &HashSet::new(),
+            comments_truncated: false,
+            now: ts,
+        });
+        outcome.recovered_roots
+    }
+
+    /// Now #1's base no longer matches #9's head, so a base-match gate
+    /// would read the accepted declaration as refused, discard the only
+    /// evidence of the abort, and resume the train (Codex review of #89,
+    /// P1). The declaration stays evidence and the train stays aborted.
+    #[test]
+    fn a_base_put_back_after_an_accepted_declaration_does_not_revive_the_train() {
+        assert_eq!(
+            retargeted_root_aborted_then_lost(comment(60, AUTHOR, "@merge-train predecessor #9")),
+            vec![],
+            "must not revive a train aborted by an accepted declaration"
+        );
+    }
+
+    /// The same loss, but the author EDITED the accepted declaration into
+    /// a self-reference before it. A PR number is immutable; an edited
+    /// comment's target is not, so a self-reference gate that read edited
+    /// bodies would clear the only evidence of the abort (Codex review of
+    /// #89, round 2, P1). Edited bodies stay evidence.
+    #[test]
+    fn an_edited_self_declaration_stays_evidence() {
+        assert_eq!(
+            retargeted_root_aborted_then_lost(CommentData {
+                edited: Edited::By {
+                    editor: Some(AUTHOR),
+                },
+                ..comment(60, AUTHOR, "@merge-train predecessor #1")
+            }),
+            vec![],
+            "must not revive a train over an edited self-declaration"
         );
     }
 

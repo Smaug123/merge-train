@@ -152,8 +152,9 @@ pub(crate) enum Abort {
     /// Another record adopted active shares a PR with this one.
     Overlaps(PrNumber),
     /// The stack grew, or moved onto the frontier, or an unledgered
-    /// declaration touches it.
-    Extended,
+    /// declaration touches it: `source` declares `target` as its
+    /// predecessor, and the train did not know it.
+    Extended { source: PrNumber, target: PrNumber },
     /// The current PR or a frozen member no longer has a predecessor of the
     /// train's own.
     Severed,
@@ -197,12 +198,13 @@ impl Abort {
                      so neither resumes — re-issue `@merge-train start` on the one that should."
                 ),
             ),
-            Abort::Extended => TrainError::new(
+            Abort::Extended { source, target } => TrainError::new(
                 TrainErrorKind::PredecessorChanged,
                 format!(
-                    "PR {root}'s stack was extended while its train was interrupted (a new \
-                     predecessor declaration appeared); a merge train cannot safely resume \
-                     over changed topology — re-issue `@merge-train start`."
+                    "PR {root}'s stack was extended while its train was interrupted: PR \
+                     {source} declares {target} as its predecessor, and the train did not know \
+                     it; a merge train cannot safely resume over changed topology — re-issue \
+                     `@merge-train start`."
                 ),
             ),
             Abort::Severed => TrainError::new(
@@ -367,24 +369,29 @@ pub(crate) fn overlapping(live: &[(PrNumber, &Footprint)]) -> HashMap<PrNumber, 
 /// that member outside the walk. Pure reorders within the frozen set are
 /// not extensions: the cascade prepares each frozen descendant against the
 /// current PR, not its live-declared predecessor.
-fn extended(record: &TrainRecord, footprint: &Footprint, present: &Present<'_>) -> bool {
+fn extended(
+    record: &TrainRecord,
+    footprint: &Footprint,
+    present: &Present<'_>,
+) -> Option<(PrNumber, PrNumber)> {
     let watermark = record.watermark.or(record.status_comment_id);
-    present.topology.prs.values().any(|p| {
+    present.topology.prs.values().find_map(|p| {
+        let target = p.predecessor?;
         let moved_onto_frontier = footprint.frontier.as_ref().is_some_and(|frozen| {
             p.number != record.original_root_pr
                 && p.state.is_open()
-                && p.predecessor == Some(record.current_pr)
+                && target == record.current_pr
                 && !frozen.contains(&p.number)
         });
-        moved_onto_frontier
-            || !footprint.core.contains(&p.number)
-                && p.state.is_open()
-                && p.predecessor.is_some_and(|t| footprint.stack.contains(&t))
-                && (footprint.recorded_stack
-                    || match (p.predecessor_comment_id, watermark) {
-                        (Some(declared), Some(mark)) => declared > mark,
-                        _ => true,
-                    })
+        let grew = !footprint.core.contains(&p.number)
+            && p.state.is_open()
+            && footprint.stack.contains(&target)
+            && (footprint.recorded_stack
+                || match (p.predecessor_comment_id, watermark) {
+                    (Some(declared), Some(mark)) => declared > mark,
+                    _ => true,
+                });
+        (moved_onto_frontier || grew).then_some((p.number, target))
     })
 }
 
@@ -395,7 +402,10 @@ fn extended(record: &TrainRecord, footprint: &Footprint, present: &Present<'_>) 
 /// frozen set and would freeze a LEDGERED extension in at its next step;
 /// an unledgered one has no edge installed, so no freeze can pick it up —
 /// its stack is what it owns (Codex trains review, P1).
-fn unledgered_touches(footprint: &Footprint, present: &Present<'_>) -> bool {
+fn unledgered_touches(
+    footprint: &Footprint,
+    present: &Present<'_>,
+) -> Option<(PrNumber, PrNumber)> {
     let stack = if footprint.frontier.is_some() {
         &footprint.stack
     } else {
@@ -404,7 +414,8 @@ fn unledgered_touches(footprint: &Footprint, present: &Present<'_>) -> bool {
     present
         .unledgered
         .iter()
-        .any(|(source, target)| stack.contains(target) || stack.contains(source))
+        .find(|(source, target)| stack.contains(target) || stack.contains(source))
+        .copied()
 }
 
 /// Whether `pr` is the train's own HISTORY: in its core, or a merged PR
@@ -577,8 +588,10 @@ pub(crate) fn judge(
     if let Some(other) = overlaps {
         return Verdict::Abort(Abort::Overlaps(other));
     }
-    if extended(record, footprint, present) || unledgered_touches(footprint, present) {
-        return Verdict::Abort(Abort::Extended);
+    if let Some((source, target)) =
+        extended(record, footprint, present).or_else(|| unledgered_touches(footprint, present))
+    {
+        return Verdict::Abort(Abort::Extended { source, target });
     }
     if severed(record, footprint, present) {
         return Verdict::Abort(Abort::Severed);
