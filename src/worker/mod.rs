@@ -31,6 +31,15 @@
 //! at a time per repo; deliveries keep processing mid-saga (that is how stop
 //! commands and head-moved observations reach the engine), and the engine
 //! work they trigger queues for the saga slot.
+//!
+//! The first-contact crawl — the one O(repository) piece of GitHub work — is
+//! the same shape: its reads run on a spawned **crawl thread** and come back
+//! as [`WorkerMsg::CrawlFinished`], so intake acks continue while a fresh
+//! repository is crawled, and the process-wide intake budget drains at
+//! intake speed however long that takes (CRAWL_OFF_THREAD_PLAN.md). No
+//! delivery is processed meanwhile (`Processor::claim` yields nothing), and
+//! the store stays single-writer: the crawl thread holds a `GitHubExec`
+//! clone and plain data, never the `Store`.
 
 mod adoption;
 pub mod authz;
@@ -59,6 +68,7 @@ use crate::github::OctocrabClient;
 use crate::store::{Store, StoreError};
 use crate::types::{PrNumber, RepoId};
 
+use bootstrap::{CrawlFetch, CrawlRequest};
 use executor::{GitHubExec, SagaBatch, execute_batch};
 use pipeline::Processor;
 
@@ -135,6 +145,21 @@ pub enum WorkerMsg {
     /// was unavailable) is due for another attempt. Carries nothing — waking
     /// the loop clears the stall, and the next turn re-claims.
     RetryStalled,
+    /// A crawl thread finished (or died): the parked first-contact delivery
+    /// resumes on the fetch (see [`dispatch_crawl`]).
+    CrawlFinished(CrawlReport),
+}
+
+/// What a crawl thread reports back, through a guard that reports even
+/// when the thread unwinds.
+pub enum CrawlReport {
+    /// The reads, or that GitHub was unavailable.
+    Finished(CrawlFetch),
+    /// The thread unwound before reporting. Fatal to the worker: the parked
+    /// delivery would otherwise wait for a fetch that never comes, and a
+    /// crawl commits nothing until it lands, so dying here is exactly a
+    /// crash mid-crawl (the store reopens with the trigger requeued).
+    Died,
 }
 
 /// Why routing a delivery to a worker failed (distinct from a successful
@@ -480,12 +505,12 @@ fn run(
                     serviced += 1;
                     stalled = false;
                     match handle_msg(&mut processor, msg, &mut parked) {
-                        Ok(Some(batch)) => {
-                            if !dispatch(&processor, batch, tx.clone()) {
-                                return fatal_spawn();
-                            }
+                        Ok(Handled::Done) => {}
+                        Ok(Handled::Released) => {
+                            stalled = true;
+                            processor.request_retry();
                         }
-                        Ok(None) => {}
+                        Ok(Handled::CrawlDied) => return fatal_crawl(),
                         Err(e) => return fatal(e),
                     }
                 }
@@ -499,7 +524,7 @@ fn run(
             match processor.pump() {
                 Ok(Some(batch)) => {
                     if !dispatch(&processor, batch, tx.clone()) {
-                        return fatal_spawn();
+                        return fatal_spawn("a saga executor");
                     }
                 }
                 Ok(None) => {}
@@ -513,23 +538,21 @@ fn run(
             match processor.claim() {
                 Ok(Some(delivery)) => {
                     processed = true;
-                    let outcome = match processor.process_claimed(delivery) {
-                        // A first-contact crawl: its reads still run on
-                        // this thread (CRAWL_OFF_THREAD_PLAN.md Stage 4
-                        // dispatches them to a crawl thread).
+                    match processor.process_claimed(delivery) {
+                        Ok(PipelineOutcome::Processed) => {}
+                        // A first-contact crawl: its reads run on a crawl
+                        // thread, and the delivery resumes on
+                        // `CrawlFinished`. Nothing is claimed meanwhile
+                        // (`claim` yields nothing while a crawl is out),
+                        // so the loop idles on the mailbox — acking
+                        // intake — until the fetch comes back.
                         Ok(PipelineOutcome::Crawling) => {
                             let request = processor
                                 .take_crawl_request()
                                 .expect("a crawl was just requested");
-                            let fetch = bootstrap::crawl(processor.github(), &request);
-                            processor.on_crawl_finished(fetch)
-                        }
-                        other => other,
-                    };
-                    match outcome {
-                        Ok(PipelineOutcome::Processed) => {}
-                        Ok(PipelineOutcome::Crawling) => {
-                            unreachable!("a finished crawl requests no other")
+                            if !dispatch_crawl(&processor, request, tx.clone()) {
+                                return fatal_spawn("a crawl");
+                            }
                         }
                         Ok(PipelineOutcome::Released) => {
                             // The webhook is already acked, so nothing external
@@ -552,7 +575,7 @@ fn run(
                         match processor.on_outcomes(root, outcomes, feedback) {
                             Ok(Some(batch)) => {
                                 if !dispatch(&processor, batch, tx.clone()) {
-                                    return fatal_spawn();
+                                    return fatal_spawn("a saga executor");
                                 }
                             }
                             Ok(None) => {}
@@ -625,12 +648,12 @@ fn run(
                 Some(msg) => {
                     stalled = false;
                     match handle_msg(&mut processor, msg, &mut parked) {
-                        Ok(Some(batch)) => {
-                            if !dispatch(&processor, batch, tx.clone()) {
-                                return fatal_spawn();
-                            }
+                        Ok(Handled::Done) => {}
+                        Ok(Handled::Released) => {
+                            stalled = true;
+                            processor.request_retry();
                         }
-                        Ok(None) => {}
+                        Ok(Handled::CrawlDied) => return fatal_crawl(),
                         Err(e) => return fatal(e),
                     }
                 }
@@ -678,8 +701,16 @@ fn prune_expired_intake(processor: &mut Processor) -> Result<(), StoreError> {
 /// outcome will ever arrive, so the worker stops (dropping the Store) and
 /// the next delivery respawns it with `processing`→`pending` recovery —
 /// wedging forever is the one unacceptable outcome (Codex M5 round 6).
-fn fatal_spawn() {
-    error!("failed to spawn a saga executor thread; stopping worker (it will respawn and recover)");
+fn fatal_spawn(what: &str) {
+    error!("failed to spawn {what} thread; stopping worker (it will respawn and recover)");
+}
+
+/// The crawl thread died without reporting (a panic in the reads). The
+/// parked delivery would wait for ever; the crawl committed nothing, so
+/// stopping the worker is a crash mid-crawl: the store reopens with the
+/// trigger requeued, and the next crawl starts afresh.
+fn fatal_crawl() {
+    error!("the crawl thread died; stopping worker (it will respawn and re-crawl)");
 }
 
 /// A Store error means we can no longer characterize this repo's state. Stop
@@ -693,12 +724,24 @@ fn fatal(e: StoreError) {
     error!(error = %e, "fatal store error; stopping worker (it will respawn and recover)");
 }
 
+/// What handling a mailbox message asks of the loop.
+enum Handled {
+    /// Nothing further.
+    Done,
+    /// A finished crawl released its delivery (GitHub unavailable, or the
+    /// trigger doubted): stall, and arm the stall-retry timer — nothing
+    /// else wakes a traffic-less repo.
+    Released,
+    /// The crawl thread died without reporting (see [`CrawlReport::Died`]).
+    CrawlDied,
+}
+
 /// Handles one mailbox message.
 fn handle_msg(
     processor: &mut Processor,
     msg: WorkerMsg,
     parked: &mut Option<(PrNumber, Vec<EffectOutcome>, bool)>,
-) -> Result<Option<SagaBatch>, StoreError> {
+) -> Result<Handled, StoreError> {
     match msg {
         // `_permit` is held until this arm returns — i.e. until after the
         // enqueue and the `delivery` body have been consumed — then dropped,
@@ -734,7 +777,7 @@ fn handle_msg(
                 Some(text) => Err(StoreError::Io(std::io::Error::other(format!(
                     "durable enqueue failed: {text}"
                 )))),
-                None => Ok(None),
+                None => Ok(Handled::Done),
             }
         }
         // Outcomes always PARK; the observation boundary runs only once the
@@ -755,15 +798,28 @@ fn handle_msg(
             // Bookkeeping, not an observation: it needs no boundary.
             processor.note_best_effort(&best_effort)?;
             *parked = Some((root, outcomes, feedback));
-            Ok(None)
+            Ok(Handled::Done)
         }
         // Receiving any message clears the stall in `run`. The timer also
         // retries any recovery that parked on GitHub unavailability: the
         // re-queued evaluations pump on the next turn.
         WorkerMsg::RetryStalled => {
             processor.requeue_marked_recoveries()?;
-            Ok(None)
+            Ok(Handled::Done)
         }
+        // The parked first-contact delivery resumes on the fetch. Its
+        // outcomes are the pipeline's: processed (the crawl landed, or the
+        // trigger was stale and closed with it), or released — which must
+        // stall and arm the retry exactly as a released claim does in the
+        // loop's step (3).
+        WorkerMsg::CrawlFinished(CrawlReport::Finished(fetch)) => {
+            match processor.on_crawl_finished(fetch)? {
+                PipelineOutcome::Processed => Ok(Handled::Done),
+                PipelineOutcome::Released => Ok(Handled::Released),
+                PipelineOutcome::Crawling => unreachable!("a finished crawl requests no other"),
+            }
+        }
+        WorkerMsg::CrawlFinished(CrawlReport::Died) => Ok(Handled::CrawlDied),
     }
 }
 
@@ -877,6 +933,55 @@ fn dispatch(processor: &Processor, batch: SagaBatch, tx: mpsc::Sender<WorkerMsg>
                 best_effort: result.best_effort,
                 feedback: batch.feedback,
             });
+        });
+    spawned.is_ok()
+}
+
+/// Hands a first-contact crawl to a fresh crawl thread, which runs the
+/// reads against a `GitHubExec` clone and reports back through the
+/// worker's own mailbox. The thread touches no `Store`: the parked
+/// delivery resumes on the worker thread (`Processor::on_crawl_finished`),
+/// where the crawl's events commit.
+///
+/// The report goes through a guard, so a thread that unwinds still
+/// reports [`CrawlReport::Died`] — the worker must not wait for ever on a
+/// fetch nobody will send. Returns `false` when the thread could not be
+/// spawned: the delivery is already parked and no fetch will arrive, so
+/// the worker must die (the store reopens with the trigger requeued),
+/// exactly as for a failed executor spawn.
+#[must_use]
+fn dispatch_crawl(
+    processor: &Processor,
+    request: CrawlRequest,
+    tx: mpsc::Sender<WorkerMsg>,
+) -> bool {
+    /// Sends `Died` on drop unless a report was sent.
+    struct Report {
+        tx: Option<mpsc::Sender<WorkerMsg>>,
+    }
+    impl Report {
+        fn send(mut self, report: CrawlReport) {
+            if let Some(tx) = self.tx.take() {
+                let _ = tx.blocking_send(WorkerMsg::CrawlFinished(report));
+            }
+        }
+    }
+    impl Drop for Report {
+        fn drop(&mut self) {
+            if let Some(tx) = self.tx.take() {
+                let _ = tx.blocking_send(WorkerMsg::CrawlFinished(CrawlReport::Died));
+            }
+        }
+    }
+
+    let github = processor.github().clone();
+    let settings = processor.git_settings();
+    let spawned = std::thread::Builder::new()
+        .name(format!("crawl-{}-{}", settings.owner, settings.repo))
+        .spawn(move || {
+            let report = Report { tx: Some(tx) };
+            let fetch = bootstrap::crawl(&github, &request);
+            report.send(CrawlReport::Finished(fetch));
         });
     spawned.is_ok()
 }

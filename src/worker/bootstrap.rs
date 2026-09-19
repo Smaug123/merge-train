@@ -77,7 +77,7 @@ use super::pipeline::cache_fill_events;
 /// declarations, and only by pulling it in can its status comment be found
 /// and its train adopted/aborted (Codex crawl review rounds 6–7).
 #[derive(Debug)]
-pub(crate) struct CrawlOutcome {
+pub struct CrawlOutcome {
     pub events: Vec<StateEventPayload>,
     pub recovered_roots: Vec<PrNumber>,
     pub referenced_uncrawled: Vec<PrNumber>,
@@ -183,7 +183,7 @@ fn replay_topology(
 /// and nothing comes from the trigger (the crawl reads the bot's own
 /// records). Plain data, so the reads can run on any thread.
 #[derive(Debug, Clone)]
-pub(crate) struct CrawlRequest {
+pub struct CrawlRequest {
     /// The PRs the wake-up webhook named: fetched individually if the
     /// list endpoints miss them, and listed first.
     pub seed_prs: Vec<PrNumber>,
@@ -195,7 +195,7 @@ pub(crate) struct CrawlRequest {
 
 /// What one crawl fetched, or that it could not.
 #[derive(Debug)]
-pub(crate) enum CrawlFetch {
+pub enum CrawlFetch {
     /// Any failure: the caller releases the delivery, and the repository's
     /// queue pauses at the stall cadence until a crawl succeeds.
     Unavailable,
@@ -208,7 +208,7 @@ pub(crate) enum CrawlFetch {
 /// The trigger's freshness is judged against these by the caller
 /// (`pipeline::judge_trigger`); nothing here is committed yet.
 #[derive(Debug)]
-pub(crate) struct CrawlReads {
+pub struct CrawlReads {
     /// Every PR the crawl fetched: listed open, listed recently merged,
     /// and referenced PRs fetched one by one.
     pub crawled: Vec<PrData>,
@@ -229,7 +229,7 @@ pub(crate) struct CrawlReads {
 /// referenced PRs the fixpoint pulls in — then `crawl_events` on the
 /// lot. Pure over `github`: it touches no store, and the caller commits
 /// (or discards) what comes back.
-pub(crate) fn crawl(github: &GitHubExec, request: &CrawlRequest) -> CrawlFetch {
+pub fn crawl(github: &GitHubExec, request: &CrawlRequest) -> CrawlFetch {
     let seed_prs: &[PrNumber] = &request.seed_prs;
     /// How many days of merged PRs the crawl considers: predecessor
     /// targets and mid-cascade roots older than this are treated as

@@ -373,6 +373,21 @@ covers a delivery received before the landing but stored after it
 - Suite green; Stage 2's model unchanged (the thread adds no
   interleaving the synchronous window did not already express).
 
+**Resolved in implementation**: `handle_msg` now returns a `Handled`
+enum (`Done`, `Released`, `CrawlDied`) instead of `Option<SagaBatch>`
+— no message arm ever produced a batch, so the `Some` path was dead
+and is gone with the change. The crawl types became `pub` because they
+ride the public mailbox variant. The released-crawl oracle is the
+existing `released_delivery_retries_without_new_webhook_traffic`
+(first contact with the fake down is exactly a released crawl), so no
+duplicate test was written; the mutation "drop the retry request on
+`Handled::Released`" fails it. The dying-thread test injects a panic
+inside the fake's listing, which poisons the fake's mutex;
+`GitHubExec`'s fake arm recovers from poison (the knob fires before
+any mutation). All three mutations were checked: inline crawl (the ack
+waits, 30 s timeout), no retry request, no death report (the worker
+outlives its crawl thread, 60 s timeout).
+
 ## Explicitly out of scope (with reasons)
 
 - **The remaining single-effect GitHub calls on the worker thread.**

@@ -111,8 +111,14 @@ impl GitHubExec {
             GitHubExec::Real { client, handle } => handle
                 .block_on(client.interpret(effect))
                 .map_err(|e| classify_github_error(&e)),
+            // A test-injected panic inside `execute` poisons the fake's
+            // mutex; the knob fires before any mutation, so the state is
+            // whole and recovering is sound.
             #[cfg(test)]
-            GitHubExec::Fake(fake) => fake.lock().unwrap().execute(&effect),
+            GitHubExec::Fake(fake) => fake
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .execute(&effect),
         }
     }
 
@@ -123,7 +129,9 @@ impl GitHubExec {
     fn after_effect(&self) {
         #[cfg(test)]
         if let GitHubExec::Fake(fake) = self {
-            fake.lock().unwrap().sync_pr_refs();
+            fake.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .sync_pr_refs();
         }
     }
 }
