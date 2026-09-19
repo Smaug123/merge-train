@@ -314,6 +314,18 @@ knobs on `FakeGitHub`, both deterministic:
   stage the crawl still blocks the worker — the test says nothing
   about acks yet.
 
+**Resolved in implementation**: the plan's premise was wrong in one
+respect — `worker::tests::registry` already drives real workers through
+`WorkerRegistry` with the fake (including the first-contact stall-retry
+test, which polls the fake under a sleep). What was missing was the
+deterministic observation, so this stage adds only the two knobs
+(`FakeGitHub::effect_log`, `FakeGitHub::listing_gate` with `Gate`), a
+`registry_for(&World)` helper so the crawl finds a real stack to list,
+`send_event`, and `effect_until`. The "handled" observation is the
+stack-ledger `PostComment` on the declaring PR, not a reaction: the
+crawl onboards the declaration itself, so the delivery's own handling
+records no second edge.
+
 ## Stage 4: the crawl thread
 
 **Dependencies**: Stages 2 and 3.

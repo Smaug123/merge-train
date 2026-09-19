@@ -101,6 +101,15 @@ pub struct FakeGitHub {
     /// [`CommentListing::Truncated`] — the whole listing is refused, no
     /// partial vector exists to leak.
     pub oversized_prs: std::collections::HashSet<PrNumber>,
+    /// Every effect `execute` receives, sent here BEFORE it is answered:
+    /// a loop-level test waits on the receiver (a channel wait, not a poll
+    /// under a sleep) to know the worker reached a step.
+    pub effect_log: Option<std::sync::mpsc::Sender<GitHubEffect>>,
+    /// While set and closed, `ListComments` BLOCKS until the gate opens —
+    /// with this fake's mutex held, so a test may not lock the fake while
+    /// the gate is closed. Holds a crawl at its listing so a test can
+    /// observe what the worker does meanwhile.
+    pub listing_gate: Option<std::sync::Arc<Gate>>,
     /// `UpdateComment` calls that reached a live comment, so a test can
     /// assert that a satisfied obligation writes nothing further.
     pub comment_updates: u32,
@@ -130,6 +139,32 @@ pub struct FakeGitHub {
     pub update_comment_broken: bool,
 }
 
+/// A gate a fake effect blocks on until a test opens it (see
+/// [`FakeGitHub::listing_gate`]). Opening is idempotent and permanent.
+#[derive(Default)]
+pub struct Gate {
+    open: std::sync::Mutex<bool>,
+    changed: std::sync::Condvar,
+}
+
+impl Gate {
+    pub fn new() -> std::sync::Arc<Gate> {
+        std::sync::Arc::new(Gate::default())
+    }
+
+    pub fn open(&self) {
+        *self.open.lock().unwrap() = true;
+        self.changed.notify_all();
+    }
+
+    fn wait(&self) {
+        let mut open = self.open.lock().unwrap();
+        while !*open {
+            open = self.changed.wait(open).unwrap();
+        }
+    }
+}
+
 impl FakeGitHub {
     pub fn new(config: GitConfig, prs: HashMap<PrNumber, FakePr>) -> FakeGitHub {
         FakeGitHub {
@@ -148,6 +183,8 @@ impl FakeGitHub {
             blocked: std::collections::HashSet::new(),
             hidden_from_listings: std::collections::HashSet::new(),
             oversized_prs: std::collections::HashSet::new(),
+            effect_log: None,
+            listing_gate: None,
             comment_updates: 0,
             stale_listing_ghosts: std::collections::BTreeMap::new(),
             stale_listing_bodies: std::collections::BTreeMap::new(),
@@ -229,6 +266,15 @@ impl FakeGitHub {
     }
 
     pub fn execute(&mut self, effect: &GitHubEffect) -> Result<GitHubResponse, EffectError> {
+        if let Some(log) = &self.effect_log {
+            // A dropped receiver means the test stopped watching.
+            let _ = log.send(effect.clone());
+        }
+        if let Some(gate) = &self.listing_gate
+            && matches!(effect, GitHubEffect::ListComments { .. })
+        {
+            gate.wait();
+        }
         if matches!(effect, GitHubEffect::GetRepoSettings) {
             self.settings_fetches += 1;
         }
