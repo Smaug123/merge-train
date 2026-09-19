@@ -13191,12 +13191,24 @@ mod registry {
         id: &str,
         body: Vec<u8>,
     ) -> Result<EnqueueOutcome, crate::store::StoreError> {
+        send_event(registry, sender, id, "pull_request", body).await
+    }
+
+    /// Hands a delivery to the worker as the webhook handler does — the
+    /// intake permit reserved, the message sent — and awaits its ack.
+    async fn send_event(
+        registry: &WorkerRegistry,
+        sender: &tokio::sync::mpsc::Sender<WorkerMsg>,
+        id: &str,
+        event_type: &str,
+        body: Vec<u8>,
+    ) -> Result<EnqueueOutcome, crate::store::StoreError> {
         let (ack_tx, ack_rx) = oneshot::channel();
         sender
             .send(WorkerMsg::Enqueue {
                 delivery: IntakeDelivery {
                     delivery_id: id.into(),
-                    event_type: "pull_request".into(),
+                    event_type: event_type.into(),
                     headers: "{}".into(),
                     body: body.clone(),
                     received_at: chrono::Utc::now(),
@@ -13207,6 +13219,135 @@ mod registry {
             .await
             .unwrap();
         ack_rx.await.unwrap()
+    }
+
+    // ─── A real worker over a real stack (CRAWL_OFF_THREAD_PLAN.md Stage 3) ───
+
+    /// A registry whose workers share the world's fake GitHub and real
+    /// git repo, so a first-contact crawl finds PRs to list. The store
+    /// lands under the world's state dir at the registry's own layout.
+    fn registry_for(world: &World) -> WorkerRegistry {
+        let deps = crate::worker::SharedDeps {
+            github: crate::worker::GitHubBackend::Fake(world.github.clone()),
+            repos_dir: world.config.base_dir.clone(),
+            commit_identity: world.config.commit_identity.clone(),
+            worktree_max_age: world.config.worktree_max_age,
+            clone_url_base: None,
+            bot_user_id: TEST_BOT_ID,
+            bot_name: "merge-train".to_owned(),
+            stall_retry_delay: std::time::Duration::from_millis(25),
+            poll_interval: std::time::Duration::ZERO,
+        };
+        WorkerRegistry::new(world.state_dir.path(), deps)
+    }
+
+    /// Drains the fake's effect log until an effect satisfies `wanted`,
+    /// returning it. The timeout exists to fail instead of hang; the wait
+    /// itself is the channel's.
+    fn effect_until(
+        log: &std::sync::mpsc::Receiver<GitHubEffect>,
+        wanted: impl Fn(&GitHubEffect) -> bool,
+    ) -> GitHubEffect {
+        loop {
+            let effect = log
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("the worker fell silent before the awaited effect");
+            if wanted(&effect) {
+                return effect;
+            }
+        }
+    }
+
+    /// A first-contact delivery on a fresh repo is crawled and then
+    /// handled by the real worker loop: the log shows the settings fetch,
+    /// the seed PR's listing, and the stack ledger the declaration owes
+    /// (the crawl onboards the declaration itself, so the delivery's
+    /// handling records no second edge and posts no reaction; the ledger
+    /// write is the engine's work after the landing).
+    #[tokio::test]
+    async fn a_first_contact_delivery_is_crawled_end_to_end() {
+        let (world, _heads) = World::linear_stack(2);
+        let (log_tx, log) = std::sync::mpsc::channel();
+        world.github.lock().unwrap().effect_log = Some(log_tx);
+        let registry = registry_for(&world);
+        let sender = registry
+            .sender_for(&world.config.owner, &world.config.repo)
+            .await
+            .unwrap();
+
+        let body = comment_body(
+            &world.config,
+            2,
+            "@merge-train predecessor #1",
+            AUTHOR,
+            "author",
+            41,
+        );
+        world.mirror_comment(&body);
+        assert_eq!(
+            send_event(&registry, &sender, "d1", "issue_comment", body)
+                .await
+                .unwrap(),
+            EnqueueOutcome::Enqueued
+        );
+        effect_until(&log, |e| matches!(e, GitHubEffect::GetRepoSettings));
+        effect_until(
+            &log,
+            |e| matches!(e, GitHubEffect::ListComments { pr } if *pr == PrNumber(2)),
+        );
+        effect_until(
+            &log,
+            |e| matches!(e, GitHubEffect::PostComment { pr, .. } if *pr == PrNumber(2)),
+        );
+    }
+
+    /// The listing gate holds a crawl at its first listing — the log shows
+    /// nothing after it until the gate opens — and the crawl then finishes.
+    /// This is the observation Stage 4's oracle stands on: what the worker
+    /// does WHILE the crawl is held.
+    #[tokio::test]
+    async fn the_gate_holds_the_crawl_at_its_listing() {
+        let (world, _heads) = World::linear_stack(2);
+        let (log_tx, log) = std::sync::mpsc::channel();
+        let gate = crate::github::test_support::Gate::new();
+        {
+            let mut github = world.github.lock().unwrap();
+            github.effect_log = Some(log_tx);
+            github.listing_gate = Some(gate.clone());
+        }
+        let registry = registry_for(&world);
+        let sender = registry
+            .sender_for(&world.config.owner, &world.config.repo)
+            .await
+            .unwrap();
+
+        let body = comment_body(
+            &world.config,
+            2,
+            "@merge-train predecessor #1",
+            AUTHOR,
+            "author",
+            41,
+        );
+        world.mirror_comment(&body);
+        assert_eq!(
+            send_event(&registry, &sender, "d1", "issue_comment", body)
+                .await
+                .unwrap(),
+            EnqueueOutcome::Enqueued
+        );
+        effect_until(&log, |e| matches!(e, GitHubEffect::ListComments { .. }));
+        // Held: the crawl is blocked inside that listing, so nothing can
+        // have been logged since (the gate is a hard block, not a delay).
+        assert!(
+            matches!(log.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+            "the gate holds the crawl at its listing"
+        );
+        gate.open();
+        effect_until(
+            &log,
+            |e| matches!(e, GitHubEffect::PostComment { pr, .. } if *pr == PrNumber(2)),
+        );
     }
 
     #[tokio::test]
