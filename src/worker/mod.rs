@@ -513,8 +513,24 @@ fn run(
             match processor.claim() {
                 Ok(Some(delivery)) => {
                     processed = true;
-                    match processor.process_claimed(delivery) {
+                    let outcome = match processor.process_claimed(delivery) {
+                        // A first-contact crawl: its reads still run on
+                        // this thread (CRAWL_OFF_THREAD_PLAN.md Stage 4
+                        // dispatches them to a crawl thread).
+                        Ok(PipelineOutcome::Crawling) => {
+                            let request = processor
+                                .take_crawl_request()
+                                .expect("a crawl was just requested");
+                            let fetch = bootstrap::crawl(processor.github(), &request);
+                            processor.on_crawl_finished(fetch)
+                        }
+                        other => other,
+                    };
+                    match outcome {
                         Ok(PipelineOutcome::Processed) => {}
+                        Ok(PipelineOutcome::Crawling) => {
+                            unreachable!("a finished crawl requests no other")
+                        }
                         Ok(PipelineOutcome::Released) => {
                             // The webhook is already acked, so nothing external
                             // retries this delivery: ask for our own wake-up

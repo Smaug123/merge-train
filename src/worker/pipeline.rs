@@ -142,10 +142,30 @@ pub struct GitSettings {
 pub enum PipelineOutcome {
     /// The delivery was fully processed and closed.
     Processed,
+    /// A first-contact delivery is PARKED on a crawl: the caller takes the
+    /// request ([`Processor::take_crawl_request`]), runs the reads, and
+    /// brings the fetch back ([`Processor::on_crawl_finished`]). No
+    /// delivery is claimed meanwhile.
+    Crawling,
     /// GitHub was unavailable for a pre-close pipeline step; the delivery was
     /// released back to `pending`. The worker should wait for the next
     /// mailbox message rather than re-claiming in a hot loop.
     Released,
+}
+
+/// A first-contact delivery parked while its crawl's reads run. Everything
+/// the resumption needs is captured here, so the reads need nothing of
+/// the processor — and can run on another thread.
+struct ParkedCrawl {
+    delivery: Delivery,
+    event: GitHubEvent,
+    key: Option<DedupeKey>,
+    freshness: Option<TriggerFreshness>,
+    /// Whether a doubt about this delivery had stood for the stall
+    /// cadence when the crawl was requested.
+    retried: bool,
+    /// The request, until `take_crawl_request` hands it out.
+    request: Option<CrawlRequest>,
 }
 
 /// Engine work waiting for the (single) saga slot.
@@ -296,6 +316,9 @@ pub(crate) struct Processor {
     /// The durable row of the start whose preflight saga is in flight; the
     /// row is deleted when the start is answered (see [`PendingWork::Start`]).
     active_start: Option<(i64, PrNumber)>,
+    /// The first-contact delivery whose crawl is out (see
+    /// [`Self::on_crawl_finished`]); `claim` yields nothing meanwhile.
+    parked_crawl: Option<ParkedCrawl>,
 }
 
 /// How many probes must miss a status comment, at least one stall-retry
@@ -413,6 +436,7 @@ impl Processor {
             repair_write_gen: HashMap::new(),
             startup_evaluates: Some(startup_evaluates),
             active_start: None,
+            parked_crawl: None,
         })
     }
 
@@ -499,6 +523,12 @@ impl Processor {
     /// evaluations plan against current state rather than overtaking the
     /// backlog (Codex M5 round 6, P1).
     pub fn claim(&mut self) -> Result<Option<Delivery>, StoreError> {
+        // A crawl is out: the delivery that requested it holds the head of
+        // the queue, and nothing behind it may run — or trigger a second
+        // crawl on the still-unbootstrapped store — until it lands.
+        if self.crawl_in_flight() {
+            return Ok(None);
+        }
         let claimed = self.store.claim_next_delivery()?;
         if claimed.is_none()
             && let Some(roots) = self.startup_evaluates.take()
@@ -565,93 +595,52 @@ impl Processor {
         // is no longer in the PR's listing — or a `created` one whose
         // comment has since been edited — is a stale redelivery, and
         // handling it would record a body the comment no longer has.
-        let mut crawl_context = delivery.crawled;
+        // The reads run elsewhere — inline on the worker thread until
+        // CRAWL_OFF_THREAD_PLAN.md Stage 4 dispatches them to a crawl
+        // thread — so the delivery PARKS with everything its resumption
+        // needs, and `claim` yields nothing until the fetch comes back.
+        // The doubt's standing is read NOW: judged when the fetch lands,
+        // the crawl's own duration could promote a doubt to a belief.
         if self.store.state().default_branch.is_empty() {
+            assert!(
+                self.parked_crawl.is_none(),
+                "one crawl at a time: claim is gated while one is out"
+            );
             let freshness = TriggerFreshness::of(&event);
             let retried = self.doubt_has_stood(&id);
-            match self.bootstrap_crawl(event.referenced_prs(), freshness.as_ref(), retried) {
-                Bootstrap::Unavailable => return self.release(&id),
-                Bootstrap::Landed {
-                    standing: TriggerStanding::Doubted,
-                    ..
-                } => {
-                    self.doubt(&id);
-                    return self.release(&id);
-                }
-                Bootstrap::Landed { outcome, standing } => {
-                    if standing != TriggerStanding::Current {
-                        if standing == TriggerStanding::Unverifiable
-                            && let Some((pr, _)) = command_in(&event, &self.deps)
-                        {
-                            self.best_effort_github(GitHubEffect::PostComment {
-                                pr,
-                                body: format!(
-                                    "The bot cannot verify this command: PR {pr}'s \
-                                     comments could not be listed within the bot's crawl \
-                                     caps (PR count, pages or body bytes), so the comment \
-                                     cannot be checked against GitHub — operator action \
-                                     likely required."
-                                ),
-                            });
-                        }
-                        // The crawl and the close of the stale delivery
-                        // commit TOGETHER: were the crawl to land alone and
-                        // the process die before the close, the retried
-                        // delivery would find a bootstrapped store, skip
-                        // this check, and be handled after all (Codex crawl
-                        // review round 2, P1).
-                        // The trigger's own suppressed creation may
-                        // transfer ownership too — judged against the
-                        // state the crawl's events produce, and committed
-                        // with them.
-                        let mut events = outcome.events.clone();
-                        let mut preview = self.store.state().clone();
-                        for payload in &events {
-                            preview.apply_event(&crate::persistence::event::StateEvent {
-                                seq: 0,
-                                ts: Utc::now(),
-                                payload: payload.clone(),
-                            });
-                        }
-                        if let Some(t) = restatement_transfer(&preview, &event, &self.deps) {
-                            info!(delivery = %id, event = ?t, "the suppressed trigger takes ownership");
-                            events.push(t);
-                        }
-                        self.store.commit_delivery_closing_crawl(
-                            &id,
-                            &events,
-                            key.as_ref(),
-                            Utc::now(),
-                            &outcome.stale_ledgers,
-                            outcome.topology_incomplete,
-                        )?;
-                        self.after_bootstrap(outcome)?;
-                        info!(delivery = %id, "closed: the trigger is stale against the crawl");
-                        return Ok(PipelineOutcome::Processed);
-                    }
-                    // The crawl's events and the mark on THIS delivery
-                    // commit together: the crawl judged the delivery
-                    // current by reading GitHub, and if that judgement
-                    // does not survive to the close, the retry must not
-                    // act on it (Codex crawl review round 14, P1).
-                    self.store.append_batch_marking(
-                        &outcome.events,
-                        Utc::now(),
-                        Some(&id),
-                        &outcome.stale_ledgers,
-                        outcome.topology_incomplete,
-                    )?;
-                    self.after_bootstrap(outcome)?;
-                    // The trigger is judged against the crawled present
-                    // exactly as a crash-marked delivery is: the founding
-                    // gate below must see it (the crawl may just have
-                    // dropped an uncorroborated ledger edge whose
-                    // retraction still sits unacked behind this very
-                    // delivery).
-                    crawl_context = true;
-                }
-            }
+            let request = CrawlRequest {
+                seed_prs: event.referenced_prs(),
+                bot_name: self.deps.bot_name.clone(),
+                bot_user_id: self.deps.bot_user_id,
+                now: Utc::now(),
+            };
+            self.parked_crawl = Some(ParkedCrawl {
+                delivery,
+                event,
+                key,
+                freshness,
+                retried,
+                request: Some(request),
+            });
+            return Ok(PipelineOutcome::Crawling);
         }
+        let crawl_context = delivery.crawled;
+        self.continue_pipeline(delivery, event, key, crawl_context)
+    }
+
+    /// The pipeline after first contact: the note of a bot-comment change,
+    /// the dedupe check, the crawled-delivery freshness re-check, the
+    /// handler. `crawl_context` is whether the delivery is judged against
+    /// a crawled present — crash-marked, or the trigger of the crawl that
+    /// just landed.
+    fn continue_pipeline(
+        &mut self,
+        delivery: Delivery,
+        event: GitHubEvent,
+        key: Option<DedupeKey>,
+        crawl_context: bool,
+    ) -> Result<PipelineOutcome, StoreError> {
+        let id = delivery.delivery_id.clone();
 
         // A change to one of the bot's own stack-ledger comments is noted
         // BEFORE the duplicate-content check: the note is idempotent (it
@@ -1501,33 +1490,119 @@ impl Processor {
     /// unavailable (any failure: transient, permanent, or a wrong
     /// variant): the caller releases the delivery and the queue pauses at
     /// the stall cadence — there is no safe degraded answer at bootstrap.
-    fn bootstrap_crawl(
-        &self,
-        seed_prs: Vec<PrNumber>,
-        freshness: Option<&TriggerFreshness>,
-        retried: bool,
-    ) -> Bootstrap {
-        let request = CrawlRequest {
-            seed_prs,
-            bot_name: self.deps.bot_name.clone(),
-            bot_user_id: self.deps.bot_user_id,
-            now: Utc::now(),
+    /// The crawl's reads came back: the parked first-contact delivery is
+    /// judged against them and — unless the trigger is doubted, or GitHub
+    /// was unavailable — the crawl's events commit and the delivery
+    /// resumes through the ordinary pipeline in crawl context.
+    pub fn on_crawl_finished(&mut self, fetch: CrawlFetch) -> Result<PipelineOutcome, StoreError> {
+        let parked = self
+            .parked_crawl
+            .take()
+            .expect("a crawl finished that no delivery requested");
+        let ParkedCrawl {
+            delivery,
+            event,
+            key,
+            freshness,
+            retried,
+            request: _,
+        } = parked;
+        let id = delivery.delivery_id.clone();
+        let reads = match fetch {
+            CrawlFetch::Unavailable => return self.release(&id),
+            CrawlFetch::Fetched(reads) => *reads,
         };
-        match super::bootstrap::crawl(&self.deps.github, &request) {
-            CrawlFetch::Unavailable => Bootstrap::Unavailable,
-            CrawlFetch::Fetched(reads) => {
-                let standing = judge_trigger(&reads, freshness, retried);
-                let reads = *reads;
-                // The crawl itself does not depend on the trigger — it
-                // reads the bot's own records — so a stale delivery needs
-                // no re-crawl: the same events stand, and only the
-                // delivery is closed unhandled.
-                Bootstrap::Landed {
-                    outcome: reads.outcome,
-                    standing,
-                }
-            }
+        let standing = judge_trigger(&reads, freshness.as_ref(), retried);
+        if standing == TriggerStanding::Doubted {
+            self.doubt(&id);
+            return self.release(&id);
         }
+        // The crawl itself does not depend on the trigger — it reads the
+        // bot's own records — so a stale delivery needs no re-crawl: the
+        // same events stand, and only the delivery is closed unhandled.
+        let outcome = reads.outcome;
+        if standing != TriggerStanding::Current {
+            if standing == TriggerStanding::Unverifiable
+                && let Some((pr, _)) = command_in(&event, &self.deps)
+            {
+                self.best_effort_github(GitHubEffect::PostComment {
+                    pr,
+                    body: format!(
+                        "The bot cannot verify this command: PR {pr}'s \
+                         comments could not be listed within the bot's crawl \
+                         caps (PR count, pages or body bytes), so the comment \
+                         cannot be checked against GitHub — operator action \
+                         likely required."
+                    ),
+                });
+            }
+            // The crawl and the close of the stale delivery
+            // commit TOGETHER: were the crawl to land alone and
+            // the process die before the close, the retried
+            // delivery would find a bootstrapped store, skip
+            // this check, and be handled after all (Codex crawl
+            // review round 2, P1).
+            // The trigger's own suppressed creation may
+            // transfer ownership too — judged against the
+            // state the crawl's events produce, and committed
+            // with them.
+            let mut events = outcome.events.clone();
+            let mut preview = self.store.state().clone();
+            for payload in &events {
+                preview.apply_event(&crate::persistence::event::StateEvent {
+                    seq: 0,
+                    ts: Utc::now(),
+                    payload: payload.clone(),
+                });
+            }
+            if let Some(t) = restatement_transfer(&preview, &event, &self.deps) {
+                info!(delivery = %id, event = ?t, "the suppressed trigger takes ownership");
+                events.push(t);
+            }
+            self.store.commit_delivery_closing_crawl(
+                &id,
+                &events,
+                key.as_ref(),
+                Utc::now(),
+                &outcome.stale_ledgers,
+                outcome.topology_incomplete,
+            )?;
+            self.after_bootstrap(outcome)?;
+            info!(delivery = %id, "closed: the trigger is stale against the crawl");
+            return Ok(PipelineOutcome::Processed);
+        }
+        // The crawl's events and the mark on THIS delivery
+        // commit together: the crawl judged the delivery
+        // current by reading GitHub, and if that judgement
+        // does not survive to the close, the retry must not
+        // act on it (Codex crawl review round 14, P1).
+        self.store.append_batch_marking(
+            &outcome.events,
+            Utc::now(),
+            Some(&id),
+            &outcome.stale_ledgers,
+            outcome.topology_incomplete,
+        )?;
+        self.after_bootstrap(outcome)?;
+        // The trigger is judged against the crawled present exactly as a
+        // crash-marked delivery is: the founding gate in
+        // `continue_pipeline` must see it (the crawl may just have dropped
+        // an uncorroborated ledger edge whose retraction still sits
+        // unacked behind this very delivery).
+        self.continue_pipeline(delivery, event, key, true)
+    }
+
+    /// The request for the parked crawl, handed out once: the caller runs
+    /// [`super::bootstrap::crawl`] on it — wherever it likes — and brings
+    /// the fetch back through [`Self::on_crawl_finished`].
+    pub fn take_crawl_request(&mut self) -> Option<CrawlRequest> {
+        self.parked_crawl.as_mut().and_then(|p| p.request.take())
+    }
+
+    /// Whether a first-contact delivery is parked on a crawl. No delivery
+    /// is claimed meanwhile ([`Self::claim`]).
+    pub fn crawl_in_flight(&self) -> bool {
+        self.parked_crawl.is_some()
     }
 
     /// What every landed crawl owes, after its events are committed: the
@@ -3672,21 +3747,6 @@ fn command_in(event: &GitHubEvent, deps: &WorkerDeps) -> Option<(PrNumber, Comma
         }
         CommentAction::Deleted => None,
     }
-}
-
-/// What the first-contact crawl decided about the delivery that woke it.
-enum Bootstrap {
-    /// GitHub was unavailable (any failure): release the delivery; the
-    /// repo's queue pauses at the stall cadence.
-    Unavailable,
-    /// The crawl computed its events (not yet committed — the caller
-    /// commits them, atomically with the delivery's close when the trigger
-    /// does not stand: a redelivery the present has overtaken, or one the
-    /// crawl could not verify).
-    Landed {
-        outcome: CrawlOutcome,
-        standing: TriggerStanding,
-    },
 }
 
 /// How the triggering delivery stands against the present the crawl

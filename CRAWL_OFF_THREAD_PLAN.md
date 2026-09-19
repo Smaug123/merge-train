@@ -265,6 +265,19 @@ while the reads happen.
   before review. This is the ∀-form of guarantee 4: the new window is
   not a new judgement.
 
+**Resolved in implementation**: `process_claimed` splits into the
+parking prelude and `continue_pipeline` (the note, the dedupe, the
+crawled re-check, the handler); `on_crawl_finished` is the old
+`Landed` arm followed by `continue_pipeline` in crawl context. The
+parked state is a `ParkedCrawl { delivery, event, key, freshness,
+retried, request }`, so the resumption needs nothing re-derived. The
+worker loop runs `bootstrap::crawl` inline on `Crawling` for now. The
+recovery model's `recovered_after(events, crash, oversized)` became
+`recovered_straddling(events, crash, read_at, oversized)`; the
+oversized property keeps `read_at = len`. The harness helper is
+`process`; the eleven call sites whose receiver was already `&mut
+Processor` pass it through.
+
 ## Stage 3: a loop-level harness (infrastructure)
 
 **Dependencies**: none (parallel with Stages 1–2).
