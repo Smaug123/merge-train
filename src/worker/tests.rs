@@ -23,7 +23,7 @@ use chrono::Utc;
 use crate::github::test_support::{FakeComment, FakeGitHub, FakePr, FakePrState};
 use crate::persistence::StateEventPayload;
 use crate::state::RepoState;
-use crate::store::Store;
+use crate::store::{Delivery, Store};
 use crate::types::{CommentId, PrNumber, Sha};
 
 use super::executor::{GitHubExec, SagaBatch, execute_batch};
@@ -552,6 +552,23 @@ fn run_sagas(processor: &mut Processor) {
     }
 }
 
+/// Runs one claimed delivery through the pipeline, performing a
+/// first-contact crawl INLINE when the processor parks the delivery on
+/// one — what the worker loop does, minus the crawl thread (as `execute`
+/// runs a saga's batch inline, minus the executor thread).
+fn process(processor: &mut Processor, delivery: Delivery) -> PipelineOutcome {
+    match processor.process_claimed(delivery).unwrap() {
+        PipelineOutcome::Crawling => {
+            let request = processor
+                .take_crawl_request()
+                .expect("a parked crawl hands its request out once");
+            let fetch = super::bootstrap::crawl(processor.github(), &request);
+            processor.on_crawl_finished(fetch).unwrap()
+        }
+        outcome => outcome,
+    }
+}
+
 /// Processes every pending delivery, then runs sagas, until quiescent.
 fn drain(processor: &mut Processor) {
     let mut rounds = 0;
@@ -562,7 +579,7 @@ fn drain(processor: &mut Processor) {
         while let Some(delivery) = processor.claim().unwrap() {
             did_work = true;
             assert_eq!(
-                processor.process_claimed(delivery).unwrap(),
+                process(processor, delivery),
                 PipelineOutcome::Processed,
                 "no test in this harness expects a release"
             );
@@ -730,7 +747,7 @@ fn an_owed_sync_is_discharged_before_its_roots_next_start() {
     );
     world.enqueue(&mut processor, "issue_comment", restart);
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
     let first = processor.pump().unwrap().expect("work is queued");
     assert!(
@@ -910,7 +927,7 @@ fn every_owed_incarnation_is_probed_before_the_next_start() {
     );
     world.enqueue(&mut processor, "issue_comment", restart);
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
     // Drive every batch the worker hands back, counting the probes and
     // stopping at the start's preflight (the settings reads).
@@ -1111,7 +1128,7 @@ fn ledger_pending(processor: &mut Processor, pr: u64) -> bool {
 /// one left owed. With no such write on the way, this is `drain`.
 fn drain_crashing_before_ack(world: &World, mut processor: Processor) -> Processor {
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
     let mut next = processor.pump().unwrap();
     let mut steps = 0;
@@ -1168,7 +1185,7 @@ fn drain_interfering_before_ack(
     interference: Interference,
 ) {
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(processor, delivery);
     }
     let mut next = processor.pump().unwrap();
     let mut steps = 0;
@@ -1218,7 +1235,7 @@ fn drain_interfering_before_ack(
             };
             world.enqueue(processor, "issue_comment", hook);
             while let Some(delivery) = processor.claim().unwrap() {
-                processor.process_claimed(delivery).unwrap();
+                process(processor, delivery);
             }
         }
         processor.note_best_effort(&landed.best_effort).unwrap();
@@ -1463,7 +1480,7 @@ fn an_orphaned_ledger_comment_is_adopted_not_duplicated() {
     );
     world.enqueue(&mut processor, "issue_comment", body);
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
     let probe = processor.pump().unwrap().expect("the ledger probe");
     let outcomes = execute(&mut processor, &probe);
@@ -1605,7 +1622,7 @@ fn a_deletion_racing_the_posts_acknowledgement_is_not_discharged_by_it() {
     );
     world.enqueue(&mut processor, "issue_comment", body);
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
     let probe = processor.pump().unwrap().expect("the ledger probe");
     let outcomes = execute(&mut processor, &probe);
@@ -1641,7 +1658,7 @@ fn a_deletion_racing_the_posts_acknowledgement_is_not_discharged_by_it() {
     );
     world.enqueue(&mut processor, "issue_comment", deletion.into_bytes());
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
     // Now the acknowledgement.
     processor.note_best_effort(&landed.best_effort).unwrap();
@@ -1901,7 +1918,7 @@ fn a_ledger_dirtied_mid_write_is_not_cleared_by_it() {
     let remark = comment_body(&world.config, 2, "a remark", AUTHOR, "author", 9001);
     world.enqueue(&mut processor, "issue_comment", remark);
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
     // The store knows the comment, so the write needs no probe first.
     let write = processor.pump().unwrap().expect("the ledger write");
@@ -2585,7 +2602,7 @@ fn a_comment_reforged_after_its_neutralization_lands_is_neutralized_again() {
     let hook = bot_comment_webhook(&world.config, 2, sibling.0, "edited", &forged);
     world.enqueue(&mut processor, "issue_comment", hook);
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
     let batch = processor
         .pump()
@@ -2618,7 +2635,7 @@ fn a_comment_reforged_after_its_neutralization_lands_is_neutralized_again() {
     let hook = bot_comment_webhook(&world.config, 2, sibling.0, "edited", &forged);
     world.enqueue(&mut processor, "issue_comment", hook);
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
     processor.note_best_effort(&landed.best_effort).unwrap();
     assert!(
@@ -2738,7 +2755,7 @@ fn a_status_comment_named_before_its_post_is_recorded_is_never_neutralized() {
     world.enqueue_stack_setup(&mut processor, 1, &heads);
     start_command(&mut world, &mut processor, 1);
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
     // Run the cascade up to and through the batch that POSTS the status
     // comment; in the window before its outcome is observed, the edit
@@ -2778,7 +2795,7 @@ fn a_status_comment_named_before_its_post_is_recorded_is_never_neutralized() {
         let hook = bot_comment_webhook(&world.config, 1, id.0, "edited", &forged);
         world.enqueue(&mut processor, "issue_comment", hook);
         while let Some(delivery) = processor.claim().unwrap() {
-            processor.process_claimed(delivery).unwrap();
+            process(&mut processor, delivery);
         }
         assert_eq!(
             processor
@@ -2838,7 +2855,7 @@ fn an_orphaned_status_comment_is_never_neutralized() {
     // has since restored the comment (the delayed-webhook shape).
     restored_by_bot(&world, live, &before);
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
     assert_eq!(
         processor
@@ -2961,7 +2978,7 @@ fn a_repair_only_sync_keeps_its_discovery_owed_across_a_crash() {
     let hook = bot_comment_webhook(&world.config, 2, named.0, "edited", &forged);
     world.enqueue(&mut processor, "issue_comment", hook);
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
     let batch = processor.pump().unwrap().expect("the sync");
     let interpreter = WorktreeGitInterpreter::new(processor.git_config(), batch.root);
@@ -3196,7 +3213,7 @@ fn a_delayed_first_listing_does_not_make_the_next_one_independent() {
 
     // The first listing: dispatched now, processed a long time later.
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
     let batch = processor.pump().unwrap().expect("the first look");
     world.advance_past_cooldown();
@@ -3232,7 +3249,7 @@ fn repairs_wait_for_an_owed_terminal_sync_whatever_id_it_carries() {
     start_command(&mut world, &mut processor, 1);
     let claim_all = |p: &mut Processor| {
         while let Some(delivery) = p.claim().unwrap() {
-            p.process_claimed(delivery).unwrap();
+            process(p, delivery);
         }
     };
     claim_all(&mut processor);
@@ -3348,7 +3365,7 @@ fn a_forgery_with_the_posts_sequence_number_cannot_claim_its_row() {
     );
     world.enqueue(&mut processor, "issue_comment", body);
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
     // A forgery whose sequence number is exactly what the post will state.
     let seq = processor.store_mut().next_seq().saturating_sub(1);
@@ -3504,7 +3521,7 @@ fn a_404_outcome_does_not_discard_a_repair_re_raised_meanwhile() {
     let hook = bot_comment_webhook(&world.config, 2, sibling.0, "edited", &forged);
     world.enqueue(&mut processor, "issue_comment", hook);
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
     let batch = processor
         .pump()
@@ -3519,7 +3536,7 @@ fn a_404_outcome_does_not_discard_a_repair_re_raised_meanwhile() {
     let hook = bot_comment_webhook(&world.config, 2, sibling.0, "edited", &forged);
     world.enqueue(&mut processor, "issue_comment", hook);
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
     processor.note_best_effort(&landed.best_effort).unwrap();
     assert_eq!(
@@ -4716,7 +4733,7 @@ fn a_failed_terminal_status_update_is_owed_until_it_lands() {
     start_command(&mut world, &mut processor, 1);
     let claim_all = |p: &mut Processor| {
         while let Some(delivery) = p.claim().unwrap() {
-            p.process_claimed(delivery).unwrap();
+            process(p, delivery);
         }
     };
     claim_all(&mut processor);
@@ -4806,7 +4823,7 @@ fn a_failed_completion_status_update_is_owed_until_it_lands() {
     let mut processor = world.processor();
     start_command(&mut world, &mut processor, 1);
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
     // Step until the batch that carries the completion update: effects
     // empty, and the train already gone from the state.
@@ -4872,7 +4889,7 @@ fn an_owed_sync_for_a_deleted_comment_is_cleared_by_the_probe() {
     start_command(&mut world, &mut processor, 1);
     let claim_all = |p: &mut Processor| {
         while let Some(delivery) = p.claim().unwrap() {
-            p.process_claimed(delivery).unwrap();
+            process(p, delivery);
         }
     };
     claim_all(&mut processor);
@@ -4943,7 +4960,7 @@ fn an_owed_update_is_matched_by_comment_not_by_batch_root() {
     start_command(&mut world, &mut processor, 1);
     let claim_all = |p: &mut Processor| {
         while let Some(delivery) = p.claim().unwrap() {
-            p.process_claimed(delivery).unwrap();
+            process(p, delivery);
         }
     };
     claim_all(&mut processor);
@@ -5021,7 +5038,7 @@ fn an_owed_sync_rewrites_a_mangled_comment_at_the_known_id() {
     start_command(&mut world, &mut processor, 1);
     let claim_all = |p: &mut Processor| {
         while let Some(delivery) = p.claim().unwrap() {
-            p.process_claimed(delivery).unwrap();
+            process(p, delivery);
         }
     };
     claim_all(&mut processor);
@@ -5087,7 +5104,7 @@ fn a_comment_posted_before_the_crash_is_synced_by_incarnation() {
     world.enqueue_stack_setup(&mut processor, 1, &heads);
     start_command(&mut world, &mut processor, 1);
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
     // Run until the batch that POSTS the status comment, execute it, and
     // die before observing it: GitHub has the comment, the store does not.
@@ -5167,7 +5184,7 @@ fn train_with_orphaned_status_comment() -> (World, Processor, crate::types::Comm
     world.enqueue_stack_setup(&mut processor, 1, &heads);
     start_command(&mut world, &mut processor, 1);
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
     let mut batch = pump_cascade(&mut processor).expect("the start's preflight");
     loop {
@@ -5310,7 +5327,7 @@ fn a_probe_that_finds_the_terminal_record_clears_without_rewriting() {
     let stop = comment_body(&world.config, 1, "@merge-train stop", AUTHOR, "author", 7);
     world.enqueue(&mut processor, "issue_comment", stop);
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
     let cleanup = pump_cascade(&mut processor).expect("the stop's cleanup batch");
     assert!(
@@ -5403,7 +5420,7 @@ fn a_queued_stop_preempts_an_owed_sync_probe() {
     let remark = comment_body(&world.config, 1, "just a remark", AUTHOR, "author", 8);
     world.enqueue(&mut processor, "issue_comment", remark);
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
     let probe = loop {
         let batch = processor.pump().unwrap().expect("the owed sync's probe");
@@ -5424,7 +5441,7 @@ fn a_queued_stop_preempts_an_owed_sync_probe() {
     let stop = comment_body(&world.config, 1, "@merge-train stop", AUTHOR, "author", 9);
     world.enqueue(&mut processor, "issue_comment", stop);
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
     let outcomes = execute(&mut processor, &probe);
     let next = processor
@@ -5561,7 +5578,7 @@ fn a_rewrite_landing_applies_deferred_aborts_before_queued_starts() {
     let remark = comment_body(&world.config, 1, "just a remark", AUTHOR, "author", 8);
     world.enqueue(&mut processor, "issue_comment", remark);
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
     let probe = loop {
         let batch = processor.pump().unwrap().expect("the owed sync's probe");
@@ -5616,7 +5633,7 @@ fn a_rewrite_landing_applies_deferred_aborts_before_queued_starts() {
         dismissal.into_bytes(),
     );
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
 
     // The rewrite's completion is the boundary where the abort must act.
@@ -5696,7 +5713,7 @@ fn an_abort_at_a_probe_boundary_survives_a_queued_restart() {
     let remark = comment_body(&world.config, 1, "just a remark", AUTHOR, "author", 8);
     world.enqueue(&mut processor, "issue_comment", remark);
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
     let probe = loop {
         let batch = processor.pump().unwrap().expect("the owed sync's probe");
@@ -5739,7 +5756,7 @@ fn an_abort_at_a_probe_boundary_survives_a_queued_restart() {
     let restart = comment_body(&world.config, 1, "@merge-train start", AUTHOR, "author", 9);
     world.enqueue(&mut processor, "issue_comment", restart);
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
 
     // The probe's boundary applies the abort; everything runs to rest.
@@ -5832,7 +5849,7 @@ fn maintainer_stop_is_authorized_via_role_lookup() {
     // *running* train: process deliveries but no sagas yet.
     while let Some(delivery) = processor.claim().unwrap() {
         assert_eq!(
-            processor.process_claimed(delivery).unwrap(),
+            process(&mut processor, delivery),
             PipelineOutcome::Processed
         );
     }
@@ -5924,7 +5941,7 @@ fn permanent_permission_lookup_failure_fails_closed() {
     world.enqueue(&mut processor, "issue_comment", body);
     while let Some(delivery) = processor.claim().unwrap() {
         assert_eq!(
-            processor.process_claimed(delivery).unwrap(),
+            process(&mut processor, delivery),
             PipelineOutcome::Processed,
             "a permanent lookup failure must close the delivery, not release it"
         );
@@ -5953,7 +5970,7 @@ fn failed_start_preflight_answers_the_user_instead_of_vanishing() {
     world.enqueue_stack_setup(&mut processor, 1, &heads);
     start_command(&mut world, &mut processor, 1);
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
     let batch = pump_cascade(&mut processor).expect("start plans preflight");
 
@@ -6005,7 +6022,7 @@ fn stop_mid_saga_takes_effect_at_the_next_observation_boundary() {
     // Process all deliveries; take the FIRST saga batch but do not feed its
     // outcomes back yet — its effects are "in flight".
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
     let batch = pump_cascade(&mut processor).expect("start plans a saga");
     let outcomes = execute(&mut processor, &batch);
@@ -6014,7 +6031,7 @@ fn stop_mid_saga_takes_effect_at_the_next_observation_boundary() {
     let body = comment_body(&world.config, 1, "@merge-train stop", AUTHOR, "author", 66);
     world.enqueue(&mut processor, "issue_comment", body);
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
 
     // At the observation boundary the stop preempts the next plan.
@@ -6068,7 +6085,7 @@ fn stop_during_inflight_squash_records_the_merge_before_stopping() {
     world.enqueue_stack_setup(&mut processor, 1, &heads);
     start_command(&mut world, &mut processor, 1);
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
 
     // Drive batches, pausing at the boundary right after the squash executed
@@ -6099,7 +6116,7 @@ fn stop_during_inflight_squash_records_the_merge_before_stopping() {
     let body = comment_body(&world.config, 1, "@merge-train stop", AUTHOR, "author", 7);
     world.enqueue(&mut processor, "issue_comment", body);
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
 
     // Feed the outcomes back and run everything to quiescence.
@@ -6152,7 +6169,7 @@ fn handler_abort_during_inflight_squash_records_the_merge_first() {
     world.enqueue_stack_setup(&mut processor, 1, &heads);
     start_command(&mut world, &mut processor, 1);
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
 
     // Drive batches, pausing right after the squash executed.
@@ -6196,7 +6213,7 @@ fn handler_abort_during_inflight_squash_records_the_merge_first() {
     );
     world.enqueue(&mut processor, "pull_request_review", body.into_bytes());
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
 
     // Feed the outcomes back and run to quiescence.
@@ -6242,7 +6259,7 @@ fn stop_mid_saga_on_an_existing_train_suppresses_the_continuation() {
     world.enqueue_stack_setup(&mut processor, 2, &heads);
     start_command(&mut world, &mut processor, 1);
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
 
     // Complete the preflight so the train record exists, leaving the next
@@ -6264,7 +6281,7 @@ fn stop_mid_saga_on_an_existing_train_suppresses_the_continuation() {
     let body = comment_body(&world.config, 1, "@merge-train stop", AUTHOR, "author", 8);
     world.enqueue(&mut processor, "issue_comment", body);
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
 
     let mut next = processor
@@ -6314,7 +6331,7 @@ fn acknowledged_stop_survives_a_crash_before_its_boundary() {
     world.enqueue_stack_setup(&mut processor, 2, &heads);
     start_command(&mut world, &mut processor, 1);
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
 
     // Preflight completes (the train now exists); the next batch is in
@@ -6330,7 +6347,7 @@ fn acknowledged_stop_survives_a_crash_before_its_boundary() {
     let body = comment_body(&world.config, 1, "@merge-train stop", AUTHOR, "author", 55);
     world.enqueue(&mut processor, "issue_comment", body);
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
 
     // Crash before the boundary: the saga outcomes and the RAM queue die.
@@ -6381,7 +6398,7 @@ fn acknowledged_start_survives_a_crash_while_queued() {
     }
     start_command(&mut world, &mut processor, 1);
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
 
     // Train 1's preflight occupies the saga slot; start 2 is acked and
@@ -6391,7 +6408,7 @@ fn acknowledged_start_survives_a_crash_while_queued() {
     let body = comment_body(&world.config, 2, "@merge-train start", AUTHOR, "author", 3);
     world.enqueue(&mut processor, "issue_comment", body);
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
 
     // Crash: in-flight outcomes and the RAM queue die.
@@ -6431,7 +6448,7 @@ fn post_restart_stop_cancels_a_reloaded_start() {
     world.enqueue_stack_setup(&mut processor, 2, &heads);
     start_command(&mut world, &mut processor, 1);
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
     // The start is acked and durable but never pumped: crash.
     drop(processor);
@@ -6713,7 +6730,7 @@ fn stop_cancels_a_queued_not_yet_started_start() {
     }
     start_command(&mut world, &mut processor, 1);
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
 
     // Train 1's preflight saga occupies the slot.
@@ -6725,7 +6742,7 @@ fn stop_cancels_a_queued_not_yet_started_start() {
     let body = comment_body(&world.config, 2, "@merge-train stop", AUTHOR, "author", 71);
     world.enqueue(&mut processor, "issue_comment", body);
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
 
     // Feed train 1's outcomes; run everything to quiescence.
@@ -6806,7 +6823,7 @@ fn a_handler_abort_behind_a_queued_start_still_notifies() {
     // Train 1's preflight occupies the saga slot...
     start_command(&mut world, &mut processor, 1);
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
     let batch = processor.pump().unwrap().expect("start 1 plans preflight");
     let outcomes = execute(&mut processor, &batch);
@@ -6836,7 +6853,7 @@ fn a_handler_abort_behind_a_queued_start_still_notifies() {
         dismissal.into_bytes(),
     );
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
 
     // Train 1's outcomes come back; everything runs to rest.
@@ -6894,7 +6911,7 @@ fn start_stop_start_sequence_runs_the_final_start() {
     }
     start_command(&mut world, &mut processor, 1);
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
 
     // Train 1's preflight saga occupies the slot.
@@ -6913,7 +6930,7 @@ fn start_stop_start_sequence_runs_the_final_start() {
         world.enqueue(&mut processor, "issue_comment", body);
     }
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
 
     // Feed train 1's outcomes and run everything to quiescence.
@@ -6949,7 +6966,7 @@ fn saga_outcomes_park_until_the_backlog_drains() {
     world.enqueue_stack_setup(&mut processor, 1, &heads);
     start_command(&mut world, &mut processor, 1);
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
     let batch = pump_cascade(&mut processor).expect("start plans preflight");
     let outcomes = execute(&mut processor, &batch);
@@ -7137,7 +7154,7 @@ fn stop_on_the_root_retires_fanned_out_trains_at_every_boundary() {
     /// `FanOutCompleted` had been integrated (`None` if never).
     fn run(world: &mut World, processor: &mut Processor, stop_at: usize) -> Option<usize> {
         while let Some(delivery) = processor.claim().unwrap() {
-            processor.process_claimed(delivery).unwrap();
+            process(processor, delivery);
         }
         let mut fan_boundary = None;
         let mut boundary = 0;
@@ -7149,7 +7166,7 @@ fn stop_on_the_root_retires_fanned_out_trains_at_every_boundary() {
                 let body = comment_body(&world.config, 1, "@merge-train stop", AUTHOR, "author", 9);
                 world.enqueue(processor, "issue_comment", body);
                 while let Some(delivery) = processor.claim().unwrap() {
-                    processor.process_claimed(delivery).unwrap();
+                    process(processor, delivery);
                 }
             }
             next = processor
@@ -7267,7 +7284,7 @@ fn crash_at_every_pipeline_boundary_loses_nothing() {
             }
             boundary += 1;
             assert_eq!(
-                processor.process_claimed(delivery).unwrap(),
+                process(&mut processor, delivery),
                 PipelineOutcome::Processed
             );
         }
@@ -7316,7 +7333,7 @@ fn run_batches_then_crash(world: &mut World, processor: Processor, depth: usize)
     let mut executed = 0;
     'outer: while executed < depth {
         while let Some(delivery) = processor.claim().unwrap() {
-            processor.process_claimed(delivery).unwrap();
+            process(&mut processor, delivery);
         }
         match processor.pump().unwrap() {
             Some(first) => {
@@ -7541,10 +7558,7 @@ fn recovery_retry_does_not_overtake_the_acked_backlog() {
     world.enqueue(&mut processor, "issue_comment", body);
     assert!(processor.pump().unwrap().is_none(), "nothing owed yet");
     let delivery = processor.claim().unwrap().expect("the stop is queued");
-    assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
-        PipelineOutcome::Released
-    );
+    assert_eq!(process(&mut processor, delivery), PipelineOutcome::Released);
 
     // GitHub returns; the stall-retry timer fires.
     world.github.lock().unwrap().unavailable = false;
@@ -7648,7 +7662,7 @@ fn recovery_refreshes_a_stale_status_comment_before_resuming() {
     world.enqueue_stack_setup(&mut processor, 2, &heads);
     start_command(&mut world, &mut processor, 1);
     while let Some(delivery) = processor.claim().unwrap() {
-        processor.process_claimed(delivery).unwrap();
+        process(&mut processor, delivery);
     }
     // Execute through batch 3 (preflight → status post → refetch), then let
     // boundary 3 plan the Preparing phase: its PhaseTransition (seq bump)
@@ -7998,7 +8012,7 @@ fn a_redelivered_created_webhook_for_a_deleted_comment_is_not_handled() {
     // listing may simply not have caught up yet.
     let delivery = processor.claim().unwrap().expect("the redelivery");
     assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
+        process(&mut processor, delivery),
         PipelineOutcome::Released,
         "an absent trigger is retried once, not believed"
     );
@@ -8305,10 +8319,7 @@ fn a_superseded_edited_redelivery_is_not_handled() {
             // The listed body differs from the payload's: doubted, and
             // stale only once the doubt has stood for the stall cadence.
             let delivery = processor.claim().unwrap().expect("the redelivery");
-            assert_eq!(
-                processor.process_claimed(delivery).unwrap(),
-                PipelineOutcome::Released
-            );
+            assert_eq!(process(&mut processor, delivery), PipelineOutcome::Released);
             world.advance_past_cooldown();
         }
         drain(&mut processor);
@@ -8350,10 +8361,7 @@ fn a_stale_pr_close_redelivered_after_a_db_loss_is_not_handled() {
     let body = pr_closed_body(&world.config, 2, &head, &branch, &base);
     world.enqueue(&mut processor, "pull_request", body);
     let delivery = processor.claim().unwrap().expect("the close");
-    assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
-        PipelineOutcome::Released
-    );
+    assert_eq!(process(&mut processor, delivery), PipelineOutcome::Released);
     world.advance_past_cooldown();
     drain(&mut processor);
     assert!(
@@ -8407,10 +8415,7 @@ fn a_stale_pr_close_redelivered_after_a_db_loss_does_not_abort_the_recovered_tra
     let body = pr_closed_body(&world.config, 2, &head, &branch, &base);
     world.enqueue(&mut processor, "pull_request", body);
     let delivery = processor.claim().unwrap().expect("the close");
-    assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
-        PipelineOutcome::Released
-    );
+    assert_eq!(process(&mut processor, delivery), PipelineOutcome::Released);
     world.advance_past_cooldown();
     drive_to_completion(&mut world, &mut processor);
     assert!(
@@ -8671,7 +8676,7 @@ fn a_synced_stopped_train_is_not_resurrected_by_a_later_db_loss() {
     start_command(&mut world, &mut processor, 1);
     let claim_all = |p: &mut Processor| {
         while let Some(delivery) = p.claim().unwrap() {
-            p.process_claimed(delivery).unwrap();
+            process(p, delivery);
         }
     };
     claim_all(&mut processor);
@@ -9181,10 +9186,7 @@ fn bootstrap_outage_releases_and_retries() {
     let body = pr_opened_body(&world.config, 1, &heads[0], "pr-1", "main");
     world.enqueue(&mut processor, "pull_request", body);
     let delivery = processor.claim().unwrap().expect("queued");
-    assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
-        PipelineOutcome::Released
-    );
+    assert_eq!(process(&mut processor, delivery), PipelineOutcome::Released);
     assert!(processor.state().default_branch.is_empty());
 
     world.github.lock().unwrap().unavailable = false;
@@ -9193,7 +9195,7 @@ fn bootstrap_outage_releases_and_retries() {
         .unwrap()
         .expect("released back to pending");
     assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
+        process(&mut processor, delivery),
         PipelineOutcome::Processed
     );
     assert_eq!(processor.state().default_branch, "main");
@@ -9230,7 +9232,7 @@ fn a_crawled_delivery_released_for_a_transient_failure_is_still_handled() {
     world2.enqueue(&mut processor, "issue_comment", stop);
     let delivery = processor.claim().unwrap().expect("queued");
     assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
+        process(&mut processor, delivery),
         PipelineOutcome::Released,
         "the crawl landed; the role lookup's outage released the delivery"
     );
@@ -9241,7 +9243,7 @@ fn a_crawled_delivery_released_for_a_transient_failure_is_still_handled() {
         .unwrap()
         .expect("released back to pending");
     assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
+        process(&mut processor, delivery),
         PipelineOutcome::Processed
     );
     // A delivery closed unheard records no dedupe key; a handled one does.
@@ -9310,10 +9312,7 @@ fn a_stale_first_contact_trigger_still_owes_the_disbelieved_ledgers() {
     // The listed body differs from the payload's: doubted, and stale only
     // once the doubt has stood for the stall cadence.
     let delivery = processor.claim().unwrap().expect("the trigger");
-    assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
-        PipelineOutcome::Released
-    );
+    assert_eq!(process(&mut processor, delivery), PipelineOutcome::Released);
     world.advance_past_cooldown();
     drain(&mut processor);
     assert_eq!(processor.state().default_branch, "main", "the crawl landed");
@@ -9367,10 +9366,7 @@ fn a_crawled_comment_delivery_is_re_checked_against_github_after_a_restart() {
             // Absent from the listing: doubted first, believed gone once
             // the doubt has stood for the stall cadence.
             let delivery = processor.claim().unwrap().expect("pending");
-            assert_eq!(
-                processor.process_claimed(delivery).unwrap(),
-                PipelineOutcome::Released
-            );
+            assert_eq!(process(&mut processor, delivery), PipelineOutcome::Released);
             world.advance_past_cooldown();
         }
         drain(&mut processor);
@@ -9408,10 +9404,7 @@ fn a_crawled_delivery_withdrawn_before_its_retry_is_not_acted_on() {
     let stop = comment_body(&world2.config, 1, "@merge-train stop", 777, "maintainer", 9);
     world2.enqueue(&mut processor, "issue_comment", stop);
     let delivery = processor.claim().unwrap().expect("queued");
-    assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
-        PipelineOutcome::Released
-    );
+    assert_eq!(process(&mut processor, delivery), PipelineOutcome::Released);
     // Withdrawn before the retry: the comment is deleted.
     {
         let mut github = world2.github.lock().unwrap();
@@ -9424,17 +9417,14 @@ fn a_crawled_delivery_withdrawn_before_its_retry_is_not_acted_on() {
         .claim()
         .unwrap()
         .expect("released back to pending");
-    assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
-        PipelineOutcome::Released
-    );
+    assert_eq!(process(&mut processor, delivery), PipelineOutcome::Released);
     world2.advance_past_cooldown();
     let delivery = processor
         .claim()
         .unwrap()
         .expect("released back to pending");
     assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
+        process(&mut processor, delivery),
         PipelineOutcome::Processed
     );
     assert!(
@@ -9588,7 +9578,7 @@ fn no_ledger_is_touched_before_the_crawl_has_landed() {
     restored_by_bot(&world, ledger_id, &ledger_body);
     let delivery = processor.claim().unwrap().expect("the edit");
     assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
+        process(&mut processor, delivery),
         PipelineOutcome::Released,
         "the crawl could not land"
     );
@@ -9606,10 +9596,7 @@ fn no_ledger_is_touched_before_the_crawl_has_landed() {
     // comment's current bytes are the bot's (its restoration superseded
     // the edit): doubted, then stale — closed unheard, and rightly so.
     let delivery = processor.claim().unwrap().expect("the edit");
-    assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
-        PipelineOutcome::Released
-    );
+    assert_eq!(process(&mut processor, delivery), PipelineOutcome::Released);
     world.advance_past_cooldown();
     drain(&mut processor);
     assert_eq!(processor.state().default_branch, "main", "the crawl landed");
@@ -9675,14 +9662,11 @@ fn a_strangers_deletion_of_the_restatement_is_refused() {
         .remove(&CommentId(701));
     let delivery = processor.claim().unwrap().expect("A");
     assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
+        process(&mut processor, delivery),
         PipelineOutcome::Processed
     );
     let delivery = processor.claim().unwrap().expect("B created");
-    assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
-        PipelineOutcome::Released
-    );
+    assert_eq!(process(&mut processor, delivery), PipelineOutcome::Released);
     world.advance_past_cooldown();
     drain(&mut processor);
     assert_eq!(
@@ -9876,7 +9860,7 @@ fn a_restatement_the_crawl_suppressed_is_retracted_after_the_crawl() {
         // A: the crawl lands, A is fresh and handled.
         let delivery = processor.claim().unwrap().expect("A");
         assert_eq!(
-            processor.process_claimed(delivery).unwrap(),
+            process(&mut processor, delivery),
             PipelineOutcome::Processed
         );
         assert_eq!(
@@ -9886,10 +9870,7 @@ fn a_restatement_the_crawl_suppressed_is_retracted_after_the_crawl() {
         // B's creation: doubted — the comment is gone, or reads otherwise —
         // and stale once the doubt has stood.
         let delivery = processor.claim().unwrap().expect("B created");
-        assert_eq!(
-            processor.process_claimed(delivery).unwrap(),
-            PipelineOutcome::Released
-        );
+        assert_eq!(process(&mut processor, delivery), PipelineOutcome::Released);
         world.advance_past_cooldown();
         drain(&mut processor);
         assert_eq!(
@@ -9969,7 +9950,7 @@ fn a_crawled_command_whose_pr_became_unreadable_is_refused() {
     world.enqueue(&mut processor, "issue_comment", declare);
     let delivery = processor.claim().unwrap().expect("the wake-up");
     assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
+        process(&mut processor, delivery),
         PipelineOutcome::Processed
     );
     assert!(
@@ -9980,7 +9961,7 @@ fn a_crawled_command_whose_pr_became_unreadable_is_refused() {
 
     let delivery = processor.claim().unwrap().expect("the declaration");
     assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
+        process(&mut processor, delivery),
         PipelineOutcome::Processed,
         "refused, not retried for ever"
     );
@@ -10005,7 +9986,7 @@ fn drain_with_cooldowns(world: &World, processor: &mut Processor) {
     while let Some(delivery) = processor.claim().unwrap() {
         rounds += 1;
         assert!(rounds < 50, "drain did not settle");
-        if processor.process_claimed(delivery).unwrap() == PipelineOutcome::Released {
+        if process(processor, delivery) == PipelineOutcome::Released {
             world.advance_past_cooldown();
         }
     }
@@ -10275,7 +10256,7 @@ fn a_suppressed_transfer_on_a_retry_queues_the_ledger_rewrite() {
         .remove(&CommentId(701));
     let delivery = processor.claim().unwrap().expect("the declaration");
     assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
+        process(&mut processor, delivery),
         PipelineOutcome::Processed
     );
     run_sagas(&mut processor);
@@ -10288,7 +10269,7 @@ fn a_suppressed_transfer_on_a_retry_queues_the_ledger_rewrite() {
     );
     let delivery = processor.claim().unwrap().expect("the restatement");
     assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
+        process(&mut processor, delivery),
         PipelineOutcome::Released,
         "absent: doubted"
     );
@@ -10298,7 +10279,7 @@ fn a_suppressed_transfer_on_a_retry_queues_the_ledger_rewrite() {
         .unwrap()
         .expect("the restatement, retried");
     assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
+        process(&mut processor, delivery),
         PipelineOutcome::Processed,
         "still absent: closed, the ownership it would have taken recorded"
     );
@@ -10545,7 +10526,7 @@ fn a_strangers_edit_of_the_restatement_is_refused() {
     world.enqueue(&mut processor, "issue_comment", edit_b);
     let delivery = processor.claim().unwrap().expect("A");
     assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
+        process(&mut processor, delivery),
         PipelineOutcome::Processed
     );
     drain_with_cooldowns(&world, &mut processor);
@@ -10612,7 +10593,7 @@ fn an_edited_away_restatement_in_the_backlog_still_retracts() {
     world.enqueue(&mut processor, "issue_comment", edit_b);
     let delivery = processor.claim().unwrap().expect("A");
     assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
+        process(&mut processor, delivery),
         PipelineOutcome::Processed
     );
     assert_eq!(
@@ -10662,7 +10643,7 @@ fn an_absent_trigger_is_not_believed_gone_within_the_cooldown() {
     for attempt in 0..2 {
         let delivery = processor.claim().unwrap().expect("pending");
         assert_eq!(
-            processor.process_claimed(delivery).unwrap(),
+            process(&mut processor, delivery),
             PipelineOutcome::Released,
             "attempt {attempt}: absence within the cooldown is not yet evidence"
         );
@@ -10670,7 +10651,7 @@ fn an_absent_trigger_is_not_believed_gone_within_the_cooldown() {
     world.advance_past_cooldown();
     let delivery = processor.claim().unwrap().expect("pending");
     assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
+        process(&mut processor, delivery),
         PipelineOutcome::Processed,
         "absent again after the cooldown: closed unheard"
     );
@@ -10715,7 +10696,7 @@ fn a_retraction_edit_the_listing_has_not_caught_up_with_is_retried() {
         .insert(CommentId(777), "@merge-train predecessor #1".to_owned());
     let delivery = processor.claim().unwrap().expect("the edit");
     assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
+        process(&mut processor, delivery),
         PipelineOutcome::Released,
         "a body the listing disagrees with is doubted, not disbelieved"
     );
@@ -10764,17 +10745,14 @@ fn every_delivery_queued_before_the_crawl_landed_is_judged_against_its_present()
     world.enqueue(&mut processor, "pull_request", stale_close);
     let delivery = processor.claim().unwrap().expect("the wake-up");
     assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
+        process(&mut processor, delivery),
         PipelineOutcome::Processed
     );
     assert_eq!(processor.state().default_branch, "main", "the crawl landed");
     // Marked by the crawl, and disagreeing with its snapshot: doubted,
     // and stale only once the doubt has stood for the stall cadence.
     let delivery = processor.claim().unwrap().expect("the close");
-    assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
-        PipelineOutcome::Released
-    );
+    assert_eq!(process(&mut processor, delivery), PipelineOutcome::Released);
     world.advance_past_cooldown();
     drain(&mut processor);
     assert!(
@@ -10827,16 +10805,13 @@ fn a_fresh_snapshot_reconciles_the_cache_even_when_the_delivery_is_stale() {
     // The close triggers the crawl, which seeds #2 and caches it CLOSED.
     let delivery = processor.claim().unwrap().expect("the close");
     assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
+        process(&mut processor, delivery),
         PipelineOutcome::Processed
     );
     assert!(!processor.state().prs[&PrNumber(2)].state.is_open());
     // The reopen, marked by the crawl, disagrees with that snapshot.
     let delivery = processor.claim().unwrap().expect("the reopen");
-    assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
-        PipelineOutcome::Released
-    );
+    assert_eq!(process(&mut processor, delivery), PipelineOutcome::Released);
     // GitHub catches up — and #2 was retargeted onto main meanwhile, so the
     // reopen's payload is stale against the fresh snapshot.
     {
@@ -10877,7 +10852,7 @@ fn a_delivery_received_during_the_crawl_is_judged_against_its_present() {
     world.enqueue(&mut processor, "pull_request", wake);
     let delivery = processor.claim().unwrap().expect("the wake-up");
     assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
+        process(&mut processor, delivery),
         PipelineOutcome::Processed,
         "the crawl landed"
     );
@@ -10902,7 +10877,7 @@ fn a_delivery_received_during_the_crawl_is_judged_against_its_present() {
     let delivery = processor.claim().unwrap().expect("the close");
     assert!(delivery.crawled, "received before the crawl landed: marked");
     assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
+        process(&mut processor, delivery),
         PipelineOutcome::Released,
         "and doubted against the crawled present, not handled"
     );
@@ -10922,7 +10897,7 @@ fn a_first_contact_command_on_an_unfetchable_pr_is_refused_with_an_answer() {
     world.enqueue(&mut processor, "issue_comment", stop);
     let delivery = processor.claim().unwrap().expect("the command");
     assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
+        process(&mut processor, delivery),
         PipelineOutcome::Processed
     );
     assert_eq!(processor.state().default_branch, "main", "the crawl landed");
@@ -10979,11 +10954,11 @@ fn an_edited_payload_is_current_only_if_its_sender_wrote_the_listed_bytes() {
         PipelineOutcome::Released, // the retraction: bytes differ
     ] {
         let delivery = processor.claim().unwrap().expect("queued");
-        assert_eq!(processor.process_claimed(delivery).unwrap(), expected);
+        assert_eq!(process(&mut processor, delivery), expected);
         world.advance_past_cooldown();
         let delivery = processor.claim().unwrap().expect("doubted, retried");
         assert_eq!(
-            processor.process_claimed(delivery).unwrap(),
+            process(&mut processor, delivery),
             PipelineOutcome::Processed,
             "still disagreeing after the cadence: closed unheard"
         );
@@ -11163,7 +11138,7 @@ fn a_crawled_delivery_closed_as_stale_dedupes_its_redelivery() {
     let mut processor = world.processor();
     let delivery = processor.claim().unwrap().expect("pending");
     assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
+        process(&mut processor, delivery),
         PipelineOutcome::Released,
         "absent: doubted"
     );
@@ -11231,7 +11206,7 @@ fn a_duplicate_crawled_delivery_is_deduped_before_its_freshness_is_doubted() {
     let delivery = processor.claim().unwrap().expect("the first copy");
     assert_eq!(delivery.delivery_id, first.delivery_id);
     assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
+        process(&mut processor, delivery),
         PipelineOutcome::Released,
         "absent: doubted"
     );
@@ -11239,14 +11214,14 @@ fn a_duplicate_crawled_delivery_is_deduped_before_its_freshness_is_doubted() {
     let delivery = processor.claim().unwrap().expect("the first copy, retried");
     assert_eq!(delivery.delivery_id, first.delivery_id);
     assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
+        process(&mut processor, delivery),
         PipelineOutcome::Processed,
         "still absent after the cadence: closed"
     );
     let delivery = processor.claim().unwrap().expect("the second copy");
     assert_eq!(delivery.delivery_id, second.delivery_id);
     assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
+        process(&mut processor, delivery),
         PipelineOutcome::Processed,
         "a duplicate of a closed delivery: discarded at once, not doubted"
     );
@@ -11309,7 +11284,7 @@ fn a_deleted_restatement_still_retracts_the_edge_it_would_have_owned() {
     // A: fresh, handled. B's creation: absent — doubted, then stale.
     let delivery = processor.claim().unwrap().expect("A");
     assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
+        process(&mut processor, delivery),
         PipelineOutcome::Processed
     );
     assert_eq!(
@@ -11317,10 +11292,7 @@ fn a_deleted_restatement_still_retracts_the_edge_it_would_have_owned() {
         Some(PrNumber(1))
     );
     let delivery = processor.claim().unwrap().expect("B created");
-    assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
-        PipelineOutcome::Released
-    );
+    assert_eq!(process(&mut processor, delivery), PipelineOutcome::Released);
     world.advance_past_cooldown();
     drain(&mut processor);
     assert_eq!(
@@ -11388,16 +11360,13 @@ fn a_close_the_crawl_listing_lagged_behind_is_handled_after_the_cooldown() {
         // The crawl lands for the wake-up, with #2 listed OPEN.
         let delivery = processor.claim().unwrap().expect("the wake-up");
         assert_eq!(
-            processor.process_claimed(delivery).unwrap(),
+            process(&mut processor, delivery),
             PipelineOutcome::Processed
         );
         assert!(processor.state().prs[&PrNumber(2)].state.is_open());
         // The close disagrees with that snapshot: doubted, not disbelieved.
         let delivery = processor.claim().unwrap().expect("the close");
-        assert_eq!(
-            processor.process_claimed(delivery).unwrap(),
-            PipelineOutcome::Released
-        );
+        assert_eq!(process(&mut processor, delivery), PipelineOutcome::Released);
         if github_catches_up {
             world
                 .github
@@ -11457,22 +11426,19 @@ fn a_crawled_pull_request_delivery_whose_pr_vanished_is_closed_not_retried_for_e
     // The crawl lands for the wake-up, with #2 listed OPEN.
     let delivery = processor.claim().unwrap().expect("the wake-up");
     assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
+        process(&mut processor, delivery),
         PipelineOutcome::Processed
     );
     // The close disagrees with that snapshot: doubted.
     let delivery = processor.claim().unwrap().expect("the close");
-    assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
-        PipelineOutcome::Released
-    );
+    assert_eq!(process(&mut processor, delivery), PipelineOutcome::Released);
     // Then the PR is gone from GitHub: fetching it 404s, permanently.
     world.github.lock().unwrap().prs.remove(&PrNumber(2));
     world.advance_past_cooldown();
     let delivery = processor.claim().unwrap().expect("the close, retried");
     assert_eq!(delivery.event_type, "pull_request");
     assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
+        process(&mut processor, delivery),
         PipelineOutcome::Processed,
         "unverifiable for good: closed, not released for ever"
     );
@@ -11482,7 +11448,7 @@ fn a_crawled_pull_request_delivery_whose_pr_vanished_is_closed_not_retried_for_e
     );
     let delivery = processor.claim().unwrap().expect("the delivery behind it");
     assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
+        process(&mut processor, delivery),
         PipelineOutcome::Processed,
         "the queue moved on"
     );
@@ -11537,7 +11503,7 @@ fn a_record_adopted_after_the_crawl_is_judged_like_one_the_crawl_read() {
     world.enqueue(&mut processor, "pull_request", wake);
     let delivery = processor.claim().unwrap().expect("the wake-up");
     assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
+        process(&mut processor, delivery),
         PipelineOutcome::Processed
     );
     assert!(
@@ -11702,7 +11668,7 @@ fn a_completion_found_after_the_crawl_gets_its_final_word_and_clears_its_marker(
     world.enqueue(&mut processor, "issue_comment", wake);
     let delivery = processor.claim().unwrap().expect("the wake-up");
     assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
+        process(&mut processor, delivery),
         PipelineOutcome::Processed
     );
     // The listing catches up with the live record, which names #2 — merged.
@@ -11780,7 +11746,7 @@ fn a_newer_incarnation_seen_after_the_crawl_supersedes_the_resumed_train() {
     world.enqueue(&mut processor, "issue_comment", wake);
     let delivery = processor.claim().unwrap().expect("the wake-up");
     assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
+        process(&mut processor, delivery),
         PipelineOutcome::Processed
     );
     assert!(
@@ -11873,7 +11839,7 @@ fn a_bar_with_no_trusted_record_left_still_bars() {
     world.enqueue(&mut processor, "issue_comment", wake);
     let delivery = processor.claim().unwrap().expect("the wake-up");
     assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
+        process(&mut processor, delivery),
         PipelineOutcome::Processed
     );
     assert!(
@@ -12373,7 +12339,7 @@ fn a_live_replacement_resumes_with_restart_cleanup() {
     world.enqueue(&mut processor, "issue_comment", wake);
     let delivery = processor.claim().unwrap().expect("the wake-up");
     assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
+        process(&mut processor, delivery),
         PipelineOutcome::Processed
     );
     // The listing catches up with the live record, ahead of the idle one.
@@ -12395,7 +12361,7 @@ fn a_live_replacement_resumes_with_restart_cleanup() {
     world.enqueue(&mut processor, "check_suite", nudge);
     while let Some(delivery) = processor.claim().unwrap() {
         assert_eq!(
-            processor.process_claimed(delivery).unwrap(),
+            process(&mut processor, delivery),
             PipelineOutcome::Processed
         );
     }
@@ -12556,14 +12522,11 @@ fn a_transient_listing_failure_at_first_contact_still_releases() {
     let body = pr_opened_body(&world.config, 1, &heads[0], "pr-1", "main");
     world.enqueue(&mut processor, "pull_request", body);
     let delivery = processor.claim().unwrap().expect("queued");
-    assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
-        PipelineOutcome::Released
-    );
+    assert_eq!(process(&mut processor, delivery), PipelineOutcome::Released);
     world.github.lock().unwrap().list_comments_broken = false;
     let delivery = processor.claim().unwrap().expect("released back");
     assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
+        process(&mut processor, delivery),
         PipelineOutcome::Processed
     );
     assert!(
@@ -12598,7 +12561,7 @@ fn a_crawled_delivery_on_an_oversized_pr_is_refused_with_the_caps_named() {
     world2.enqueue(&mut processor, "issue_comment", stop);
     let delivery = processor.claim().unwrap().expect("queued");
     assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
+        process(&mut processor, delivery),
         PipelineOutcome::Released,
         "the crawl landed; the role lookup's outage released the delivery"
     );
@@ -12609,7 +12572,7 @@ fn a_crawled_delivery_on_an_oversized_pr_is_refused_with_the_caps_named() {
     }
     let delivery = processor.claim().unwrap().expect("released back");
     assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
+        process(&mut processor, delivery),
         PipelineOutcome::Processed,
         "refused for good, not released for ever"
     );
@@ -12660,7 +12623,7 @@ fn a_first_contact_command_on_an_oversized_pr_is_answered_not_discarded() {
     world.enqueue(&mut processor, "issue_comment", stop);
     let delivery = processor.claim().unwrap().expect("queued");
     assert_eq!(
-        processor.process_claimed(delivery).unwrap(),
+        process(&mut processor, delivery),
         PipelineOutcome::Processed,
         "refused in one attempt: an over-cap listing is not a doubt"
     );
@@ -12683,6 +12646,213 @@ fn a_first_contact_command_on_an_oversized_pr_is_answered_not_discarded() {
             .any(|(pr, text)| *pr == PrNumber(1) && text.contains("cap")),
         "the refusal names the caps"
     );
+}
+
+// ─── The parked crawl (CRAWL_OFF_THREAD_PLAN.md Stage 2) ───
+
+/// While a first-contact delivery is parked on its crawl, nothing behind
+/// it is claimed: a second delivery would otherwise run against an
+/// unbootstrapped store, or trigger a second crawl. The request is
+/// handed out once, and the deliveries waiting when the crawl lands are
+/// marked crawled by the landing.
+#[test]
+fn claim_yields_nothing_while_a_crawl_is_parked() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    enqueue_pr_opens(&mut world, &mut processor, 2, &heads);
+    drain(&mut processor);
+    drop(processor);
+    destroy_state_db(&world);
+
+    let mut processor = world.processor();
+    let remark = comment_body(&world.config, 2, "just a remark", STRANGER, "stranger", 41);
+    world.enqueue(&mut processor, "issue_comment", remark);
+    let declaration = comment_body(
+        &world.config,
+        2,
+        "@merge-train predecessor #1",
+        AUTHOR,
+        "author",
+        42,
+    );
+    world.enqueue(&mut processor, "issue_comment", declaration);
+
+    let trigger = processor.claim().unwrap().expect("the remark");
+    assert_eq!(
+        processor.process_claimed(trigger).unwrap(),
+        PipelineOutcome::Crawling
+    );
+    assert!(processor.crawl_in_flight());
+    assert!(
+        processor.claim().unwrap().is_none(),
+        "nothing is claimed while the crawl is out"
+    );
+    let request = processor.take_crawl_request().expect("the request");
+    assert!(
+        processor.take_crawl_request().is_none(),
+        "the request is handed out once"
+    );
+    let fetch = super::bootstrap::crawl(processor.github(), &request);
+    assert_eq!(
+        processor.on_crawl_finished(fetch).unwrap(),
+        PipelineOutcome::Processed
+    );
+    assert!(!processor.crawl_in_flight());
+    assert_eq!(processor.state().default_branch, "main", "the crawl landed");
+    let next = processor
+        .claim()
+        .unwrap()
+        .expect("the declaration, once the crawl landed");
+    assert!(next.crawled, "marked by the landing");
+    assert_eq!(process(&mut processor, next), PipelineOutcome::Processed);
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor,
+        Some(PrNumber(1))
+    );
+}
+
+/// A comment delivery stored BETWEEN the crawl's reads and its landing —
+/// the window a crawl off the intake thread opens — is marked crawled by
+/// the landing and judged against the present, as a crash-marked delivery
+/// is: re-checked on GitHub, and handled when its comment is still there.
+#[test]
+fn a_comment_stored_during_the_crawl_is_judged_against_its_present() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    enqueue_pr_opens(&mut world, &mut processor, 2, &heads);
+    drain(&mut processor);
+    drop(processor);
+    destroy_state_db(&world);
+
+    let mut processor = world.processor();
+    let remark = comment_body(&world.config, 2, "just a remark", STRANGER, "stranger", 41);
+    world.enqueue(&mut processor, "issue_comment", remark);
+    let trigger = processor.claim().unwrap().expect("the remark");
+    assert_eq!(
+        processor.process_claimed(trigger).unwrap(),
+        PipelineOutcome::Crawling
+    );
+    let request = processor.take_crawl_request().expect("the request");
+    let fetch = super::bootstrap::crawl(processor.github(), &request);
+    // After the reads, before the landing: the author declares.
+    let declaration = comment_body(
+        &world.config,
+        2,
+        "@merge-train predecessor #1",
+        AUTHOR,
+        "author",
+        42,
+    );
+    world.enqueue(&mut processor, "issue_comment", declaration);
+    assert_eq!(
+        processor.on_crawl_finished(fetch).unwrap(),
+        PipelineOutcome::Processed
+    );
+    let next = processor.claim().unwrap().expect("the declaration");
+    assert!(
+        next.crawled,
+        "stored during the crawl: marked by the landing"
+    );
+    assert_eq!(process(&mut processor, next), PipelineOutcome::Processed);
+    assert_eq!(
+        processor.state().prs[&PrNumber(2)].predecessor,
+        Some(PrNumber(1)),
+        "listed on GitHub at the re-check: handled"
+    );
+}
+
+/// A pull-request delivery stored between the reads and the landing is
+/// judged against the crawled snapshot: an unmerged `closed` for a PR the
+/// crawl found open is doubted, then stale once the doubt has stood — the
+/// PR stays open in the store.
+#[test]
+fn a_pr_event_stored_during_the_crawl_is_judged_against_its_present() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    enqueue_pr_opens(&mut world, &mut processor, 2, &heads);
+    drain(&mut processor);
+    drop(processor);
+    destroy_state_db(&world);
+
+    let mut processor = world.processor();
+    let remark = comment_body(&world.config, 2, "just a remark", STRANGER, "stranger", 41);
+    world.enqueue(&mut processor, "issue_comment", remark);
+    let trigger = processor.claim().unwrap().expect("the remark");
+    assert_eq!(
+        processor.process_claimed(trigger).unwrap(),
+        PipelineOutcome::Crawling
+    );
+    let request = processor.take_crawl_request().expect("the request");
+    let fetch = super::bootstrap::crawl(processor.github(), &request);
+    // After the reads, before the landing: an old `closed` redelivered
+    // for a PR that is open on GitHub.
+    let closed = pr_closed_body(&world.config, 2, &heads[1], "pr-2", "pr-1");
+    world.enqueue(&mut processor, "pull_request", closed);
+    assert_eq!(
+        processor.on_crawl_finished(fetch).unwrap(),
+        PipelineOutcome::Processed
+    );
+    let next = processor.claim().unwrap().expect("the close");
+    assert!(
+        next.crawled,
+        "stored during the crawl: marked by the landing"
+    );
+    assert_eq!(
+        process(&mut processor, next),
+        PipelineOutcome::Released,
+        "disagrees with the crawled snapshot: doubted"
+    );
+    world.advance_past_cooldown();
+    drain_with_cooldowns(&world, &mut processor);
+    assert!(
+        processor.state().prs[&PrNumber(2)].state.is_open(),
+        "the stale close did not close the PR the crawl found open"
+    );
+    assert!(processor.claim().unwrap().is_none(), "the close is closed");
+}
+
+/// A crawl whose fetch never comes back — the process died with it out —
+/// is exactly a crash mid-crawl: nothing was committed, the trigger is
+/// requeued when the store reopens, and the next crawl lands.
+#[test]
+fn a_crawl_whose_result_is_lost_is_a_crash_mid_crawl() {
+    let (mut world, heads) = World::linear_stack(2);
+    let mut processor = world.processor();
+    enqueue_pr_opens(&mut world, &mut processor, 2, &heads);
+    drain(&mut processor);
+    drop(processor);
+    destroy_state_db(&world);
+
+    let mut processor = world.processor();
+    let remark = comment_body(&world.config, 2, "just a remark", STRANGER, "stranger", 41);
+    world.enqueue(&mut processor, "issue_comment", remark);
+    let trigger = processor.claim().unwrap().expect("the remark");
+    assert_eq!(
+        processor.process_claimed(trigger).unwrap(),
+        PipelineOutcome::Crawling
+    );
+    let request = processor.take_crawl_request().expect("the request");
+    // The reads happen; their result is lost with the process.
+    let _fetch = super::bootstrap::crawl(processor.github(), &request);
+    drop(processor);
+
+    let mut processor = world.processor();
+    assert!(
+        processor.state().default_branch.is_empty(),
+        "nothing committed before the landing"
+    );
+    let again = processor
+        .claim()
+        .unwrap()
+        .expect("the trigger, requeued on reopen");
+    assert!(!again.crawled, "no crawl landed for it");
+    assert_eq!(process(&mut processor, again), PipelineOutcome::Processed);
+    assert_eq!(
+        processor.state().default_branch,
+        "main",
+        "the next crawl landed"
+    );
+    assert!(processor.claim().unwrap().is_none());
 }
 
 /// Supplementary recovery on a root whose listing is truncated PARKS at
@@ -12821,7 +12991,7 @@ fn a_truncated_sync_probe_keeps_the_terminal_update_owed() {
     start_command(&mut world, &mut processor, 1);
     let claim_all = |p: &mut Processor| {
         while let Some(delivery) = p.claim().unwrap() {
-            p.process_claimed(delivery).unwrap();
+            process(p, delivery);
         }
     };
     claim_all(&mut processor);
@@ -13515,7 +13685,7 @@ mod interleaving {
                 Step::ProcessOne => {
                     if let Some(delivery) = self.processor().claim().unwrap() {
                         assert_eq!(
-                            self.processor().process_claimed(delivery).unwrap(),
+                            process(self.processor(), delivery),
                             PipelineOutcome::Processed,
                             "the fake is up; nothing may release"
                         );
@@ -13608,7 +13778,7 @@ mod interleaving {
                         progressed = true;
                     }
                     while let Some(delivery) = self.processor().claim().unwrap() {
-                        self.processor().process_claimed(delivery).unwrap();
+                        process(self.processor(), delivery);
                         progressed = true;
                     }
                     if self.held.is_none()
@@ -14228,13 +14398,21 @@ mod recovery_model {
             );
         }
     }
-    /// The history split at `crash`: everything before it processed live —
-    /// the ledger writes it owes landed — the database lost, and the rest
-    /// unacked in the backlog when the crawl runs. A remark of a stranger's
-    /// wakes the crawl in case nothing was left in the backlog.
-    fn recovered_after(
+    /// The history split twice. `[0, crash)` is processed live — the
+    /// ledger writes it owes landed — then the database is lost. The rest
+    /// is unacked when the crawl runs: `[crash, read_at)` is in the backlog
+    /// BEFORE the crawl reads GitHub (a stranger's remark wakes the crawl
+    /// when that range is empty), and `[read_at, len)` is stored between
+    /// the reads and the landing — the window a crawl off the intake
+    /// thread opens (CRAWL_OFF_THREAD_PLAN.md): those deliveries describe
+    /// changes the crawled present may not hold, and are judged against
+    /// it as crash-marked deliveries are. `read_at == len` is the plain
+    /// crash-index model. With `oversized`, PR 2's listing is over the
+    /// caps when the crawl runs.
+    fn recovered_straddling(
         events: &[Event],
         crash: usize,
+        read_at: usize,
         oversized: bool,
     ) -> (Option<PrNumber>, Option<usize>) {
         let (mut world, heads) = World::linear_stack(2);
@@ -14259,7 +14437,7 @@ mod recovery_model {
                 .insert(PrNumber(2));
         }
         let mut processor = world.processor();
-        for event in &events[crash..] {
+        for event in &events[crash..read_at] {
             let body = payload(&world, &mut created, event);
             world.enqueue(&mut processor, "issue_comment", body);
         }
@@ -14279,6 +14457,24 @@ mod recovery_model {
                 "created",
             ),
         );
+        // The first backlog delivery parks on the crawl; the reads happen;
+        // the rest of the history lands in the store before the fetch
+        // comes back.
+        let trigger = processor.claim().unwrap().expect("the backlog");
+        assert_eq!(
+            processor.process_claimed(trigger).unwrap(),
+            PipelineOutcome::Crawling,
+            "a fresh store crawls"
+        );
+        let request = processor.take_crawl_request().expect("the request");
+        let fetch = super::super::bootstrap::crawl(processor.github(), &request);
+        for event in &events[read_at..] {
+            let body = payload(&world, &mut created, event);
+            world.enqueue(&mut processor, "issue_comment", body);
+        }
+        if processor.on_crawl_finished(fetch).unwrap() == PipelineOutcome::Released {
+            world.advance_past_cooldown();
+        }
         drain_with_cooldowns(&world, &mut processor);
         assert_eq!(processor.state().default_branch, "main", "the crawl landed");
         if oversized {
@@ -14296,16 +14492,19 @@ mod recovery_model {
             .. ProptestConfig::default()
         })]
 
-        /// With the ledger: the crash may fall anywhere in the history.
+        /// With the ledger: the crash may fall anywhere in the history, and
+        /// the crawl's reads anywhere after it.
         #[test]
-        fn recovery_from_any_crash_point_reaches_what_live_processing_reached(
+        fn recovery_from_any_crash_and_read_point_reaches_what_live_processing_reached(
             choices in proptest::collection::vec(arb_choice(), 1..=8),
             crash_at in 0usize..=8,
+            read_offset in 0usize..=8,
         ) {
             let events = history(&choices);
             let crash = crash_at.min(events.len());
+            let read_at = (crash + read_offset).min(events.len());
             let expected = live(&events, false);
-            let actual = recovered_after(&events, crash, false);
+            let actual = recovered_straddling(&events, crash, read_at, false);
             let live_owner_unattributable =
                 expected.1.is_some_and(|owner| !authors_own_declaration(&events, owner));
             let deviation_permitted = live_owner_unattributable
@@ -14314,7 +14513,8 @@ mod recovery_model {
                         && actual.1.is_some_and(|owner| authors_declaration(&events, owner))));
             prop_assert!(
                 actual == expected || deviation_permitted,
-                "recovered {actual:?}, live {expected:?}; crash at {crash}; history: {events:#?}"
+                "recovered {actual:?}, live {expected:?}; crash at {crash}, read at {read_at}; \
+                 history: {events:#?}"
             );
         }
     }
@@ -14347,7 +14547,7 @@ mod recovery_model {
                 events
             );
             prop_assert_eq!(
-                recovered_after(&events, crash, true),
+                recovered_straddling(&events, crash, events.len(), true),
                 (None, None),
                 "recovery granted an edge nobody could verify; crash at {}; history: {:#?}",
                 crash,
