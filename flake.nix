@@ -80,6 +80,7 @@
             pkgs.codex
             pkgs.alejandra
             pkgs.shellcheck
+            pkgs.cargo-mutants
           ]
           ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
             pkgs.bubblewrap
