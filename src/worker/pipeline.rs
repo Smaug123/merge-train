@@ -575,8 +575,22 @@ impl Processor {
                     self.doubt(&id);
                     return self.release(&id);
                 }
-                Bootstrap::Landed { outcome, stale } => {
-                    if stale {
+                Bootstrap::Landed { outcome, standing } => {
+                    if standing != TriggerStanding::Current {
+                        if standing == TriggerStanding::Unverifiable
+                            && let Some((pr, _)) = command_in(&event, &self.deps)
+                        {
+                            self.best_effort_github(GitHubEffect::PostComment {
+                                pr,
+                                body: format!(
+                                    "The bot cannot verify this command: PR {pr}'s \
+                                     comments could not be listed within the bot's crawl \
+                                     caps (PR count, pages or body bytes), so the comment \
+                                     cannot be checked against GitHub — operator action \
+                                     likely required."
+                                ),
+                            });
+                        }
                         // The crawl and the close of the stale delivery
                         // commit TOGETHER: were the crawl to land alone and
                         // the process die before the close, the retried
@@ -1576,6 +1590,14 @@ impl Processor {
         // ledger, or a whole train member, may then be missing from the
         // crawl, and no train can be recovered from a partial read.
         let mut comments_truncated = false;
+        // PRs whose listing was ATTEMPTED and refused (over the page or
+        // body-byte cap). `listed` alone cannot say so: it counts every
+        // attempt against the listings cap, refused or not, so a trigger
+        // on one of these would look merely absent from its listing and
+        // be doubted — released, re-crawled whole, and closed as stale
+        // with no answer, although the PR cannot shrink on a retry
+        // (Codex bounded-listings review on #80, P2).
+        let mut unread: HashSet<PrNumber> = HashSet::new();
         let mut pending: Vec<PrNumber> = seed_prs
             .iter()
             .copied()
@@ -1653,6 +1675,7 @@ impl Processor {
                              likely required"
                         );
                         comments_truncated = true;
+                        unread.insert(pr);
                     }
                     Ok(other) => {
                         error!(?other, "bootstrap fetch answered the wrong variant");
@@ -1704,7 +1727,7 @@ impl Processor {
         // otherwise close — and abort the recovered train of — a PR the
         // crawl just cached as open (Codex crawl review round 2, P1s). The
         // crawl itself stands either way; only the delivery is stale.
-        let stale = match &freshness {
+        let standing = match &freshness {
             Some(TriggerFreshness::Comment {
                 pr,
                 id: trigger_id,
@@ -1726,7 +1749,7 @@ impl Processor {
                     // only if it still disagrees after the stall cadence.
                     Some(c) if c.body != *body || !written_by_the_sender(c, *sender) => {
                         if retried {
-                            true
+                            TriggerStanding::Stale
                         } else {
                             info!(
                                 %pr, comment = %trigger_id,
@@ -1736,7 +1759,7 @@ impl Processor {
                             return Ok(Bootstrap::TriggerDoubted);
                         }
                     }
-                    Some(_) => false,
+                    Some(_) => TriggerStanding::Current,
                     // ABSENT. GitHub is not read-after-write consistent, so
                     // a just-created comment can be missing from a listing
                     // taken moments later — absence alone is not proof the
@@ -1755,21 +1778,24 @@ impl Processor {
                     // command on an unfetchable PR with an answer, as it
                     // would after bootstrap (Codex first-contact review,
                     // P2).
-                    None if unfetchable.contains(pr) => false,
-                    None if !listed.contains(pr) => {
-                        // The cap bit before this PR's comments were read,
-                        // so the trigger cannot be verified at all. Seeds
-                        // are listed first, so reaching this means the
-                        // repository is past what the bot supports;
+                    None if unfetchable.contains(pr) => TriggerStanding::Current,
+                    None if !listed.contains(pr) || unread.contains(pr) => {
+                        // The PR's comments were never read: the listings
+                        // cap bit before this PR (seeds are listed first,
+                        // so the repository is past what the bot supports),
+                        // or its own listing exceeded the page or body-byte
+                        // cap. The trigger cannot be verified at all, and
                         // executing an unverifiable command after a DB
                         // loss is the one thing recovery must not do
-                        // (Codex crawl review round 10, P1).
+                        // (Codex crawl review round 10, P1). Not a doubt
+                        // either: no retry can read what the caps refuse,
+                        // so the delivery is refused now, with an answer.
                         error!(
                             %pr, comment = %trigger_id,
                             "the triggering PR's comments were never listed; refusing to \
                              act on a delivery the crawl cannot verify"
                         );
-                        true
+                        TriggerStanding::Unverifiable
                     }
                     None if !retried => {
                         info!(
@@ -1779,7 +1805,7 @@ impl Processor {
                         );
                         return Ok(Bootstrap::TriggerDoubted);
                     }
-                    None => true,
+                    None => TriggerStanding::Stale,
                 }
             }
             Some(pr_trigger @ TriggerFreshness::PullRequest { pr, .. }) => {
@@ -1799,14 +1825,18 @@ impl Processor {
                     );
                     return Ok(Bootstrap::TriggerDoubted);
                 }
-                disagrees
+                if disagrees {
+                    TriggerStanding::Stale
+                } else {
+                    TriggerStanding::Current
+                }
             }
-            None => false,
+            None => TriggerStanding::Current,
         };
         // The crawl itself does not depend on the trigger — it reads the
         // bot's own records — so a stale delivery needs no re-crawl: the
         // same events stand, and only the delivery is closed unhandled.
-        Ok(Bootstrap::Landed { outcome, stale })
+        Ok(Bootstrap::Landed { outcome, standing })
     }
 
     /// What every landed crawl owes, after its events are committed: the
@@ -3964,8 +3994,28 @@ enum Bootstrap {
     TriggerDoubted,
     /// The crawl computed its events (not yet committed — the caller
     /// commits them, atomically with the delivery's close when the trigger
-    /// is `stale`: a redelivery the present has overtaken).
-    Landed { outcome: CrawlOutcome, stale: bool },
+    /// does not stand: a redelivery the present has overtaken, or one the
+    /// crawl could not verify).
+    Landed {
+        outcome: CrawlOutcome,
+        standing: TriggerStanding,
+    },
+}
+
+/// How the triggering delivery stands against the present the crawl
+/// fetched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TriggerStanding {
+    /// Current: handled against the crawled present.
+    Current,
+    /// A redelivery the present has overtaken: closed unhandled.
+    Stale,
+    /// The crawl could not read the trigger's PR — its comments were
+    /// never listed (the listings cap) or its listing was refused (the
+    /// page or body-byte cap) — and no retry can. Closed unhandled, and a
+    /// COMMAND is answered with the caps named, as the crawled-delivery
+    /// re-check answers one.
+    Unverifiable,
 }
 
 /// The facts a first-contact trigger asserts about the present, checked
