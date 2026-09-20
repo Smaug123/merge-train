@@ -21,3 +21,4 @@ cc 1366ba16b279be740105a305fe99546388f5cb2bbf94f4f26156068879b21281 # shrinks to
 cc 093ea46b860296003f1a3d381a84d7bfb7129f3a150edadc15d89ba92d85401f # shrinks to choices = [Choice { kind: 0, which: 0, body: 0, by_author: false }, Choice { kind: 0, which: 0, body: 0, by_author: false }, Choice { kind: 1, which: 1, body: 0, by_author: true }, Choice { kind: 1, which: 1, body: 0, by_author: false }]
 cc 93531d274ad0e2fa05d0b6ce212ae0da77dfcc090ee3025a2ed5bdbb9bf4e78b # shrinks to choices = [Choice { kind: 0, which: 0, body: 0, by_author: true }, Choice { kind: 0, which: 0, body: 0, by_author: false }, Choice { kind: 1, which: 1, body: 0, by_author: true }, Choice { kind: 1, which: 1, body: 2, by_author: true }]
 cc 25cd0f887b2ef423ce8ca235fcf48cbe082d42c98c2e9e0871ecf6e79979c5aa
+cc bd00b7bd724a88b7818fba4a2de286b29066d93251ad0ec55d7f9354c18af429

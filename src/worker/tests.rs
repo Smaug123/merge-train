@@ -14627,6 +14627,61 @@ mod recovery_model {
         );
     }
 
+    /// A declaration the author retracts and then restores by editing the
+    /// SAME comment. Live settles that comment when it retracts, and a
+    /// later edit of an already-settled comment founds nothing — so live
+    /// ends with no edge. Recovery reads the comment's present body, sees
+    /// a declaration by the PR's author, and founds the edge live refused.
+    ///
+    /// Found by `recovery_reaches_what_live_processing_reached` (seed
+    /// `bd00b7bd724a88b7818fba4a2de286b29066d93251ad0ec55d7f9354c18af429`)
+    /// and reduced to this history. Pre-existing: it reproduces on
+    /// 7d53568, before the state-endpoint and train-cap work.
+    #[test]
+    fn recovery_founds_no_edge_from_a_declaration_live_had_settled() {
+        let events = vec![
+            Event::Create {
+                k: 0,
+                by: Actor::Stranger,
+                body: DECLARE_1,
+            },
+            Event::Create {
+                k: 1,
+                by: Actor::Author,
+                body: DECLARE_1,
+            },
+            Event::Edit {
+                k: 1,
+                by: Actor::Author,
+                from: DECLARE_1,
+                to: DECLARE_1,
+            },
+            Event::Edit {
+                k: 1,
+                by: Actor::Author,
+                from: DECLARE_1,
+                to: PROSE,
+            },
+            Event::Edit {
+                k: 1,
+                by: Actor::Author,
+                from: PROSE,
+                to: DECLARE_1,
+            },
+        ];
+        assert_eq!(
+            live(&events, false),
+            (None, None),
+            "live settles the comment when it retracts, and founds nothing from \
+             a later edit of it"
+        );
+        assert_eq!(
+            recovered(&events),
+            (None, None),
+            "recovery must not found an edge live had already settled away"
+        );
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig {
             cases: 48,
