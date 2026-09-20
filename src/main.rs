@@ -3,9 +3,11 @@
 //! This binary runs the HTTP server that accepts GitHub webhooks and
 //! drives the merge train state machine.
 
+use std::env::VarError;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use merge_train::cascade::TrainSizeCap;
 use merge_train::git::CommitIdentity;
 use merge_train::server::{AppState, InvalidStateToken, StateAuth, StateToken, build_router};
 use merge_train::worker::{GitHubBackend, SharedDeps};
@@ -40,6 +42,9 @@ struct Config {
     /// How often each worker re-evaluates its active trains as a fallback
     /// for missed webhooks. Zero disables polling.
     poll_interval: std::time::Duration,
+
+    /// The largest train `@merge-train start` will accept.
+    max_train_size: TrainSizeCap,
 
     /// Overrides for the git commit identity (defaults derive from the bot's
     /// GitHub identity at startup).
@@ -105,6 +110,37 @@ fn state_auth_from(value: Option<String>) -> Result<StateAuth, &'static str> {
     }
 }
 
+/// The largest train `@merge-train start` will accept, from
+/// `MERGE_TRAIN_MAX_STACK_SIZE`. Default [`TrainSizeCap::DEFAULT`].
+///
+/// Unlike [`poll_interval_from`], a malformed value is refused rather than
+/// defaulted. The poll interval is a performance knob, where carrying on at
+/// the default is harmless; this one decides which `@merge-train start`
+/// commands the bot accepts, so an operator who mistypes it must be told
+/// rather than left believing in a limit that is not in force.
+///
+/// It therefore takes the whole [`VarError`], not an `Option`: `.ok()` maps
+/// [`VarError::NotUnicode`] to `None`, which would file a value the operator
+/// did set — bytes that are not UTF-8 — under "unset" and silently pick the
+/// default. That is exactly the silent defaulting this function exists to
+/// refuse (Codex review, P3).
+fn max_train_size_from(value: Result<String, VarError>) -> Result<TrainSizeCap, String> {
+    let raw = match value {
+        Ok(raw) => raw,
+        Err(VarError::NotPresent) => return Ok(TrainSizeCap::DEFAULT),
+        Err(VarError::NotUnicode(bytes)) => {
+            return Err(format!(
+                "MERGE_TRAIN_MAX_STACK_SIZE is not valid UTF-8: {bytes:?}"
+            ));
+        }
+    };
+    let requested: usize = raw
+        .trim()
+        .parse()
+        .map_err(|_| format!("MERGE_TRAIN_MAX_STACK_SIZE is not a whole number of PRs: {raw:?}"))?;
+    TrainSizeCap::new(requested).map_err(|e| format!("MERGE_TRAIN_MAX_STACK_SIZE: {e}"))
+}
+
 /// Validates the GitHub token read from the environment. Required: the worker
 /// executes real API effects (squash merges!) — there is no unauthenticated
 /// mode.
@@ -119,9 +155,10 @@ fn github_token_from(value: Option<String>) -> Result<String, &'static str> {
 impl Config {
     /// Loads configuration from environment variables.
     ///
-    /// `LISTEN_ADDR`, `STATE_DIR`, and `REPOS_DIR` have defaults;
-    /// `WEBHOOK_SECRET` and `GITHUB_TOKEN` are required.
-    fn from_env() -> Result<Self, &'static str> {
+    /// `LISTEN_ADDR`, `STATE_DIR`, `REPOS_DIR`,
+    /// `MERGE_TRAIN_POLL_INTERVAL_MINS` and `MERGE_TRAIN_MAX_STACK_SIZE`
+    /// have defaults; `WEBHOOK_SECRET` and `GITHUB_TOKEN` are required.
+    fn from_env() -> Result<Self, String> {
         let listen_addr = std::env::var("LISTEN_ADDR")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -149,6 +186,8 @@ impl Config {
         let poll_interval =
             poll_interval_from(std::env::var("MERGE_TRAIN_POLL_INTERVAL_MINS").ok())?;
 
+        let max_train_size = max_train_size_from(std::env::var("MERGE_TRAIN_MAX_STACK_SIZE"))?;
+
         Ok(Config {
             listen_addr,
             state_dir,
@@ -157,6 +196,7 @@ impl Config {
             state_auth,
             github_token,
             poll_interval,
+            max_train_size,
             git_user_name: std::env::var("GIT_USER_NAME").ok(),
             git_user_email: std::env::var("GIT_USER_EMAIL").ok(),
             git_signing_key: std::env::var("GIT_SIGNING_KEY").ok(),
@@ -239,6 +279,7 @@ async fn main() {
         bot = %identity.login,
         bot_user_id = identity.user_id,
         state_api,
+        max_train_size = config.max_train_size.get(),
         "Starting merge train bot"
     );
 
@@ -269,6 +310,7 @@ async fn main() {
         bot_name: identity.login,
         stall_retry_delay: std::time::Duration::from_secs(30),
         poll_interval: config.poll_interval,
+        max_train_size: config.max_train_size,
     };
 
     // Create application state
@@ -370,6 +412,73 @@ mod tests {
 
         let already = PathBuf::from("/var/lib/merge-train/repos");
         assert_eq!(absolutize(already.clone()), already);
+    }
+
+    /// The environment as the parser sees it: a value that is set.
+    fn set(value: &str) -> Result<String, VarError> {
+        Ok(value.to_owned())
+    }
+
+    #[test]
+    fn an_unset_train_cap_is_the_default() {
+        assert_eq!(
+            max_train_size_from(Err(VarError::NotPresent)).unwrap(),
+            TrainSizeCap::DEFAULT
+        );
+    }
+
+    /// A value that is set but is not UTF-8 is a value the operator chose,
+    /// not an absent one. `std::env::var(..).ok()` would file it under
+    /// "unset" and silently pick the default, which is the silent
+    /// defaulting this parser refuses (Codex review, P3).
+    #[test]
+    fn a_non_unicode_train_cap_is_refused_not_defaulted() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let not_utf8 = OsString::from_vec(vec![b'7', 0xff]);
+        let refusal = max_train_size_from(Err(VarError::NotUnicode(not_utf8)))
+            .expect_err("non-UTF-8 must be refused, not defaulted");
+        assert!(
+            refusal.contains("MERGE_TRAIN_MAX_STACK_SIZE"),
+            "the refusal must name the variable, got: {refusal}"
+        );
+    }
+
+    #[test]
+    fn a_configured_train_cap_is_honoured() {
+        assert_eq!(max_train_size_from(set("120")).unwrap().get(), 120);
+        // Surrounding whitespace is a transcription artefact, not a typo.
+        assert_eq!(max_train_size_from(set(" 7 ")).unwrap().get(), 7);
+    }
+
+    #[test]
+    fn a_malformed_train_cap_is_refused_not_defaulted() {
+        for bad in ["fifty", "", "12x", "-1", "1.5"] {
+            assert!(
+                max_train_size_from(set(bad)).is_err(),
+                "expected {bad:?} to be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unusable_train_cap_is_refused() {
+        // Zero would refuse every train; above the ceiling the status
+        // comment could not hold the train.
+        assert!(max_train_size_from(set("0")).is_err());
+        assert!(
+            max_train_size_from(set(
+                &(merge_train::status::MAX_SUPPORTED_TRAIN_SIZE + 1).to_string()
+            ))
+            .is_err()
+        );
+        assert!(
+            max_train_size_from(set(
+                &merge_train::status::MAX_SUPPORTED_TRAIN_SIZE.to_string()
+            ))
+            .is_ok()
+        );
     }
 
     #[test]

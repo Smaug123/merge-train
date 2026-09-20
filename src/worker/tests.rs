@@ -338,6 +338,7 @@ impl World {
             bot_name: "merge-train".to_owned(),
             stall_retry_delay: STALL_RETRY_DELAY,
             poll_interval: std::time::Duration::ZERO,
+            max_train_size: crate::cascade::TrainSizeCap::DEFAULT,
             clock: super::pipeline::Clock::Manual(self.clock.clone()),
         }
     }
@@ -13237,6 +13238,7 @@ mod registry {
             bot_name: "merge-train".to_owned(),
             stall_retry_delay: std::time::Duration::from_millis(25),
             poll_interval: std::time::Duration::ZERO,
+            max_train_size: crate::cascade::TrainSizeCap::DEFAULT,
         };
         WorkerRegistry::new(world.state_dir.path(), deps)
     }

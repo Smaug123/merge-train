@@ -21,6 +21,9 @@ pub mod format;
 pub mod ledger;
 pub mod parse;
 
-pub use format::{GITHUB_COMMENT_SIZE_LIMIT, format_status_comment, truncate_for_size_limit};
+pub use format::{
+    GITHUB_COMMENT_SIZE_LIMIT, MAX_SUPPORTED_TRAIN_SIZE, format_status_comment,
+    truncate_for_size_limit,
+};
 pub use ledger::{Declaration, StackLedger, format_stack_ledger, parse_stack_ledger};
 pub use parse::{ParseError, parse_status_comment};
