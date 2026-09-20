@@ -30,10 +30,12 @@ use thiserror::Error;
 
 use crate::worker::WorkerRegistry;
 
+pub mod auth;
 pub mod health;
 pub mod state;
 pub mod webhook;
 
+pub use auth::{InvalidStateToken, StateAuth, StateToken, parse_bearer};
 pub use health::health_handler;
 pub use state::state_handler;
 pub use webhook::webhook_handler;
@@ -86,8 +88,9 @@ pub fn validate_path_component(s: &str) -> Result<(), InvalidPathComponent> {
 ///
 /// Passed to every handler via Axum's `State` extractor. It owns the
 /// [`WorkerRegistry`] (the per-repo workers the webhook handler routes
-/// deliveries to) and the webhook signing secret. The async server never
-/// touches a `Store` directly — only the workers do (plan P1-H).
+/// deliveries to), the webhook signing secret, and the state endpoint's
+/// authorization config. The async server never touches a `Store` directly
+/// — only the workers do (plan P1-H).
 #[derive(Clone)]
 pub struct AppState {
     inner: Arc<AppStateInner>,
@@ -99,6 +102,9 @@ struct AppStateInner {
 
     /// Webhook secret for HMAC-SHA256 signature verification.
     webhook_secret: Vec<u8>,
+
+    /// How the state-inspection endpoint authorizes its callers.
+    state_auth: StateAuth,
 }
 
 impl AppState {
@@ -110,15 +116,19 @@ impl AppState {
     /// * `webhook_secret` - Secret for verifying webhook signatures
     /// * `deps` - Process-wide worker dependencies (GitHub access, git
     ///   settings, bot identity)
+    /// * `state_auth` - How `/api/v1/repos/{owner}/{repo}/state` authorizes
+    ///   callers; [`StateAuth::Disabled`] serves nothing
     pub fn new(
         state_dir: impl Into<PathBuf>,
         webhook_secret: impl Into<Vec<u8>>,
         deps: crate::worker::SharedDeps,
+        state_auth: StateAuth,
     ) -> Self {
         AppState {
             inner: Arc::new(AppStateInner {
                 workers: WorkerRegistry::new(state_dir, deps),
                 webhook_secret: webhook_secret.into(),
+                state_auth,
             }),
         }
     }
@@ -136,6 +146,11 @@ impl AppState {
     /// Returns the webhook secret.
     pub fn webhook_secret(&self) -> &[u8] {
         &self.inner.webhook_secret
+    }
+
+    /// Returns the state endpoint's authorization config.
+    pub fn state_auth(&self) -> &StateAuth {
+        &self.inner.state_auth
     }
 }
 
@@ -250,14 +265,46 @@ mod integration_tests {
     use crate::persistence::snapshot::PersistedRepoSnapshot;
     use crate::webhooks::{compute_signature, format_signature_header};
 
+    /// The state-API token the state-endpoint tests present.
+    const TEST_STATE_TOKEN: &str = "test-state-token";
+
     /// Creates a test app state rooted at a temporary state directory, with a
     /// fake GitHub backend (these tests exercise intake, not processing).
+    /// The state endpoint is enabled with [`TEST_STATE_TOKEN`].
     fn test_app_state(secret: &[u8]) -> (AppState, tempfile::TempDir) {
+        test_app_state_with_auth(
+            secret,
+            StateAuth::Bearer(StateToken::new(TEST_STATE_TOKEN).unwrap()),
+        )
+    }
+
+    /// As [`test_app_state`], with the state endpoint's authorization chosen
+    /// by the caller.
+    fn test_app_state_with_auth(
+        secret: &[u8],
+        state_auth: StateAuth,
+    ) -> (AppState, tempfile::TempDir) {
         let state_dir = tempdir().unwrap();
         let (deps, _fake) =
             crate::worker::test_support::fake_shared_deps(state_dir.path(), Default::default());
-        let state = AppState::new(state_dir.path(), secret.to_vec(), deps);
+        let state = AppState::new(state_dir.path(), secret.to_vec(), deps, state_auth);
         (state, state_dir)
+    }
+
+    /// A `GET` of a repo's state endpoint, presenting `credential` as the
+    /// whole `Authorization` header value when one is given.
+    fn state_request(uri: &str, credential: Option<&str>) -> Request<Body> {
+        let builder = Request::builder().uri(uri);
+        let builder = match credential {
+            Some(credential) => builder.header("authorization", credential),
+            None => builder,
+        };
+        builder.body(Body::empty()).unwrap()
+    }
+
+    /// The `Authorization` header value a well-behaved caller sends.
+    fn valid_credential() -> String {
+        format!("Bearer {TEST_STATE_TOKEN}")
     }
 
     /// Creates a valid webhook request with proper signature from raw body bytes.
@@ -614,41 +661,42 @@ mod integration_tests {
 
     // ─── State endpoint tests ───
 
-    #[tokio::test]
-    async fn state_returns_json_for_existing_repo() {
+    /// Materializes state for `octocat/hello-world` by appending an event to
+    /// its `Store` (which also creates `<root>/octocat/hello-world/state.db`),
+    /// then releases it so a handler can read it back.
+    fn seed_repo_state(root: &std::path::Path) {
         use crate::persistence::event::StateEventPayload;
         use crate::store::Store;
         use crate::types::PrNumber;
 
+        let db_path = root.join("octocat").join("hello-world").join("state.db");
+        let mut store = Store::open(&db_path).unwrap();
+        store
+            .append(
+                StateEventPayload::TrainStarted {
+                    root_pr: PrNumber(42),
+                    current_pr: PrNumber(42),
+                },
+                chrono::Utc::now(),
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn state_returns_json_for_existing_repo() {
+        use crate::types::PrNumber;
+
         let (state, state_dir) = test_app_state(b"secret");
+        seed_repo_state(state_dir.path());
         let app = build_router(state);
 
-        // Materialize state by appending an event to the repo's Store (this also
-        // creates `<state_dir>/octocat/hello-world/state.db`), then release it.
-        let db_path = state_dir
-            .path()
-            .join("octocat")
-            .join("hello-world")
-            .join("state.db");
-        {
-            let mut store = Store::open(&db_path).unwrap();
-            store
-                .append(
-                    StateEventPayload::TrainStarted {
-                        root_pr: PrNumber(42),
-                        current_pr: PrNumber(42),
-                    },
-                    chrono::Utc::now(),
-                )
-                .unwrap();
-        }
-
-        let request = Request::builder()
-            .uri("/api/v1/repos/octocat/hello-world/state")
-            .body(Body::empty())
+        let response = app
+            .oneshot(state_request(
+                "/api/v1/repos/octocat/hello-world/state",
+                Some(&valid_credential()),
+            ))
+            .await
             .unwrap();
-
-        let response = app.oneshot(request).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
 
@@ -662,14 +710,238 @@ mod integration_tests {
         let (state, _state_dir) = test_app_state(b"secret");
         let app = build_router(state);
 
-        let request = Request::builder()
-            .uri("/api/v1/repos/nonexistent/repo/state")
-            .body(Body::empty())
+        let response = app
+            .oneshot(state_request(
+                "/api/v1/repos/nonexistent/repo/state",
+                Some(&valid_credential()),
+            ))
+            .await
             .unwrap();
 
-        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ─── State endpoint authorization ───
+
+    /// The endpoint is off unless a token is configured: an operator who has
+    /// not thought about the question does not publish their repositories'
+    /// branch names and topology by omission.
+    #[tokio::test]
+    async fn state_is_not_served_when_no_token_is_configured() {
+        let (state, state_dir) = test_app_state_with_auth(b"secret", StateAuth::Disabled);
+        seed_repo_state(state_dir.path());
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(state_request(
+                "/api/v1/repos/octocat/hello-world/state",
+                None,
+            ))
+            .await
+            .unwrap();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Disabled means disabled: a caller who somehow knows a token still
+    /// gets nothing, because there is no token to match.
+    #[tokio::test]
+    async fn a_disabled_state_endpoint_refuses_even_a_credentialled_caller() {
+        let (state, state_dir) = test_app_state_with_auth(b"secret", StateAuth::Disabled);
+        seed_repo_state(state_dir.path());
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(state_request(
+                "/api/v1/repos/octocat/hello-world/state",
+                Some(&valid_credential()),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn state_without_a_credential_is_unauthorized() {
+        let (state, state_dir) = test_app_state(b"secret");
+        seed_repo_state(state_dir.path());
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(state_request(
+                "/api/v1/repos/octocat/hello-world/state",
+                None,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        // RFC 9110 §11.6.1: a 401 names the scheme the caller should use.
+        assert_eq!(
+            response
+                .headers()
+                .get("www-authenticate")
+                .map(|v| v.to_str().unwrap()),
+            Some("Bearer")
+        );
+    }
+
+    #[tokio::test]
+    async fn state_with_the_wrong_token_is_unauthorized() {
+        let (state, state_dir) = test_app_state(b"secret");
+        seed_repo_state(state_dir.path());
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(state_request(
+                "/api/v1/repos/octocat/hello-world/state",
+                Some("Bearer not-the-token"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn state_with_a_malformed_credential_is_unauthorized() {
+        let (state, state_dir) = test_app_state(b"secret");
+        seed_repo_state(state_dir.path());
+
+        for credential in [
+            // Another scheme.
+            format!("Basic {TEST_STATE_TOKEN}"),
+            // The bare token, with no scheme.
+            TEST_STATE_TOKEN.to_owned(),
+            // The scheme with nothing after it.
+            "Bearer".to_owned(),
+            "Bearer ".to_owned(),
+            // The right token with something appended.
+            format!("Bearer {TEST_STATE_TOKEN}x"),
+            // A credential that is not even UTF-8-safe to read back.
+            "Bearer \u{00e9}".to_owned(),
+        ] {
+            let app = build_router(state.clone());
+            let response = app
+                .oneshot(state_request(
+                    "/api/v1/repos/octocat/hello-world/state",
+                    Some(&credential),
+                ))
+                .await
+                .unwrap();
+
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "expected {credential:?} to be refused"
+            );
+        }
+    }
+
+    /// The scheme is case-insensitive (RFC 9110 §11.1), so a caller that
+    /// writes it differently still gets in.
+    #[tokio::test]
+    async fn state_accepts_a_case_variant_scheme() {
+        let (state, state_dir) = test_app_state(b"secret");
+        seed_repo_state(state_dir.path());
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(state_request(
+                "/api/v1/repos/octocat/hello-world/state",
+                Some(&format!("bEaReR {TEST_STATE_TOKEN}")),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Authorization comes first: an unauthenticated caller must not be able
+    /// to tell which repositories the bot holds state for, nor to reach the
+    /// path validation behind the endpoint.
+    #[tokio::test]
+    async fn an_unauthenticated_caller_cannot_probe_for_repos() {
+        let (state, state_dir) = test_app_state(b"secret");
+        seed_repo_state(state_dir.path());
+
+        for uri in [
+            // Exists.
+            "/api/v1/repos/octocat/hello-world/state",
+            // Does not exist: must be indistinguishable from the above.
+            "/api/v1/repos/octocat/no-such-repo/state",
+            // Would otherwise be a 400 from path validation.
+            "/api/v1/repos/../hello-world/state",
+        ] {
+            let app = build_router(state.clone());
+            let response = app.oneshot(state_request(uri, None)).await.unwrap();
+
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "expected {uri} to be refused before it was answered"
+            );
+        }
+    }
+
+    /// Neither the token nor a near miss of it appears in what the endpoint
+    /// says to an unauthorized caller.
+    #[tokio::test]
+    async fn an_unauthorized_response_does_not_echo_the_token() {
+        let (state, _state_dir) = test_app_state(b"secret");
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(state_request(
+                "/api/v1/repos/octocat/hello-world/state",
+                Some("Bearer not-the-token"),
+            ))
+            .await
+            .unwrap();
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&body);
+        assert!(!body.contains(TEST_STATE_TOKEN), "leaked the token: {body}");
+        assert!(
+            !body.contains("not-the-token"),
+            "echoed the credential: {body}"
+        );
+    }
+
+    /// The other endpoints are unaffected: `/health` is a liveness probe and
+    /// `/webhook` authenticates with GitHub's signature, not this token.
+    #[tokio::test]
+    async fn the_state_token_does_not_gate_health_or_webhooks() {
+        let secret = b"test-secret";
+        let (state, _state_dir) = test_app_state_with_auth(secret, StateAuth::Disabled);
+        let app = build_router(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let app = build_router(state);
+        let body = serde_json::json!({
+            "repository": {"name": "hello-world", "owner": {"login": "octocat"}}
+        });
+        let response = app
+            .oneshot(create_webhook_request(
+                secret,
+                "pull_request",
+                "delivery-state-auth",
+                &body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     // ─── Path traversal protection tests ───
@@ -679,13 +951,15 @@ mod integration_tests {
         let (state, _state_dir) = test_app_state(b"secret");
         let app = build_router(state);
 
-        // Attempt path traversal in owner segment
-        let request = Request::builder()
-            .uri("/api/v1/repos/../hello-world/state")
-            .body(Body::empty())
+        // Attempt path traversal in owner segment, as an authorized caller:
+        // the check being tested here sits behind authorization.
+        let response = app
+            .oneshot(state_request(
+                "/api/v1/repos/../hello-world/state",
+                Some(&valid_credential()),
+            ))
+            .await
             .unwrap();
-
-        let response = app.oneshot(request).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
@@ -695,13 +969,14 @@ mod integration_tests {
         let (state, _state_dir) = test_app_state(b"secret");
         let app = build_router(state);
 
-        // Attempt path traversal in repo segment
-        let request = Request::builder()
-            .uri("/api/v1/repos/octocat/../state")
-            .body(Body::empty())
+        // Attempt path traversal in repo segment, as an authorized caller.
+        let response = app
+            .oneshot(state_request(
+                "/api/v1/repos/octocat/../state",
+                Some(&valid_credential()),
+            ))
+            .await
             .unwrap();
-
-        let response = app.oneshot(request).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
