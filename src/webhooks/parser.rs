@@ -133,6 +133,14 @@ struct RawIssueCommentPayload {
     issue: RawIssue,
     repository: RawRepository,
     sender: RawUser,
+    changes: Option<RawCommentChanges>,
+}
+
+/// `changes` on an `issue_comment.edited` payload. GitHub sends `body` only
+/// when the body is what changed, so it is optional twice over.
+#[derive(Debug, Deserialize)]
+struct RawCommentChanges {
+    body: Option<RawFrom>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -190,6 +198,7 @@ fn parse_issue_comment(payload: &[u8]) -> Result<IssueCommentEvent, ParseError> 
         sender_login: raw.sender.login,
         pr_author_id: raw.issue.user.id,
         updated_at: raw.comment.updated_at,
+        body_change_from: raw.changes.and_then(|c| c.body).map(|b| b.from),
     })
 }
 
@@ -487,6 +496,81 @@ mod tests {
     // ========================================================================
     // Unit tests for each event type
     // ========================================================================
+
+    /// `changes.body.from` is what the dedupe key needs to tell an edit
+    /// from a redelivery of an earlier edit that reached the same body.
+    #[test]
+    fn parse_issue_comment_edited_keeps_the_body_it_replaced() {
+        let payload = r#"{
+            "action": "edited",
+            "comment": {
+                "id": 12345,
+                "body": "@merge-train predecessor #1",
+                "user": { "id": 100, "login": "octocat" },
+                "updated_at": "2024-01-15T10:00:00Z"
+            },
+            "changes": { "body": { "from": "never mind" } },
+            "issue": {
+                "number": 42,
+                "pull_request": { "url": "https://api.github.com/repos/owner/repo/pulls/42" },
+                "user": { "id": 100, "login": "octocat" }
+            },
+            "repository": { "owner": { "login": "myorg" }, "name": "myrepo" },
+            "sender": { "id": 100, "login": "octocat" }
+        }"#;
+
+        let event = parse_webhook("issue_comment", payload.as_bytes())
+            .unwrap()
+            .expect("should parse");
+        match event {
+            GitHubEvent::IssueComment(e) => {
+                assert_eq!(e.action, CommentAction::Edited);
+                assert_eq!(e.body_change_from.as_deref(), Some("never mind"));
+            }
+            other => panic!("expected IssueComment, got {other:?}"),
+        }
+    }
+
+    /// An edit that changed something other than the body carries no
+    /// `changes.body`, and an absent `changes` is not an error.
+    #[test]
+    fn parse_issue_comment_edited_without_a_body_change() {
+        let without = |changes: &str| {
+            format!(
+                r#"{{
+                    "action": "edited",
+                    "comment": {{
+                        "id": 12345,
+                        "body": "unchanged",
+                        "user": {{ "id": 100, "login": "octocat" }},
+                        "updated_at": "2024-01-15T10:00:00Z"
+                    }},
+                    {changes}
+                    "issue": {{
+                        "number": 42,
+                        "pull_request": {{ "url": "https://api.github.com/repos/owner/repo/pulls/42" }},
+                        "user": {{ "id": 100, "login": "octocat" }}
+                    }},
+                    "repository": {{ "owner": {{ "login": "myorg" }}, "name": "myrepo" }},
+                    "sender": {{ "id": 100, "login": "octocat" }}
+                }}"#
+            )
+        };
+
+        for changes in ["", r#""changes": {},"#, r#""changes": { "body": null },"#] {
+            let payload = without(changes);
+            let event = parse_webhook("issue_comment", payload.as_bytes())
+                .unwrap()
+                .unwrap_or_else(|| panic!("should parse with {changes:?}"));
+            match event {
+                GitHubEvent::IssueComment(e) => assert_eq!(
+                    e.body_change_from, None,
+                    "no body change to report with {changes:?}"
+                ),
+                other => panic!("expected IssueComment, got {other:?}"),
+            }
+        }
+    }
 
     #[test]
     fn parse_issue_comment_created() {
