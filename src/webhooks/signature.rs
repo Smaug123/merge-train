@@ -114,6 +114,42 @@ pub fn verify_signature(payload: &[u8], signature_header: &str, secret: &[u8]) -
     mac.verify_slice(&expected_signature).is_ok()
 }
 
+/// Domain-separation key for [`secrets_match`]. Not a secret: it only keeps
+/// this comparison's digests distinct from webhook signatures computed over
+/// the same bytes.
+const COMPARISON_KEY: &[u8] = b"merge-train:constant-time-secret-comparison";
+
+/// Constant-time equality for two secrets of any length.
+///
+/// Compares HMACs of the two values rather than the values themselves. The
+/// digests are always 32 bytes, so the comparison's timing reveals neither
+/// secret's length nor the position of the first differing byte, both of
+/// which `a == b` on the raw bytes would leak. Equality of digests implies
+/// equality of inputs by SHA-256's collision resistance.
+///
+/// This is general, not webhook-specific; it lives here because this module
+/// owns the crate's HMAC machinery.
+///
+/// # Examples
+///
+/// ```
+/// use merge_train::webhooks::secrets_match;
+///
+/// assert!(secrets_match(b"hunter2", b"hunter2"));
+/// assert!(!secrets_match(b"hunter2", b"hunter3"));
+/// assert!(!secrets_match(b"hunter2", b"hunter2 "));
+/// ```
+pub fn secrets_match(a: &[u8], b: &[u8]) -> bool {
+    let mut mac = match HmacSha256::new_from_slice(COMPARISON_KEY) {
+        Ok(mac) => mac,
+        Err(_) => return false,
+    };
+    mac.update(a);
+    // `verify_slice` compares the two 32-byte digests in constant time.
+    mac.verify_slice(&compute_signature(b, COMPARISON_KEY))
+        .is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,7 +348,49 @@ mod tests {
     // Property-based tests
     // ========================================================================
 
+    // ========================================================================
+    // Constant-time secret comparison
+    // ========================================================================
+
+    #[test]
+    fn secrets_match_agrees_with_equality_on_edge_cases() {
+        assert!(secrets_match(b"", b""));
+        assert!(secrets_match(b"token", b"token"));
+        assert!(!secrets_match(b"", b"token"));
+        assert!(!secrets_match(b"token", b""));
+        // A prefix is not a match: length must matter.
+        assert!(!secrets_match(b"token", b"tok"));
+        assert!(!secrets_match(b"tok", b"token"));
+        // Case and trailing whitespace are significant.
+        assert!(!secrets_match(b"Token", b"token"));
+        assert!(!secrets_match(b"token ", b"token"));
+        // Binary secrets, including interior NULs.
+        assert!(secrets_match(&[0x00, 0xff, 0x00], &[0x00, 0xff, 0x00]));
+        assert!(!secrets_match(&[0x00, 0xff, 0x00], &[0x00, 0xff, 0x01]));
+    }
+
     proptest! {
+        /// Property: `secrets_match` is exactly equality.
+        ///
+        /// The whole point of the function is to decide `a == b` without
+        /// leaking timing; it must therefore decide `a == b`.
+        #[test]
+        fn prop_secrets_match_is_equality(a: Vec<u8>, b: Vec<u8>) {
+            prop_assert_eq!(secrets_match(&a, &b), a == b);
+        }
+
+        /// Property: equal secrets always match, however long.
+        #[test]
+        fn prop_secrets_match_is_reflexive(a: Vec<u8>) {
+            prop_assert!(secrets_match(&a, &a));
+        }
+
+        /// Property: `secrets_match` is symmetric.
+        #[test]
+        fn prop_secrets_match_is_symmetric(a: Vec<u8>, b: Vec<u8>) {
+            prop_assert_eq!(secrets_match(&a, &b), secrets_match(&b, &a));
+        }
+
         /// Property: verify(payload, sign(payload, secret), secret) == true
         ///
         /// For any payload and secret, signing and then verifying with the

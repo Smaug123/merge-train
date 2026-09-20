@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use merge_train::git::CommitIdentity;
-use merge_train::server::{AppState, build_router};
+use merge_train::server::{AppState, InvalidStateToken, StateAuth, StateToken, build_router};
 use merge_train::worker::{GitHubBackend, SharedDeps};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -24,6 +24,10 @@ struct Config {
 
     /// Secret for verifying webhook signatures. Non-empty.
     webhook_secret: Vec<u8>,
+
+    /// How `/api/v1/repos/{owner}/{repo}/state` authorizes callers.
+    /// Disabled unless `STATE_API_TOKEN` is set.
+    state_auth: StateAuth,
 
     /// GitHub token. Non-empty. Must be a *user-scoped* token (a classic or
     /// fine-grained PAT, or a GitHub App user-to-server token): startup
@@ -73,6 +77,34 @@ fn webhook_secret_from(value: Option<String>) -> Result<Vec<u8>, &'static str> {
     }
 }
 
+/// Reads the state endpoint's authorization from the environment.
+///
+/// Unset means the endpoint is disabled, not open: the listener has to be
+/// reachable from the internet for GitHub to deliver webhooks to it, and
+/// the endpoint serves a private repository's branch names, SHAs and train
+/// topology. An operator who has not configured a token gets no endpoint
+/// rather than an unauthenticated one.
+///
+/// A token that is set but unusable is refused rather than ignored — an
+/// empty `STATE_API_TOKEN` is a secret-injection that silently failed, and
+/// silently disabling the endpoint would hide it.
+fn state_auth_from(value: Option<String>) -> Result<StateAuth, &'static str> {
+    match value {
+        None => Ok(StateAuth::Disabled),
+        Some(token) => match StateToken::new(token) {
+            Ok(token) => Ok(StateAuth::Bearer(token)),
+            Err(InvalidStateToken::Empty) => Err(
+                "STATE_API_TOKEN is empty; unset it to disable the state endpoint, \
+                 or set it to a token",
+            ),
+            Err(InvalidStateToken::Unpresentable) => Err(
+                "STATE_API_TOKEN contains a byte that cannot appear in an HTTP header \
+                 value (only visible ASCII is usable), so no caller could present it",
+            ),
+        },
+    }
+}
+
 /// Validates the GitHub token read from the environment. Required: the worker
 /// executes real API effects (squash merges!) — there is no unauthenticated
 /// mode.
@@ -112,6 +144,7 @@ impl Config {
 
         let webhook_secret = webhook_secret_from(std::env::var("WEBHOOK_SECRET").ok())?;
         let github_token = github_token_from(std::env::var("GITHUB_TOKEN").ok())?;
+        let state_auth = state_auth_from(std::env::var("STATE_API_TOKEN").ok())?;
 
         let poll_interval =
             poll_interval_from(std::env::var("MERGE_TRAIN_POLL_INTERVAL_MINS").ok())?;
@@ -121,6 +154,7 @@ impl Config {
             state_dir,
             repos_dir,
             webhook_secret,
+            state_auth,
             github_token,
             poll_interval,
             git_user_name: std::env::var("GIT_USER_NAME").ok(),
@@ -191,11 +225,20 @@ async fn main() {
         }
     };
 
+    // The state endpoint's mode is worth saying out loud: an operator who
+    // expected to be able to read a repo's state gets a 404 when no token is
+    // configured, and this line is what tells them why.
+    let state_api = match config.state_auth {
+        StateAuth::Disabled => "disabled (set STATE_API_TOKEN to enable)",
+        StateAuth::Bearer(_) => "enabled (bearer token required)",
+    };
+
     tracing::info!(
         state_dir = %config.state_dir.display(),
         repos_dir = %config.repos_dir.display(),
         bot = %identity.login,
         bot_user_id = identity.user_id,
+        state_api,
         "Starting merge train bot"
     );
 
@@ -229,7 +272,12 @@ async fn main() {
     };
 
     // Create application state
-    let app_state = AppState::new(config.state_dir, config.webhook_secret, deps);
+    let app_state = AppState::new(
+        config.state_dir,
+        config.webhook_secret,
+        deps,
+        config.state_auth,
+    );
 
     // Spawn workers for repos with deliveries left queued by a previous run, so
     // an acked-but-unprocessed delivery is drained at startup rather than
@@ -346,6 +394,32 @@ mod tests {
     fn missing_github_token_is_refused() {
         assert!(github_token_from(None).is_err());
         assert!(github_token_from(Some(String::new())).is_err());
+    }
+
+    #[test]
+    fn an_unset_state_token_disables_the_endpoint() {
+        assert!(matches!(state_auth_from(None), Ok(StateAuth::Disabled)));
+    }
+
+    #[test]
+    fn an_empty_state_token_is_refused_rather_than_disabling() {
+        // Silently disabling would hide a secret-injection that failed.
+        assert!(state_auth_from(Some(String::new())).is_err());
+    }
+
+    #[test]
+    fn an_unpresentable_state_token_is_refused() {
+        assert!(state_auth_from(Some("has space".to_owned())).is_err());
+        assert!(state_auth_from(Some("café".to_owned())).is_err());
+    }
+
+    #[test]
+    fn a_usable_state_token_enables_the_endpoint() {
+        let auth = state_auth_from(Some("s3cret".to_owned())).unwrap();
+        match auth {
+            StateAuth::Bearer(token) => assert!(token.matches(b"s3cret")),
+            StateAuth::Disabled => panic!("expected the endpoint to be enabled"),
+        }
     }
 
     #[test]

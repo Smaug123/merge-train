@@ -1039,7 +1039,7 @@ GET /api/v1/repos/{owner}/{repo}/state
 - Monitoring integration
 - Operator visibility into bot state
 
-**Authentication**: This endpoint should be protected by the same authentication as webhook endpoints (e.g., GitHub App installation verification or operator API key).
+**Authentication**: an operator API key, `STATE_API_TOKEN`, presented as `Authorization: Bearer <token>`. The endpoint is served only when a token is configured; unconfigured means off, not open, since the listener has to be reachable from the internet for GitHub to deliver webhooks to it. Webhooks authenticate separately, by GitHub's signature, so this token does not gate them.
 
 ### Stack topology
 

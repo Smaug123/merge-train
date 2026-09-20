@@ -4,6 +4,7 @@ This bot implements a merge train, following [my standard workflow](https://www.
 
 # Gotchas
 
+* The state-inspection endpoint (`GET /api/v1/repos/{owner}/{repo}/state`) is switched off unless you set `STATE_API_TOKEN`, and callers must then present it as `Authorization: Bearer <token>`. The bot's listener has to be reachable from the internet for GitHub to deliver webhooks to it, and that endpoint serves a private repository's branch names, SHAs and train topology, so it is off by default rather than open by default. While it is off it answers 404 — the same status it gives for a repository it holds no state for, with a body saying the endpoint is disabled. `/health` and `/webhook` are unaffected; webhooks authenticate with GitHub's signature, not with this token.
 * If the root PR is a draft, the bot rejects `@merge-train start` with an error asking you to mark the PR as ready for review first. Draft PRs elsewhere in the stack are allowed: when the cascade reaches them, it waits (similar to waiting for CI) rather than failing immediately. However, draft PRs cannot be merged into main, so they must be marked ready before the cascade can complete.
 
 # Limitations by design

@@ -31,5 +31,6 @@ pub use events::{
 pub use parser::{ParseError, parse_webhook};
 pub use priority::{EventPriority, classify_priority, classify_priority_with_bot_name};
 pub use signature::{
-    compute_signature, format_signature_header, parse_signature_header, verify_signature,
+    compute_signature, format_signature_header, parse_signature_header, secrets_match,
+    verify_signature,
 };
