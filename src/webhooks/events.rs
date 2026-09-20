@@ -118,6 +118,20 @@ pub struct IssueCommentEvent {
     /// For `deleted` actions, this will be empty.
     pub body: String,
 
+    /// For `edited` events, the body this edit replaced
+    /// (`changes.body.from`), when GitHub sent it. The dedupe key needs the
+    /// transition, not just its destination: with second-resolution
+    /// timestamps, an edit whose *destination* matches an earlier
+    /// same-second edit's body would otherwise dedupe away, so a comment
+    /// edited A → B → A within one second would lose the edit back to A
+    /// and leave the declaration it restores unrecorded. This is the same
+    /// hazard `PullRequestEvent::base_change_from` exists for.
+    ///
+    /// Nothing but the dedupe key reads it: what a comment used to say is
+    /// not evidence of anything, because GitHub reports only the immediately
+    /// previous body and an unacked edit may have come between.
+    pub body_change_from: Option<String>,
+
     /// The comment author's user ID.
     pub author_id: u64,
 
@@ -613,6 +627,7 @@ mod tests {
             (1u64..1000000u64, 1u64..1000000u64),
             "[a-z][a-z0-9]{0,15}",
             arb_updated_at(),
+            proptest::option::of("[a-zA-Z0-9 @#]{0,100}"),
         )
             .prop_map(
                 |(
@@ -624,8 +639,10 @@ mod tests {
                     (author_id, pr_author_id),
                     author_login,
                     updated_at,
+                    body_change_from,
                 )| {
                     IssueCommentEvent {
+                        body_change_from,
                         repo,
                         action,
                         pr_number: pr_number.map(PrNumber),

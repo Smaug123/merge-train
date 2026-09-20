@@ -2355,6 +2355,7 @@ mod tests {
                 comment_id: CommentId(60),
                 body: "@merge-train predecessor #9".to_owned(),
                 author_id: AUTHOR,
+                body_change_from: None,
                 author_login: "author".to_owned(),
                 sender_id: AUTHOR,
                 sender_login: "author".to_owned(),

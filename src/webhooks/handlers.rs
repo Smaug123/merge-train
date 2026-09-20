@@ -890,6 +890,7 @@ mod tests {
             comment_id: CommentId(7),
             body: body.to_owned(),
             author_id: author,
+            body_change_from: None,
             author_login: "alice".to_owned(),
             sender_id: author,
             sender_login: "alice".to_owned(),
