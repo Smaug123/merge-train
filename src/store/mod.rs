@@ -113,7 +113,25 @@ use crate::webhooks::dedupe::DedupeKey;
 /// v6 added the stack-ledger obligations; v7 the repairs, unresolved
 /// comments and settled verdicts the ledger's hardening keeps; v8 the
 /// `deliveries.crawled` mark the first-contact crawl leaves.
-const STORE_SCHEMA_VERSION: i64 = 8;
+///
+/// v9 changed no DDL. It marks a change in what the rows MEAN: the dedupe
+/// key for an edited comment now names the edit's transition rather than
+/// its destination (`DedupeKey::issue_comment_edited`), so every edit key
+/// written by an older binary is a string this one will never compute.
+/// `is_duplicate` is an exact lookup, so those rows silently stop
+/// deduplicating anything — and an edit is a live utterance whenever it
+/// arrives, deliberately exempt from the settlement watermark, so dedupe is
+/// the ONLY thing standing between a redelivered old declaration and the
+/// resurrection of a predecessor a later edit retracted (Codex review on
+/// the transition-key fix, P2).
+///
+/// The keys cannot be migrated: the old key does not record the body the
+/// edit replaced, so the new one is not computable from it. Honouring the
+/// guarantee is therefore impossible on such a store, and the store is
+/// refused instead — recovering a repository by re-crawling GitHub is a
+/// designed path, and a loud refusal is cheaper than a silently resurrected
+/// stack.
+const STORE_SCHEMA_VERSION: i64 = 9;
 
 /// Errors from the store.
 #[derive(Debug, Error)]

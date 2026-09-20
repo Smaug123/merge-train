@@ -48,7 +48,9 @@ use std::path::PathBuf;
 use chrono::Utc;
 use tracing::{error, info, warn};
 
-use crate::cascade::{self, Control, EffectError, Observation, ReplayFacts, StepPlan, observe};
+use crate::cascade::{
+    self, Control, EffectError, Observation, ReplayFacts, StepPlan, TrainSizeCap, observe,
+};
 use crate::commands::{Command, parse_command};
 use crate::effects::github::{CommentData, CommentListing, GitHubEffect};
 use crate::effects::{Effect, GitHubResponse, PrData};
@@ -115,6 +117,8 @@ pub struct WorkerDeps {
     /// How often the poll timer re-evaluates active trains (the
     /// missed-webhook fallback). Zero disables polling.
     pub poll_interval: std::time::Duration,
+    /// The largest train `@merge-train start` will accept.
+    pub max_train_size: TrainSizeCap,
     /// The clock cooldowns are measured against.
     pub clock: Clock,
 }
@@ -3040,7 +3044,7 @@ impl Processor {
                             restart_cleanup: false,
                         }));
                     }
-                    match cascade::start_train(state, pr, now) {
+                    match cascade::start_train(state, pr, now, self.deps.max_train_size) {
                         Ok(plan) => {
                             let decided = !matches!(plan.control, Control::Continue);
                             let batch = self.integrate_plan(pr, plan, now)?;

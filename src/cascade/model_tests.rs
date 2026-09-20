@@ -38,7 +38,8 @@ use crate::types::{
 
 use super::plan::{EffectError, EffectOutcome, EffectResponse};
 use super::{
-    Control, Observation, ReplayFacts, StepPlan, advance, observe, start_train, stop_train,
+    Control, Observation, ReplayFacts, StepPlan, TrainSizeCap, advance, observe, start_train,
+    stop_train,
 };
 
 // ─── The model world ───
@@ -890,7 +891,8 @@ impl Driver {
     /// Starts the root's train and drives every resulting train (including
     /// fan-out children and re-evaluations after parking) to completion.
     fn run_to_completion(&mut self, root: PrNumber) {
-        let plan = start_train(&self.state, root, self.now).expect("start plans");
+        let plan =
+            start_train(&self.state, root, self.now, TrainSizeCap::DEFAULT).expect("start plans");
         self.drive(vec![(root, Some(plan))]);
     }
 
@@ -1105,7 +1107,7 @@ proptest! {
         let (world, state) = seed(&shape);
         let mut driver = Driver::new(world, state);
         let root = pr_number(0);
-        let plan = start_train(&driver.state, root, driver.now).expect("start plans");
+        let plan = start_train(&driver.state, root, driver.now, TrainSizeCap::DEFAULT).expect("start plans");
 
         let mut stopped = false;
         let outcome = driver.run_plan(plan, root, &mut |d, step| {
@@ -1231,7 +1233,7 @@ fn preparation_conflict_aborts_before_any_irreversible_op() {
     let mut driver = Driver::new(world, state);
 
     let root = pr_number(0);
-    let plan = start_train(&driver.state, root, driver.now).unwrap();
+    let plan = start_train(&driver.state, root, driver.now, TrainSizeCap::DEFAULT).unwrap();
     let outcome = driver.run_plan(plan, root, &mut |_, _| {});
     assert_eq!(outcome, RunOutcome::Done);
 
@@ -1269,7 +1271,7 @@ fn force_push_mid_preparation_aborts() {
     let root = pr_number(0);
 
     let mut injected = false;
-    let plan = start_train(&driver.state, root, driver.now).unwrap();
+    let plan = start_train(&driver.state, root, driver.now, TrainSizeCap::DEFAULT).unwrap();
     let outcome = driver.run_plan(plan, root, &mut |d, _| {
         // Fire once, after the first descendant's prep push completed.
         if !injected {
@@ -1313,7 +1315,7 @@ fn foreign_push_during_preparation_is_absorbed() {
     let root = pr_number(0);
 
     let mut injected = false;
-    let plan = start_train(&driver.state, root, driver.now).unwrap();
+    let plan = start_train(&driver.state, root, driver.now, TrainSizeCap::DEFAULT).unwrap();
     let outcome = driver.run_plan(plan, root, &mut |d, _| {
         // Between the descendant's prep merge and its push: land a foreign
         // commit so the push rejects.
@@ -1395,7 +1397,7 @@ fn branch_deleted_between_merge_and_push_is_skipped() {
     let root = pr_number(0);
 
     let mut injected = false;
-    let plan = start_train(&driver.state, root, driver.now).unwrap();
+    let plan = start_train(&driver.state, root, driver.now, TrainSizeCap::DEFAULT).unwrap();
     let outcome = driver.run_plan(plan, root, &mut |d, _| {
         // The observation boundary right after pr-2's preparation merge (the
         // worktree HEAD is the merge result) and before the intent+push plan:
@@ -1446,7 +1448,7 @@ fn branch_deleted_between_reconcile_merge_and_push_is_skipped() {
     let root = pr_number(0);
 
     let mut injected = false;
-    let plan = start_train(&driver.state, root, driver.now).unwrap();
+    let plan = start_train(&driver.state, root, driver.now, TrainSizeCap::DEFAULT).unwrap();
     let outcome = driver.run_plan(plan, root, &mut |d, _| {
         // The first observation boundary inside Reconciling is right after
         // pr-2's reconcile merge (the PT and the MergeReconcile effect share
@@ -1510,7 +1512,7 @@ fn descendant_closed_mid_cascade_is_skipped() {
     let root = pr_number(0);
 
     let mut injected = false;
-    let plan = start_train(&driver.state, root, driver.now).unwrap();
+    let plan = start_train(&driver.state, root, driver.now, TrainSizeCap::DEFAULT).unwrap();
     let outcome = driver.run_plan(plan, root, &mut |d, _| {
         // Once pr-2's reconcile push is durable, a human closes pr-2. The
         // webhook lands as a PrClosed event; the world stops accepting
@@ -1566,7 +1568,7 @@ fn retargeted_current_pr_aborts_instead_of_squashing() {
     let mut driver = Driver::new(world, state);
     let root = pr_number(0);
 
-    let plan = start_train(&driver.state, root, driver.now).unwrap();
+    let plan = start_train(&driver.state, root, driver.now, TrainSizeCap::DEFAULT).unwrap();
     let outcome = driver.run_plan(plan, root, &mut |_, _| {});
     assert_eq!(outcome, RunOutcome::Done);
 
@@ -1599,7 +1601,7 @@ fn externally_merged_current_pr_completes_and_updates_cache() {
     let mut driver = Driver::new(world, state);
     let root = pr_number(0);
 
-    let plan = start_train(&driver.state, root, driver.now).unwrap();
+    let plan = start_train(&driver.state, root, driver.now, TrainSizeCap::DEFAULT).unwrap();
     let outcome = driver.run_plan(plan, root, &mut |_, _| {});
     assert_eq!(outcome, RunOutcome::Done);
 
@@ -1617,7 +1619,7 @@ fn externally_merged_current_pr_completes_and_updates_cache() {
         "the bot must not re-squash an externally merged PR"
     );
     // And a fresh `start` on it is now correctly rejected as not-open.
-    let plan = start_train(&driver.state, root, driver.now).unwrap();
+    let plan = start_train(&driver.state, root, driver.now, TrainSizeCap::DEFAULT).unwrap();
     assert_eq!(plan.control, Control::Done);
     assert!(plan.events.is_empty());
 }
@@ -1640,7 +1642,7 @@ fn stop_below_merged_members_still_stops_the_train() {
     let mut driver = Driver::new(world, state);
     let root = pr_number(0);
 
-    let plan = start_train(&driver.state, root, driver.now).unwrap();
+    let plan = start_train(&driver.state, root, driver.now, TrainSizeCap::DEFAULT).unwrap();
     let outcome = driver.run_plan(plan, root, &mut |_, _| {});
     assert_eq!(outcome, RunOutcome::Parked);
     let train = &driver.state.active_trains[&root];
@@ -1749,7 +1751,7 @@ fn behind_root_is_updated_then_train_completes() {
     let mut driver = Driver::new(world, state);
     let root = pr_number(0);
 
-    let plan = start_train(&driver.state, root, driver.now).unwrap();
+    let plan = start_train(&driver.state, root, driver.now, TrainSizeCap::DEFAULT).unwrap();
     let outcome = driver.run_plan(plan, root, &mut |_, _| {});
     // The behind-fix pushed and parked for CI.
     assert_eq!(outcome, RunOutcome::Parked);
@@ -1787,7 +1789,13 @@ fn start_rejections_are_comments() {
     let mut driver = Driver::new(world, state);
 
     // Starting on a non-root (the descendant) is rejected.
-    let plan = start_train(&driver.state, pr_number(1), driver.now).unwrap();
+    let plan = start_train(
+        &driver.state,
+        pr_number(1),
+        driver.now,
+        TrainSizeCap::DEFAULT,
+    )
+    .unwrap();
     assert_eq!(plan.control, Control::Done);
     assert!(plan.events.is_empty());
     assert!(matches!(
@@ -1805,7 +1813,7 @@ fn start_rejections_are_comments() {
         },
     });
     for pr in [pr_number(0), pr_number(1)] {
-        let plan = start_train(&driver.state, pr, driver.now).unwrap();
+        let plan = start_train(&driver.state, pr, driver.now, TrainSizeCap::DEFAULT).unwrap();
         assert_eq!(
             plan.control,
             Control::Done,
@@ -1827,7 +1835,7 @@ fn preflight_failure_refuses_to_start() {
     let mut driver = Driver::new(world, state);
     let root = pr_number(0);
 
-    let plan = start_train(&driver.state, root, driver.now).unwrap();
+    let plan = start_train(&driver.state, root, driver.now, TrainSizeCap::DEFAULT).unwrap();
     let outcome = driver.run_plan(plan, root, &mut |_, _| {});
     assert_eq!(outcome, RunOutcome::Done);
     assert!(
@@ -1860,4 +1868,107 @@ fn stop_without_train_is_a_comment() {
         plan.best_effort.as_slice(),
         [Effect::GitHub(GitHubEffect::PostComment { .. })]
     ));
+}
+
+// ─── The train size cap ───
+
+/// A linear stack of `members` PRs, rooted at `pr_number(0)`.
+fn linear_stack(members: usize) -> StackShape {
+    StackShape {
+        predecessors: (0..members - 1).collect(),
+        advanced: vec![true; members],
+    }
+}
+
+/// Whether `@merge-train start` on the root of a `members`-long stack is
+/// accepted under `cap`. Acceptance is "the plan continues to preflight";
+/// a refusal settles immediately with a comment.
+fn starts_under_cap(members: usize, cap: TrainSizeCap) -> (bool, Vec<String>) {
+    let (world, state) = seed(&linear_stack(members));
+    let driver = Driver::new(world, state);
+    let plan = start_train(&driver.state, pr_number(0), driver.now, cap).unwrap();
+    let comments = plan
+        .best_effort
+        .iter()
+        .filter_map(|e| match e {
+            Effect::GitHub(GitHubEffect::PostComment { body, .. }) => Some(body.clone()),
+            _ => None,
+        })
+        .collect();
+    (matches!(plan.control, Control::Continue), comments)
+}
+
+/// The refusal has to name the limit that is actually in force: an operator
+/// who raised the cap and still sees "maximum 50" would be chasing a bug
+/// that is not there.
+#[test]
+fn the_refusal_names_the_configured_cap_not_the_default() {
+    let cap = TrainSizeCap::new(3).unwrap();
+    let (started, comments) = starts_under_cap(4, cap);
+    assert!(!started, "4 PRs must not start under a cap of 3");
+    assert_eq!(comments.len(), 1);
+    assert!(
+        comments[0].contains("maximum 3"),
+        "the refusal must name the configured cap, got: {}",
+        comments[0]
+    );
+    assert!(
+        comments[0].contains("4 PRs"),
+        "the refusal must say how large the train actually is, got: {}",
+        comments[0]
+    );
+}
+
+/// A cap of one admits the degenerate train — a root with no descendants —
+/// and nothing else.
+#[test]
+fn a_cap_of_one_admits_only_a_lone_root() {
+    let cap = TrainSizeCap::new(1).unwrap();
+    assert!(starts_under_cap(1, cap).0);
+    assert!(!starts_under_cap(2, cap).0);
+}
+
+proptest! {
+    /// Property: the cap the worker is configured with is exactly the cap
+    /// the engine enforces — a stack starts if and only if it has at most
+    /// that many PRs. The boundary belongs to the cap: a stack of exactly
+    /// `cap` PRs runs.
+    #[test]
+    fn a_train_starts_exactly_when_the_configured_cap_admits_it(
+        members in 1usize..=7,
+        cap in 1usize..=7,
+    ) {
+        let cap = TrainSizeCap::new(cap).unwrap();
+        let (started, _) = starts_under_cap(members, cap);
+        prop_assert_eq!(started, members <= cap.get());
+    }
+
+    /// Property: whenever a train is refused for its size, it is refused
+    /// with a comment and nothing else — no event, no effect, no train.
+    /// Being too large is a rejection, not an abort.
+    #[test]
+    fn an_oversized_train_is_refused_without_a_trace(
+        cap in 1usize..=6,
+        extra in 1usize..=3,
+    ) {
+        let members = cap + extra;
+        let (world, state) = seed(&linear_stack(members));
+        let driver = Driver::new(world, state);
+        let plan = start_train(
+            &driver.state,
+            pr_number(0),
+            driver.now,
+            TrainSizeCap::new(cap).unwrap(),
+        )
+        .unwrap();
+
+        prop_assert_eq!(plan.control, Control::Done);
+        prop_assert!(plan.events.is_empty(), "a refusal records nothing");
+        prop_assert!(plan.effects.is_empty(), "a refusal runs no effect");
+        let one_comment = matches!(
+            plan.best_effort.as_slice(),
+            [Effect::GitHub(GitHubEffect::PostComment { .. })]
+        );
+        prop_assert!(one_comment, "a refusal is exactly one comment");
+    }
 }

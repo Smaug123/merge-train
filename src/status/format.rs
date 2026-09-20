@@ -39,6 +39,27 @@ const MAX_JSON_SIZE: usize = 60 * 1024;
 /// GitHub's comment size limit (65536 bytes).
 pub const GITHUB_COMMENT_SIZE_LIMIT: usize = 65536;
 
+/// The largest train an operator may configure the bot to run
+/// (`MERGE_TRAIN_MAX_STACK_SIZE`; see `cascade::TrainSizeCap`).
+///
+/// The status comment carries the whole `TrainRecord`, and a train's members
+/// appear in up to three of its lists (`frozen_descendants`, `known_stack`,
+/// and one of `completed`/`skipped`). Nothing truncates those lists — only
+/// the error fields are truncatable — so the train size is the only thing
+/// bounding the JSON, and a train above the bound would abort mid-flight
+/// with [`StatusCommentTooLarge`] rather than fail to start.
+///
+/// The bound is measured, not assumed:
+/// `the_worst_case_train_at_the_ceiling_still_fits` searches for the largest
+/// train that survives the worst case this schema admits — 20-digit PR
+/// numbers, a 255-byte default branch, every member in all three lists, and
+/// error text of pure control characters, each byte of which JSON escaping
+/// expands sixfold. That search says 605. This ceiling keeps a sixth of the
+/// budget in reserve for schema growth, and
+/// `the_measured_headroom_has_not_been_eaten` fails if a future field spends
+/// it.
+pub const MAX_SUPPORTED_TRAIN_SIZE: usize = 500;
+
 /// The marker that begins a status comment JSON block.
 pub const STATUS_COMMENT_START: &str = "<!-- merge-train-state\n";
 
@@ -95,9 +116,10 @@ pub fn terminal_message(record: &TrainRecord, fanned_into: &[PrNumber]) -> Strin
 /// # Errors
 ///
 /// Returns [`StatusCommentTooLarge`] if the JSON portion exceeds 60KB even
-/// after aggressive truncation of error fields. With the 50-PR train cap the
-/// only way to get there is a pathological non-truncatable field; the caller
-/// must abort the train rather than run without backup state.
+/// after aggressive truncation of error fields. Within
+/// [`MAX_SUPPORTED_TRAIN_SIZE`] the only way to get there is a pathological
+/// non-truncatable field; the caller must abort the train rather than run
+/// without backup state.
 pub fn format_status_comment(
     train: &TrainRecord,
     human_message: &str,
@@ -236,10 +258,10 @@ mod tests {
     use super::*;
     use crate::test_utils::test_timestamp;
     use crate::test_utils::{
-        arb_datetime, arb_pr_number, arb_sha, arb_train_record, arb_train_state,
+        arb_datetime, arb_hostile_text, arb_pr_number, arb_sha, arb_train_record, arb_train_state,
     };
-    use crate::types::CommentId;
     use crate::types::train::TrainRecord;
+    use crate::types::{CommentId, Sha};
     use proptest::prelude::*;
 
     /// Generates a train with a realistic large descendant set (up to 50 PRs).
@@ -293,6 +315,142 @@ mod tests {
                     }
                 },
             )
+    }
+
+    /// The most expensive train of `members` members this schema admits:
+    /// every PR number 20 digits, a 255-byte default branch, every member in
+    /// `frozen_descendants`, `known_stack` AND `completed`, and `error_text`
+    /// in both truncatable fields.
+    ///
+    /// Nothing here is realistic; that is the point. The ceiling has to hold
+    /// for the worst input, not the typical one.
+    fn worst_case_train(members: usize, error_text: &str) -> TrainRecord {
+        use crate::types::train::{
+            CascadePhase, DescendantProgress, TrainError, TrainErrorKind, TrainState,
+        };
+
+        let prs: Vec<PrNumber> = (0..members)
+            .map(|i| PrNumber(u64::MAX - i as u64))
+            .collect();
+        let mut progress = DescendantProgress::with_known_stack(prs.clone(), prs.clone());
+        for pr in &prs {
+            progress.mark_completed(*pr).unwrap();
+        }
+
+        TrainRecord {
+            version: 1,
+            recovery_seq: u64::MAX,
+            state: TrainState::Aborted {
+                error: TrainError {
+                    kind: TrainErrorKind::MergeConflict,
+                    message: error_text.to_owned(),
+                    stderr: Some(error_text.to_owned()),
+                },
+                ended_at: test_timestamp(),
+            },
+            original_root_pr: PrNumber(u64::MAX),
+            current_pr: PrNumber(u64::MAX),
+            cascade_phase: CascadePhase::Reconciling {
+                progress,
+                squash_sha: Sha::parse("a".repeat(40)).unwrap(),
+            },
+            predecessor_pr: Some(PrNumber(u64::MAX)),
+            predecessor_head_sha: Some(Sha::parse("b".repeat(40)).unwrap()),
+            last_squash_parent_sha: Some(Sha::parse("c".repeat(40)).unwrap()),
+            started_at: test_timestamp(),
+            parent: None,
+            // GitHub's own branch-name limit.
+            default_branch: "m".repeat(255),
+            watermark: None,
+            status_comment_id: Some(CommentId(u64::MAX)),
+        }
+    }
+
+    /// Error text whose every byte costs six in the JSON: a control
+    /// character escapes to `\u00XX`. This is the most expansion the
+    /// truncatable fields can buy.
+    fn most_expensive_error_text() -> String {
+        "\u{1}".repeat(64 * 1024)
+    }
+
+    /// The largest train `format_status_comment` accepts, found by search.
+    ///
+    /// "Fits" is monotone in the member count: the verdict depends only on
+    /// whether the aggressively-truncated JSON is within budget, and that
+    /// grows with every member added, so a binary search is sound.
+    fn largest_train_that_fits() -> usize {
+        let fits = |n: usize| {
+            format_status_comment(&worst_case_train(n, &most_expensive_error_text()), "x").is_ok()
+        };
+        let (mut lo, mut hi) = (0usize, 8192usize);
+        assert!(fits(lo), "an empty train must always fit");
+        assert!(!fits(hi), "the search's upper bound must not fit");
+        while lo < hi - 1 {
+            let mid = lo + (hi - lo) / 2;
+            if fits(mid) { lo = mid } else { hi = mid }
+        }
+        lo
+    }
+
+    /// The guarantee [`MAX_SUPPORTED_TRAIN_SIZE`] exists to make: a train the
+    /// operator is allowed to configure always has a status comment to live
+    /// in, so it can never abort mid-cascade for being unrepresentable.
+    #[test]
+    fn the_worst_case_train_at_the_ceiling_still_fits() {
+        let train = worst_case_train(MAX_SUPPORTED_TRAIN_SIZE, &most_expensive_error_text());
+        assert!(
+            format_status_comment(&train, "x").is_ok(),
+            "the worst case at the ceiling of {MAX_SUPPORTED_TRAIN_SIZE} must fit"
+        );
+    }
+
+    /// A tripwire for schema growth. The ceiling was chosen with the measured
+    /// cliff a sixth above it; if a new `TrainRecord` field spends that
+    /// reserve, this fails while there is still margin, rather than the
+    /// ceiling silently becoming unsafe.
+    #[test]
+    fn the_measured_headroom_has_not_been_eaten() {
+        let cliff = largest_train_that_fits();
+        assert!(
+            cliff >= 600,
+            "the worst-case train now tops out at {cliff}, leaving too little \
+             margin above the {MAX_SUPPORTED_TRAIN_SIZE}-PR ceiling. Either the \
+             record grew a field or the budget shrank: re-measure, and lower \
+             MAX_SUPPORTED_TRAIN_SIZE (a breaking change for anyone who \
+             configured a larger train) or win the space back."
+        );
+    }
+
+    proptest! {
+        /// Property: whatever the error text and however many members up to
+        /// the ceiling, a status comment can be formatted. The error fields
+        /// are the only truncatable part, so this is the claim that
+        /// truncation always recovers enough room.
+        #[test]
+        fn any_train_within_the_ceiling_can_be_formatted(
+            members in 0usize..=MAX_SUPPORTED_TRAIN_SIZE,
+            error_text in arb_hostile_text(64),
+            human in arb_hostile_text(16),
+        ) {
+            let train = worst_case_train(members, &error_text);
+            prop_assert!(format_status_comment(&train, &human).is_ok());
+        }
+
+        /// Property: and the comment it produces is within GitHub's limit,
+        /// not merely within the JSON budget.
+        #[test]
+        fn a_formatted_comment_within_the_ceiling_fits_github(
+            members in 0usize..=MAX_SUPPORTED_TRAIN_SIZE,
+            error_text in arb_hostile_text(64),
+        ) {
+            let train = worst_case_train(members, &error_text);
+            let body = format_status_comment(&train, "status").unwrap();
+            prop_assert!(
+                body.len() <= GITHUB_COMMENT_SIZE_LIMIT,
+                "comment of {} bytes exceeds GitHub's {GITHUB_COMMENT_SIZE_LIMIT}",
+                body.len()
+            );
+        }
     }
 
     mod truncation {

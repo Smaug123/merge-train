@@ -60,7 +60,7 @@ use chrono::Utc;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tracing::{error, info, warn};
 
-use crate::cascade::{EffectError, EffectOutcome};
+use crate::cascade::{EffectError, EffectOutcome, TrainSizeCap};
 use crate::effects::Effect;
 use crate::git::CommitIdentity;
 use crate::git::interpreter::WorktreeGitInterpreter;
@@ -221,6 +221,10 @@ pub struct SharedDeps {
     /// How often each worker re-evaluates its active trains as a fallback
     /// for missed webhooks (DESIGN §Polling fallback). Zero disables it.
     pub poll_interval: std::time::Duration,
+
+    /// The largest train `@merge-train start` will accept, from
+    /// `MERGE_TRAIN_MAX_STACK_SIZE`.
+    pub max_train_size: TrainSizeCap,
 }
 
 impl SharedDeps {
@@ -250,6 +254,7 @@ impl SharedDeps {
             bot_name: self.bot_name.clone(),
             stall_retry_delay: self.stall_retry_delay,
             poll_interval: self.poll_interval,
+            max_train_size: self.max_train_size,
             clock: Clock::System,
         }
     }
@@ -1041,6 +1046,7 @@ pub(crate) mod test_support {
             bot_user_id: TEST_BOT_ID,
             bot_name: "merge-train".to_owned(),
             stall_retry_delay: std::time::Duration::from_millis(25),
+            max_train_size: crate::cascade::TrainSizeCap::DEFAULT,
             // Tests drive polls directly (`Processor::poll_active_trains`);
             // the background timer stays off for determinism.
             poll_interval: std::time::Duration::ZERO,

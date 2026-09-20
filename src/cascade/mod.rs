@@ -14,6 +14,7 @@
 mod engine;
 mod observe;
 mod plan;
+mod size;
 
 #[cfg(test)]
 mod conformance_tests;
@@ -21,9 +22,10 @@ mod conformance_tests;
 mod model_tests;
 
 pub(crate) use engine::handler_abort_cleanup;
-pub use engine::{MAX_TRAIN_SIZE, advance, recover_train, start_train, stop_train};
+pub use engine::{advance, recover_train, start_train, stop_train};
 pub use observe::{ObserveError, observe};
 pub use plan::{
     CascadeError, Control, EffectError, EffectOutcome, EffectResponse, IntentFact, Observation,
     ReplayFacts, StepPlan,
 };
+pub use size::{InvalidTrainSizeCap, TrainSizeCap};

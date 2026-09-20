@@ -338,6 +338,7 @@ impl World {
             bot_name: "merge-train".to_owned(),
             stall_retry_delay: STALL_RETRY_DELAY,
             poll_interval: std::time::Duration::ZERO,
+            max_train_size: crate::cascade::TrainSizeCap::DEFAULT,
             clock: super::pipeline::Clock::Manual(self.clock.clone()),
         }
     }
@@ -13237,6 +13238,7 @@ mod registry {
             bot_name: "merge-train".to_owned(),
             stall_retry_delay: std::time::Duration::from_millis(25),
             poll_interval: std::time::Duration::ZERO,
+            max_train_size: crate::cascade::TrainSizeCap::DEFAULT,
         };
         WorkerRegistry::new(world.state_dir.path(), deps)
     }
@@ -14624,6 +14626,68 @@ mod recovery_model {
             recovered(&events),
             (None, None),
             "recovery cannot verify a founding edit on a stranger's comment"
+        );
+    }
+
+    /// A declaration the author retracts and then restores by editing the
+    /// SAME comment, every edit inside one timestamp second.
+    ///
+    /// The comment ends up declaring #1, written by the PR's author, so
+    /// both live and a lost-DB crawl must see the edge. Live used not to:
+    /// the first edit (to the declaration) and the third (back to it)
+    /// shared pr, comment, sender, second and destination body, so the
+    /// third deduped away as a redelivery and the restored declaration was
+    /// never recorded. The crawl, reading GitHub's present, founded it —
+    /// and the two disagreed, which is the one thing the crawl exists not
+    /// to do.
+    ///
+    /// Found by `recovery_reaches_what_live_processing_reached` (seed
+    /// `bd00b7bd724a88b7818fba4a2de286b29066d93251ad0ec55d7f9354c18af429`)
+    /// and reduced to this history. It was pre-existing, reproducing on
+    /// 7d53568. The fix keys the dedupe on the transition rather than its
+    /// destination (`DedupeKey::issue_comment_edited`).
+    #[test]
+    fn a_declaration_restored_by_editing_one_comment_survives_in_both_paths() {
+        let events = vec![
+            Event::Create {
+                k: 0,
+                by: Actor::Stranger,
+                body: DECLARE_1,
+            },
+            Event::Create {
+                k: 1,
+                by: Actor::Author,
+                body: DECLARE_1,
+            },
+            Event::Edit {
+                k: 1,
+                by: Actor::Author,
+                from: DECLARE_1,
+                to: DECLARE_1,
+            },
+            Event::Edit {
+                k: 1,
+                by: Actor::Author,
+                from: DECLARE_1,
+                to: PROSE,
+            },
+            Event::Edit {
+                k: 1,
+                by: Actor::Author,
+                from: PROSE,
+                to: DECLARE_1,
+            },
+        ];
+        assert_eq!(
+            live(&events, false),
+            (Some(PrNumber(1)), Some(1)),
+            "the restoring edit is a live utterance, not a redelivery of the \
+             earlier edit that reached the same body"
+        );
+        assert_eq!(
+            recovered(&events),
+            (Some(PrNumber(1)), Some(1)),
+            "and the crawl reads the same declaration off GitHub"
         );
     }
 
