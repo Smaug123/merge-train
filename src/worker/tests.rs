@@ -14627,6 +14627,77 @@ mod recovery_model {
         );
     }
 
+    /// An older comment edited into a declaration *after* a newer one took
+    /// ownership, and the newer one then retracted.
+    ///
+    /// The author declares #9 in comment 0, declares #1 in comment 1 (which
+    /// takes ownership, being newer), edits comment 0 to declare #1 too,
+    /// and finally edits comment 1 to prose. What GitHub is left holding is
+    /// one standing declaration: comment 0, written by the author, naming
+    /// #1.
+    ///
+    /// Live ends with no edge. Its ownership moves only FORWARD in comment
+    /// id, so the edit of comment 0 is "the owner\'s declaration restated by
+    /// an older comment" and changes nothing; when comment 1 retracts, the
+    /// edge goes with it and comment 0\'s standing declaration is not
+    /// considered. The crawl reads the comments and founds from comment 0.
+    ///
+    /// They must agree. This asserts only that, not which of them moves:
+    /// live\'s forward-only ownership and the crawl\'s reading of the final
+    /// bytes are both deliberate, and reconciling them is a design decision
+    /// rather than an obvious repair.
+    ///
+    /// Found by `recovery_from_any_crash_and_read_point_reaches_what_live_processing_reached`
+    /// (seed `1708c19c0b88f47b6f0db51e2af156e4c1f65c3200f86309bb0e5e3cff5ef87e`).
+    /// Pre-existing and distinct from the dedupe-key divergence: it
+    /// reproduces on 7d53568, and none of its edits ever shared a key.
+    #[test]
+    fn an_older_comment_edited_into_the_declaration_does_not_split_the_paths() {
+        let events = vec![
+            Event::Create {
+                k: 0,
+                by: Actor::Author,
+                body: DECLARE_9,
+            },
+            Event::Create {
+                k: 1,
+                by: Actor::Author,
+                body: DECLARE_1,
+            },
+            Event::Create {
+                k: 2,
+                by: Actor::Stranger,
+                body: DECLARE_1,
+            },
+            Event::Edit {
+                k: 0,
+                by: Actor::Author,
+                from: DECLARE_9,
+                to: DECLARE_1,
+            },
+            Event::Delete {
+                k: 2,
+                by: Actor::Stranger,
+            },
+            Event::Edit {
+                k: 1,
+                by: Actor::Author,
+                from: DECLARE_1,
+                to: PROSE,
+            },
+        ];
+        assert_eq!(
+            recovered(&events),
+            live(&events, false),
+            "the crawl and live processing must reach the same topology"
+        );
+        assert_eq!(
+            recovered_straddling(&events, 0, 0, false),
+            live(&events, false),
+            "and so must the crawl that reads before the backlog lands"
+        );
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig {
             cases: 48,
