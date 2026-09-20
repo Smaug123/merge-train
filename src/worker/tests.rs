@@ -14628,17 +14628,24 @@ mod recovery_model {
     }
 
     /// A declaration the author retracts and then restores by editing the
-    /// SAME comment. Live settles that comment when it retracts, and a
-    /// later edit of an already-settled comment founds nothing — so live
-    /// ends with no edge. Recovery reads the comment's present body, sees
-    /// a declaration by the PR's author, and founds the edge live refused.
+    /// SAME comment, every edit inside one timestamp second.
+    ///
+    /// The comment ends up declaring #1, written by the PR's author, so
+    /// both live and a lost-DB crawl must see the edge. Live used not to:
+    /// the first edit (to the declaration) and the third (back to it)
+    /// shared pr, comment, sender, second and destination body, so the
+    /// third deduped away as a redelivery and the restored declaration was
+    /// never recorded. The crawl, reading GitHub's present, founded it —
+    /// and the two disagreed, which is the one thing the crawl exists not
+    /// to do.
     ///
     /// Found by `recovery_reaches_what_live_processing_reached` (seed
     /// `bd00b7bd724a88b7818fba4a2de286b29066d93251ad0ec55d7f9354c18af429`)
-    /// and reduced to this history. Pre-existing: it reproduces on
-    /// 7d53568, before the state-endpoint and train-cap work.
+    /// and reduced to this history. It was pre-existing, reproducing on
+    /// 7d53568. The fix keys the dedupe on the transition rather than its
+    /// destination (`DedupeKey::issue_comment_edited`).
     #[test]
-    fn recovery_founds_no_edge_from_a_declaration_live_had_settled() {
+    fn a_declaration_restored_by_editing_one_comment_survives_in_both_paths() {
         let events = vec![
             Event::Create {
                 k: 0,
@@ -14671,14 +14678,14 @@ mod recovery_model {
         ];
         assert_eq!(
             live(&events, false),
-            (None, None),
-            "live settles the comment when it retracts, and founds nothing from \
-             a later edit of it"
+            (Some(PrNumber(1)), Some(1)),
+            "the restoring edit is a live utterance, not a redelivery of the \
+             earlier edit that reached the same body"
         );
         assert_eq!(
             recovered(&events),
-            (None, None),
-            "recovery must not found an edge live had already settled away"
+            (Some(PrNumber(1)), Some(1)),
+            "and the crawl reads the same declaration off GitHub"
         );
     }
 

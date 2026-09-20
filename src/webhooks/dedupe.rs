@@ -7,7 +7,7 @@
 //! # Key Formats by Event Type
 //!
 //! - `issue_comment.created`: `issue_comment:<pr>:<comment_id>:created`
-//! - `issue_comment.edited`: `issue_comment:<pr>:<comment_id>:edited:<updated_at>:<body-digest>:<sender>`
+//! - `issue_comment.edited`: `issue_comment:<pr>:<comment_id>:edited:<updated_at>:<from-digest>:<body-digest>:<sender>`
 //! - `issue_comment.deleted`: `issue_comment:<pr>:<comment_id>:deleted`
 //! - `pull_request.<action>`: `pull_request:<pr>:<action>:<head_sha>:<merge>:<updated_at>`
 //! - `pull_request.edited`: `pull_request:<pr>:edited:<base-from>:<base>:<updated_at>`
@@ -53,23 +53,44 @@ impl DedupeKey {
     /// must not be dropped as a duplicate: a digest of the body is part of
     /// the key (Codex M5 round 12), and so is the editor — authorization is
     /// sender-based, so a denied non-author edit must not swallow the
-    /// author's identical same-second edit (Codex M5 round 16). Pure
-    /// redeliveries share body and sender and still dedupe.
+    /// author's identical same-second edit (Codex M5 round 16).
+    ///
+    /// The destination body is not enough, because a body can be returned
+    /// to: a comment edited A → B → A within one second gives its first and
+    /// third edits the same pr, comment, sender, timestamp and destination,
+    /// so the edit back to A dedupes away and the declaration it restores is
+    /// never recorded — live then disagrees with what a lost-DB crawl reads
+    /// off GitHub. So the key identifies the TRANSITION: `from` is
+    /// `changes.body.from`, the body this edit replaced. This is the hazard
+    /// `pull_request.edited` already keys around with `base.ref.from`
+    /// (Codex M5 round 18); comment bodies had been left out.
+    ///
+    /// `from` is `None` when GitHub sent no `changes.body` — an edit that
+    /// changed something else. Those key as they did before, which is right:
+    /// with no body change there is no declaration to lose.
+    ///
+    /// Pure redeliveries repeat the whole payload, so they share `from`,
+    /// body and sender, and still dedupe.
     pub fn issue_comment_edited(
         pr: PrNumber,
         comment_id: CommentId,
         sender_id: u64,
+        from: Option<&str>,
         body: &str,
         updated_at: &DateTime<Utc>,
     ) -> Self {
         use sha2::{Digest, Sha256};
-        let digest = Sha256::digest(body.as_bytes());
+        let digest = |s: &str| hex::encode(&Sha256::digest(s.as_bytes())[..8]);
+        // A distinct marker rather than a digest, so that "no body change"
+        // can never collide with an edit FROM some particular text.
+        let from = from.map_or_else(|| "none".to_owned(), digest);
         DedupeKey(format!(
-            "issue_comment:{}:{}:edited:{}:{}:{}",
+            "issue_comment:{}:{}:edited:{}:{}:{}:{}",
             pr.0,
             comment_id.0,
             updated_at.to_rfc3339(),
-            hex::encode(&digest[..8]),
+            from,
+            digest(body),
             sender_id,
         ))
     }
@@ -212,6 +233,7 @@ impl DedupeKey {
                         pr,
                         e.comment_id,
                         e.sender_id,
+                        e.body_change_from.as_deref(),
                         &e.body,
                         &e.updated_at,
                     ),
@@ -297,6 +319,7 @@ mod tests {
             comment_id: CommentId(comment_id),
             body: String::new(),
             author_id: 1,
+            body_change_from: None,
             author_login: "a".to_owned(),
             sender_id: 1,
             sender_login: "a".to_owned(),
@@ -401,7 +424,7 @@ mod tests {
             updated_at in arb_datetime(),
         ) {
             let key1 = DedupeKey::issue_comment_created(pr, comment_id);
-            let key2 = DedupeKey::issue_comment_edited(pr, comment_id, 1, "b", &updated_at);
+            let key2 = DedupeKey::issue_comment_edited(pr, comment_id, 1, Some("a"), "b", &updated_at);
             let key3 = DedupeKey::issue_comment_deleted(pr, comment_id);
             // Compare using as_str() to avoid move issues
             prop_assert_ne!(key1.as_str(), key2.as_str());
@@ -418,8 +441,8 @@ mod tests {
             comment_id in arb_comment_id(),
             updated_at in arb_datetime(),
         ) {
-            let a = DedupeKey::issue_comment_edited(pr, comment_id, 1, "same", &updated_at);
-            let b = DedupeKey::issue_comment_edited(pr, comment_id, 2, "same", &updated_at);
+            let a = DedupeKey::issue_comment_edited(pr, comment_id, 1, Some("was"), "same", &updated_at);
+            let b = DedupeKey::issue_comment_edited(pr, comment_id, 2, Some("was"), "same", &updated_at);
             prop_assert_ne!(a, b);
         }
 
@@ -432,9 +455,90 @@ mod tests {
             comment_id in arb_comment_id(),
             updated_at in arb_datetime(),
         ) {
-            let a = DedupeKey::issue_comment_edited(pr, comment_id, 1, "@bot predecessor #1", &updated_at);
-            let b = DedupeKey::issue_comment_edited(pr, comment_id, 1, "@bot predecessor #2", &updated_at);
+            let a = DedupeKey::issue_comment_edited(pr, comment_id, 1, Some("was"), "@bot predecessor #1", &updated_at);
+            let b = DedupeKey::issue_comment_edited(pr, comment_id, 1, Some("was"), "@bot predecessor #2", &updated_at);
             prop_assert_ne!(a, b);
+        }
+
+        /// A body can be returned to. A comment edited A → B → A within one
+        /// second gives its first and third edits the same pr, comment,
+        /// sender, timestamp and destination body; keyed on the destination
+        /// alone they collide, and the edit back to A is discarded as a
+        /// redelivery — losing a declaration the author restored, which a
+        /// lost-DB crawl then reads off GitHub and founds, so live and
+        /// recovery disagree.
+        #[test]
+        fn a_body_edited_away_and_back_in_one_second_keys_three_times(
+            pr in arb_pr_number(),
+            comment_id in arb_comment_id(),
+            updated_at in arb_datetime(),
+            a in "[a-z]{1,16}",
+            b in "[a-z]{1,16}",
+        ) {
+            prop_assume!(a != b);
+            let edit = |from: &str, to: &str| {
+                DedupeKey::issue_comment_edited(pr, comment_id, 1, Some(from), to, &updated_at)
+            };
+            // The history: something → A, then A → B, then B → A.
+            let to_a_first = edit(&b, &a);
+            let to_b = edit(&a, &b);
+            let back_to_a = edit(&b, &a);
+
+            prop_assert_ne!(to_a_first.as_str(), to_b.as_str());
+            prop_assert_ne!(to_b.as_str(), back_to_a.as_str());
+            // The first and third edits genuinely ARE the same transition
+            // (b → a) in the same second by the same sender, so they key
+            // alike; what matters is that the edit AWAY from A does not sit
+            // between two keys that collide across it.
+            prop_assert_eq!(to_a_first.as_str(), back_to_a.as_str());
+        }
+
+        /// The transition is what is keyed: two edits reaching the same body
+        /// in the same second from DIFFERENT bodies are different events.
+        #[test]
+        fn same_second_edits_to_one_body_from_different_bodies_differ(
+            pr in arb_pr_number(),
+            comment_id in arb_comment_id(),
+            updated_at in arb_datetime(),
+            from_a in "[a-z]{1,16}",
+            from_b in "[a-z]{1,16}",
+            to in "[a-z]{1,16}",
+        ) {
+            prop_assume!(from_a != from_b);
+            let a = DedupeKey::issue_comment_edited(pr, comment_id, 1, Some(&from_a), &to, &updated_at);
+            let b = DedupeKey::issue_comment_edited(pr, comment_id, 1, Some(&from_b), &to, &updated_at);
+            prop_assert_ne!(a, b);
+        }
+
+        /// "GitHub sent no body change" is its own case, never confusable
+        /// with an edit from some particular text.
+        #[test]
+        fn an_absent_body_change_keys_differently_from_any_present_one(
+            pr in arb_pr_number(),
+            comment_id in arb_comment_id(),
+            updated_at in arb_datetime(),
+            from in "[a-z]{1,16}",
+            to in "[a-z]{1,16}",
+        ) {
+            let absent = DedupeKey::issue_comment_edited(pr, comment_id, 1, None, &to, &updated_at);
+            let present = DedupeKey::issue_comment_edited(pr, comment_id, 1, Some(&from), &to, &updated_at);
+            prop_assert_ne!(absent, present);
+        }
+
+        /// A pure redelivery repeats the whole payload, so it still dedupes.
+        #[test]
+        fn a_redelivered_edit_still_dedupes(
+            pr in arb_pr_number(),
+            comment_id in arb_comment_id(),
+            updated_at in arb_datetime(),
+            from in proptest::option::of("[a-z]{1,16}"),
+            to in "[a-z]{1,16}",
+            sender in any::<u64>(),
+        ) {
+            let key = || DedupeKey::issue_comment_edited(
+                pr, comment_id, sender, from.as_deref(), &to, &updated_at,
+            );
+            prop_assert_eq!(key(), key());
         }
 
         #[test]
@@ -445,8 +549,8 @@ mod tests {
             updated_at2 in arb_datetime(),
         ) {
             prop_assume!(updated_at1 != updated_at2);
-            let key1 = DedupeKey::issue_comment_edited(pr, comment_id, 1, "b", &updated_at1);
-            let key2 = DedupeKey::issue_comment_edited(pr, comment_id, 1, "b", &updated_at2);
+            let key1 = DedupeKey::issue_comment_edited(pr, comment_id, 1, Some("a"), "b", &updated_at1);
+            let key2 = DedupeKey::issue_comment_edited(pr, comment_id, 1, Some("a"), "b", &updated_at2);
             prop_assert_ne!(key1, key2);
         }
 
@@ -511,7 +615,7 @@ mod tests {
         ) {
             for (action, expected) in [
                 (CommentAction::Created, DedupeKey::issue_comment_created(pr, CommentId(comment_id.0))),
-                (CommentAction::Edited, DedupeKey::issue_comment_edited(pr, CommentId(comment_id.0), 1, "", &updated_at)),
+                (CommentAction::Edited, DedupeKey::issue_comment_edited(pr, CommentId(comment_id.0), 1, None, "", &updated_at)),
                 (CommentAction::Deleted, DedupeKey::issue_comment_deleted(pr, CommentId(comment_id.0))),
             ] {
                 let event = GitHubEvent::IssueComment(comment_event(action, Some(pr), comment_id.0, updated_at));
