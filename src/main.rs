@@ -72,13 +72,23 @@ fn absolutize(path: PathBuf) -> PathBuf {
 /// A missing or empty secret is refused: HMAC with an empty key verifies
 /// signatures forged with that same empty key, so starting without a secret
 /// would accept arbitrary webhooks.
-fn webhook_secret_from(value: Option<String>) -> Result<Vec<u8>, &'static str> {
+///
+/// A secret that is set but is not UTF-8 is refused as well, and says so:
+/// `.ok()` would report it as "not set", sending an operator who did set it
+/// to look in the wrong place. The refusal does not quote the bytes.
+fn webhook_secret_from(value: Result<String, VarError>) -> Result<Vec<u8>, &'static str> {
     match value {
-        None => Err("WEBHOOK_SECRET is not set; refusing to start without signature verification"),
-        Some(s) if s.is_empty() => {
+        Err(VarError::NotPresent) => {
+            Err("WEBHOOK_SECRET is not set; refusing to start without signature verification")
+        }
+        Err(VarError::NotUnicode(_)) => Err(
+            "WEBHOOK_SECRET is set but is not valid UTF-8; refusing to start without \
+             signature verification",
+        ),
+        Ok(s) if s.is_empty() => {
             Err("WEBHOOK_SECRET is empty; refusing to start without signature verification")
         }
-        Some(s) => Ok(s.into_bytes()),
+        Ok(s) => Ok(s.into_bytes()),
     }
 }
 
@@ -93,20 +103,34 @@ fn webhook_secret_from(value: Option<String>) -> Result<Vec<u8>, &'static str> {
 /// A token that is set but unusable is refused rather than ignored — an
 /// empty `STATE_API_TOKEN` is a secret-injection that silently failed, and
 /// silently disabling the endpoint would hide it.
-fn state_auth_from(value: Option<String>) -> Result<StateAuth, &'static str> {
-    match value {
-        None => Ok(StateAuth::Disabled),
-        Some(token) => match StateToken::new(token) {
-            Ok(token) => Ok(StateAuth::Bearer(token)),
-            Err(InvalidStateToken::Empty) => Err(
-                "STATE_API_TOKEN is empty; unset it to disable the state endpoint, \
-                 or set it to a token",
-            ),
-            Err(InvalidStateToken::Unpresentable) => Err(
-                "STATE_API_TOKEN contains a byte that cannot appear in an HTTP header \
-                 value (only visible ASCII is usable), so no caller could present it",
-            ),
-        },
+///
+/// It therefore takes the whole [`VarError`], not an `Option`: `.ok()` maps
+/// [`VarError::NotUnicode`] to `None`, which would file a token the operator
+/// did set — bytes that are not UTF-8 — under "unset" and silently disable
+/// the endpoint, which is the silent failure this function exists to refuse.
+/// The refusal does not quote the offending bytes, unlike the other
+/// variables': they are a secret.
+fn state_auth_from(value: Result<String, VarError>) -> Result<StateAuth, &'static str> {
+    let token = match value {
+        Ok(token) => token,
+        Err(VarError::NotPresent) => return Ok(StateAuth::Disabled),
+        Err(VarError::NotUnicode(_)) => {
+            return Err(
+                "STATE_API_TOKEN is not valid UTF-8, so no caller could present it; \
+                 unset it to disable the state endpoint, or set it to a usable token",
+            );
+        }
+    };
+    match StateToken::new(token) {
+        Ok(token) => Ok(StateAuth::Bearer(token)),
+        Err(InvalidStateToken::Empty) => Err(
+            "STATE_API_TOKEN is empty; unset it to disable the state endpoint, \
+             or set it to a token",
+        ),
+        Err(InvalidStateToken::Unpresentable) => Err(
+            "STATE_API_TOKEN contains a byte that cannot appear in an HTTP header \
+             value (only visible ASCII is usable), so no caller could present it",
+        ),
     }
 }
 
@@ -144,11 +168,17 @@ fn max_train_size_from(value: Result<String, VarError>) -> Result<TrainSizeCap, 
 /// Validates the GitHub token read from the environment. Required: the worker
 /// executes real API effects (squash merges!) — there is no unauthenticated
 /// mode.
-fn github_token_from(value: Option<String>) -> Result<String, &'static str> {
+fn github_token_from(value: Result<String, VarError>) -> Result<String, &'static str> {
     match value {
-        None => Err("GITHUB_TOKEN is not set; the bot cannot run without GitHub access"),
-        Some(s) if s.is_empty() => Err("GITHUB_TOKEN is empty"),
-        Some(s) => Ok(s),
+        Err(VarError::NotPresent) => {
+            Err("GITHUB_TOKEN is not set; the bot cannot run without GitHub access")
+        }
+        // As for the webhook secret: a token that is set but is not UTF-8 is
+        // refused saying so, rather than reported as absent. The refusal does
+        // not quote the bytes.
+        Err(VarError::NotUnicode(_)) => Err("GITHUB_TOKEN is set but is not valid UTF-8"),
+        Ok(s) if s.is_empty() => Err("GITHUB_TOKEN is empty"),
+        Ok(s) => Ok(s),
     }
 }
 
@@ -179,9 +209,9 @@ impl Config {
                 .unwrap_or_else(|_| PathBuf::from("./data/repos")),
         );
 
-        let webhook_secret = webhook_secret_from(std::env::var("WEBHOOK_SECRET").ok())?;
-        let github_token = github_token_from(std::env::var("GITHUB_TOKEN").ok())?;
-        let state_auth = state_auth_from(std::env::var("STATE_API_TOKEN").ok())?;
+        let webhook_secret = webhook_secret_from(std::env::var("WEBHOOK_SECRET"))?;
+        let github_token = github_token_from(std::env::var("GITHUB_TOKEN"))?;
+        let state_auth = state_auth_from(std::env::var("STATE_API_TOKEN"))?;
 
         let poll_interval =
             poll_interval_from(std::env::var("MERGE_TRAIN_POLL_INTERVAL_MINS").ok())?;
@@ -483,56 +513,102 @@ mod tests {
 
     #[test]
     fn missing_webhook_secret_is_refused() {
-        assert!(webhook_secret_from(None).is_err());
+        assert!(webhook_secret_from(Err(VarError::NotPresent)).is_err());
     }
 
     #[test]
     fn empty_webhook_secret_is_refused() {
-        assert!(webhook_secret_from(Some(String::new())).is_err());
+        assert!(webhook_secret_from(Ok(String::new())).is_err());
     }
 
     #[test]
     fn nonempty_webhook_secret_is_accepted() {
-        assert_eq!(
-            webhook_secret_from(Some("s3cret".to_string())).unwrap(),
-            b"s3cret"
-        );
+        assert_eq!(webhook_secret_from(set("s3cret")).unwrap(), b"s3cret");
     }
 
     #[test]
     fn missing_github_token_is_refused() {
-        assert!(github_token_from(None).is_err());
-        assert!(github_token_from(Some(String::new())).is_err());
+        assert!(github_token_from(Err(VarError::NotPresent)).is_err());
+        assert!(github_token_from(Ok(String::new())).is_err());
     }
 
     #[test]
     fn an_unset_state_token_disables_the_endpoint() {
-        assert!(matches!(state_auth_from(None), Ok(StateAuth::Disabled)));
+        assert!(matches!(
+            state_auth_from(Err(VarError::NotPresent)),
+            Ok(StateAuth::Disabled)
+        ));
     }
 
     #[test]
     fn an_empty_state_token_is_refused_rather_than_disabling() {
         // Silently disabling would hide a secret-injection that failed.
-        assert!(state_auth_from(Some(String::new())).is_err());
+        assert!(state_auth_from(Ok(String::new())).is_err());
+    }
+
+    /// A token that is set but is not UTF-8 is a token the operator chose,
+    /// not an absent one. `std::env::var(..).ok()` would file it under
+    /// "unset" and silently disable the endpoint, hiding a secret injection
+    /// that failed — the very thing this parser refuses for an empty value.
+    #[test]
+    fn a_non_unicode_state_token_is_refused_not_treated_as_unset() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let not_utf8 = OsString::from_vec(vec![b's', 0xff]);
+        let refusal = state_auth_from(Err(VarError::NotUnicode(not_utf8)))
+            .expect_err("non-UTF-8 must be refused, not read as unset");
+        assert!(
+            refusal.contains("STATE_API_TOKEN"),
+            "the refusal must name the variable, got: {refusal}"
+        );
     }
 
     #[test]
     fn an_unpresentable_state_token_is_refused() {
-        assert!(state_auth_from(Some("has space".to_owned())).is_err());
-        assert!(state_auth_from(Some("café".to_owned())).is_err());
+        assert!(state_auth_from(set("has space")).is_err());
+        assert!(state_auth_from(set("café")).is_err());
     }
 
     #[test]
     fn a_usable_state_token_enables_the_endpoint() {
-        let auth = state_auth_from(Some("s3cret".to_owned())).unwrap();
+        let auth = state_auth_from(set("s3cret")).unwrap();
         match auth {
             StateAuth::Bearer(token) => assert!(token.matches(b"s3cret")),
             StateAuth::Disabled => panic!("expected the endpoint to be enabled"),
         }
     }
 
+    /// Both secrets are refused when set but not UTF-8, and say so rather
+    /// than reporting themselves absent: the outcome was always right (the
+    /// bot refuses to start either way), but an operator who did set the
+    /// variable was told it was missing and sent to look in the wrong place.
+    #[test]
+    fn a_non_unicode_secret_is_refused_as_set_not_as_missing() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let not_utf8 = || OsString::from_vec(vec![b's', 0xff]);
+
+        let refusal = webhook_secret_from(Err(VarError::NotUnicode(not_utf8())))
+            .expect_err("a non-UTF-8 secret must be refused");
+        assert!(
+            refusal.contains("not valid UTF-8"),
+            "the refusal must say the secret is unusable, not absent, got: {refusal}"
+        );
+        assert!(!refusal.contains("is not set"), "got: {refusal}");
+
+        let refusal = github_token_from(Err(VarError::NotUnicode(not_utf8())))
+            .expect_err("a non-UTF-8 token must be refused");
+        assert!(
+            refusal.contains("not valid UTF-8"),
+            "the refusal must say the token is unusable, not absent, got: {refusal}"
+        );
+        assert!(!refusal.contains("is not set"), "got: {refusal}");
+    }
+
     #[test]
     fn nonempty_github_token_is_accepted() {
-        assert_eq!(github_token_from(Some("t".to_string())).unwrap(), "t");
+        assert_eq!(github_token_from(set("t")).unwrap(), "t");
     }
 }
