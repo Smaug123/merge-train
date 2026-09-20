@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main]
 
+env:
+  CACHIX_CACHE: smaug123
+
 jobs:
   nix-build:
     runs-on: ubuntu-latest
@@ -13,6 +16,21 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: DeterminateSystems/nix-installer-action@ab0a9732c6464e5bb81efb82a2103c7d98f0946f
       - uses: DeterminateSystems/magic-nix-cache-action@b8276522d77f21bf19d3574e5bc99186a6c7aa6c
+
+      # With the token the action's post step pushes every store path this job
+      # built, so a later run whose sources hash the same fetches the result
+      # instead of rebuilding it. Two cases pay for themselves here. The
+      # vendored `cargoDeps` derivation is keyed on Cargo.lock alone, so it
+      # survives ordinary source changes. And because `src = ./.` hashes the
+      # tree rather than the history, a squash merge of a PR whose tree already
+      # built lands on `main` with the same store path, so the push build is a
+      # straight cache hit rather than another ten minutes.
+      - name: Use Cachix
+        uses: cachix/cachix-action@ad2ddac53f961de1989924296a1f236fcfbaa4fc # v15
+        with:
+          name: ${{ env.CACHIX_CACHE }}
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
       - name: Build
         run: nix build -L
 
@@ -22,6 +40,36 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: DeterminateSystems/nix-installer-action@ab0a9732c6464e5bb81efb82a2103c7d98f0946f
       - uses: DeterminateSystems/magic-nix-cache-action@b8276522d77f21bf19d3574e5bc99186a6c7aa6c
+
+      # rust-cache computes its key from `rustc -vV` and `Cargo.lock`, so the
+      # devshell's toolchain has to be on PATH for the step itself. The cargo
+      # invocations below still run under `nix develop` for the rest of the
+      # shell's environment; this only lets the cache action see rustc. The
+      # devshell evaluation it pays for is not extra work: the first
+      # `nix develop` in the job used to pay it instead.
+      #
+      # Only the Nix store entries are exported. `nix develop` inherits the
+      # runner's PATH, and the runner's rustup shim directory
+      # (/home/runner/.cargo/bin) sorts ahead of the toolchain the devshell
+      # brings, so exporting the devshell PATH verbatim leaves rust-cache
+      # keying on the runner's rustc (1.98.1) rather than ours (1.96.0). The
+      # grep drops the shim from the exported block; the runner's own PATH is
+      # still appended after it, so nothing is lost. An empty grep fails the
+      # step, which is what we want if this assumption ever stops holding.
+      - name: Expose the devshell toolchain to later steps
+        run: |
+          nix develop --command sh -c 'printf "%s\n" "$PATH" | tr ":" "\n"' \
+            | grep '^/nix/store/' >> "$GITHUB_PATH"
+
+      # Restores ~/.cargo (registry, git checkouts) and target/ from the last
+      # run of this job with the same Cargo.lock and toolchain. Without it
+      # clippy compiles all ~240 dependency crates from scratch every run.
+      # `cache-on-failure` saves the dependency build even when a later step
+      # fails, so a red run still warms the next one.
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-on-failure: true
 
       - name: Shellcheck
         run: nix develop --command shellcheck scripts/*.sh
@@ -38,6 +86,19 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: DeterminateSystems/nix-installer-action@ab0a9732c6464e5bb81efb82a2103c7d98f0946f
       - uses: DeterminateSystems/magic-nix-cache-action@b8276522d77f21bf19d3574e5bc99186a6c7aa6c
+
+      # See the `check` job: rust-cache needs to see the devshell's rustc, and
+      # only the Nix store entries get exported so the runner's rustup shims
+      # cannot shadow it.
+      - name: Expose the devshell toolchain to later steps
+        run: |
+          nix develop --command sh -c 'printf "%s\n" "$PATH" | tr ":" "\n"' \
+            | grep '^/nix/store/' >> "$GITHUB_PATH"
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-on-failure: true
 
       - name: Test
         run: nix develop --command cargo test
