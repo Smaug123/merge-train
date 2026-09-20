@@ -506,7 +506,7 @@ Train running — reconciling PR #124 after squash (1/2 descendants complete)
 
 Rather than attempting truncated recovery (which is fragile and can violate freeze invariants), the bot refuses to operate on trains that are too large:
 
-1. **Train size limit**: The bot enforces a maximum of **50 PRs per train** (configurable via `MERGE_TRAIN_MAX_STACK_SIZE`, default 50). This limit is conservative enough to always fit within comment size limits with margin.
+1. **Train size limit**: The bot enforces a maximum number of PRs per train, configurable via `MERGE_TRAIN_MAX_STACK_SIZE` (default 50). The configured value is itself capped at `status::MAX_SUPPORTED_TRAIN_SIZE` (500), the largest train that always fits within comment size limits; a larger configuration is refused at startup rather than honoured into a mid-cascade abort. A malformed value is refused too, not defaulted.
 
 2. **Validation on start**: When `@merge-train start` is issued, the bot walks the descendant tree to count total PRs. If the count exceeds the limit:
    - The command is rejected
@@ -515,10 +515,10 @@ Rather than attempting truncated recovery (which is fragile and can violate free
 
 3. **Validation during cascade**: Before entering the `Preparing` phase for any PR, the bot re-validates the descendant count. If new PRs have been added that push the total over the limit:
    - The cascade is aborted
-   - The bot posts to the current root PR: "Train has grown too large (N PRs, maximum 50). New PRs were added during the cascade. Please split the stack or remove excess PRs, then restart."
+   - The bot posts to the current root PR: "Train has grown too large (N PRs, maximum M). New PRs were added during the cascade. Please split the stack or remove excess PRs, then restart."
    - The train transitions to `aborted` state
 
-4. **Why 50 PRs?** A train with 50 PRs produces status comment JSON of approximately 20-30KB (depending on branch names and SHA lengths), well under the 60KB safe threshold. This leaves ample headroom for human-readable content and any future schema additions.
+4. **Why 50, and why a ceiling of 500?** 50 is a default chosen for the cost of *running* a train rather than the cost of recording one: the cascade runs CI quadratically often in the train's length, so a 50-PR train is already expensive. The 500 ceiling is the cost of recording one, and it is measured rather than estimated (see `the_measured_headroom_has_not_been_eaten` in `status::format`): the worst case this schema admits — 20-digit PR numbers, a 255-byte default branch, every member in all three of `frozen_descendants`, `known_stack` and `completed`, and error text of pure control characters, each byte of which JSON escaping expands sixfold — tops out at 605 PRs. The ceiling keeps the remaining sixth in reserve for schema growth, and a test fails if a new field spends it.
 
 5. **Unbounded field truncation**: The `error.message` field and other variable-length strings (git command output, API error responses) are truncated before serialization to ensure the total JSON stays within bounds:
    - `error.message`: Maximum 4KB (truncated with "... [truncated]" suffix)
@@ -529,7 +529,7 @@ Rather than attempting truncated recovery (which is fragile and can violate free
 
 6. **Final size check**: Before posting/updating the status comment, the bot verifies the serialized JSON is under 60KB. If it exceeds this (which should not happen with the above limits):
    - First, aggressively truncate `error.message` and `error.stderr` to 500 characters each and retry
-   - If STILL too large after aggressive truncation, this indicates a bug in the size estimation (the 50 PR limit with truncation should always fit). The bot MUST NOT post a minimal comment without JSON, as this would silently disable GitHub-based recovery:
+   - If STILL too large after aggressive truncation, this indicates a bug in the size estimation (any train within the configured cap should always fit, since that cap is bounded by the measured ceiling). The bot MUST NOT post a minimal comment without JSON, as this would silently disable GitHub-based recovery:
      - Abort the train with error: "Status comment size limit exceeded unexpectedly. This is a bug — please report it with the train configuration. Train aborted to prevent recovery data loss."
      - Transition to `aborted` state
      - Log the full serialized JSON size and structure for debugging

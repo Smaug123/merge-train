@@ -32,7 +32,9 @@ use crate::test_utils::test_timestamp;
 use crate::types::{CachedPr, MergeStateStatus, PrNumber, PrState};
 
 use super::plan::{EffectError, EffectOutcome, EffectResponse};
-use super::{Control, Observation, ReplayFacts, StepPlan, advance, observe, start_train};
+use super::{
+    Control, Observation, ReplayFacts, StepPlan, TrainSizeCap, advance, observe, start_train,
+};
 
 // ─── Stack seeding on a real repo ───
 
@@ -227,7 +229,8 @@ impl Driver {
     }
 
     fn run_to_completion(&mut self, root: PrNumber) {
-        let plan = start_train(&self.state, root, self.now).expect("start plans");
+        let plan =
+            start_train(&self.state, root, self.now, TrainSizeCap::DEFAULT).expect("start plans");
         let mut queue = vec![(root, Some(plan))];
         let mut rounds = 0;
         while let Some((r, plan)) = queue.pop() {

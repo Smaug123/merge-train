@@ -48,11 +48,7 @@ use crate::types::{
 use super::plan::{
     CascadeError, Control, EffectError, IntentFact, Observation, ReplayFacts, StepPlan,
 };
-
-/// Maximum PRs in one train (root + all transitive descendants). Matches the
-/// status-comment sizing assumption ("the 50-PR train cap") in
-/// `crate::status::format`.
-pub const MAX_TRAIN_SIZE: usize = 50;
+use super::size::TrainSizeCap;
 
 /// Immutable planning context for one engine call.
 struct Ctx<'a> {
@@ -186,6 +182,7 @@ pub fn start_train(
     state: &RepoState,
     pr: PrNumber,
     _now: DateTime<Utc>,
+    max_train_size: TrainSizeCap,
 ) -> Result<StepPlan, CascadeError> {
     let Some(cached) = state.prs.get(&pr) else {
         return Err(CascadeError::UnknownPr { pr });
@@ -237,10 +234,14 @@ pub fn start_train(
                 .join(" → ")
         )));
     }
-    if members.len() > MAX_TRAIN_SIZE {
+    // Checked once, here: a train the status comment cannot hold must be
+    // refused at the start rather than discovered mid-cascade, when the
+    // first status comment fails to post (`size::TrainSizeCap`).
+    if !max_train_size.admits(members.len()) {
         return Ok(reject(format!(
-            "Cannot start: this train would contain {} PRs (maximum {MAX_TRAIN_SIZE}).",
-            members.len()
+            "Cannot start: this train would contain {} PRs (maximum {}).",
+            members.len(),
+            max_train_size.get()
         )));
     }
 
