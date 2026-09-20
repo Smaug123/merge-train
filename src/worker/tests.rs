@@ -14245,16 +14245,25 @@ mod interleaving {
 ///   absolutes (≤1 squash, exact store↔GitHub agreement, matched intent
 ///   ledgers, empty command backlog).
 ///
-/// The QUIET gap is the whole scope here: nothing touched GitHub while the
-/// database was gone. Comment EDITS are therefore excluded — a pre-loss
-/// edit is honored live by authorizing the *editor* (`sender_id`), which
-/// the crawl cannot reconstruct from `ListComments` (rounds 2/15), and that
-/// divergence is documented, not accidental. Likewise a stranger's comment
-/// *deletion*: GitHub loses the comment either way, but live keeps the
-/// unauthorized retraction's edge while the crawl cannot see it. A NOISY
-/// gap — reality moving while the bot is dead — makes equivalence
-/// unattainable by design and is owed the documented envelope instead; it
-/// gets its own property.
+/// - [`gap_mutations_keep_recovery_inside_the_envelope`] — the envelope
+///   property. The gap mutates GitHub while the DB is gone (closes, manual
+///   merges, new stacked PRs, comment edits and deletions, a deleted status
+///   comment), so equivalence is unattainable BY DESIGN; what recovery owes
+///   is the documented envelope: every at-loss train whose status comment
+///   survives is adopted (never orphaned); a train whose comment is gone is
+///   not resurrected; an extended stack is never driven (owner ruling:
+///   recovery aborts on ANY extension); every recovered predecessor edge is
+///   backed by a surviving, unedited, author-authored declaration; the
+///   store never claims a merge reality did not perform; and the system
+///   reaches quiescence.
+///
+/// Comment EDITS are gap-only moves: a pre-loss edit is honored live by
+/// authorizing the *editor* (`sender_id`), which the crawl cannot
+/// reconstruct from `ListComments` (rounds 2/15) — that divergence is
+/// documented, not accidental, so the differential property excludes edits
+/// and the envelope property owns them. Likewise stranger comment
+/// *deletions*: GitHub loses the comment either way, but live keeps the
+/// unauthorized retraction's edge while the crawl cannot see it.
 ///
 /// One residual the differential property EXEMPTS rather than excludes:
 /// a command acknowledged but not yet answered when the DB dies is gone —
@@ -14274,6 +14283,7 @@ mod lost_db {
 
     use super::*;
     use crate::commands::{Command, parse_command};
+    use crate::git::test_support::squash_merge_to_main;
     use crate::persistence::event::StateEventPayload;
     use crate::state::descendants::collect_all_descendants;
     use crate::status::parse::parse_status_comment;
@@ -14437,6 +14447,18 @@ mod lost_db {
             "created",
         );
         world.enqueue(processor, "issue_comment", body);
+    }
+
+    /// A REDELIVERY: GitHub replays the original payload without touching
+    /// the comment — which may since have been edited or deleted — so the
+    /// fake's comment store is left alone.
+    fn enqueue_redelivery(world: &mut World, processor: &mut Processor, body: Vec<u8>) {
+        world.next_delivery += 1;
+        let id = format!("delivery-{}", world.next_delivery);
+        processor
+            .store_mut()
+            .enqueue(&id, "issue_comment", "{}", &body, chrono::Utc::now())
+            .unwrap();
     }
 
     /// Deletes a user comment: from the fake's store AND as a webhook whose
@@ -15617,6 +15639,76 @@ mod lost_db {
         assert_eq!(live_trains, lost_trains, "train outcomes diverged");
     }
 
+    // ── The envelope property's gap moves ──
+
+    /// What the gap did to GitHub while the DB was gone, for the oracle.
+    /// What the gap left of a user comment. Several moves may touch the
+    /// same comment; only the FINAL state is what the crawl sees, so only
+    /// the final state feeds the oracle (Codex harness review, P2).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum CommentFate {
+        /// Edited into a declaration: (source pr, target).
+        EditedInto(u64, u64),
+        EditedAway,
+        Deleted,
+    }
+
+    #[derive(Default, Debug)]
+    struct Gap {
+        closed: Vec<u64>,
+        /// New stacked PRs and their declaration targets: (source, target).
+        extensions: Vec<(u64, u64)>,
+        /// The final fate of every user comment the gap touched.
+        comments: HashMap<u64, CommentFate>,
+        /// Roots whose bot status comment was deleted.
+        deleted_status_roots: Vec<u64>,
+        /// How many moves of each kind actually changed something (a move
+        /// with no subject is a no-op), for the coverage floor.
+        applied: [u32; 7],
+    }
+
+    impl Gap {
+        /// Comments whose FINAL body is a declaration: (source pr, target).
+        fn edited_decls(&self) -> Vec<(u64, u64)> {
+            self.comments
+                .values()
+                .filter_map(|fate| match fate {
+                    CommentFate::EditedInto(source, target) => Some((*source, *target)),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    /// The user comments a removal move should prefer: surviving
+    /// DECLARATIONS (whose edges the crawl must not reconstruct), falling
+    /// back to any surviving user comment when there are none.
+    fn declaration_candidates(github: &FakeGitHub, history: &History) -> Vec<u64> {
+        let surviving: Vec<u64> = history
+            .user_comments
+            .iter()
+            .copied()
+            .filter(|id| github.comments.contains_key(&CommentId(*id)))
+            .collect();
+        let declarations: Vec<u64> = surviving
+            .iter()
+            .copied()
+            .filter(|id| {
+                github.comments.get(&CommentId(*id)).is_some_and(|c| {
+                    matches!(
+                        parse_command(&c.body, "merge-train"),
+                        Some(Command::Predecessor(_))
+                    )
+                })
+            })
+            .collect();
+        if declarations.is_empty() {
+            surviving
+        } else {
+            declarations
+        }
+    }
+
     /// The PRs reality has already merged — at a crash, exactly the merges
     /// whose close webhooks GitHub had already delivered and the dead DB
     /// had acked. Nothing re-announces them afterwards.
@@ -15637,17 +15729,401 @@ mod lost_db {
         github.prs.keys().map(|n| n.0).collect()
     }
 
-    /// Any webhook wakes the repository after the loss; the crawl rebuilds
-    /// everything before it is handled. A green check-suite for the root's
-    /// head will do.
-    fn fallback_wakeup(world: &mut World, processor: &mut Processor) {
+    fn open_prs(world: &World) -> Vec<u64> {
+        let github = world.github.lock().unwrap();
+        let mut open: Vec<u64> = github
+            .prs
+            .iter()
+            .filter(|(_, p)| matches!(p.state, FakePrState::Open))
+            .map(|(n, _)| n.0)
+            .collect();
+        open.sort_unstable();
+        open
+    }
+
+    /// Applies fake-only mutations — reality moving while the bot is dead.
+    /// No webhooks: those died with the DB. Extension targets are biased
+    /// toward at-loss train members — the corner the owner ruling exists
+    /// for — with a minority of unbiased picks.
+    fn apply_gap(
+        world: &mut World,
+        specs: &[(u8, Index, Index)],
+        history: &History,
+        at_loss: &RepoState,
+    ) -> Gap {
+        let train_prs: Vec<u64> = {
+            let mut prs: Vec<u64> = at_loss
+                .active_trains
+                .values()
+                .filter(|t| t.state.is_active())
+                .flat_map(train_members)
+                .map(|pr| pr.0)
+                .collect();
+            prs.sort_unstable();
+            prs.dedup();
+            prs
+        };
+        let mut gap = Gap::default();
+        for (j, (kind, a, b)) in specs.iter().enumerate() {
+            match kind % 7 {
+                // A PR is closed unmerged.
+                0 => {
+                    let open = open_prs(world);
+                    if open.is_empty() {
+                        continue;
+                    }
+                    let pr = open[a.index(open.len())];
+                    world
+                        .github
+                        .lock()
+                        .unwrap()
+                        .prs
+                        .get_mut(&PrNumber(pr))
+                        .unwrap()
+                        .state = FakePrState::Closed;
+                    gap.closed.push(pr);
+                }
+                // Someone merges a PR by hand (the button, not the bot).
+                // Only PRs whose base IS the default branch: GitHub's
+                // button merges into the PR's base, and the fake's
+                // squash-to-main helper models exactly that case. (A
+                // manual merge of a still-stacked PR lands on its parent
+                // BRANCH — a different scenario needing a squash-to-base
+                // helper; not modeled yet.)
+                1 => {
+                    let open: Vec<u64> = {
+                        let github = world.github.lock().unwrap();
+                        let mut v: Vec<u64> = github
+                            .prs
+                            .iter()
+                            .filter(|(_, p)| {
+                                matches!(p.state, FakePrState::Open) && p.base_ref == "main"
+                            })
+                            .map(|(n, _)| n.0)
+                            .collect();
+                        v.sort_unstable();
+                        v
+                    };
+                    if open.is_empty() {
+                        continue;
+                    }
+                    let pr = open[a.index(open.len())];
+                    let (head, config) = {
+                        let github = world.github.lock().unwrap();
+                        (
+                            github.branch_head(&github.prs[&PrNumber(pr)].branch),
+                            world.config.clone(),
+                        )
+                    };
+                    let squash = squash_merge_to_main(&config, &head);
+                    world
+                        .github
+                        .lock()
+                        .unwrap()
+                        .prs
+                        .get_mut(&PrNumber(pr))
+                        .unwrap()
+                        .state = FakePrState::Merged {
+                        squash_sha: squash.squash_sha,
+                    };
+                }
+                // A new PR appears, stacked on an existing one, with an
+                // author declaration — the round-4 extension.
+                2 => {
+                    let (max, target, target_branch) = {
+                        let github = world.github.lock().unwrap();
+                        let max = github.prs.keys().map(|p| p.0).max().unwrap();
+                        let existing: Vec<u64> = {
+                            let mut v: Vec<u64> = github.prs.keys().map(|p| p.0).collect();
+                            v.sort_unstable();
+                            v
+                        };
+                        let target = if !train_prs.is_empty() && b.index(4) < 3 {
+                            train_prs[a.index(train_prs.len())]
+                        } else {
+                            existing[a.index(existing.len())]
+                        };
+                        (max, target, github.prs[&PrNumber(target)].branch.clone())
+                    };
+                    let new = max + 1;
+                    let branch = format!("pr-{new}");
+                    let head = create_branch_with_file(
+                        &world.config,
+                        &branch,
+                        &format!("pr-{new}.txt"),
+                        &format!("content {new}"),
+                        &target_branch,
+                    );
+                    create_pr_ref(&world.config, new, &head);
+                    let mut github = world.github.lock().unwrap();
+                    github.prs.insert(
+                        PrNumber(new),
+                        FakePr {
+                            branch,
+                            base_ref: target_branch,
+                            state: FakePrState::Open,
+                            author_id: AUTHOR,
+                        },
+                    );
+                    // Above every existing id: a gap declaration is
+                    // POSTED after everything pre-loss, and GitHub ids are
+                    // globally monotonic — a lower id would replay before
+                    // pre-loss comments and test the wrong topology (Codex
+                    // harness review round 7, P2).
+                    let gap_comment_id = github
+                        .comments
+                        .keys()
+                        .map(|c| c.0 + 1)
+                        .max()
+                        .unwrap_or(3000)
+                        .max(3000 + j as u64);
+                    github.comments.insert(
+                        CommentId(gap_comment_id),
+                        FakeComment {
+                            pr: PrNumber(new),
+                            author_id: AUTHOR,
+                            body: format!("@merge-train predecessor #{target}"),
+                            edited: Edited::Never,
+                        },
+                    );
+                    gap.extensions.push((new, target));
+                }
+                // An existing user comment is edited INTO a declaration —
+                // the round-14/15/17/18 move. The crawl cannot attribute
+                // the editor, so the edge is untrusted but the possible
+                // extension must still be honored.
+                3 => {
+                    let mut github = world.github.lock().unwrap();
+                    let candidates: Vec<u64> = history
+                        .user_comments
+                        .iter()
+                        .copied()
+                        .filter(|id| github.comments.contains_key(&CommentId(*id)))
+                        .collect();
+                    if candidates.is_empty() {
+                        continue;
+                    }
+                    let id = candidates[a.index(candidates.len())];
+                    let max = github.prs.keys().map(|p| p.0).max().unwrap();
+                    // Biased toward train members, like the extension move.
+                    let target = if !train_prs.is_empty() && b.index(4) < 3 {
+                        train_prs[b.index(train_prs.len())]
+                    } else {
+                        b.index(max as usize) as u64 + 1
+                    };
+                    let comment = github.comments.get_mut(&CommentId(id)).unwrap();
+                    comment.body = format!("@merge-train predecessor #{target}");
+                    comment.edited = Edited::By { editor: None };
+                    let source = comment.pr.0;
+                    gap.comments
+                        .insert(id, CommentFate::EditedInto(source, target));
+                }
+                // An existing user comment is edited AWAY (no longer a
+                // command). Any edge it owned must not be reconstructed.
+                // Declarations FIRST: editing away a spent start/stop
+                // command mutates nothing the crawl reads, and this regime
+                // exists to exercise a removed declaration (Codex harness
+                // review round 4, P2).
+                4 => {
+                    let mut github = world.github.lock().unwrap();
+                    let candidates: Vec<u64> = declaration_candidates(&github, history);
+                    if candidates.is_empty() {
+                        continue;
+                    }
+                    let id = candidates[a.index(candidates.len())];
+                    let comment = github.comments.get_mut(&CommentId(id)).unwrap();
+                    comment.body = "(edited away)".to_owned();
+                    comment.edited = Edited::By { editor: None };
+                    gap.comments.insert(id, CommentFate::EditedAway);
+                }
+                // A user comment is deleted (by anyone — no webhook, so the
+                // deleter's identity is unknowable to the crawl).
+                // Declarations first, as above.
+                5 => {
+                    let mut github = world.github.lock().unwrap();
+                    let candidates: Vec<u64> = declaration_candidates(&github, history);
+                    if candidates.is_empty() {
+                        continue;
+                    }
+                    let id = candidates[a.index(candidates.len())];
+                    github.comments.remove(&CommentId(id));
+                    gap.comments.insert(id, CommentFate::Deleted);
+                }
+                // The bot's status comment for some root is deleted: the
+                // off-disk backup is gone, and with the DB also gone the
+                // train must NOT be resurrected (the documented envelope).
+                6 => {
+                    let mut github = world.github.lock().unwrap();
+                    // The CURRENT incarnation's comment only: a
+                    // start/stop/start history leaves an obsolete one
+                    // behind, and deleting that would say the backup is
+                    // gone when the live one still stands (Codex harness
+                    // review round 5, P2).
+                    let mut records: Vec<(u64, u64)> = github
+                        .comments
+                        .iter()
+                        .filter(|(_, c)| c.author_id == TEST_BOT_ID)
+                        .filter_map(|(id, c)| {
+                            let record = parse_status_comment(&c.body).ok()?;
+                            let current = at_loss
+                                .active_trains
+                                .get(&c.pr)
+                                .is_some_and(|t| t.started_at == record.started_at);
+                            (record.original_root_pr == c.pr && current).then_some((c.pr.0, id.0))
+                        })
+                        .collect();
+                    records.sort_unstable();
+                    if records.is_empty() {
+                        continue;
+                    }
+                    let (root, id) = records[a.index(records.len())];
+                    github.comments.remove(&CommentId(id));
+                    gap.deleted_status_roots.push(root);
+                }
+                _ => unreachable!(),
+            }
+            gap.applied[(kind % 7) as usize] += 1;
+        }
+        gap
+    }
+
+    /// The generated wake-up webhook: whatever reality happens to send
+    /// first after the outage. Falls back to a check-suite on PR 1 when the
+    /// chosen kind has no subject. Returns the PR numbers the delivery
+    /// references — the crawl's seeds, which the orphan oracle needs.
+    /// What the wake-up delivered: the PRs it referenced (seeds for the
+    /// crawl's reach), and the declaration comment it REDELIVERED, if any
+    /// — the one edge the live path may legitimately install after
+    /// recovery without a ledger having granted it first.
+    struct Wakeup {
+        referenced: Vec<u64>,
+        redelivered: Option<CommentId>,
+    }
+
+    fn enqueue_wakeup(
+        world: &mut World,
+        processor: &mut Processor,
+        wake: &(u8, Index),
+        history: &History,
+        gap: &Gap,
+    ) -> Wakeup {
+        let (kind, pick) = wake;
+        match kind % 4 {
+            // The close webhook for a gap-closed PR.
+            1 if !gap.closed.is_empty() => {
+                let pr = gap.closed[pick.index(gap.closed.len())];
+                let (head, branch, base) = {
+                    let github = world.github.lock().unwrap();
+                    let fake = &github.prs[&PrNumber(pr)];
+                    (
+                        github.branch_head(&fake.branch),
+                        fake.branch.clone(),
+                        fake.base_ref.clone(),
+                    )
+                };
+                let body = pr_closed_body(&world.config, pr, &head, &branch, &base);
+                world.enqueue(processor, "pull_request", body);
+                Wakeup {
+                    referenced: vec![pr],
+                    redelivered: None,
+                }
+            }
+            // GitHub redelivers an old declaration comment — the round
+            // 10/11 trigger — replaying the ORIGINAL payload whatever has
+            // happened to the comment since: retracted in the history,
+            // edited or deleted in the gap. A redelivery for a comment the
+            // crawl cannot see is the stale shape the pipeline must close
+            // (monolith review, P1). (Commands are excluded: re-running an
+            // old start/stop is real live behavior but out of envelope
+            // scope.)
+            2 => {
+                let mut candidates: Vec<(u64, u64, String, u64)> = history
+                    .originals
+                    .iter()
+                    .filter(|(_, (_, text, _))| {
+                        matches!(
+                            parse_command(text, "merge-train"),
+                            Some(Command::Predecessor(_))
+                        )
+                    })
+                    .map(|(id, (pr, text, author))| (*id, *pr, text.clone(), *author))
+                    .collect();
+                candidates.sort_unstable();
+                if candidates.is_empty() {
+                    return fallback_wakeup(world, processor);
+                }
+                let (id, pr, text, author) = candidates[pick.index(candidates.len())].clone();
+                let login = if author == AUTHOR {
+                    "author"
+                } else {
+                    "stranger"
+                };
+                let body = user_comment_json(
+                    &world.config,
+                    pr,
+                    Some(&text),
+                    author,
+                    login,
+                    author,
+                    login,
+                    id,
+                    "created",
+                );
+                let alive = world
+                    .github
+                    .lock()
+                    .unwrap()
+                    .comments
+                    .contains_key(&CommentId(id));
+                coverage::hit(
+                    "envelope",
+                    if alive {
+                        "redelivery of a live comment"
+                    } else {
+                        "redelivery of a gone comment"
+                    },
+                );
+                enqueue_redelivery(world, processor, body);
+                Wakeup {
+                    referenced: vec![pr],
+                    redelivered: Some(CommentId(id)),
+                }
+            }
+            // The opened webhook for a gap-born extension PR.
+            3 if !gap.extensions.is_empty() => {
+                let (pr, _) = gap.extensions[pick.index(gap.extensions.len())];
+                let (head, branch, base) = {
+                    let github = world.github.lock().unwrap();
+                    let fake = &github.prs[&PrNumber(pr)];
+                    (
+                        github.branch_head(&fake.branch),
+                        fake.branch.clone(),
+                        fake.base_ref.clone(),
+                    )
+                };
+                let body = pr_opened_body(&world.config, pr, &head, &branch, &base);
+                world.enqueue(processor, "pull_request", body);
+                Wakeup {
+                    referenced: vec![pr],
+                    redelivered: None,
+                }
+            }
+            _ => fallback_wakeup(world, processor),
+        }
+    }
+
+    fn fallback_wakeup(world: &mut World, processor: &mut Processor) -> Wakeup {
         let head = world.github.lock().unwrap().branch_head("pr-1");
         let suite = world.next_delivery + 900;
         let body = check_suite_green_body(&world.config, &head, &[1], suite);
         world.enqueue(processor, "check_suite", body);
+        Wakeup {
+            referenced: vec![1],
+            redelivered: None,
+        }
     }
 
-    // ── What a train is made of ──
+    // ── The envelope oracle ──
 
     /// A train's known stack at loss: frozen set + primaries + the recorded
     /// descendant closure (mirrors the crawl's own extension definition,
@@ -15681,6 +16157,634 @@ mod lost_db {
         members.insert(record.original_root_pr);
         members.insert(record.current_pr);
         members
+    }
+
+    /// GitHub as the crawl finds it: read after the gap and BEFORE
+    /// recovery. Recovery itself merges the members it drives, rewrites
+    /// the ledgers it disbelieves and re-posts what it adopts, so anything
+    /// read afterwards is the crawl's own word about itself — a crawl that
+    /// wrongly rebuilt an edge from an older comment would rewrite the
+    /// ledger to match and then pass a check that reads it (Codex harness
+    /// review rounds 14 and 12, P2).
+    struct AtRecovery {
+        /// PRs open at recovery: the only members the crawl can drive.
+        open: HashSet<u64>,
+        /// PRs closed unmerged at recovery: in neither listing, reached
+        /// only by reference.
+        closed_unmerged: HashSet<u64>,
+        /// PRs merged at recovery: the crawl lists them too (recently
+        /// merged), so a declaration on one is a way in.
+        merged: HashSet<u64>,
+        /// Squash counts per PR, for the at-most-once delta.
+        squash_before: HashMap<PrNumber, u32>,
+        /// What the ledgers attested per PR (see [`attested_edge`]).
+        attested: HashMap<PrNumber, Option<(PrNumber, CommentId)>>,
+        /// The unledgered declarations the crawl reads as evidence, and
+        /// whose targets it follows (see [`unledgered_evidence`]).
+        evidence: Vec<(PrNumber, PrNumber)>,
+        /// The bot's status records standing at recovery, in its own
+        /// bytes, by root: what the crawl adopts, and — for an active one
+        /// — whose named members it fetches.
+        status_records: Vec<(u64, TrainRecord)>,
+        /// PRs carrying a comment of the bot's — any comment, a refusal
+        /// reply included. Whether the crawl ONBOARDS (derives edges from
+        /// the declarations as live would read them, with no ledger to
+        /// grant them) is decided over the PRs it can REACH, since a trace
+        /// on an unreachable PR is one it never sees.
+        bot_commented: HashSet<u64>,
+    }
+
+    fn at_recovery(world: &World) -> AtRecovery {
+        let github = world.github.lock().unwrap();
+        AtRecovery {
+            open: github
+                .prs
+                .iter()
+                .filter(|(_, p)| matches!(p.state, FakePrState::Open))
+                .map(|(n, _)| n.0)
+                .collect(),
+            closed_unmerged: github
+                .prs
+                .iter()
+                .filter(|(_, p)| matches!(p.state, FakePrState::Closed))
+                .map(|(n, _)| n.0)
+                .collect(),
+            merged: github
+                .prs
+                .iter()
+                .filter(|(_, p)| matches!(p.state, FakePrState::Merged { .. }))
+                .map(|(n, _)| n.0)
+                .collect(),
+            squash_before: github.squash_count.clone(),
+            attested: github
+                .prs
+                .keys()
+                .map(|pr| (*pr, attested_edge(&github, *pr)))
+                .collect(),
+            evidence: unledgered_evidence(&github),
+            bot_commented: github
+                .comments
+                .values()
+                .filter(|c| c.author_id == TEST_BOT_ID)
+                .map(|c| c.pr.0)
+                .collect(),
+            status_records: github
+                .comments
+                .values()
+                .filter(|c| written_by(c, TEST_BOT_ID))
+                .filter_map(|c| {
+                    let record = parse_status_comment(&c.body).ok()?;
+                    (record.original_root_pr == c.pr).then_some((c.pr.0, record))
+                })
+                .collect(),
+        }
+    }
+
+    /// The descendant closure of `anchor` over the topology the crawl
+    /// RECOVERS — the ledgered edges standing at recovery — as
+    /// `Footprint::of` walks it: through OPEN PRs only, a closed or merged
+    /// descendant blocking the walk (`collect_all_descendants`; Codex
+    /// harness review round 18, P2 — a generated case had failed).
+    fn descendants_at_recovery(at_recovery: &AtRecovery, anchor: PrNumber) -> HashSet<PrNumber> {
+        let mut closure = HashSet::new();
+        let mut frontier = vec![anchor];
+        while let Some(parent) = frontier.pop() {
+            for (child, edge) in &at_recovery.attested {
+                if edge.is_some_and(|(target, _)| target == parent)
+                    && at_recovery.open.contains(&child.0)
+                    && closure.insert(*child)
+                {
+                    frontier.push(*child);
+                }
+            }
+        }
+        closure
+    }
+
+    /// What a record's train is MADE OF, as `Footprint::of` computes it
+    /// against the recovered topology: the PRs it names plus the
+    /// descendant closure of its root and current PR — and, mid-phase,
+    /// the members it already completed or skipped (its `stack`; an idle
+    /// record's `owned`).
+    fn footprint_at_recovery(at_recovery: &AtRecovery, record: &TrainRecord) -> HashSet<PrNumber> {
+        let mut footprint: HashSet<PrNumber> = record_named(record).into_iter().collect();
+        if let Some(progress) = record.cascade_phase.progress() {
+            footprint.extend(progress.completed().iter().copied());
+            footprint.extend(progress.skipped().iter().copied());
+        }
+        for anchor in [record.original_root_pr, record.current_pr] {
+            footprint.extend(descendants_at_recovery(at_recovery, anchor));
+        }
+        footprint
+    }
+
+    /// Every PR a record NAMES: its root, its current PR, its frozen set
+    /// and the whole stack it knew at the freeze (`Footprint::named`).
+    fn record_named(record: &TrainRecord) -> Vec<PrNumber> {
+        std::iter::once(record.original_root_pr)
+            .chain(std::iter::once(record.current_pr))
+            .chain(record.cascade_phase.progress().into_iter().flat_map(|p| {
+                p.frozen_descendants()
+                    .iter()
+                    .chain(p.known_stack().iter())
+                    .copied()
+            }))
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assert_envelope(
+        world: &World,
+        processor: &mut Processor,
+        at_loss: &RepoState,
+        status_roots_at_loss: &HashSet<u64>,
+        gap: &Gap,
+        delivered_late: &[(u64, u64)],
+        at_recovery: &AtRecovery,
+        wake: &Wakeup,
+    ) {
+        let squash_before = &at_recovery.squash_before;
+        let open_at_recovery = &at_recovery.open;
+        let closed_unmerged_at_recovery = &at_recovery.closed_unmerged;
+        // The absolutes: never ahead of reality, never a double squash.
+        {
+            let github = world.github.lock().unwrap();
+            for (pr, count) in &github.squash_count {
+                assert!(*count <= 1, "PR #{pr} squashed {count} times");
+            }
+            for (pr, cached) in &processor.state().prs {
+                if let PrState::Merged { merge_commit_sha } = &cached.state {
+                    // The SHA too: descendant reconciliation fences on it,
+                    // so "merged" alone is not agreement (Codex harness
+                    // review round 6, P2).
+                    assert_eq!(
+                        Some(merge_commit_sha),
+                        match github.prs.get(pr).map(|f| &f.state) {
+                            Some(FakePrState::Merged { squash_sha }) => Some(squash_sha),
+                            _ => None,
+                        },
+                        "store and reality disagree about PR #{pr}'s merge"
+                    );
+                }
+            }
+        }
+
+        let events = processor.store_mut().events().unwrap();
+        // The record each root was adopted FROM (its status comment as the
+        // crawl read it) — the extension ruling is relative to THAT frozen
+        // set, not the store's at-loss one: the comment may lag the store
+        // by the crash window, and an Idle-phase record legitimately
+        // re-freezes against current topology.
+        let adopted_records: HashMap<u64, TrainRecord> = events
+            .iter()
+            .filter_map(|e| match &e.payload {
+                StateEventPayload::TrainRecordAdopted { root_pr, record } => {
+                    Some((root_pr.0, record.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        let adopted: HashSet<u64> = adopted_records.keys().copied().collect();
+        let aborted: HashSet<u64> = events
+            .iter()
+            .filter_map(|e| match &e.payload {
+                StateEventPayload::TrainAborted { root_pr, .. } => Some(root_pr.0),
+                _ => None,
+            })
+            .collect();
+
+        let squash_delta = |members: &HashSet<PrNumber>| -> u32 {
+            let github = world.github.lock().unwrap();
+            members
+                .iter()
+                .map(|pr| {
+                    github.squash_count.get(pr).copied().unwrap_or(0)
+                        - squash_before.get(pr).copied().unwrap_or(0)
+                })
+                .sum()
+        };
+
+        // Everything the crawl REACHES, as GitHub stood at recovery. The
+        // crawl lists the open PRs and the recently merged ones, lists
+        // their comments, and fetches each PR those reference — by a stack
+        // LEDGER's edge, or by an UNLEDGERED declaration it reads as
+        // evidence (`an_unledgered_declarations_target_is_still_fetched`)
+        // — and their comments too, transitively (Codex harness review
+        // rounds 2, 12 and 13, P2). The wake-up's references join the
+        // seed. A crawl that stopped following either kind of reference
+        // would orphan a train this oracle then demands.
+        let crawl_reach: HashSet<u64> = {
+            let mut seen: HashSet<u64> = open_at_recovery
+                .iter()
+                .chain(at_recovery.merged.iter())
+                .chain(wake.referenced.iter())
+                .copied()
+                .collect();
+            let mut frontier: Vec<u64> = seen.iter().copied().collect();
+            while let Some(pr) = frontier.pop() {
+                let ledgered = at_recovery
+                    .attested
+                    .get(&PrNumber(pr))
+                    .copied()
+                    .flatten()
+                    .map(|(target, _)| target.0);
+                let unledgered = at_recovery
+                    .evidence
+                    .iter()
+                    .filter(|(source, _)| source.0 == pr)
+                    .map(|(_, target)| target.0);
+                // An ACTIVE status record on a reached root names its
+                // members, and the crawl fetches each (Codex trains
+                // review, P2).
+                let named = at_recovery
+                    .status_records
+                    .iter()
+                    .filter(|(root, record)| *root == pr && record.state.is_active())
+                    .flat_map(|(_, record)| record_named(record))
+                    .map(|member| member.0);
+                for target in ledgered.into_iter().chain(unledgered).chain(named) {
+                    if seen.insert(target) {
+                        frontier.push(target);
+                    }
+                }
+            }
+            seen
+        };
+        // Onboarding is the crawl finding NO comment of the bot's among
+        // the PRs it reaches: a trace on an unreachable closed PR is one it
+        // never sees (Codex harness review round 15, P2).
+        let onboarding = at_recovery.bot_commented.is_disjoint(&crawl_reach);
+
+        // EVERY at-loss record — terminal ones too — owes adoption when its
+        // status comment survives and is reachable: dropping a stopped
+        // record loses the user's stop (Codex harness review round 3, P2).
+        // Only the resume checks below are active-only.
+        for (root, record) in at_loss.active_trains.iter() {
+            let members = train_members(record);
+            let comment_survives = status_roots_at_loss.contains(&root.0)
+                && !gap.deleted_status_roots.contains(&root.0);
+
+            // A root closed UNMERGED during the gap is in neither crawl
+            // list endpoint; its status comment is reachable only if
+            // something still points at the PR — the wake-up naming it
+            // (round 6) or a surviving declaration on an OPEN PR (round
+            // 7; open PRs are always listed). With NO surviving
+            // reference, the crawl cannot adopt what it cannot see: a
+            // sub-stop residual (the root was closed by a human, nothing
+            // runs, nothing merges; the residue is a stale status comment
+            // on a closed PR) within the 2026-07-18 ruling. A
+            // `ListRecentlyClosedPrs` crawl endpoint would close it
+            // completely if ever wanted.
+            let reachable =
+                !closed_unmerged_at_recovery.contains(&root.0) || crawl_reach.contains(&root.0);
+            if comment_survives && reachable {
+                assert!(
+                    adopted.contains(&root.0),
+                    "train #{root} had a surviving, reachable status comment but \
+                     was never adopted — orphaned by the crawl"
+                );
+                // And the record adopted is THIS incarnation, not an older
+                // one whose comment also survives: `started_at` is the
+                // incarnation key (Codex harness review round 3, P2).
+                assert_eq!(
+                    adopted_records[&root.0].started_at, record.started_at,
+                    "train #{root}: recovery adopted a different incarnation"
+                );
+                // And adopted AS WRITTEN: the record the crawl reads from
+                // the comment is the one it judges, so its phase and its
+                // state are the backup's — an adoption that reset the
+                // phase to idle would slip past every mid-phase check
+                // below (Codex harness review round 19, P2). Of several
+                // comments of the incarnation, the crawl chooses the
+                // highest sequence.
+                let backup = at_recovery
+                    .status_records
+                    .iter()
+                    .filter(|(r, on_github)| {
+                        *r == root.0 && on_github.started_at == record.started_at
+                    })
+                    .max_by_key(|(_, on_github)| on_github.recovery_seq)
+                    .map(|(_, on_github)| on_github);
+                if let Some(backup) = backup {
+                    let adopted_record = &adopted_records[&root.0];
+                    assert_eq!(
+                        adopted_record.cascade_phase, backup.cascade_phase,
+                        "train #{root}: the adopted record's phase is not the backup's"
+                    );
+                    assert_eq!(
+                        adopted_record.state, backup.state,
+                        "train #{root}: the adopted record's state is not the backup's"
+                    );
+                }
+                // A surviving comment that says this incarnation is OVER —
+                // stopped, aborted, completed, the terminal update having
+                // landed — is the last word: recovery adopts it as it is
+                // and nothing of the train may move (Codex harness review
+                // round 16, P2). A stale ACTIVE backup of a train the store
+                // had stopped is the documented residual and is judged by
+                // the active-only checks below.
+                let terminal_on_github = at_recovery.status_records.iter().any(|(r, on_github)| {
+                    *r == root.0
+                        && on_github.started_at == record.started_at
+                        && !on_github.state.is_active()
+                });
+                if terminal_on_github {
+                    assert!(
+                        processor
+                            .state()
+                            .active_trains
+                            .get(root)
+                            .is_none_or(|t| !t.state.is_active()),
+                        "train #{root} was over on GitHub yet recovery resumed it"
+                    );
+                    assert_eq!(
+                        squash_delta(&members),
+                        0,
+                        "train #{root} was over on GitHub yet its members were squashed \
+                         after recovery"
+                    );
+                }
+            } else if comment_survives {
+                // Unreachable: adoption is impossible, but nothing of the
+                // train may move either.
+                assert_eq!(
+                    squash_delta(&members),
+                    0,
+                    "train #{root} is unreachable by the crawl yet its members \
+                     were squashed after recovery"
+                );
+            } else {
+                // No sound record to resurrect from: the stack must behave
+                // as if no train was running.
+                assert!(
+                    processor
+                        .state()
+                        .active_trains
+                        .get(root)
+                        .is_none_or(|t| !t.state.is_active()),
+                    "train #{root} resurrected without a status comment"
+                );
+                assert_eq!(
+                    squash_delta(&members),
+                    0,
+                    "train #{root} has no status comment yet its members were \
+                     squashed after recovery"
+                );
+            }
+
+            // An UNLEDGERED declaration touching the train — sitting on a
+            // member, or naming one — aborts it whatever its phase: an
+            // idle record re-freezes against the ledgered topology, but an
+            // unledgered edge is not installed for that freeze to pick up,
+            // and the train would squash the root without preparing the PR
+            // the user stacked (`adoption::unledgered_touches`; Codex
+            // harness review round 14, P2). A record whose members all
+            // merged in the gap has finished in fact and is completed, not
+            // aborted.
+            // Keyed on the ADOPTED record's state — GitHub's word — not on
+            // the lost database's: a stop that committed before the loss
+            // but whose status update never landed leaves an active
+            // backup, and recovery drives what GitHub says (Codex harness
+            // review round 19, P2).
+            if let Some(adopted_record) =
+                adopted_records.get(&root.0).filter(|r| r.state.is_active())
+            {
+                // The train as production sees it at recovery — an idle
+                // record's ledgered descendants included: a gap PR
+                // declaring onto one of them touches the train as surely
+                // as one declaring onto the root (Codex harness review
+                // round 17, P2).
+                let touched = footprint_at_recovery(at_recovery, adopted_record);
+                let finished = train_members(adopted_record)
+                    .iter()
+                    .all(|m| at_recovery.merged.contains(&m.0));
+                // Only evidence the crawl can SEE: a comment on an
+                // unreachable closed PR is one it never lists (Codex
+                // harness review round 16, P1 — a generated case failed).
+                let touches = at_recovery
+                    .evidence
+                    .iter()
+                    .filter(|(source, _)| crawl_reach.contains(&source.0))
+                    .any(|(source, target)| touched.contains(source) || touched.contains(target));
+                if touches && !finished {
+                    assert_eq!(
+                        squash_delta(&train_members(adopted_record)),
+                        0,
+                        "train #{root} is touched by an unledgered declaration \
+                         {:?}, yet recovery squashed its members",
+                        at_recovery.evidence
+                    );
+                    assert!(
+                        aborted.contains(&root.0),
+                        "train #{root} is touched by an unledgered declaration \
+                         {:?}; recovery must abort it: aborted={aborted:?}",
+                        at_recovery.evidence
+                    );
+                }
+            }
+
+            // The owner ruling: recovery never drives an extended stack,
+            // judged against the ADOPTED record's frozen set — the status
+            // comment as the crawl read it, which may lag the store by the
+            // crash window. (An Idle-phase record has no frozen set yet
+            // and legitimately re-freezes against current topology; a
+            // record adopted as completed/stopped/aborted drives nothing.)
+            let mid_phase_adoption = adopted_records
+                .get(&root.0)
+                .filter(|r| r.state.is_active() && r.cascade_phase.progress().is_some());
+            if let Some(adopted_record) = mid_phase_adoption {
+                let stack = train_stack(at_loss, adopted_record);
+                let adopted_members = train_members(adopted_record);
+                // The record's own CORE — what the train froze and knew —
+                // as production judges it. The at-loss closure is not the
+                // right side for the SOURCE: a pre-loss late declaration
+                // put its source inside that closure, which would hide the
+                // extension (Codex harness review round 6, P2).
+                let core: HashSet<PrNumber> = adopted_record
+                    .cascade_phase
+                    .progress()
+                    .into_iter()
+                    .flat_map(|p| {
+                        p.frozen_descendants()
+                            .iter()
+                            .chain(p.known_stack().iter())
+                            .copied()
+                    })
+                    .chain([adopted_record.original_root_pr, adopted_record.current_pr])
+                    .collect();
+                // An extension counts only if BOTH ends were still open
+                // when recovery began. A declaration onto a member that
+                // had since merged (or closed) is what live treats as a
+                // late addition — it never joins the train, live never
+                // aborts for it, and the crawl's closure walk deliberately
+                // stops at merged members (round 13). A SOURCE closed (or
+                // merged) during the gap annulled the extension before
+                // recovery saw it — the stack is not growing under the
+                // train, and live (which records the edge without
+                // aborting) would drive on identically. (Judged from the
+                // pre-wake-up snapshot: a wrongly-resumed train could
+                // itself merge the target and mask the violation.)
+                let edited_decls = gap.edited_decls();
+                let extended = gap
+                    .extensions
+                    .iter()
+                    .chain(edited_decls.iter())
+                    .chain(delivered_late.iter())
+                    .any(|(source, target)| {
+                        stack.contains(&PrNumber(*target))
+                            && !core.contains(&PrNumber(*source))
+                            && open_at_recovery.contains(target)
+                            && open_at_recovery.contains(source)
+                    });
+                if extended {
+                    assert_eq!(
+                        squash_delta(&adopted_members),
+                        0,
+                        "train #{root}'s stack was extended during the gap, yet \
+                         recovery squashed its members (must abort instead)"
+                    );
+                    assert!(
+                        aborted.contains(&root.0),
+                        "train #{root}'s stack was extended during the gap; \
+                         recovery must abort it loudly, not leave it limbo or \
+                         drive it: aborted={aborted:?}"
+                    );
+                }
+
+                // A frozen member UNSTACKED during the gap (its declaration
+                // edited away or deleted) is the same hazard from the other
+                // side: the frozen set is stale, and driving it merges a PR
+                // the user removed from the stack. Live aborts on that
+                // removal; recovery must too (Codex harness review round 3,
+                // P2). Judged on the members the crawl could SEE — one it
+                // never fetched aborts through the unfetchable path.
+                //
+                // Severed means the LEDGER's edge is gone: no ledger, or a
+                // ledger the comment it names no longer corroborates. An
+                // edit that left the target alone corroborates it still —
+                // requiring an unedited comment would call a valid member
+                // severed and demand an abort recovery does not owe (Codex
+                // harness review round 14, P2). Only a member OPEN at
+                // recovery: `adoption::severed` checks only those, since a
+                // closed one cannot be driven — and the state is read at
+                // recovery, not after, because recovery itself merges the
+                // members it drives (Codex harness review round 11, P2).
+                //
+                // Judged on the ledgers AS THEY STOOD AT RECOVERY: a crawl
+                // that wrongly fell back to an older same-target comment
+                // would rewrite the ledger to name it, and a check reading
+                // the ledgers afterwards would find the edge attested
+                // (Codex harness review round 12, P2).
+                //
+                // Every member the record NAMES is judged — the current
+                // PR, the frozen set, and the whole stack it knew at the
+                // freeze — as `adoption::severed` judges them: a known
+                // member behind the frontier abandoned would leave the
+                // train finishing without it (Codex harness review round
+                // 13, P2).
+                let named: HashSet<PrNumber> = record_named(adopted_record)
+                    .into_iter()
+                    .filter(|m| *m != adopted_record.original_root_pr)
+                    .collect();
+                let severed = named.iter().any(|m| {
+                    open_at_recovery.contains(&m.0)
+                        && at_recovery
+                            .attested
+                            .get(m)
+                            .is_none_or(|edge| edge.is_none())
+                });
+                if severed {
+                    assert_eq!(
+                        squash_delta(&adopted_members),
+                        0,
+                        "train #{root} has a frozen member with no surviving \
+                         declaration, yet recovery squashed its members"
+                    );
+                    assert!(
+                        aborted.contains(&root.0),
+                        "train #{root} has an unstacked frozen member; recovery \
+                         must abort it: aborted={aborted:?}"
+                    );
+                }
+            }
+        }
+
+        // No phantom edges: every recovered predecessor edge is backed by
+        // the comment its owner names, still on that PR and still
+        // declaring that predecessor. This is the crawl's revoke rule
+        // asserted from the outside — an edge whose comment the gap
+        // deleted, or edited to say something else, must be gone.
+        //
+        // The comment may be EDITED and still count: what grants the edge
+        // is the LEDGER, which only the bot writes, and the comment merely
+        // corroborates it — in the PR author's own bytes, as live and the
+        // crawl require. An edit that changed the target fails that
+        // corroboration; one by the author that did not change it changes
+        // nothing; one by an unknown hand is nobody's word (Codex harness
+        // review round 11, P2).
+        {
+            let github = world.github.lock().unwrap();
+            for (pr, cached) in &processor.state().prs {
+                let (Some(target), Some(comment_id)) =
+                    (cached.predecessor, cached.predecessor_comment_id)
+                else {
+                    continue;
+                };
+                let comment = github.comments.get(&comment_id);
+                let author = github.prs.get(pr).map(|p| p.author_id);
+                let backed = comment.is_some_and(|c| {
+                    c.pr == *pr
+                        && author.is_some_and(|author| written_by(c, author))
+                        && matches!(
+                            parse_command(&c.body, "merge-train"),
+                            Some(Command::Predecessor(t)) if t == target
+                        )
+                });
+                // The wake-up's REDELIVERED declaration may instead have
+                // TRANSFERRED ownership of the attested edge to itself:
+                // a stale payload of a newer same-target comment, deleted
+                // since, is suppressed by the live path while the edge it
+                // restates moves to it (`pipeline::restatement_transfer`;
+                // the documented redelivery residual). The edge is the
+                // ledger's; only its owner need not survive (Codex
+                // harness review round 19, P1 — a generated case failed).
+                let attested = at_recovery.attested.get(pr).copied().flatten();
+                let transferred = wake.redelivered == Some(comment_id)
+                    && attested.is_some_and(|(attested_target, _)| attested_target == target);
+                assert!(
+                    backed || transferred,
+                    "PR #{pr}'s recovered predecessor edge to #{target} (comment \
+                     {comment_id}) is not backed by a comment that still declares \
+                     it: {comment:?}"
+                );
+                // And GRANTED: a recovery reads the ledgers, never the
+                // declarations — an edge the ledgers did not attest at
+                // recovery is one the crawl derived from a comment, which
+                // only an ONBOARDING crawl (no trace of the bot) may do.
+                // The one other legitimate source is the live path itself,
+                // after recovery, accepting the declaration the wake-up
+                // redelivered (Codex harness review round 14, P2).
+                // The whole grant, target AND owning comment: in recovery
+                // the crawl installs exactly the ledger's owner, and which
+                // comment owns the edge decides which later deletion
+                // retracts it (Codex harness review round 15, P2).
+                let granted = onboarding
+                    || attested == Some((target, comment_id))
+                    || wake.redelivered == Some(comment_id);
+                assert!(
+                    granted,
+                    "PR #{pr}'s recovered predecessor edge to #{target} (comment \
+                     {comment_id}) was granted by no ledger at recovery: \
+                     attested {:?}",
+                    at_recovery.attested.get(pr)
+                );
+            }
+        }
+
+        assert!(
+            processor.store_mut().pending_commands().unwrap().is_empty(),
+            "acknowledged commands left unanswered at quiescence"
+        );
     }
 
     // ── The retraction-receipt tombstone, end to end ──
@@ -16200,6 +17304,249 @@ mod lost_db {
         eprintln!("{P} coverage: {}", coverage::report(P));
     }
 
+    type EnvelopeInputs = (
+        Vec<usize>,
+        Vec<(u8, Index, Index)>,
+        Vec<(u8, Index, Index)>,
+        usize,
+        Vec<(u8, Index, Index)>,
+        (u8, Index),
+    );
+
+    fn envelope_strategy() -> impl Strategy<Value = EnvelopeInputs> {
+        (
+            arb_bases(),
+            proptest::collection::vec(any::<(u8, Index, Index)>(), 1..8),
+            proptest::collection::vec(any::<(u8, Index, Index)>(), 0..4),
+            // Deep enough that multi-PR trains are regularly mid-phase,
+            // and past the first squash and its reconciliation (see
+            // `at_a_depth_hitting`'s `MAX_DEPTH`).
+            1usize..=24,
+            proptest::collection::vec(any::<(u8, Index, Index)>(), 1..5),
+            any::<(u8, Index)>(),
+        )
+    }
+
+    /// One envelope case. `regime` below `GAP_KINDS.len()` forces a train
+    /// (with a late declaration) under that gap move kind, the wake-up kind
+    /// rotating with it; the last regime is free.
+    fn envelope_case(
+        regime: usize,
+        (bases, mut decls, mut cmds, depth, mut gap_specs, mut wake): EnvelopeInputs,
+        late_extension: Option<(u64, u64)>,
+    ) {
+        const P: &str = "envelope";
+        if regime < GAP_KINDS.len() {
+            force_train(&bases, &mut decls, &mut cmds, true);
+            gap_specs[0].0 = regime as u8;
+            wake.0 = (regime % 4) as u8;
+        }
+
+        let (mut world, heads) = build_world(&bases);
+        let mut processor = world.processor();
+        let mut history = enqueue_history(
+            &mut world,
+            &mut processor,
+            &bases,
+            &heads,
+            &decls,
+            &cmds,
+            true,
+        );
+        // A late declaration the generator cannot reliably produce: an
+        // outsider attaching to a train member mid-cascade, which live
+        // records and recovery must abort on (Codex harness review round
+        // 6, P2 — the generic decoder's random indexes rarely validate).
+        if let Some((source, target)) = late_extension {
+            history.late.push((source, target, 9000));
+        }
+        let (at_loss, _pending) =
+            run_batches_then_snapshot(&mut world, processor, depth, &mut history);
+        let already_announced = merged_prs(&world);
+        crash_db(&world);
+
+        // Which roots still had their off-disk backup at the moment of
+        // death (before the gap has a chance to delete it) — for THIS
+        // incarnation. A start/stop/start history leaves the previous
+        // incarnation's terminal comment behind, and that is no backup for
+        // the train now running: requiring its adoption would demand
+        // recovery from a record that does not exist (Codex harness review
+        // round 14, P2).
+        let status_roots_at_loss = status_roots_at_loss(&world, &at_loss);
+        let gap = apply_gap(&mut world, &gap_specs, &history, &at_loss);
+        for (kind, n) in gap.applied.iter().enumerate() {
+            if *n > 0 {
+                coverage::hit(P, GAP_KINDS[kind]);
+            }
+        }
+        let at_recovery = at_recovery(&world);
+
+        let mut processor = world.processor();
+        let wake = enqueue_wakeup(&mut world, &mut processor, &wake, &history, &gap);
+        let announce: HashSet<u64> = all_prs(&world)
+            .difference(&already_announced)
+            .copied()
+            .collect();
+        settle(&mut world, &mut processor, &announce);
+        record_lost_run_coverage(P, &at_loss, &mut processor);
+        assert_envelope(
+            &world,
+            &mut processor,
+            &at_loss,
+            &status_roots_at_loss,
+            &gap,
+            &history.delivered_late,
+            &at_recovery,
+            &wake,
+        );
+    }
+
+    /// With a NOISY gap — reality moved while the DB was gone — recovery
+    /// owes the documented envelope, not equivalence. One regime per gap
+    /// move kind (that kind leads the gap, with a forced train under it),
+    /// plus a free regime. Each forced regime runs one FIXED case first — a
+    /// two-PR stack, an honest declaration, a start on the root, a depth
+    /// that leaves the train recorded, the regime's move applied — whose
+    /// coverage is asserted exactly; the random cases' distribution is
+    /// reported, never asserted.
+    #[test]
+    fn gap_mutations_keep_recovery_inside_the_envelope() {
+        const P: &str = "envelope";
+        coverage::reset(P);
+        // One regime per gap move kind, then the free regime.
+        let regimes: Vec<Option<&'static str>> = GAP_KINDS
+            .iter()
+            .copied()
+            .map(Some)
+            .chain(std::iter::once(None))
+            .collect();
+        for (regime, kind) in regimes.into_iter().enumerate() {
+            if let Some(what) = kind {
+                let (_, sample, _, _, _, _) = fixed_sample(&envelope_strategy());
+                let (_, a, b) = sample[0];
+                // Deleting the status comment is the one move that
+                // legitimately prevents adoption.
+                let mut required = vec!["train recorded at loss", what];
+                if regime != 6 {
+                    required.push("adoption");
+                }
+                if what == "gap: extension" {
+                    // An Idle-phase record legitimately re-freezes against
+                    // current topology, so a depth that merely records a
+                    // train would exercise none of the conservative abort
+                    // this regime exists for (Codex harness review round
+                    // 14, P2).
+                    required.push("crash mid-phase");
+                }
+                at_a_depth_hitting(P, what, &required, |depth| {
+                    // Each gap kind's fixed case exercises THAT mutation
+                    // alone: a forced pre-loss extension here would make
+                    // the envelope abort for the wrong reason and hide the
+                    // gap move under test (Codex harness review round 8,
+                    // P2). The pre-loss case runs separately, below.
+                    envelope_case(
+                        regime,
+                        (
+                            vec![0, 1],
+                            vec![(0, a, b)],
+                            vec![(0, a, b)],
+                            depth,
+                            vec![(regime as u8, a, b)],
+                            ((regime % 4) as u8, a),
+                        ),
+                        None,
+                    );
+                });
+            }
+            let mut runner = TestRunner::new(runner_config(GAP_KINDS.len() as u32 + 1));
+            runner
+                .run(&envelope_strategy(), |inputs| {
+                    envelope_case(regime, inputs, None);
+                    Ok(())
+                })
+                .unwrap_or_else(|e| panic!("envelope, regime {regime}: {e}"));
+        }
+
+        // The boundaries PAST the first squash, with no gap move at all:
+        // a lost squash outcome, and the descendants' reconciliation
+        // against it. The random cases reach them only by chance; these
+        // require them (Codex harness review round 12, P2).
+        for (what, required) in [
+            (
+                "a crash after a squash",
+                &["adoption", "crash after a squash"],
+            ),
+            (
+                "a crash while reconciling",
+                &["adoption", "crash while reconciling"],
+            ),
+        ] {
+            let (_, sample, _, _, _, _) = fixed_sample(&envelope_strategy());
+            let (_, a, b) = sample[0];
+            at_a_depth_hitting(P, what, required, |depth| {
+                envelope_case(
+                    GAP_KINDS.len(),
+                    (
+                        vec![0, 1],
+                        vec![(0, a, b)],
+                        vec![(0, a, b)],
+                        depth,
+                        vec![],
+                        (0, a),
+                    ),
+                    None,
+                );
+            });
+        }
+
+        // The PRE-LOSS extension, on its own: an outsider attaches to a
+        // train member while the cascade is running and BEFORE the DB
+        // dies, with no gap move at all. Live aborts on the topology
+        // change; recovery must reach the same answer from the ledgers.
+        // It runs here rather than inside a gap regime because there it
+        // would abort the train for its own reason and hide the gap move
+        // under test (Codex harness review round 8/9, P2).
+        {
+            let (_, sample, _, _, _, _) = fixed_sample(&envelope_strategy());
+            let (_, a, b) = sample[0];
+            let delivered = coverage::count(P, "late declaration delivered");
+            // No gap move at all (kind 0 would close a PR during the
+            // outage and could idle the record before the extension
+            // mattered), and the depth accepted must be one where the
+            // extension DID abort the recovered train (Codex harness
+            // review round 14, P2).
+            at_a_depth_hitting(
+                P,
+                "a pre-loss extension",
+                &[
+                    "train recorded at loss",
+                    "crash mid-phase",
+                    "late declaration delivered",
+                    "extension abort",
+                ],
+                |depth| {
+                    envelope_case(
+                        GAP_KINDS.len(),
+                        (
+                            vec![0, 1, 2],
+                            vec![(0, a, b)],
+                            vec![(0, a, b)],
+                            depth,
+                            vec![],
+                            (0, a),
+                        ),
+                        Some((3, 2)),
+                    );
+                },
+            );
+            assert!(
+                coverage::count(P, "late declaration delivered") > delivered,
+                "the pre-loss case must actually deliver its extension"
+            );
+        }
+        eprintln!("{P} coverage: {}", coverage::report(P));
+    }
+
     // ── The oracle's own fidelity: cases a review found it wrong on ──
 
     /// A deterministic `Index` that picks `want` out of `len`: the
@@ -16219,6 +17566,180 @@ mod lost_db {
     /// `at_a_depth_hitting`); a fixed case that must reach a window sweeps
     /// them all instead.
     const SWEPT_DEPTHS: std::ops::RangeInclusive<usize> = 1..=24;
+
+    /// A history that really STOPS a running train. A stop queued with
+    /// the rest of the history is consumed at the first observation
+    /// boundary, where it cancels a pending start or finds no train, so
+    /// only a stop delivered at a saga boundary reaches a train that was
+    /// actually stopped — and with it the window where the record is
+    /// stopped while its status comment still says active (Codex review
+    /// of #90, round 3, P2).
+    #[test]
+    fn a_history_can_stop_a_running_train() {
+        let (_, sample, _, _, _, _) = fixed_sample(&envelope_strategy());
+        let (_, a, b) = sample[0];
+        let first = index_picking(0, 2);
+        at_a_depth_hitting(
+            "envelope",
+            "a stopped train",
+            &["crash with a stopped train"],
+            |depth| {
+                envelope_case(
+                    GAP_KINDS.len(),
+                    (
+                        vec![0, 1],
+                        vec![(0, a, b)],
+                        vec![(0, a, b), (3, a, b), (4, first, first)],
+                        depth,
+                        vec![],
+                        (0, a),
+                    ),
+                    None,
+                );
+            },
+        );
+    }
+
+    /// A closed-unmerged root discoverable ONLY through a gap PR's
+    /// unledgered declaration onto it: the crawl follows those targets, so
+    /// the oracle demands the adoption. A crawl that stopped following
+    /// them would orphan the train and, with a ledger-only walk, pass
+    /// (Codex harness review round 12, P2 — the mutation check).
+    #[test]
+    fn a_root_reachable_only_through_an_unledgered_declaration_is_owed_adoption() {
+        let z = index_picking(0, 4);
+        for depth in SWEPT_DEPTHS {
+            envelope_case(
+                GAP_KINDS.len(),
+                (
+                    vec![0, 1],
+                    vec![(0, z, z)],
+                    vec![(0, z, z)],
+                    depth,
+                    vec![(5, z, z), (0, z, z), (2, z, z)],
+                    (3, z),
+                ),
+                None,
+            );
+        }
+    }
+
+    /// A member whose OWNING declaration the gap deleted, while an older
+    /// same-target comment survives: severed, and recovery must abort. A
+    /// crawl that fell back to the older comment would rewrite the ledger
+    /// to name it, and an oracle reading the ledgers after recovery would
+    /// find the edge attested (Codex harness review round 12, P2 — the
+    /// mutation check).
+    #[test]
+    fn a_member_whose_owning_declaration_was_deleted_is_severed() {
+        let z = index_picking(0, 4);
+        let o = index_picking(1, 2);
+        for depth in SWEPT_DEPTHS {
+            envelope_case(
+                GAP_KINDS.len(),
+                (
+                    vec![0, 1],
+                    vec![(0, z, z), (4, z, z)],
+                    vec![(0, z, z)],
+                    depth,
+                    vec![(5, o, z)],
+                    (0, z),
+                ),
+                None,
+            );
+        }
+    }
+
+    /// A frozen member CLOSED during the gap, its declaration deleted, is
+    /// not severed: `adoption::severed` deliberately checks only open
+    /// members, since a closed one cannot be driven. The oracle must not
+    /// demand an abort recovery does not owe — a valid generated history
+    /// would otherwise fail at random (Codex harness review round 11, P2).
+    /// The whole depth range is swept so the case is reached whatever the
+    /// batch sequence looks like.
+    #[test]
+    fn a_closed_member_with_its_declaration_deleted_is_not_severed() {
+        let (_, sample, _, _, _, _) = fixed_sample(&envelope_strategy());
+        let (_, a, b) = sample[0];
+        let child = index_picking(1, 2);
+        for depth in 1..=14 {
+            envelope_case(
+                GAP_KINDS.len(),
+                (
+                    vec![0, 1],
+                    vec![(0, a, b)],
+                    vec![(0, a, b)],
+                    depth,
+                    vec![(0, child, b), (5, a, b)],
+                    (0, a),
+                ),
+                None,
+            );
+        }
+    }
+
+    /// A recovered edge must be backed by a declaration in the PR
+    /// AUTHOR'S OWN BYTES, as the live path and the crawl require — not
+    /// merely by a comment whose text still reads as the declaration. An
+    /// edit by an unknown editor that left the target alone is not the
+    /// author's word; an oracle satisfied by the text alone would pass a
+    /// crawl that kept such an edge and drove its train (Codex harness
+    /// review round 11, P2).
+    #[test]
+    fn the_envelope_rejects_an_edge_backed_only_by_an_unattributable_comment() {
+        let (mut world, heads) = build_world(&[0, 1]);
+        let mut processor = world.processor();
+        enqueue_history(&mut world, &mut processor, &[0, 1], &heads, &[], &[], false);
+        post_mirrored_comment(
+            &mut world,
+            &mut processor,
+            2,
+            1000,
+            "@merge-train predecessor #1",
+            AUTHOR,
+            "author",
+        );
+        process_backlog(&world, &mut processor);
+        assert_eq!(
+            processor.state().prs[&PrNumber(2)].predecessor,
+            Some(PrNumber(1))
+        );
+        let at_loss = processor.state().clone();
+        let check = |world: &World, processor: &mut Processor| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                assert_envelope(
+                    world,
+                    processor,
+                    &at_loss,
+                    &HashSet::new(),
+                    &Gap::default(),
+                    &[],
+                    &at_recovery(world),
+                    &Wakeup {
+                        referenced: vec![1],
+                        redelivered: None,
+                    },
+                )
+            }))
+            .is_ok()
+        };
+        assert!(
+            check(&world, &mut processor),
+            "the author's own unedited declaration backs the edge"
+        );
+        world
+            .github
+            .lock()
+            .unwrap()
+            .comments
+            .get_mut(&CommentId(1000))
+            .unwrap()
+            .edited = Edited::By { editor: None };
+        assert!(
+            !check(&world, &mut processor),
+            "an unattributable comment backs nothing: the envelope must reject the edge"
+        );
+    }
 
     /// The no-backup exemption must be decided by GitHub, not by the lost
     /// record: a `PostComment` that landed before its outcome was recorded
@@ -16334,6 +17855,638 @@ mod lost_db {
         assert!(
             unledgered_evidence(&github).contains(&(PrNumber(2), PrNumber(3))),
             "the edited owner is evidence of its new target"
+        );
+    }
+
+    /// A member the record KNOWS but has not frozen yet — behind the
+    /// frontier of a three-PR chain — whose declaration the gap deleted:
+    /// `adoption::severed` judges every member the record names, and the
+    /// oracle must too, or a crawl that judged only the frozen set would
+    /// merge the frontier and pass (Codex harness review round 13, P2 —
+    /// the mutation check).
+    #[test]
+    fn a_known_member_behind_the_frontier_with_its_declaration_deleted_is_severed() {
+        let z = index_picking(0, 4);
+        let o = index_picking(1, 2);
+        for depth in SWEPT_DEPTHS {
+            envelope_case(
+                GAP_KINDS.len(),
+                (
+                    vec![0, 1, 2],
+                    vec![(0, z, z), (0, z, z)],
+                    vec![(0, z, z)],
+                    depth,
+                    vec![(5, o, z)],
+                    (0, z),
+                ),
+                None,
+            );
+        }
+    }
+
+    /// A closed-unmerged root reachable only through a declaration on a PR
+    /// MERGED during the gap: the crawl lists recently merged PRs, so it
+    /// reaches the root and owes the adoption. The oracle's walk must seed
+    /// from the merged PRs too, or a crawl that forgot the train passes
+    /// (Codex harness review round 13, P2). The forgetting crawl is
+    /// simulated by hiding the root's status comment from listings.
+    #[test]
+    fn a_root_reachable_through_a_pr_merged_in_the_gap_is_owed_adoption() {
+        let a = index_picking(2, 3);
+        let b = index_picking(1, 3);
+        let m = index_picking(1, 2);
+        for depth in 1..=18 {
+            let (mut world, heads) = build_world(&[0, 0, 0]);
+            let mut processor = world.processor();
+            let mut history = enqueue_history(
+                &mut world,
+                &mut processor,
+                &[0, 0, 0],
+                &heads,
+                &[(2, a, b)],
+                &[(0, b, b)],
+                true,
+            );
+            let (at_loss, _) =
+                run_batches_then_snapshot(&mut world, processor, depth, &mut history);
+            let backups = status_roots_at_loss(&world, &at_loss);
+            if !backups.contains(&2) || !open_prs(&world).contains(&2) {
+                continue;
+            }
+            crash_db(&world);
+            let gap = apply_gap(&mut world, &[(0, b, b), (1, m, m)], &history, &at_loss);
+            let snapshot = at_recovery(&world);
+            assert!(
+                snapshot.closed_unmerged.contains(&2),
+                "precondition: #2 closed"
+            );
+            assert!(!snapshot.open.contains(&3), "precondition: #3 merged");
+            assert!(
+                snapshot.evidence.contains(&(PrNumber(3), PrNumber(2))),
+                "precondition: #3 still declares #2"
+            );
+            {
+                let mut github = world.github.lock().unwrap();
+                let ids: Vec<CommentId> = github
+                    .comments
+                    .iter()
+                    .filter(|(_, c)| c.pr == PrNumber(2) && parse_status_comment(&c.body).is_ok())
+                    .map(|(id, _)| *id)
+                    .collect();
+                github.hidden_from_listings.extend(ids);
+            }
+            let mut processor = world.processor();
+            let wake = fallback_wakeup(&mut world, &mut processor);
+            let announce = all_prs(&world);
+            settle(&mut world, &mut processor, &announce);
+            assert!(
+                !processor
+                    .store_mut()
+                    .events()
+                    .unwrap()
+                    .iter()
+                    .any(|e| matches!(
+                        e.payload,
+                        StateEventPayload::TrainRecordAdopted {
+                            root_pr: PrNumber(2),
+                            ..
+                        }
+                    )),
+                "precondition: the hidden comment was not adopted"
+            );
+            let accepted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                assert_envelope(
+                    &world,
+                    &mut processor,
+                    &at_loss,
+                    &backups,
+                    &gap,
+                    &[],
+                    &snapshot,
+                    &wake,
+                )
+            }))
+            .is_ok();
+            assert!(
+                !accepted,
+                "depth {depth}: the oracle must demand #2's adoption"
+            );
+            return;
+        }
+        panic!("no depth reached a train on #2 with its comment posted");
+    }
+
+    /// An unledgered declaration made in the gap onto an IDLE train's root
+    /// aborts it: no edge is installed for the next freeze to pick up. The
+    /// oracle demands that abort of every active record, not only the
+    /// mid-phase ones (Codex harness review round 14, P2 — a production
+    /// mutant that spares idle trains is the mutation check).
+    #[test]
+    fn an_unledgered_declaration_onto_an_idle_train_aborts_it() {
+        let z = index_picking(0, 4);
+        let mut checked = false;
+        for depth in SWEPT_DEPTHS {
+            let (mut world, heads) = build_world(&[0, 1]);
+            let mut processor = world.processor();
+            let mut history = enqueue_history(
+                &mut world,
+                &mut processor,
+                &[0, 1],
+                &heads,
+                &[(0, z, z)],
+                &[(0, z, z)],
+                true,
+            );
+            let (at_loss, _) =
+                run_batches_then_snapshot(&mut world, processor, depth, &mut history);
+            let backups = status_roots_at_loss(&world, &at_loss);
+            let idle = world
+                .github
+                .lock()
+                .unwrap()
+                .comments
+                .values()
+                .filter_map(|c| parse_status_comment(&c.body).ok())
+                .any(|r| r.state.is_active() && r.cascade_phase.progress().is_none());
+            if !backups.contains(&1) || !idle {
+                continue;
+            }
+            crash_db(&world);
+            let gap = apply_gap(&mut world, &[(2, z, z)], &history, &at_loss);
+            assert!(
+                !gap.extensions.is_empty(),
+                "precondition: a gap PR declared onto the stack"
+            );
+            let snapshot = at_recovery(&world);
+            let mut processor = world.processor();
+            let wake = fallback_wakeup(&mut world, &mut processor);
+            let announce = all_prs(&world);
+            settle(&mut world, &mut processor, &announce);
+            assert_envelope(
+                &world,
+                &mut processor,
+                &at_loss,
+                &backups,
+                &gap,
+                &[],
+                &snapshot,
+                &wake,
+            );
+            assert_eq!(
+                world
+                    .github
+                    .lock()
+                    .unwrap()
+                    .squash_count
+                    .get(&PrNumber(1))
+                    .copied()
+                    .unwrap_or(0),
+                0,
+                "the idle train was aborted, not driven"
+            );
+            checked = true;
+            break;
+        }
+        assert!(
+            checked,
+            "no depth left an idle train with its comment posted"
+        );
+    }
+
+    /// A recovered edge must be GRANTED by a ledger standing at recovery
+    /// (or be the one the wake-up's redelivered declaration installs
+    /// live). A crawl that derived an edge from a gap-created comment
+    /// would otherwise satisfy an oracle that only checks the comment
+    /// still reads as the declaration (Codex harness review round 14,
+    /// P2). Simulated by injecting exactly that edge after recovery.
+    #[test]
+    fn the_envelope_rejects_a_recovered_edge_no_ledger_granted() {
+        let z = index_picking(0, 4);
+        let (mut world, heads) = build_world(&[0, 1]);
+        let mut processor = world.processor();
+        let history = enqueue_history(
+            &mut world,
+            &mut processor,
+            &[0, 1],
+            &heads,
+            &[(0, z, z)],
+            &[],
+            true,
+        );
+        let announce = all_prs(&world);
+        settle(&mut world, &mut processor, &announce);
+        let at_loss = processor.state().clone();
+        drop(processor);
+        crash_db(&world);
+        let gap = apply_gap(&mut world, &[(2, z, z)], &history, &at_loss);
+        let snapshot = at_recovery(&world);
+        let (source, target) = gap.extensions[0];
+        let owner = {
+            let github = world.github.lock().unwrap();
+            *github
+                .comments
+                .iter()
+                .find(|(_, c)| c.pr == PrNumber(source))
+                .unwrap()
+                .0
+        };
+        assert!(
+            snapshot.attested[&PrNumber(source)].is_none(),
+            "precondition: no ledger grants the gap declaration"
+        );
+        let mut processor = world.processor();
+        let wake = fallback_wakeup(&mut world, &mut processor);
+        let announce = all_prs(&world);
+        settle(&mut world, &mut processor, &announce);
+        assert!(
+            processor.state().prs[&PrNumber(source)]
+                .predecessor
+                .is_none(),
+            "precondition: the true crawl installs no such edge"
+        );
+        processor
+            .store_mut()
+            .append(
+                StateEventPayload::PredecessorDeclared {
+                    pr: PrNumber(source),
+                    predecessor: PrNumber(target),
+                    comment_id: owner,
+                },
+                Utc::now(),
+            )
+            .unwrap();
+        let accepted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_envelope(
+                &world,
+                &mut processor,
+                &at_loss,
+                &HashSet::new(),
+                &gap,
+                &[],
+                &snapshot,
+                &wake,
+            )
+        }))
+        .is_ok();
+        assert!(!accepted, "an edge no ledger granted must be rejected");
+    }
+
+    /// The bot's only trace sits on a closed-unmerged PR nothing
+    /// references: the crawl never sees it and legitimately ONBOARDS,
+    /// deriving a gap PR's declaration into an edge no ledger granted. An
+    /// oracle deciding onboarding from every comment on GitHub would
+    /// reject that edge — a valid history failing (Codex harness review
+    /// round 15, P2).
+    #[test]
+    fn a_bot_trace_on_an_unreachable_closed_pr_is_no_prior_contact() {
+        let z = index_picking(0, 4);
+        let o = index_picking(1, 2);
+        envelope_case(
+            GAP_KINDS.len(),
+            (
+                vec![0, 0],
+                vec![(2, o, o)],
+                vec![],
+                1,
+                vec![(0, o, z), (2, z, z)],
+                (0, z),
+            ),
+            None,
+        );
+    }
+
+    /// A ledger grants ONE owning comment. Two surviving comments declare
+    /// the same predecessor (a restatement moved ownership forward); a
+    /// recovery that installed the superseded one as owner would let the
+    /// wrong later deletion retract the edge, and an oracle matching the
+    /// target alone would pass it (Codex harness review round 15, P2).
+    #[test]
+    fn the_envelope_rejects_an_edge_owned_by_a_superseded_comment() {
+        let z = index_picking(0, 4);
+        let (mut world, heads) = build_world(&[0, 1]);
+        let mut processor = world.processor();
+        enqueue_history(
+            &mut world,
+            &mut processor,
+            &[0, 1],
+            &heads,
+            &[(0, z, z), (4, z, z)],
+            &[],
+            false,
+        );
+        let announce = all_prs(&world);
+        settle(&mut world, &mut processor, &announce);
+        let at_loss = processor.state().clone();
+        drop(processor);
+        crash_db(&world);
+        let snapshot = at_recovery(&world);
+        assert_eq!(
+            snapshot.attested[&PrNumber(2)],
+            Some((PrNumber(1), CommentId(1001))),
+            "precondition: the restatement owns the edge"
+        );
+        let mut processor = world.processor();
+        let wake = fallback_wakeup(&mut world, &mut processor);
+        settle(&mut world, &mut processor, &announce);
+        processor
+            .store_mut()
+            .append(
+                StateEventPayload::PredecessorDeclared {
+                    pr: PrNumber(2),
+                    predecessor: PrNumber(1),
+                    comment_id: CommentId(1000),
+                },
+                Utc::now(),
+            )
+            .unwrap();
+        let accepted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_envelope(
+                &world,
+                &mut processor,
+                &at_loss,
+                &HashSet::new(),
+                &Gap::default(),
+                &[],
+                &snapshot,
+                &wake,
+            )
+        }))
+        .is_ok();
+        assert!(
+            !accepted,
+            "an edge owned by the superseded comment must be rejected"
+        );
+    }
+
+    /// A train STOPPED before the loss, its terminal status update having
+    /// landed: the surviving comment is the last word, and recovery may
+    /// neither resume it nor squash a member. A crawl that resumed the
+    /// stopped train would pass an oracle whose driving checks are
+    /// active-only (Codex harness review round 16, P2). Simulated by
+    /// injecting a squash after recovery.
+    #[test]
+    fn a_train_stopped_on_github_is_not_driven_by_recovery() {
+        let z = index_picking(0, 4);
+        let mut checked = false;
+        for depth in SWEPT_DEPTHS {
+            let (mut world, heads) = build_world(&[0, 1]);
+            let mut processor = world.processor();
+            let mut history = enqueue_history(
+                &mut world,
+                &mut processor,
+                &[0, 1],
+                &heads,
+                &[(0, z, z)],
+                &[(0, z, z)],
+                false,
+            );
+            let (mid_run, _) =
+                run_batches_then_snapshot(&mut world, processor, depth, &mut history);
+            if !mid_run
+                .active_trains
+                .get(&PrNumber(1))
+                .is_some_and(|t| t.state.is_active() && t.cascade_phase.progress().is_some())
+            {
+                continue;
+            }
+            // The DB survives (only `crash_db` loses it): reopen, stop the
+            // train, and let the terminal update land.
+            let mut processor = world.processor();
+            post_mirrored_comment(
+                &mut world,
+                &mut processor,
+                1,
+                2500,
+                "@merge-train stop",
+                AUTHOR,
+                "author",
+            );
+            let announce = all_prs(&world);
+            settle(&mut world, &mut processor, &announce);
+            let at_loss = processor.state().clone();
+            drop(processor);
+            let stopped_on_github = {
+                let github = world.github.lock().unwrap();
+                github.comments.values().any(|c| {
+                    c.pr == PrNumber(1)
+                        && parse_status_comment(&c.body).is_ok_and(|r| {
+                            matches!(r.state, TrainState::Stopped { .. })
+                                && at_loss
+                                    .active_trains
+                                    .get(&PrNumber(1))
+                                    .is_some_and(|t| t.started_at == r.started_at)
+                        })
+                })
+            };
+            if !stopped_on_github {
+                continue;
+            }
+            let backups = status_roots_at_loss(&world, &at_loss);
+            crash_db(&world);
+            let snapshot = at_recovery(&world);
+            let mut processor = world.processor();
+            let wake = fallback_wakeup(&mut world, &mut processor);
+            settle(&mut world, &mut processor, &announce);
+            // The true crawl leaves it stopped...
+            assert_envelope(
+                &world,
+                &mut processor,
+                &at_loss,
+                &backups,
+                &Gap::default(),
+                &[],
+                &snapshot,
+                &wake,
+            );
+            // ...and a recovery that squashed a member must be rejected.
+            *world
+                .github
+                .lock()
+                .unwrap()
+                .squash_count
+                .entry(PrNumber(1))
+                .or_default() += 1;
+            let accepted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                assert_envelope(
+                    &world,
+                    &mut processor,
+                    &at_loss,
+                    &backups,
+                    &Gap::default(),
+                    &[],
+                    &snapshot,
+                    &wake,
+                )
+            }))
+            .is_ok();
+            assert!(
+                !accepted,
+                "depth {depth}: a squash of a stopped train must be rejected"
+            );
+            checked = true;
+            break;
+        }
+        assert!(checked, "no depth reached a mid-phase train to stop");
+    }
+
+    /// The same, onto an idle train's ledgered DESCENDANT rather than its
+    /// root: the idle record names only its root and current PR, but its
+    /// train is that plus the descendant closure the crawl recovers, and
+    /// a gap PR declaring onto a descendant touches it (Codex harness
+    /// review round 17, P2 — a production mutant confined to the named
+    /// members is the mutation check).
+    #[test]
+    fn an_unledgered_declaration_onto_an_idle_trains_descendant_aborts_it() {
+        let z = index_picking(0, 4);
+        let onto_second = index_picking(1, 2);
+        let off_train = index_picking(3, 4);
+        let mut checked = false;
+        for depth in SWEPT_DEPTHS {
+            let (mut world, heads) = build_world(&[0, 1]);
+            let mut processor = world.processor();
+            let mut history = enqueue_history(
+                &mut world,
+                &mut processor,
+                &[0, 1],
+                &heads,
+                &[(0, z, z)],
+                &[(0, z, z)],
+                true,
+            );
+            let (at_loss, _) =
+                run_batches_then_snapshot(&mut world, processor, depth, &mut history);
+            let backups = status_roots_at_loss(&world, &at_loss);
+            let idle = world
+                .github
+                .lock()
+                .unwrap()
+                .comments
+                .values()
+                .filter_map(|c| parse_status_comment(&c.body).ok())
+                .any(|r| r.state.is_active() && r.cascade_phase.progress().is_none());
+            if !backups.contains(&1) || !idle {
+                continue;
+            }
+            crash_db(&world);
+            let gap = apply_gap(
+                &mut world,
+                &[(2, onto_second, off_train)],
+                &history,
+                &at_loss,
+            );
+            assert_eq!(
+                gap.extensions.first().map(|(_, target)| *target),
+                Some(2),
+                "precondition: the gap PR declared onto the descendant"
+            );
+            let snapshot = at_recovery(&world);
+            let mut processor = world.processor();
+            let wake = fallback_wakeup(&mut world, &mut processor);
+            let announce = all_prs(&world);
+            settle(&mut world, &mut processor, &announce);
+            assert_envelope(
+                &world,
+                &mut processor,
+                &at_loss,
+                &backups,
+                &gap,
+                &[],
+                &snapshot,
+                &wake,
+            );
+            assert_eq!(
+                world
+                    .github
+                    .lock()
+                    .unwrap()
+                    .squash_count
+                    .get(&PrNumber(1))
+                    .copied()
+                    .unwrap_or(0),
+                0,
+                "the idle train was aborted, not driven"
+            );
+            checked = true;
+            break;
+        }
+        assert!(
+            checked,
+            "no depth left an idle train with its comment posted"
+        );
+    }
+
+    /// An idle train's ledgered descendant CLOSED in the gap, and a gap PR
+    /// declaring onto it: the closed PR blocks production's descendant
+    /// walk, so the train is not touched and recovery drives it. An
+    /// oracle walking through closed PRs would demand an abort not owed —
+    /// a valid generated history failing (Codex harness review round 18,
+    /// P2).
+    #[test]
+    fn a_declaration_onto_a_closed_descendant_does_not_touch_the_train() {
+        let z = index_picking(0, 4);
+        let second = index_picking(1, 2);
+        let off_train = index_picking(3, 4);
+        let mut checked = false;
+        for depth in SWEPT_DEPTHS {
+            let (mut world, heads) = build_world(&[0, 1]);
+            let mut processor = world.processor();
+            let mut history = enqueue_history(
+                &mut world,
+                &mut processor,
+                &[0, 1],
+                &heads,
+                &[(0, z, z)],
+                &[(0, z, z)],
+                true,
+            );
+            let (at_loss, _) =
+                run_batches_then_snapshot(&mut world, processor, depth, &mut history);
+            let backups = status_roots_at_loss(&world, &at_loss);
+            let idle = world
+                .github
+                .lock()
+                .unwrap()
+                .comments
+                .values()
+                .filter_map(|c| parse_status_comment(&c.body).ok())
+                .any(|r| r.state.is_active() && r.cascade_phase.progress().is_none());
+            if !backups.contains(&1) || !idle {
+                continue;
+            }
+            crash_db(&world);
+            let gap = apply_gap(
+                &mut world,
+                &[(0, second, z), (2, second, off_train)],
+                &history,
+                &at_loss,
+            );
+            assert_eq!(gap.closed, vec![2], "precondition: #2 closed");
+            assert_eq!(
+                gap.extensions.first().map(|(_, target)| *target),
+                Some(2),
+                "precondition: the gap PR declared onto the closed descendant"
+            );
+            let snapshot = at_recovery(&world);
+            let mut processor = world.processor();
+            let wake = fallback_wakeup(&mut world, &mut processor);
+            let announce = all_prs(&world);
+            settle(&mut world, &mut processor, &announce);
+            assert_envelope(
+                &world,
+                &mut processor,
+                &at_loss,
+                &backups,
+                &gap,
+                &[],
+                &snapshot,
+                &wake,
+            );
+            checked = true;
+            break;
+        }
+        assert!(
+            checked,
+            "no depth left an idle train with its comment posted"
         );
     }
 
@@ -16552,6 +18705,17 @@ mod lost_db {
         }
         assert!(checked, "no depth left both starts pending");
     }
+
+    /// The gap move kinds, by decoder index.
+    const GAP_KINDS: [&str; 7] = [
+        "gap: close unmerged",
+        "gap: manual merge",
+        "gap: extension",
+        "gap: edit into declaration",
+        "gap: edit away",
+        "gap: delete comment",
+        "gap: delete status comment",
+    ];
 }
 
 // ─── The recovery oracle: first contact against live processing ───
