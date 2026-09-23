@@ -224,7 +224,7 @@ impl FakeGitHub {
     }
 
     /// The `PrData` GitHub would return for `pr` right now.
-    fn pr_data(&self, pr: PrNumber) -> (PrData, MergeStateStatus) {
+    pub fn pr_data(&self, pr: PrNumber) -> (PrData, MergeStateStatus) {
         let fake = self.prs.get(&pr).expect("fetch of a known PR");
         let (state, head_sha, merge_state) = match &fake.state {
             FakePrState::Open => (

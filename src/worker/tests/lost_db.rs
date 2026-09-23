@@ -50,7 +50,7 @@ use crate::persistence::event::StateEventPayload;
 use crate::state::descendants::collect_all_descendants;
 use crate::status::parse::parse_status_comment;
 use crate::store::DurableCommand;
-use crate::types::{PrState, TrainRecord, TrainState};
+use crate::types::{CachedPr, PrState, TrainRecord, TrainState};
 
 // ── World building ──
 
@@ -1259,18 +1259,33 @@ fn assert_equivalent(
                 "PR #{pr}: routing fields diverged"
             );
         }
-        // Each world's head matches its OWN reality, exemption or not:
+        // Each world's cache matches its OWN reality, exemption or not:
         // a lost command excuses the two worlds differing, never a
-        // world disagreeing with the GitHub it can see (Codex review
-        // of #90, round 3, P2).
+        // world disagreeing with the GitHub it can see — not its head
+        // (Codex review of #90, round 3, P2), and not its state or
+        // routing either (round 4, P2). "What GitHub would say" is the
+        // fake's own answer to a fetch, not a re-derivation of it.
         for (world, cached, which) in [(lw, l, "live"), (cw, c, "lost-db")] {
             let github = world.github.lock().unwrap();
-            if let Some(fake) = github.prs.get(pr)
-                && matches!(fake.state, FakePrState::Open)
-            {
+            if !github.prs.contains_key(pr) {
+                continue;
+            }
+            let (real, _) = github.pr_data(*pr);
+            assert_eq!(
+                (
+                    &cached.state,
+                    &cached.head_ref,
+                    &cached.base_ref,
+                    cached.is_draft
+                ),
+                (&real.state, &real.head_ref, &real.base_ref, real.is_draft),
+                "{which}: PR #{pr}'s cached state or routing disagrees with its GitHub"
+            );
+            // Only an open PR's head is tracked: a closed or merged PR's
+            // branch is no longer the cache's to follow.
+            if real.state == PrState::Open {
                 assert_eq!(
-                    cached.head_sha,
-                    github.branch_head(&fake.branch),
+                    cached.head_sha, real.head_sha,
                     "{which}: PR #{pr}'s cached head is stale"
                 );
             }
@@ -2108,42 +2123,104 @@ fn an_owning_comment_edited_to_name_another_predecessor_is_evidence() {
 
 /// A lost command excuses the two worlds DIFFERING from each other. It
 /// never excuses a world disagreeing with the GitHub that world can
-/// see, so a stale cached head is a defect the oracle must catch on an
-/// exempt PR exactly as on any other (Codex review of #90, round 3,
-/// P2).
+/// see, so every fact the cache holds about an exempt PR must be
+/// checked against that world's own GitHub exactly as on any other PR:
+/// its head (Codex review of #90, round 3, P2), and its state and
+/// routing (round 4, P2). Each corruption must be caught by the check
+/// that names it, not incidentally by another.
 #[test]
-fn a_stale_cached_head_is_caught_even_under_a_command_loss_exemption() {
+fn a_cache_disagreeing_with_its_own_github_is_caught_under_a_command_loss_exemption() {
     let (_, sample, _, _) = fixed_sample(&differential_strategy());
     let (_, a, b) = sample[0];
-    let mut checked = false;
-    for depth in SWEPT_DEPTHS {
-        let (live_world, mut live) = run_live(&[0, 1], &[(0, a, b)], &[(0, a, b)]);
-        let (lost_world, mut lost, exempt_prs, exempt_roots, attested) =
+    let pr = PrNumber(2);
+    let run = |depth| {
+        let (live_world, live) = run_live(&[0, 1], &[(0, a, b)], &[(0, a, b)]);
+        let (lost_world, lost, exempt_prs, exempt_roots, attested) =
             run_lost(&[0, 1], &[(0, a, b)], &[(0, a, b)], depth, "probe");
-        if !exempt_prs.contains(&PrNumber(2)) {
-            continue;
-        }
-        // As recovered, the two worlds are equivalent...
-        assert_equivalent(
-            &live_world,
-            &mut live,
-            &lost_world,
-            &mut lost,
-            &exempt_prs,
-            &exempt_roots,
-            attested.as_ref(),
+        (
+            live_world,
+            live,
+            lost_world,
+            lost,
+            exempt_prs,
+            exempt_roots,
+            attested,
+        )
+    };
+    let depth = SWEPT_DEPTHS
+        .clone()
+        .find(|&depth| {
+            let (live_world, mut live, lost_world, mut lost, exempt_prs, exempt_roots, attested) =
+                run(depth);
+            if !exempt_prs.contains(&pr) {
+                return false;
+            }
+            // As recovered, the two worlds are equivalent.
+            assert_equivalent(
+                &live_world,
+                &mut live,
+                &lost_world,
+                &mut lost,
+                &exempt_prs,
+                &exempt_roots,
+                attested.as_ref(),
+            );
+            true
+        })
+        .expect("no depth left PR #2 exempt through a lost command");
+
+    type Corruption = fn(&CachedPr) -> StateEventPayload;
+    let corruptions: [(&str, Corruption, &str); 5] = [
+        (
+            "a stale head",
+            |c| StateEventPayload::PrSynchronized {
+                pr: c.number,
+                new_head_sha: Sha::parse("0".repeat(40)).unwrap(),
+            },
+            "cached head is stale",
+        ),
+        (
+            "a wrong base",
+            |c| StateEventPayload::PrBaseChanged {
+                pr: c.number,
+                old_base: c.base_ref.clone(),
+                new_base: "wrong-base".to_owned(),
+            },
+            "cached state or routing disagrees with its GitHub",
+        ),
+        (
+            "a wrong head branch",
+            |c| StateEventPayload::PrOpened {
+                pr: c.number,
+                head_sha: c.head_sha.clone(),
+                head_ref: "wrong-head".to_owned(),
+                base_ref: c.base_ref.clone(),
+                is_draft: c.is_draft,
+            },
+            "cached state or routing disagrees with its GitHub",
+        ),
+        (
+            "a closure GitHub never saw",
+            |c| StateEventPayload::PrClosed { pr: c.number },
+            "cached state or routing disagrees with its GitHub",
+        ),
+        (
+            "a draft GitHub never saw",
+            |c| StateEventPayload::PrConvertedToDraft { pr: c.number },
+            "cached state or routing disagrees with its GitHub",
+        ),
+    ];
+    let mut escaped = Vec::new();
+    for (what, corrupt, expected) in corruptions {
+        let (live_world, mut live, lost_world, mut lost, exempt_prs, exempt_roots, attested) =
+            run(depth);
+        assert!(
+            exempt_prs.contains(&pr),
+            "depth {depth} stopped exempting PR #2"
         );
-        // ...and staling the exempt PR's cached head must be rejected.
-        lost.store_mut()
-            .append(
-                StateEventPayload::PrSynchronized {
-                    pr: PrNumber(2),
-                    new_head_sha: Sha::parse("0".repeat(40)).unwrap(),
-                },
-                Utc::now(),
-            )
-            .unwrap();
-        let accepted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let event = corrupt(&lost.state().prs[&pr]);
+        lost.store_mut().append(event, Utc::now()).unwrap();
+        let verdict = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             assert_equivalent(
                 &live_world,
                 &mut live,
@@ -2153,16 +2230,26 @@ fn a_stale_cached_head_is_caught_even_under_a_command_loss_exemption() {
                 &exempt_roots,
                 attested.as_ref(),
             )
-        }))
-        .is_ok();
-        assert!(
-            !accepted,
-            "depth {depth}: a stale cached head on an exempt PR must be caught"
-        );
-        checked = true;
-        break;
+        }));
+        match verdict {
+            Ok(()) => escaped.push(format!("{what}: accepted")),
+            Err(payload) => {
+                let message = payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+                    .unwrap_or_default();
+                if !message.contains(&format!("lost-db: PR #{pr}'s {expected}")) {
+                    escaped.push(format!("{what}: rejected by another check: {message}"));
+                }
+            }
+        }
     }
-    assert!(checked, "no depth left PR #2 exempt through a lost command");
+    assert!(
+        escaped.is_empty(),
+        "depth {depth}: corruptions of an exempt PR's cache the oracle missed:\n{}",
+        escaped.join("\n")
+    );
 }
 
 /// A pending `start` that a later pending `stop` CANCELS changes
