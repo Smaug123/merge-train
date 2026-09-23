@@ -528,6 +528,57 @@ impl ReplayFacts {
     }
 }
 
+/// Every intent `root`'s log left unmatched when the ledger was CLOSED:
+/// at each boundary that ends a unit of work — a `PhaseTransition`, a fan-out,
+/// or the train stopping, aborting or completing — paired with the index of
+/// that boundary in `events`, plus whatever the current ledger holds unmatched
+/// (at index `events.len()`).
+///
+/// [`ReplayFacts::for_train`] answers for the CURRENT phase only, so asking it
+/// about a finished train always answers "nothing unmatched": the terminal
+/// boundary cleared the ledger. This audits the whole history instead, with the
+/// same ledger derivation. A `TrainStarted` or `TrainRecordAdopted` boundary is
+/// not audited: the former opens a run whose predecessor was audited at its own
+/// end, and the latter supersedes a log that regressed.
+#[cfg(test)]
+pub(crate) fn unmatched_at_boundaries(
+    events: &[StateEvent],
+    root: PrNumber,
+) -> Vec<(usize, IntentFact)> {
+    let closes_the_ledger = |payload: &StateEventPayload| match payload {
+        StateEventPayload::PhaseTransition { train_root, .. }
+        | StateEventPayload::TrainStopped {
+            root_pr: train_root,
+        }
+        | StateEventPayload::TrainCompleted {
+            root_pr: train_root,
+        }
+        | StateEventPayload::TrainAborted {
+            root_pr: train_root,
+            ..
+        }
+        | StateEventPayload::FanOutCompleted {
+            old_root: train_root,
+            ..
+        } => *train_root == root,
+        _ => false,
+    };
+    events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| closes_the_ledger(&e.payload))
+        .map(|(i, _)| i)
+        .chain(std::iter::once(events.len()))
+        .flat_map(|i| {
+            ReplayFacts::for_train(&events[..i], root)
+                .unmatched()
+                .cloned()
+                .map(move |fact| (i, fact))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 /// Marks the earliest fact matching `pred` as done.
 fn mark_done(intents: &mut [IntentFact], pred: impl Fn(&IntentFact) -> bool) {
     if let Some(fact) = intents.iter_mut().find(|f| pred(f)) {

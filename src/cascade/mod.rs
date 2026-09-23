@@ -24,6 +24,8 @@ mod model_tests;
 pub(crate) use engine::handler_abort_cleanup;
 pub use engine::{advance, recover_train, start_train, stop_train};
 pub use observe::{ObserveError, observe};
+#[cfg(test)]
+pub(crate) use plan::unmatched_at_boundaries;
 pub use plan::{
     CascadeError, Control, EffectError, EffectOutcome, EffectResponse, IntentFact, Observation,
     ReplayFacts, StepPlan,

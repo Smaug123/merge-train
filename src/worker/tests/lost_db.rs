@@ -37,7 +37,7 @@
 //! Every case does real git work; case counts are deliberately small. Raise
 //! `PROPTEST_CASES` when touching the crawl or recovery.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use proptest::prelude::*;
 use proptest::sample::Index;
@@ -1147,8 +1147,8 @@ fn train_kinds(state: &RepoState) -> std::collections::BTreeMap<u64, &'static st
 }
 
 /// One world's absolutes: ≤1 squash per PR, exact store↔GitHub merge
-/// agreement, matched intent ledgers for completed trains, and an empty
-/// command backlog.
+/// agreement, matched intent ledgers for finished trains (at every
+/// boundary, not just the last), and an empty command backlog.
 fn assert_consistent(world: &World, processor: &mut Processor, ctx: &str) {
     {
         let github = world.github.lock().unwrap();
@@ -1172,20 +1172,25 @@ fn assert_consistent(world: &World, processor: &mut Processor, ctx: &str) {
             );
         }
     }
+    // A train that finished — completed, or retired by a fan-out — settled
+    // every intent before each boundary that cleared its ledger. Asking
+    // `ReplayFacts::for_train` instead would answer for the last phase
+    // alone, which the terminal boundary already cleared: it can never
+    // fail (Codex review of #90, round 5, P2).
     let events = processor.store_mut().events().unwrap();
-    let completed: Vec<PrNumber> = events
+    let finished: BTreeSet<PrNumber> = events
         .iter()
         .filter_map(|e| match e.payload {
             StateEventPayload::TrainCompleted { root_pr } => Some(root_pr),
+            StateEventPayload::FanOutCompleted { old_root, .. } => Some(old_root),
             _ => None,
         })
         .collect();
-    for root in completed {
-        let facts = ReplayFacts::for_train(&events, root);
-        assert_eq!(
-            facts.unmatched().count(),
-            0,
-            "{ctx}: completed train #{root} has unmatched intents"
+    for root in finished {
+        let unmatched = crate::cascade::unmatched_at_boundaries(&events, root);
+        assert!(
+            unmatched.is_empty(),
+            "{ctx}: finished train #{root} left intents unmatched: {unmatched:?}"
         );
     }
     assert!(
