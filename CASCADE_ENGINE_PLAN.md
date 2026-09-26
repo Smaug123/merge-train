@@ -934,7 +934,7 @@ stage shippable).
 >    reconstruction is the most adversarial recovery surface; every
 >    finding was a real divergence from live-operation guarantees, each
 >    pinned by a mutation-checked test. **Post-convergence, the reviewer
->    is MECHANIZED** (`worker/tests.rs::lost_db`, mirroring how the
+>    is MECHANIZED** (`worker/tests/lost_db.rs`, mirroring how the
 >    `interleaving` harness ended the M5/M6 saga-ordering rounds): a
 >    differential property runs one generated history (shapes incl.
 >    fan-out; valid/junk/stranger/restated/retracted declarations;

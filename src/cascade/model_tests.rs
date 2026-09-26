@@ -36,7 +36,7 @@ use crate::types::{
     TrainErrorKind, TrainState,
 };
 
-use super::plan::{EffectError, EffectOutcome, EffectResponse};
+use super::plan::{EffectError, EffectOutcome, EffectResponse, unmatched_at_boundaries};
 use super::{
     Control, Observation, ReplayFacts, StepPlan, TrainSizeCap, advance, observe, start_train,
     stop_train,
@@ -1096,6 +1096,52 @@ proptest! {
             }
 
             assert_stack_fully_merged(&driver, &shape);
+        }
+    }
+
+    /// The intent audit is not vacuous. An uninterrupted run leaves nothing
+    /// unmatched at any boundary where the ledger is cleared, and deleting
+    /// any ONE settling record from that log — a `Done*` or a
+    /// `SquashCommitted` — is caught. `for_train` over a finished train's
+    /// whole log answers for its last phase only, which the terminal
+    /// boundary has already cleared, so it catches none of these (Codex
+    /// review of #90, round 5, P2).
+    #[test]
+    fn the_intent_audit_catches_every_dropped_settlement(shape in arb_stack(5)) {
+        let (world, state) = seed(&shape);
+        let mut driver = Driver::new(world, state);
+        driver.run_to_completion(pr_number(0));
+        let log = driver.log;
+
+        let settles = |payload: &StateEventPayload| match payload {
+            StateEventPayload::DonePushPrep { train_root, .. }
+            | StateEventPayload::SquashCommitted { train_root, .. }
+            | StateEventPayload::DonePushReconcile { train_root, .. }
+            | StateEventPayload::DonePushCatchup { train_root, .. }
+            | StateEventPayload::DoneRetarget { train_root, .. } => Some(*train_root),
+            _ => None,
+        };
+        let roots: BTreeSet<PrNumber> = log.iter().filter_map(|e| settles(&e.payload)).collect();
+        for root in &roots {
+            prop_assert_eq!(
+                unmatched_at_boundaries(&log, *root),
+                vec![],
+                "an uninterrupted run left train {}'s intents unmatched",
+                root
+            );
+        }
+        for (i, event) in log.iter().enumerate() {
+            let Some(root) = settles(&event.payload) else {
+                continue;
+            };
+            let mut dropped = log.clone();
+            dropped.remove(i);
+            prop_assert!(
+                !unmatched_at_boundaries(&dropped, root).is_empty(),
+                "deleting #{} {:?} went unnoticed",
+                i,
+                event.payload
+            );
         }
     }
 

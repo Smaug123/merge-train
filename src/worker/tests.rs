@@ -14228,6 +14228,8 @@ mod interleaving {
 
 // ─── The lost-DB crawl conformance harness ───
 
+mod lost_db;
+
 // ─── The recovery oracle: first contact against live processing ───
 
 /// Recovery must reach what live processing reached. For any history of
